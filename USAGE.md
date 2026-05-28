@@ -1,4 +1,4 @@
-# Coding Agent 使用教程
+# Forge Agent 使用教程
 
 自主编程智能体，支持对话式代码编辑、自动修复 Bug、运行测试，
 支持 Claude、DeepSeek、OpenAI、Groq、Ollama 多种模型。
@@ -29,7 +29,7 @@
 ```bash
 # 克隆项目
 git clone <repo-url>
-cd coding-agent
+cd forge-agent
 
 # 创建虚拟环境（推荐）
 python -m venv .venv
