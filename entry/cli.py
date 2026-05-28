@@ -250,8 +250,14 @@ def run(
     except ImportError:
         is_tiktoken_available = lambda: False
 
-    # 流式回调：每个 token 立刻 flush 到终端
+    # 流式回调：最终回答正常亮色
     def _stream_cb(text: str) -> None:
+        import sys
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    # 推理回调：思考过程 dim 暗色
+    def _thought_cb(text: str) -> None:
         import sys
         sys.stdout.write(dim(text))
         sys.stdout.flush()
@@ -262,6 +268,7 @@ def run(
         history_max_messages=config.context.history_window * 2,
         stream=stream,
         stream_callback=_stream_cb if stream else None,
+        thought_callback=_thought_cb if stream else None,
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
     )

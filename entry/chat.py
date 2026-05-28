@@ -72,6 +72,7 @@ def _print_event_live(event) -> None:
             sys.stdout.flush()
 
         if tc:
+            _print_event_live._last_tool_name = tc['name']  # 供 observation 判断
             click.echo(cyan(f"  [{step}] {tc['name']}"), nl=False)
             # 打印关键参数
             params = tc.get("params", {})
@@ -91,6 +92,9 @@ def _print_event_live(event) -> None:
                 click.echo()
         elif atype == "finish":
             click.echo(green(f"\n  [{step}] ✓ finish"))
+            # 把 message 存到全局，供 TASK_COMPLETE event 打印
+            _finish_message = action.get("message", "") or ""
+            _print_event_live._pending_message = _finish_message
         elif atype == "give_up":
             click.echo(red(f"\n  [{step}] ✗ give_up"))
 
@@ -100,17 +104,26 @@ def _print_event_live(event) -> None:
         output = (obs.get("output") or "").strip()
         error = obs.get("error")
 
+        # 从上一条 action event 取工具名（_last_tool_name 由 ACTION 分支设置）
+        tool_name = getattr(_print_event_live, "_last_tool_name", "")
+
+        # 只读类工具：只显示 ✓ 或 ✗，不打印内容（内容已被模型读取，用户不需要看）
+        SILENT_TOOLS = {"file_read", "file_view", "file_write", "find_files", "find_symbol"}
+        silent = tool_name in SILENT_TOOLS
+
         if status == "success":
-            lines = output.splitlines()
-            # 最多显示 20 行，超出折叠
-            MAX_PREVIEW = 20
-            preview = "\n".join(f"    {l}" for l in lines[:MAX_PREVIEW])
-            if lines:
-                click.echo(green("  ✓") + dim(f"\n{preview}"))
-                if len(lines) > MAX_PREVIEW:
-                    click.echo(dim(f"    ... ({len(lines)-MAX_PREVIEW} more lines)"))
-            else:
+            if silent:
                 click.echo(green("  ✓"))
+            else:
+                lines = output.splitlines()
+                MAX_PREVIEW = 20
+                preview = "\n".join(f"    {l}" for l in lines[:MAX_PREVIEW])
+                if lines:
+                    click.echo(green("  ✓") + dim(f"\n{preview}"))
+                    if len(lines) > MAX_PREVIEW:
+                        click.echo(dim(f"    ... ({len(lines)-MAX_PREVIEW} more lines)"))
+                else:
+                    click.echo(green("  ✓"))
         else:
             click.echo(red(f"  ✗ {error or output[:120]}"))
 
@@ -119,7 +132,22 @@ def _print_event_live(event) -> None:
         click.echo(yellow(f"\n  ⟳ Reflection ({reason}) — reconsidering approach...\n"))
 
     elif etype == EventType.TASK_COMPLETE:
-        pass  # 流式模式下回答内容已经实时打印完了，无需重复显示
+        # 取出 finish action 存的 message
+        message = getattr(_print_event_live, "_pending_message", "")
+        _print_event_live._pending_message = ""
+
+        if message:
+            # 获取流式打印的 thought（存在 stream_callback 里）
+            streamed = getattr(_print_event_live, "_streamed_thought", "").strip()
+            msg_stripped = message.strip()
+
+            if msg_stripped and msg_stripped != streamed:
+                # thought 和 message 不同（如 Claude）→ 单独打印最终回答
+                import sys
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                click.echo(msg_stripped)
+            # thought == message（如 DeepSeek flash）→ 已经流式打印过，不重复
 
     elif etype == EventType.TASK_FAILED:
         reason = p.get("reason", "")
@@ -149,17 +177,38 @@ class ChatSession:
         self._confirm_callback = confirm_callback
 
         # 流式回调：每个 token 立刻 flush 到终端
-        _stream_started = [False]  # 用列表以便闭包修改
+        _stream_started = [False]
+        _thought_printed = [False]  # 标记是否打过 thought，用于 message 前换行
+        _streamed_buf = []   # 记录流式打印的内容，用于和 message 比较
 
-        def _stream_cb(text: str) -> None:
+        def _thought_cb(text: str) -> None:
+            """推理过程：dim 暗色，表示模型在思考"""
             import sys
             if not _stream_started[0]:
-                # 第一个 token 到来前先清行（防止 readline 残留内容）
-                sys.stdout.write("\r  ")  # 覆盖"Agent working..."提示
+                sys.stdout.write("\r  ")
                 sys.stdout.flush()
                 _stream_started[0] = True
             sys.stdout.write(dim(text))
             sys.stdout.flush()
+            _thought_printed[0] = True
+
+        def _stream_cb(text: str) -> None:
+            """最终回答：正常亮色"""
+            import sys
+            if not _stream_started[0]:
+                # 第一次打 message，之前没打过任何内容
+                sys.stdout.write("\r  ")
+                sys.stdout.flush()
+                _stream_started[0] = True
+            elif _thought_printed[0]:
+                # 之前打过 thought，先换两行作为分隔再打 message
+                sys.stdout.write("\n\n")
+                sys.stdout.flush()
+                _thought_printed[0] = False  # 只换一次
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            _streamed_buf.append(text)
+            _print_event_live._streamed_thought = "".join(_streamed_buf)
 
         agent_cfg = AgentConfig(
             max_steps=config.agent.max_steps,
@@ -169,6 +218,7 @@ class ChatSession:
             llm_retry_delay=1.0,
             stream=True,
             stream_callback=_stream_cb,
+            thought_callback=_thought_cb,
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
         )

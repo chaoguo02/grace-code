@@ -113,10 +113,12 @@ class LLMBackend(ABC):
         messages: "list[LLMMessage]",
         tools: "list[LLMToolSchema]",
         on_text: "StreamCallback | None" = None,
+        on_thought: "StreamCallback | None" = None,
     ) -> "LLMResponse":
         """
         流式调用 LLM。默认 fallback 到 complete()。
-        支持流式的 backend 覆盖此方法实现真正的流式。
+        on_text:    模型最终回答（message）的流式回调
+        on_thought: 模型推理过程（thought）的流式回调，仅推理模型有内容
         """
         response = self.complete(messages, tools)
         if on_text and response.raw_content:

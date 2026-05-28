@@ -58,7 +58,8 @@ class AgentConfig:
     llm_max_retries: int = 3               # LLM 调用失败最大重试次数
     llm_retry_delay: float = 2.0           # 重试间隔（秒，指数退避）
     stream: bool = False                   # 是否启用流式输出
-    stream_callback: object = None         # StreamCallback，流式时调用
+    stream_callback: object = None         # StreamCallback，最终回答流式回调
+    thought_callback: object = None        # StreamCallback，推理过程流式回调（推理模型专用）
     confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
 
@@ -156,7 +157,7 @@ class Agent:
             action = response.action
 
             # ── 2. 写入 Action event ────────────────────────────────────
-            log.log_action(step=step, action=action)
+            log.log_action(step=step, action=action, raw_content=response.raw_content)
             logger.info("Step %d: %r", step, action)
 
             # ── 3. 检测死循环（连续相同 action）────────────────────────
@@ -368,8 +369,13 @@ class Agent:
             try:
                 if self._cfg.stream:
                     cb = self._cfg.stream_callback
+                    thought_cb = self._cfg.thought_callback
                     if hasattr(self._backend, "stream"):
-                        return self._backend.stream(messages, tools, on_text=cb)
+                        return self._backend.stream(
+                            messages, tools,
+                            on_text=cb,
+                            on_thought=thought_cb,
+                        )
                 return self._backend.complete(messages, tools)
             except Exception as exc:
                 last_exc = exc

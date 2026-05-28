@@ -222,8 +222,8 @@ def _parse_openai_response(choice: Any, thought: str) -> Action:
         if thought and thought != "(no thought)":
             return Action(
                 action_type=ActionType.FINISH,
-                thought=thought,
-                message=thought,
+                thought="",      # 普通 chat 模型没有独立推理链，thought 置空
+                message=thought,  # 模型输出的内容就是最终回答
             )
         return Action(
             action_type=ActionType.GIVE_UP,
@@ -367,22 +367,22 @@ def _openai_stream(
     messages: list,
     tools: list,
     on_text: StreamCallback | None = None,
+    on_thought: StreamCallback | None = None,
 ) -> "LLMResponse":
     """
     OpenAI-compatible 流式调用实现。
-
-    function calling 模式：text delta 实时回调，tool_call 在流结束后解析。
-    文本解析模式（R1 等）：同样实时回调，最后整体解析。
+    on_text:    最终回答（message）的流式回调
+    on_thought: 推理过程（reasoning_content）的流式回调，仅推理模型有内容
     """
     api_messages = _to_openai_messages(messages)
 
     if self._use_function_calling:
-        return _stream_with_tools(self, api_messages, tools, on_text)
+        return _stream_with_tools(self, api_messages, tools, on_text, on_thought)
     else:
         return _stream_text_only(self, api_messages, tools, on_text)
 
 
-def _stream_with_tools(self, api_messages, tools, on_text):
+def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
     api_tools = [_to_openai_tool(t) for t in tools] if tools else None
 
     kwargs = dict(
@@ -397,6 +397,7 @@ def _stream_with_tools(self, api_messages, tools, on_text):
 
     # 收集流式 chunks
     full_text = ""
+    full_reasoning = ""  # reasoning_content（推理模型专有）
     finish_reason = None
     tool_calls_raw = []      # 收集 tool call deltas
 
@@ -409,7 +410,14 @@ def _stream_with_tools(self, api_messages, tools, on_text):
         delta = choice.delta
         finish_reason = choice.finish_reason or finish_reason
 
-        # text delta
+        # reasoning_content delta（DeepSeek R1 / Claude thinking）
+        reasoning_delta = getattr(delta, "reasoning_content", None)
+        if reasoning_delta:
+            full_reasoning += reasoning_delta
+            if on_thought:
+                on_thought(reasoning_delta)
+
+        # text delta（最终回答）
         if delta.content:
             full_text += delta.content
             if on_text:
@@ -444,8 +452,18 @@ def _stream_with_tools(self, api_messages, tools, on_text):
         mock_message = SimpleNamespace(content=full_text or None, tool_calls=None)
 
     mock_choice = SimpleNamespace(finish_reason=finish_reason or "stop", message=mock_message)
-    thought = full_text or "(no thought)"
-    action = _parse_openai_response(mock_choice, thought)
+    # 有 reasoning_content 时，thought = 推理过程，message = 最终回答
+    # 没有时（普通 chat 模型），thought 置空，message = 模型输出
+    thought_for_parse = full_text or "(no thought)"
+    action = _parse_openai_response(mock_choice, thought_for_parse)
+    # 如果有推理内容，覆盖 action.thought
+    if full_reasoning and action.action_type.value == "finish":
+        action = action.__class__(
+            action_type=action.action_type,
+            thought=full_reasoning,
+            tool_call=action.tool_call,
+            message=action.message,
+        )
 
     # 流式模式拿不到精确 token 数，估算
     from context.token_budget import estimate_tokens

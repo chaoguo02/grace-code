@@ -75,8 +75,11 @@ class TestCoreStreamPath:
         backend = MockBackend(script)
         stream_calls = []
 
-        def fake_stream(messages, tools, on_text=None):
+        def fake_stream(messages, tools, on_text=None, on_thought=None):
             stream_calls.append({"messages": messages, "on_text": on_text})
+            # 模拟推理模型：先流式输出 thought，再输出 message
+            if on_thought:
+                on_thought("thinking... ")
             # 模拟流式：分 3 次调用 on_text
             if on_text:
                 on_text("I will ")
@@ -179,7 +182,7 @@ class TestCoreStreamPath:
         script = [Action(ActionType.FINISH, "done", message="ok")]
         base_backend = MockBackend(script)
 
-        def flaky_stream(messages, tools, on_text=None):
+        def flaky_stream(messages, tools, on_text=None, on_thought=None):
             nonlocal attempt
             attempt += 1
             if attempt < 2:

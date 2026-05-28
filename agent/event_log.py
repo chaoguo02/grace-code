@@ -82,14 +82,15 @@ class EventLog:
             payload={"task": task.to_dict()},
         ))
 
-    def log_action(self, step: int, action: Action) -> None:
-        """Agent 的每一步决策。"""
+    def log_action(self, step: int, action: Action, raw_content: str = "") -> None:
+        """Agent 的每一步决策。raw_content 是模型返回的完整原始文本。"""
         self._append(Event(
             event_type=EventType.ACTION,
             task_id=self._current_task_id,
             payload={
-                "step":   step,
-                "action": action.to_dict(),
+                "step":        step,
+                "action":      action.to_dict(),
+                "raw_content": raw_content,  # 模型原始输出，含完整推理链
             },
         ))
 
