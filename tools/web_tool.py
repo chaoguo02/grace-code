@@ -156,11 +156,11 @@ class WebSearchTool(BaseTool):
             return ToolResult(success=False, output="", error="query is required")
 
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
         except ImportError:
             return ToolResult(
                 success=False, output="",
-                error="duckduckgo_search not installed. Run: pip install duckduckgo-search",
+                error="ddgs not installed. Run: pip install ddgs",
             )
 
         try:

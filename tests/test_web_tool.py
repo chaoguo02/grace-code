@@ -124,7 +124,7 @@ class TestExtractContent:
 
 
 # ---------------------------------------------------------------------------
-# WebSearchTool — fake duckduckgo_search 模块
+# WebSearchTool — fake ddgs 模块
 # ---------------------------------------------------------------------------
 
 SAMPLE_SEARCH_RESULTS = [
@@ -135,7 +135,7 @@ SAMPLE_SEARCH_RESULTS = [
 
 
 def _inject_fake_ddgs(text_results=None, side_effect=None):
-    """向 sys.modules 注入一个 fake duckduckgo_search 模块。"""
+    """向 sys.modules 注入一个 fake ddgs 模块。"""
     fake_mod = MagicMock()
 
     if side_effect:
@@ -145,9 +145,9 @@ def _inject_fake_ddgs(text_results=None, side_effect=None):
         ctx.text.return_value = text_results
         fake_mod.DDGS.return_value = ctx
 
-    mod = types.ModuleType("duckduckgo_search")
+    mod = types.ModuleType("ddgs")
     mod.DDGS = fake_mod.DDGS
-    sys.modules["duckduckgo_search"] = mod
+    sys.modules["ddgs"] = mod
     return mod
 
 
@@ -179,8 +179,8 @@ class TestWebSearchTool:
 
     def test_search_package_missing(self):
         """清除 fake 模块后，import 失败 → 优雅报错。"""
-        sys.modules.pop("duckduckgo_search", None)
-        with patch("builtins.__import__", side_effect=ImportError("no duckduckgo_search")):
+        sys.modules.pop("ddgs", None)
+        with patch("builtins.__import__", side_effect=ImportError("no ddgs")):
             result = self.tool.execute({"query": "test"})
             assert not result.success
 
