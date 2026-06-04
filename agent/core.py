@@ -66,6 +66,24 @@ class AgentConfig:
 
 
 # ---------------------------------------------------------------------------
+# 共享工具函数
+# ---------------------------------------------------------------------------
+
+def _git_diff(repo_path: str) -> str | None:
+    """抓取 git diff HEAD 作为 patch，失败时静默返回 None。"""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "HEAD"],
+            capture_output=True, text=True, timeout=10, cwd=repo_path,
+        )
+        diff = proc.stdout.strip()
+        return diff if diff else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # ReActAgent — ReAct (Reasoning + Acting) 主循环
 # ---------------------------------------------------------------------------
 
@@ -400,16 +418,7 @@ class ReActAgent:
 
     def _get_git_diff(self, repo_path: str) -> str | None:
         """抓取 git diff HEAD 作为 patch，失败时静默返回 None。"""
-        import subprocess
-        try:
-            proc = subprocess.run(
-                ["git", "diff", "HEAD"],
-                capture_output=True, text=True, timeout=10, cwd=repo_path,
-            )
-            diff = proc.stdout.strip()
-            return diff if diff else None
-        except Exception:
-            return None
+        return _git_diff(repo_path)
 
 
 # ---------------------------------------------------------------------------
@@ -578,13 +587,4 @@ class PlanExecuteAgent:
 
     def _get_git_diff(self, repo_path: str) -> str | None:
         """抓取 git diff HEAD 作为 patch，失败时静默返回 None。"""
-        import subprocess
-        try:
-            proc = subprocess.run(
-                ["git", "diff", "HEAD"],
-                capture_output=True, text=True, timeout=10, cwd=repo_path,
-            )
-            diff = proc.stdout.strip()
-            return diff if diff else None
-        except Exception:
-            return None
+        return _git_diff(repo_path)

@@ -15,8 +15,9 @@ import pytest
 
 from tools.web_tool import (
     WebSearchTool, WebFetchTool,
-    _validate_url, _truncate, _extract_content, _strip_tags,
+    _validate_url, _extract_content, _strip_tags,
 )
+from tools.utils import truncate_output
 
 
 # ---------------------------------------------------------------------------
@@ -84,11 +85,11 @@ class TestValidateURL:
 
 class TestTruncate:
     def test_short_unchanged(self):
-        assert _truncate("hello", 100) == "hello"
+        assert truncate_output("hello", 100) == "hello"
 
     def test_long_truncated(self):
         text = "x" * 10_000
-        result = _truncate(text, 1_000)
+        result = truncate_output(text, 1_000)
         assert len(result) < len(text)
         assert "truncated" in result
 

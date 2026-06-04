@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from tools.base import BaseTool, ToolResult
 from tools.runtime import LocalRuntime, Runtime
+from tools.utils import truncate_output
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +193,7 @@ class ShellTool(BaseTool):
     def _run(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
         """通过 runtime 执行命令（本地或 Docker 沙箱）。"""
         result = self._runtime.exec(cmd, cwd=cwd, timeout=timeout)
-        output = _truncate(result.output, MAX_OUTPUT_CHARS)
+        output = truncate_output(result.output, MAX_OUTPUT_CHARS)
         if not result.success:
             # 区分 timeout 和普通错误，error 字段包含可读原因
             if "timed out" in result.stderr.lower():
@@ -223,9 +224,7 @@ def _is_readonly(cmd: str) -> bool:
     包含 > 写重定向的命令不算只读（即使命令名在白名单里）。
     """
     # 包含写重定向（> 但不是 >>）时不算只读
-    # 用正则精确匹配：>[^>] 是写重定向，>> 是追加（相对安全）
-    import re as _re
-    if _re.search(r'(?<![>])>(?![>])', cmd):
+    if re.search(r'(?<![>])>(?![>])', cmd):
         return False
     stripped = cmd.strip().lower()
     for prefix in _READONLY_PREFIXES:
@@ -243,20 +242,6 @@ def _needs_confirm(cmd: str) -> bool:
         return False
     cmd_lower = cmd.lower()
     return any(kw in cmd_lower for kw in _CONFIRM_KEYWORDS)
-
-
-def _truncate(text: str, max_chars: int) -> str:
-    """输出过长时截断：保留头部 60% + 尾部 40%。"""
-    if len(text) <= max_chars:
-        return text
-    head = int(max_chars * 0.6)
-    tail = max_chars - head
-    omitted = len(text) - max_chars
-    return (
-        text[:head]
-        + f"\n... [{omitted} characters truncated] ...\n"
-        + text[-tail:]
-    )
 
 
 # ---------------------------------------------------------------------------

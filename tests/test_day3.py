@@ -15,7 +15,8 @@ import pytest
 from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
 from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
 from tools.search_tool import FindFilesTool, FindSymbolTool, SearchTextTool
-from tools.shell_tool import ShellTool, _check_blocked, _truncate
+from tools.shell_tool import ShellTool, _check_blocked
+from tools.utils import truncate_output
 from tools.test_tool import PytestTool
 
 
@@ -235,11 +236,11 @@ class TestShellBlacklist:
 
 class TestShellTruncate:
     def test_short_output_unchanged(self):
-        assert _truncate("hello", 100) == "hello"
+        assert truncate_output("hello", 100) == "hello"
 
     def test_long_output_truncated(self):
         text = "x" * 10_000
-        result = _truncate(text, 1_000)
+        result = truncate_output(text, 1_000)
         assert len(result) < len(text)
         assert "truncated" in result
 
@@ -247,7 +248,7 @@ class TestShellTruncate:
         head = "START" * 200
         tail = "END" * 200
         text = head + "MIDDLE" * 1000 + tail
-        result = _truncate(text, 500)
+        result = truncate_output(text, 500)
         assert result.startswith("START")
         assert result.endswith("END" * (200 // len("END")))
 

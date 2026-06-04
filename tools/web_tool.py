@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from tools.base import BaseTool, ToolResult
+from tools.utils import truncate_output
 
 logger = logging.getLogger(__name__)
 
@@ -88,20 +89,6 @@ def _validate_url(url: str) -> tuple[bool, str | None]:
         pass
 
     return True, None
-
-
-def _truncate(text: str, max_chars: int) -> str:
-    """截断文本：保留头部 60% + 尾部 40%。"""
-    if len(text) <= max_chars:
-        return text
-    head = int(max_chars * 0.6)
-    tail = max_chars - head
-    omitted = len(text) - max_chars
-    return (
-        text[:head]
-        + f"\n... [{omitted} characters truncated] ...\n"
-        + text[-tail:]
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +280,7 @@ class WebFetchTool(BaseTool):
 
         # 提取正文
         text = _extract_content(html, url)
-        text = _truncate(text, MAX_FETCH_CHARS)
+        text = truncate_output(text, MAX_FETCH_CHARS)
 
         if not text.strip():
             return ToolResult(
