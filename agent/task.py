@@ -25,12 +25,16 @@ from typing import Any
 
 class EventType(str, Enum):
     """Event log 中的事件类型，str enum 序列化后直接是字符串。"""
-    TASK_START      = "task_start"
-    ACTION          = "action"
-    OBSERVATION     = "observation"
-    REFLECTION      = "reflection"
-    TASK_COMPLETE   = "task_complete"
-    TASK_FAILED     = "task_failed"
+    TASK_START       = "task_start"
+    ACTION           = "action"
+    OBSERVATION      = "observation"
+    REFLECTION       = "reflection"
+    PLAN_GENERATED   = "plan_generated"
+    SUBTASK_START    = "subtask_start"
+    SUBTASK_COMPLETE = "subtask_complete"
+    SUBTASK_FAILED   = "subtask_failed"
+    TASK_COMPLETE    = "task_complete"
+    TASK_FAILED      = "task_failed"
 
 
 class ActionType(str, Enum):

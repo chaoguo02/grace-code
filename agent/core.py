@@ -66,16 +66,19 @@ class AgentConfig:
 
 
 # ---------------------------------------------------------------------------
-# Agent
+# ReActAgent — ReAct (Reasoning + Acting) 主循环
 # ---------------------------------------------------------------------------
 
-class Agent:
+class ReActAgent:
     """
     ReAct 主循环实现。
 
     用法：
-        agent = Agent(backend, registry, config)
+        agent = ReActAgent(backend, registry, config)
         result = agent.run(task, log)
+
+    这是一个纯粹的 ReAct agent：每步 思考→行动→观察，循环直到完成或超限。
+    对于需要"先规划后执行"的多步骤复杂任务，使用 PlanExecuteAgent 作为编排层。
     """
 
     def __init__(
@@ -394,6 +397,184 @@ class Agent:
                     delay *= 2
 
         raise last_exc  # type: ignore[misc]
+
+    def _get_git_diff(self, repo_path: str) -> str | None:
+        """抓取 git diff HEAD 作为 patch，失败时静默返回 None。"""
+        import subprocess
+        try:
+            proc = subprocess.run(
+                ["git", "diff", "HEAD"],
+                capture_output=True, text=True, timeout=10, cwd=repo_path,
+            )
+            diff = proc.stdout.strip()
+            return diff if diff else None
+        except Exception:
+            return None
+
+
+# ---------------------------------------------------------------------------
+# 向后兼容别名 — 所有旧代码可继续使用 Agent
+# ---------------------------------------------------------------------------
+
+Agent = ReActAgent
+
+
+# ---------------------------------------------------------------------------
+# PlanExecuteAgent — Plan-then-Execute 编排层
+# ---------------------------------------------------------------------------
+
+class PlanExecuteAgent:
+    """
+    先规划后执行的 Agent 编排器。
+
+    工作流程：
+    1. 调用 LLM 生成结构化执行计划（JSON 格式的 subtask 列表）
+    2. 按序执行每个 subtask，每个 subtask 由 ReActAgent 独立完成
+    3. 首个 subtask 失败即停止，返回汇总结果
+    4. 计划生成失败时降级为直接 ReActAgent.run()
+
+    用法：
+        agent = PlanExecuteAgent(backend, registry, config)
+        result = agent.run(task, log)
+    """
+
+    def __init__(
+        self,
+        backend: LLMBackend,
+        registry: ToolRegistry,
+        agent_config: AgentConfig | None = None,
+        plan_config: "PlanExecuteConfig | None" = None,
+    ) -> None:
+        self._backend = backend
+        self._registry = registry
+        self._cfg = agent_config or AgentConfig()
+        # 延迟 import，避免顶层循环依赖
+        from agent.plan import PlanExecuteConfig as _PlanCfg
+        self._plan_cfg = plan_config or _PlanCfg()
+        # 共享一个 ReActAgent，跨 subtask 复用 repo_map 缓存
+        self._react_agent = ReActAgent(backend, registry, self._cfg)
+
+    # ------------------------------------------------------------------
+    # 公开接口
+    # ------------------------------------------------------------------
+
+    def run(self, task: Task, log: EventLog) -> RunResult:
+        """
+        使用 Plan-then-Execute 策略执行任务。
+
+        Args:
+            task: 任务描述
+            log:  父级 EventLog（整个 PlanExecute 过程的事件写到这里）
+
+        Returns:
+            RunResult，汇总所有 subtask 的执行结果
+        """
+        log.log_task_start(task)
+        logger.info("PlanExecuteAgent starting task %s", task.task_id)
+
+        # ── Phase 1: 生成计划 ──────────────────────────────────────
+        try:
+            plan = self._generate_plan(task.description)
+        except Exception as exc:
+            logger.warning(
+                "Plan generation failed: %s — falling back to ReActAgent", exc
+            )
+            log.log_task_failed(steps=0, reason=f"Planning failed: {exc}")
+            return self._react_agent.run(task, log)
+
+        log.log_plan_generated(plan)
+        logger.info(
+            "Plan generated: %d subtasks — %s",
+            len(plan.subtasks), plan.reasoning[:80],
+        )
+
+        # ── Phase 2: 按序执行 ──────────────────────────────────────
+        results: list[RunResult] = []
+        total_tokens = 0
+
+        for i, subtask in enumerate(plan.subtasks, start=1):
+            log.log_subtask_start(subtask, index=i, total=len(plan.subtasks))
+            logger.info("Subtask %d/%d: %s", i, len(plan.subtasks), subtask.description[:60])
+
+            # 每个 subtask 创建一个独立的 Task
+            sub_task = Task(
+                description=subtask.description,
+                repo_path=task.repo_path,
+                max_steps=task.max_steps,
+                budget_tokens=task.budget_tokens,
+            )
+
+            # 每个 subtask 有自己的 EventLog（详细 trace）
+            sub_log = EventLog.create(
+                sub_task, log_dir=self._plan_cfg.plan_subtask_log_dir,
+            )
+            result = self._react_agent.run(sub_task, sub_log)
+            sub_log.close()
+
+            total_tokens += result.total_tokens
+            results.append(result)
+
+            if result.is_success():
+                log.log_subtask_complete(subtask, result)
+            else:
+                log.log_subtask_failed(subtask, result)
+                total_steps = sum(r.steps_taken for r in results)
+                summary = (
+                    f"Plan aborted at subtask {subtask.id}/{len(plan.subtasks)}: "
+                    f"{result.summary}"
+                )
+                log.log_task_failed(steps=total_steps, reason=summary)
+                return RunResult(
+                    task_id=task.task_id,
+                    status=result.status,
+                    summary=summary,
+                    steps_taken=total_steps,
+                    total_tokens=total_tokens,
+                    error=result.error,
+                )
+
+        # 全部成功
+        total_steps = sum(r.steps_taken for r in results)
+        patch = self._get_git_diff(task.repo_path)
+        summary = (
+            f"Completed {len(results)}/{len(plan.subtasks)} subtasks. "
+            f"{plan.subtasks[-1].description[:80]}"
+        )
+        log.log_task_complete(steps=total_steps, summary=summary)
+        return RunResult(
+            task_id=task.task_id,
+            status=RunStatus.SUCCESS,
+            summary=summary,
+            steps_taken=total_steps,
+            total_tokens=total_tokens,
+            patch=patch,
+        )
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
+
+    def _generate_plan(self, task_description: str) -> "Plan":
+        """
+        调用 LLM 生成执行计划。
+
+        使用 tools=[] 的纯文本调用，LLM 返回 JSON 格式的 Plan。
+        解析失败时抛出 PlanGenerationError。
+        """
+        from agent.plan import Plan, PlanGenerationError
+        from agent.prompt import build_planning_prompt
+
+        system_content = build_planning_prompt(task_description)
+        messages = [
+            LLMMessage(role="system", content=system_content),
+            LLMMessage(role="user", content=task_description),
+        ]
+
+        response = self._backend.complete(messages, tools=[])
+
+        # 从 action.message 拿文本（real backend 的 FINISH action 把 LLM 输出放在这里）
+        plan_text = response.action.message or response.raw_content or ""
+        return Plan.from_json(plan_text, task_description)
 
     def _get_git_diff(self, repo_path: str) -> str | None:
         """抓取 git diff HEAD 作为 patch，失败时静默返回 None。"""

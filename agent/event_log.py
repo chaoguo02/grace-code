@@ -22,7 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from agent.task import Event, EventType, Task, Action, Observation
+from agent.task import Event, EventType, Task, Action, Observation, RunResult
+from agent.plan import Plan, SubTask
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +119,54 @@ class EventLog:
                 "step":   step,
                 "reason": reason,
                 "prompt": prompt,
+            },
+        ))
+
+    def log_plan_generated(self, plan: Plan) -> None:
+        """PlanExecuteAgent 成功生成执行计划。"""
+        self._append(Event(
+            event_type=EventType.PLAN_GENERATED,
+            task_id=self._current_task_id,
+            payload={"plan": plan.to_dict()},
+        ))
+
+    def log_subtask_start(
+        self, subtask: SubTask, index: int, total: int
+    ) -> None:
+        """开始执行一个子任务。"""
+        self._append(Event(
+            event_type=EventType.SUBTASK_START,
+            task_id=self._current_task_id,
+            payload={
+                "subtask": subtask.to_dict(),
+                "index": index,
+                "total": total,
+            },
+        ))
+
+    def log_subtask_complete(
+        self, subtask: SubTask, result: RunResult
+    ) -> None:
+        """子任务成功完成。"""
+        self._append(Event(
+            event_type=EventType.SUBTASK_COMPLETE,
+            task_id=self._current_task_id,
+            payload={
+                "subtask_id": subtask.id,
+                "result": result.to_dict(),
+            },
+        ))
+
+    def log_subtask_failed(
+        self, subtask: SubTask, result: RunResult
+    ) -> None:
+        """子任务执行失败。"""
+        self._append(Event(
+            event_type=EventType.SUBTASK_FAILED,
+            task_id=self._current_task_id,
+            payload={
+                "subtask_id": subtask.id,
+                "result": result.to_dict(),
             },
         ))
 
