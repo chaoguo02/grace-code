@@ -218,13 +218,15 @@ SIMPLE_HTML = """\
 def _make_fake_response(status_code=200, html=SIMPLE_HTML, side_effect=None):
     """造一个 fake requests.get 返回值。"""
     if side_effect:
-        def _fake_get(url, headers=None, timeout=None, allow_redirects=True, stream=True):
+        def _fake_get(url, **kwargs):
             raise side_effect
         return _fake_get
 
-    def _fake_get(url, headers=None, timeout=None, allow_redirects=True, stream=True):
+    def _fake_get(url, **kwargs):
         resp = MagicMock()
         resp.status_code = status_code
+        resp.url = url  # 重定向校验需要
+        resp.history = []  # 无重定向
         resp.iter_content.return_value = [html.encode("utf-8")] if html else [b""]
         return resp
     return _fake_get
@@ -233,7 +235,8 @@ def _make_fake_response(status_code=200, html=SIMPLE_HTML, side_effect=None):
 class TestWebFetchTool:
     tool = WebFetchTool()
 
-    def test_fetch_extracts_content(self):
+    @patch("tools.web_tool._resolve_and_check", return_value=(True, None))
+    def test_fetch_extracts_content(self, _dns):
         with patch("requests.get", side_effect=_make_fake_response(200)):
             result = self.tool.execute({"url": "https://example.com/article"})
             assert result.success
@@ -253,13 +256,15 @@ class TestWebFetchTool:
         assert not result.success
         assert "required" in result.error.lower()
 
-    def test_fetch_404(self):
+    @patch("tools.web_tool._resolve_and_check", return_value=(True, None))
+    def test_fetch_404(self, _dns):
         with patch("requests.get", side_effect=_make_fake_response(404)):
             result = self.tool.execute({"url": "https://example.com/notfound"})
             assert not result.success
             assert "404" in result.error
 
-    def test_fetch_timeout(self):
+    @patch("tools.web_tool._resolve_and_check", return_value=(True, None))
+    def test_fetch_timeout(self, _dns):
         import requests as req_mod
         with patch("requests.get", side_effect=_make_fake_response(
             side_effect=req_mod.exceptions.Timeout("timed out")
@@ -268,16 +273,24 @@ class TestWebFetchTool:
             assert not result.success
             assert "timed out" in result.error.lower()
 
-    def test_fetch_connection_error(self):
+    @patch("tools.web_tool._resolve_and_check", return_value=(True, None))
+    def test_fetch_connection_error(self, _dns):
         import requests as req_mod
         with patch("requests.get", side_effect=_make_fake_response(
             side_effect=req_mod.exceptions.ConnectionError("refused")
         )):
             result = self.tool.execute({"url": "https://example.com"})
             assert not result.success
-            assert "connection" in result.error.lower()
+            assert "refused" in result.error.lower()
 
     def test_schema_requires_url(self):
         schema = self.tool.to_llm_schema()
         assert schema.name == "web_fetch"
         assert "url" in schema.parameters["required"]
+
+    @patch("tools.web_tool._resolve_and_check", return_value=(False, "Blocked: resolves to private IP"))
+    def test_dns_rebinding_blocked(self, _dns):
+        """域名解析到内网 IP 时应被拦截。"""
+        result = self.tool.execute({"url": "https://evil.internal.example.com/secret"})
+        assert not result.success
+        assert "private" in result.error.lower() or "blocked" in result.error.lower()

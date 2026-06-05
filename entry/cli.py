@@ -72,6 +72,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None):
     from tools.test_tool import PytestTool
     from tools.web_tool import WebSearchTool, WebFetchTool
 
+    web_cfg = cfg.tools.web
     return (
         ToolRegistry()
         .register(ShellTool(confirm_callback=confirm_callback, runtime=runtime))
@@ -86,8 +87,11 @@ def _build_registry(cfg, confirm_callback=None, runtime=None):
         .register(GitDiffTool(runtime=runtime))
         .register(GitAddTool(runtime=runtime))
         .register(GitCommitTool(runtime=runtime))
-        .register(WebSearchTool())
-        .register(WebFetchTool())
+        .register(WebSearchTool(max_results=web_cfg.search_max_results))
+        .register(WebFetchTool(
+            max_chars=web_cfg.fetch_max_chars,
+            timeout=web_cfg.fetch_timeout,
+        ))
     )
 
 
