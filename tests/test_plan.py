@@ -1,10 +1,11 @@
 """
 tests/test_plan.py
 
-测试 Plan-and-Execute 模式：
-- Plan.from_json 解析（正常 / markdown 包裹 / 异常）
-- PlanExecuteAgent 主流程（MockBackend）
-- 降级 fallback
+测试 Plan-and-Execute 模式（Claude Code 风格）：
+- Plan 数据结构（JSON 兼容 + markdown 新格式）
+- PlanExecuteAgent 两阶段流程
+- 用户审批流程
+- 只读工具限制
 - Event log 事件完整性
 """
 
@@ -34,17 +35,25 @@ def task(tmp_path) -> Task:
         task_id="plan001",
         description="Fix the parser bug in src/parser.py and add a unit test for it.",
         repo_path=str(tmp_path),
-        max_steps=10,
+        max_steps=15,
     )
 
 
 @pytest.fixture
 def registry() -> ToolRegistry:
-    return ToolRegistry().register(NoopTool("shell"))
+    return (
+        ToolRegistry()
+        .register(NoopTool("shell"))
+        .register(NoopTool("file_read"))
+        .register(NoopTool("file_view"))
+        .register(NoopTool("file_write"))
+        .register(NoopTool("find_files"))
+        .register(NoopTool("search_text"))
+    )
 
 
 # ===========================================================================
-# Plan.from_json
+# Plan.from_json — 旧格式兼容
 # ===========================================================================
 
 VALID_PLAN_JSON = """\
@@ -97,7 +106,6 @@ class TestPlanFromJson:
         assert len(plan.subtasks) == 3
 
     def test_invalid_json_raises(self):
-        # "this is not json at all" — 没有花括号，触发 "No JSON object" 错误
         with pytest.raises(PlanGenerationError, match="No JSON object"):
             Plan.from_json("this is not json at all", "task")
 
@@ -142,6 +150,35 @@ class TestPlanFromJson:
 
 
 # ===========================================================================
+# Plan.from_markdown — 新格式
+# ===========================================================================
+
+class TestPlanFromMarkdown:
+    def test_basic_markdown(self):
+        md = "### Analysis\nFound bug in parser.py\n### Changes\nFix line 42"
+        plan = Plan.from_markdown(md, "Fix parser")
+        assert plan.is_markdown_plan
+        assert plan.original_task == "Fix parser"
+        assert "Found bug" in plan.plan_text
+        assert len(plan.subtasks) == 0
+
+    def test_plan_text_property(self):
+        md = "Step 1: Read files\nStep 2: Edit code"
+        plan = Plan.from_markdown(md, "task")
+        assert plan.plan_text == md
+
+    def test_repr_markdown(self):
+        plan = Plan.from_markdown("short plan", "task")
+        assert "markdown" in repr(plan)
+
+    def test_is_markdown_false_for_json(self):
+        plan = Plan.from_json(
+            '{"plan": [{"id": "1", "description": "x"}]}', "task"
+        )
+        assert not plan.is_markdown_plan
+
+
+# ===========================================================================
 # SubTask.to_dict
 # ===========================================================================
 
@@ -160,81 +197,87 @@ class TestSubTask:
 
 
 # ===========================================================================
-# PlanExecuteAgent
+# PlanExecuteAgent — 新版两阶段
 # ===========================================================================
 
 class TestPlanExecuteAgent:
 
-    def _make_plan_json(self, subtask_count: int = 2) -> str:
-        """生成指定数量的 subtask JSON。"""
-        import json
-        plan_data = {
-            "reasoning": "Step by step",
-            "plan": [
-                {"id": str(i), "description": f"Step {i}", "expected_outcome": f"Done {i}"}
-                for i in range(1, subtask_count + 1)
-            ],
-        }
-        return json.dumps(plan_data)
-
-    def _make_finish_for_plan_json(self, plan_json: str) -> Action:
-        """构造一个 FINISH action，其 message 包含 plan JSON。
-        这是对 planning LLM 调用的模拟——planning 调用 tools=[]，
-        LLM 以 FINISH 返回 JSON 文本。
-        """
-        return Action(
-            action_type=ActionType.FINISH,
-            thought="",
-            message=plan_json,
-        )
-
-    def _make_plan_execute_agent(
-        self, script: list[Action], registry=None, agent_config=None
-    ) -> PlanExecuteAgent:
-        """创建 PlanExecuteAgent，planning 调用用 mock 脚本。"""
-        backend = MockBackend(script)
-        return PlanExecuteAgent(
-            backend, registry or ToolRegistry().register(NoopTool("shell")),
-            agent_config=agent_config,
-        )
-
-    def test_complete_run_succeeds(self, tmp_path, task):
-        """完整 plan+execute 流程：生成 plan → 依次执行 → 成功。"""
-        registry = ToolRegistry().register(NoopTool("shell"))
-        plan_json = self._make_plan_json(2)
-
-        # Script:
-        #   1st call: planning → FINISH with JSON plan
-        #   2nd call: subtask 1 → TOOL_CALL then FINISH
-        #   3rd call: subtask 2 → TOOL_CALL then FINISH
+    def test_plan_and_execute_with_approval(self, tmp_path, task, registry):
+        """完整两阶段流程：规划 → 审批 → 执行 → 成功。"""
+        # Phase 1: plan agent 探索后 FINISH with plan text
+        # Phase 2: exec agent 执行后 FINISH
         script = [
-            self._make_finish_for_plan_json(plan_json),     # planning
-            Action(ActionType.TOOL_CALL, "step1", ToolCall("shell", {"cmd": "ls"})),  # sub1
-            Action(ActionType.FINISH, "done1", message="ok1"),
-            Action(ActionType.TOOL_CALL, "step2", ToolCall("shell", {"cmd": "pwd"})),  # sub2
-            Action(ActionType.FINISH, "done2", message="ok2"),
+            # Phase 1 (plan): read a file, then finish with plan
+            Action(ActionType.TOOL_CALL, "exploring", ToolCall("file_read", {"path": "x.py"})),
+            Action(ActionType.FINISH, "plan done", message="### Changes\nFix line 10 in x.py"),
+            # Phase 2 (exec): make edit, then finish
+            Action(ActionType.TOOL_CALL, "fixing", ToolCall("file_write", {"path": "x.py", "content": "fixed"})),
+            Action(ActionType.FINISH, "executed", message="Fixed the bug"),
         ]
         backend = MockBackend(script)
-        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=5))
+
+        plan_cfg = PlanExecuteConfig(
+            plan_subtask_log_dir=str(tmp_path / "plan_logs"),
+            plan_approval_callback=lambda text: True,  # auto-approve
+        )
+        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=15), plan_cfg)
 
         with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
             result = agent.run(task, log)
 
-        assert result.status == RunStatus.SUCCESS
-        # 2 subtasks, each: 1 TOOL_CALL + 1 FINISH = 2 steps → 4 total
-        assert result.steps_taken == 4
-        assert "2/2" in result.summary
+        assert result.is_success()
+        assert "Fixed the bug" in result.summary
+
+    def test_plan_rejected_returns_gave_up(self, tmp_path, task, registry):
+        """用户拒绝 plan 时返回 GAVE_UP。"""
+        script = [
+            Action(ActionType.FINISH, "plan", message="### Plan\nDo stuff"),
+        ]
+        backend = MockBackend(script)
+
+        plan_cfg = PlanExecuteConfig(
+            plan_subtask_log_dir=str(tmp_path / "plan_logs"),
+            plan_approval_callback=lambda text: False,  # reject
+        )
+        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=15), plan_cfg)
+
+        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
+            result = agent.run(task, log)
+
+        assert result.status == RunStatus.GAVE_UP
+        assert "rejected" in result.summary.lower()
+
+    def test_no_approval_callback_auto_executes(self, tmp_path, task, registry):
+        """没有审批回调时自动执行（向后兼容）。"""
+        script = [
+            Action(ActionType.FINISH, "plan", message="### Plan\nFix it"),
+            Action(ActionType.FINISH, "done", message="Fixed"),
+        ]
+        backend = MockBackend(script)
+
+        plan_cfg = PlanExecuteConfig(
+            plan_subtask_log_dir=str(tmp_path / "plan_logs"),
+        )
+        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=15), plan_cfg)
+
+        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
+            result = agent.run(task, log)
+
+        assert result.is_success()
 
     def test_plan_generated_event_logged(self, tmp_path, task, registry):
         """父级 EventLog 应包含 PLAN_GENERATED 事件。"""
-        plan_json = self._make_plan_json(1)
-
         script = [
-            self._make_finish_for_plan_json(plan_json),
+            Action(ActionType.FINISH, "plan", message="My plan here"),
             Action(ActionType.FINISH, "done", message="ok"),
         ]
         backend = MockBackend(script)
-        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=5))
+
+        plan_cfg = PlanExecuteConfig(
+            plan_subtask_log_dir=str(tmp_path / "plan_logs"),
+            plan_approval_callback=lambda t: True,
+        )
+        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=15), plan_cfg)
 
         with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
             agent.run(task, log)
@@ -242,207 +285,96 @@ class TestPlanExecuteAgent:
 
         plan_events = [e for e in events if e.event_type == EventType.PLAN_GENERATED]
         assert len(plan_events) == 1
-        plan_payload = plan_events[0].payload["plan"]
-        assert len(plan_payload["subtasks"]) == 1
 
-    def test_subtask_events_logged(self, tmp_path, task, registry):
-        """父级 EventLog 应包含 SUBTASK_START / SUBTASK_COMPLETE 事件。"""
-        plan_json = self._make_plan_json(2)
-
-        script = [
-            self._make_finish_for_plan_json(plan_json),
-            Action(ActionType.FINISH, "done1", message="ok1"),
-            Action(ActionType.FINISH, "done2", message="ok2"),
-        ]
-        backend = MockBackend(script)
-        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=5))
-
-        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
-            agent.run(task, log)
-            events = log.replay()
-
-        start_events = [e for e in events if e.event_type == EventType.SUBTASK_START]
-        complete_events = [e for e in events if e.event_type == EventType.SUBTASK_COMPLETE]
-        assert len(start_events) == 2
-        assert len(complete_events) == 2
-
-    def test_plan_failed_fallback_to_react(self, tmp_path, task, registry):
-        """plan 生成失败时降级为纯 ReAct。"""
-        # planning 调用返回非 JSON 的 GIVE_UP → 解析失败 → fallback
-        script = [
-            Action(ActionType.GIVE_UP, "cannot plan", message="I can't plan"),
-            Action(ActionType.TOOL_CALL, "react_step", ToolCall("shell", {"cmd": "ls"})),
-            Action(ActionType.FINISH, "react_done", message="Fixed via ReAct"),
-        ]
-        backend = MockBackend(script)
-        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=5))
-
-        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
-            result = agent.run(task, log)
-
-        # fallback to ReActAgent — should succeed
-        assert result.status == RunStatus.SUCCESS
-        assert "Fixed via ReAct" in result.summary
-
-    def test_subtask_give_up_stops(self, tmp_path, task, registry):
-        """第一个 subtask GAVE_UP 时提前终止，不执行后续 subtask。"""
-        plan_json = self._make_plan_json(3)
-
-        script = [
-            self._make_finish_for_plan_json(plan_json),
-            Action(ActionType.GIVE_UP, "stuck", message="Cannot fix this part"),
-            # subtask 2, 3 不应该被执行
-        ]
-        backend = MockBackend(script)
-        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=5))
-
-        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
-            result = agent.run(task, log)
-            events = log.replay()
-
-        assert result.status == RunStatus.GAVE_UP
-        assert "aborted" in result.summary.lower()
-
-        # 应该只有第一个 subtask 的 START 事件
-        start_events = [e for e in events if e.event_type == EventType.SUBTASK_START]
-        assert len(start_events) == 1
-
-        failed_events = [e for e in events if e.event_type == EventType.SUBTASK_FAILED]
-        assert len(failed_events) == 1
-
-    def test_subtask_max_steps_stops(self, tmp_path, registry):
-        """subtask 达到 MAX_STEPS 时提前终止。"""
-        plan_json = self._make_plan_json(2)
-
-        # subtask 需要 max_steps=3，配 5 个 TOOL_CALL
-        task = Task(
-            task_id="maxsteps",
-            description="Fix",
-            repo_path=str(tmp_path),
-            max_steps=3,  # subtask 继承此值
+    def test_readonly_registry_in_phase1(self, tmp_path, task):
+        """Phase 1 应该只有只读工具可用。"""
+        registry = (
+            ToolRegistry()
+            .register(NoopTool("shell"))
+            .register(NoopTool("file_read"))
+            .register(NoopTool("file_write"))
+            .register(NoopTool("find_files"))
+            .register(NoopTool("search_text"))
         )
 
-        many_steps = [
-            Action(ActionType.TOOL_CALL, f"s{i}", ToolCall("shell", {"cmd": f"echo {i}"}))
-            for i in range(5)
-        ]
-        script = [
-            self._make_finish_for_plan_json(plan_json),
-            *many_steps,   # 5 步 TOOL_CALL，subtask max_steps=3 → MAX_STEPS
-        ]
-        backend = MockBackend(script)
-        agent = PlanExecuteAgent(
-            backend, registry,
-            AgentConfig(max_steps=3, loop_detection_window=10),
-        )
+        backend = MockBackend([
+            Action(ActionType.FINISH, "plan", message="plan text"),
+            Action(ActionType.FINISH, "done", message="ok"),
+        ])
 
-        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
-            result = agent.run(task, log)
-
-        assert result.status == RunStatus.MAX_STEPS
-
-    def test_subtask_log_created(self, tmp_path, task, registry):
-        """每个 subtask 应生成独立的 EventLog 文件。"""
-        plan_json = self._make_plan_json(2)
-
-        script = [
-            self._make_finish_for_plan_json(plan_json),
-            Action(ActionType.FINISH, "done1", message="ok1"),
-            Action(ActionType.FINISH, "done2", message="ok2"),
-        ]
-        backend = MockBackend(script)
         plan_cfg = PlanExecuteConfig(
-            plan_subtask_log_dir=str(tmp_path / "subtask_logs"),
+            plan_subtask_log_dir=str(tmp_path / "plan_logs"),
+            plan_approval_callback=lambda t: True,
         )
-        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=5), plan_cfg)
+        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=15), plan_cfg)
+
+        readonly = agent._make_readonly_registry()
+        tool_names = set(readonly._tools.keys())
+
+        # 只读工具应该保留
+        assert "file_read" in tool_names
+        assert "find_files" in tool_names
+        assert "search_text" in tool_names
+        # 写入工具应该被过滤
+        assert "shell" not in tool_names
+        assert "file_write" not in tool_names
+
+    def test_empty_plan_falls_back(self, tmp_path, task, registry):
+        """Plan 为空时降级到 ReActAgent。"""
+        script = [
+            # Phase 1 plan agent gives up (empty summary)
+            Action(ActionType.GIVE_UP, "stuck", message=""),
+            # Fallback ReActAgent runs
+            Action(ActionType.FINISH, "direct", message="Done directly"),
+        ]
+        backend = MockBackend(script)
+
+        plan_cfg = PlanExecuteConfig(
+            plan_subtask_log_dir=str(tmp_path / "plan_logs"),
+        )
+        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=15), plan_cfg)
 
         with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
-            agent.run(task, log)
+            result = agent.run(task, log)
 
-        import os
-        subtask_log_dir = tmp_path / "subtask_logs"
-        log_files = list(subtask_log_dir.glob("*.jsonl"))
-        assert len(log_files) >= 2  # 每个 subtask 一个文件
+        assert result.is_success()
+        assert "Done directly" in result.summary
 
     def test_plan_config_defaults(self):
         """PlanExecuteConfig 默认值。"""
         cfg = PlanExecuteConfig()
         assert cfg.plan_max_subtasks == 10
         assert cfg.plan_subtask_log_dir == "./logs/subtasks"
+        assert cfg.plan_approval_callback is None
 
-    def test_agent_config_not_modified(self, tmp_path, task, registry):
-        """PlanExecuteAgent 不应修改传入的 AgentConfig。"""
-        plan_json = self._make_plan_json(1)
+    def test_execution_phase_failure(self, tmp_path, task, registry):
+        """执行阶段失败时正确返回错误状态。"""
         script = [
-            self._make_finish_for_plan_json(plan_json),
-            Action(ActionType.FINISH, "done", message="ok"),
+            Action(ActionType.FINISH, "plan", message="### Plan\nFix it"),
+            Action(ActionType.GIVE_UP, "stuck", message="Cannot fix"),
         ]
         backend = MockBackend(script)
-        cfg = AgentConfig(max_steps=42, budget_tokens=99999)
-        agent = PlanExecuteAgent(backend, registry, cfg)
 
-        with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
-            agent.run(task, log)
-
-        # 原始 config 不应被修改
-        assert cfg.max_steps == 42
-        assert cfg.budget_tokens == 99999
-
-    def test_patch_included_on_success(self, tmp_path):
-        """PlanExecuteAgent 成功时应包含 git diff patch。"""
-        import subprocess
-
-        # 初始化 git repo
-        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
-        subprocess.run(
-            ["git", "config", "user.email", "t@t.com"],
-            cwd=tmp_path, capture_output=True,
+        plan_cfg = PlanExecuteConfig(
+            plan_subtask_log_dir=str(tmp_path / "plan_logs"),
+            plan_approval_callback=lambda t: True,
         )
-        subprocess.run(
-            ["git", "config", "user.name", "T"],
-            cwd=tmp_path, capture_output=True,
-        )
-        f = tmp_path / "main.py"
-        f.write_text("x = 1\n")
-        subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", "init"],
-            cwd=tmp_path, capture_output=True,
-        )
-
-        # 修改文件（模拟 agent 编辑）
-        f.write_text("x = 99\n")
-
-        task = Task(
-            task_id="patch_plan",
-            description="Fix",
-            repo_path=str(tmp_path),
-            max_steps=5,
-        )
-        plan_json = self._make_plan_json(1)
-        script = [
-            self._make_finish_for_plan_json(plan_json),
-            Action(ActionType.FINISH, "done", message="Fixed"),
-        ]
-        backend = MockBackend(script)
-        registry = ToolRegistry().register(NoopTool("shell"))
-        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=5))
+        agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=15), plan_cfg)
 
         with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
             result = agent.run(task, log)
 
-        assert result.is_success()
-        assert result.patch is not None
-        assert "main.py" in result.patch
+        assert result.status == RunStatus.GAVE_UP
+        assert "Cannot fix" in result.summary
 
 
 # ===========================================================================
-# PlanExecuteAgent — planning LLM 异常
+# PlanExecuteAgent — LLM 异常
 # ===========================================================================
 
 class TestPlanExecuteAgentLLMError:
     def test_backend_exception_on_planning(self, tmp_path, task, registry):
-        """planning LLM 调用抛异常时，应日志失败并返回 FAILED。"""
+        """planning LLM 调用抛异常时，应降级到 ReAct。"""
         class FailingBackend(MockBackend):
             def complete(self, messages, tools):
                 raise ConnectionError("API unreachable")
@@ -453,6 +385,44 @@ class TestPlanExecuteAgentLLMError:
         with EventLog.create(task, log_dir=str(tmp_path / "logs")) as log:
             result = agent.run(task, log)
 
-        # LLM 异常 → plan 生成失败 → 降级 → 但降级的 ReActAgent 也用同一个 backend
-        # 所以也会抛异常，整个 run 返回 FAILED
+        # Both plan agent and fallback use same failing backend
         assert result.status == RunStatus.FAILED
+
+
+# ===========================================================================
+# Factory integration
+# ===========================================================================
+
+class TestFactoryPlanMode:
+    def test_factory_creates_plan_agent(self):
+        from agent.factory import create_agent
+        backend = MockBackend([])
+        registry = ToolRegistry().register(NoopTool("shell"))
+        agent = create_agent("plan", backend, registry)
+        assert isinstance(agent, PlanExecuteAgent)
+
+    def test_factory_passes_approval_callback(self):
+        from agent.factory import create_agent
+        backend = MockBackend([])
+        registry = ToolRegistry().register(NoopTool("shell"))
+        cb = lambda text: True
+        agent = create_agent("plan", backend, registry, plan_approval_callback=cb)
+        assert agent._plan_cfg.plan_approval_callback is cb
+
+    def test_factory_auto_mode_simple_task(self):
+        from agent.factory import create_agent
+        from agent.core import ReActAgent
+        backend = MockBackend([])
+        registry = ToolRegistry().register(NoopTool("shell"))
+        agent = create_agent("auto", backend, registry, task_description="fix typo")
+        assert isinstance(agent, ReActAgent)
+
+    def test_factory_auto_mode_complex_task(self):
+        from agent.factory import create_agent
+        backend = MockBackend([])
+        registry = ToolRegistry().register(NoopTool("shell"))
+        agent = create_agent(
+            "auto", backend, registry,
+            task_description="1. Refactor the authentication module\n2. Add tests\n3. Update docs\n4. Deploy",
+        )
+        assert isinstance(agent, PlanExecuteAgent)

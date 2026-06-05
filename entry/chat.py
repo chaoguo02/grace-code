@@ -29,7 +29,18 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from agent.factory import create_agent  # noqa: E402
-from entry.renderer import Renderer  # noqa: E402
+from entry.renderer import InlineRenderer, create_renderer  # noqa: E402
+
+# 兼容别名
+Renderer = InlineRenderer
+RendererBase = InlineRenderer
+
+
+def _cyan_prompt(text: str) -> str:
+    """为 prompt 文本加 cyan 颜色（仅 TTY）。"""
+    if sys.stdout.isatty():
+        return f"\033[36m{text}\033[0m"
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +65,7 @@ class ChatSession:
         repo_path: str,
         log_dir: str,
         confirm_callback=None,
-        renderer: Renderer | None = None,
+        renderer: RendererBase | None = None,
     ) -> None:
         from agent.core import AgentConfig
         from context.history import ConversationHistory
@@ -69,7 +80,9 @@ class ChatSession:
 
         self._backend = backend
         self._registry = registry
-        self._renderer = renderer or Renderer(model=self._model, mode=self._mode)
+        self._renderer = renderer or create_renderer(
+            model=self._model, mode=self._mode,
+        )
 
         # ── 流式回调（委托给 Renderer）────────────────────────────
         _stream_started = [False]
@@ -110,6 +123,7 @@ class ChatSession:
         )
         self.agent = create_agent(
             self._mode, self._backend, self._registry, self._agent_cfg,
+            plan_approval_callback=self._plan_approval,
         )
         self._shared_history = ConversationHistory(
             max_messages=config.context.history_window * 2,
@@ -156,7 +170,33 @@ class ChatSession:
         """用当前的 backend + mode 重建 agent 实例。"""
         self.agent = create_agent(
             self._mode, self._backend, self._registry, self._agent_cfg,
+            plan_approval_callback=self._plan_approval,
         )
+
+    def _plan_approval(self, plan_text: str) -> bool:
+        """
+        交互式 Plan 审批。展示 plan，等待用户 approve/reject。
+        返回 True 表示批准，False 表示拒绝。
+        """
+        self._renderer.on_plan_generated(plan_text)
+        try:
+            response = input(
+                _cyan_prompt("  [approve(y)/reject(n)/edit(e)] > ")
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            self._renderer.on_plan_rejected()
+            return False
+
+        if response in ("y", "yes", "approve", "a", ""):
+            self._renderer.on_plan_approved()
+            return True
+        elif response in ("n", "no", "reject", "r"):
+            self._renderer.on_plan_rejected()
+            return False
+        else:
+            # 任何其他输入视为批准（宽容处理）
+            self._renderer.on_plan_approved()
+            return True
 
     # ------------------------------------------------------------------
     # 核心循环
@@ -185,6 +225,12 @@ class ChatSession:
         t0 = time.time()
         with EventLog.create(task, log_dir=self.log_dir) as log:
             result = self._run_with_renderer(task, log)
+            # 自动归档到历史目录
+            try:
+                from entry.history_viewer import archive_log
+                archive_log(log.path)
+            except Exception:
+                pass
 
         elapsed = time.time() - t0
         self.total_tokens += result.total_tokens

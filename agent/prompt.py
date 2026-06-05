@@ -163,9 +163,51 @@ URL: {issue_url}
 
 
 # ---------------------------------------------------------------------------
-# Planning prompt（PlanExecuteAgent 用）
+# Planning prompt（PlanExecuteAgent Phase 1 用 — 只读探索）
 # ---------------------------------------------------------------------------
 
+_PLAN_MODE_INJECTION = """\
+[PLAN MODE] You are in planning mode — a read-only exploration phase.
+
+Your job is to explore the codebase, understand the problem, and produce a \
+clear implementation plan. You MUST NOT make any edits, run any shell commands, \
+or otherwise modify the system.
+
+## Available tools (read-only only)
+You can use: file_read, file_view, find_files, find_symbol, search_text, \
+git_status, git_diff, web_search, web_fetch
+
+You MUST NOT use: file_write, shell, pytest, git_add, git_commit
+
+## Workflow
+1. Explore the relevant code to understand the current state
+2. Identify what needs to change and where
+3. When ready, call **finish** with your implementation plan as the message
+
+## Plan format
+Your plan (the finish message) should be structured markdown:
+
+### Analysis
+What you found: key files, functions, current behavior
+
+### Changes
+What needs to change: specific files, functions, edits to make
+
+### Verification
+How to verify: what tests to run, expected outcomes
+
+Be specific — name files, functions, line numbers. This plan will be shown to \
+the user for approval before execution begins.\
+"""
+
+_PLAN_EXECUTION_INJECTION = """\
+[EXECUTION MODE] The user has approved your plan. Execute it now.
+
+You have full tool access. Make the changes described in your plan, then verify \
+they work. When complete, call finish with a summary of what you changed.\
+"""
+
+# Legacy template for backward compatibility (old JSON-based planning)
 _PLANNING_SYSTEM_TEMPLATE = """\
 You are a task planner. Break the user's coding task into a short, concrete \
 sequence of subtasks. Each subtask will be executed by a coding agent with \
@@ -188,8 +230,18 @@ TASK_COMPLETE: {{"reasoning": "<brief>", "plan": [{{"id": "1", "description": ".
 
 
 def build_planning_prompt(task_description: str) -> str:
-    """返回规划专用的 system prompt。"""
+    """返回规划专用的 system prompt（legacy JSON 模式，保留兼容）。"""
     return _PLANNING_SYSTEM_TEMPLATE
+
+
+def get_plan_mode_injection() -> str:
+    """返回 Plan Mode Phase 1 的 prompt 注入（只读探索阶段）。"""
+    return _PLAN_MODE_INJECTION
+
+
+def get_plan_execution_injection() -> str:
+    """返回 Plan Mode Phase 2 的 prompt 注入（执行阶段）。"""
+    return _PLAN_EXECUTION_INJECTION
 
 
 def build_task_prompt(

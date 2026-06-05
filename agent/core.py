@@ -429,21 +429,33 @@ Agent = ReActAgent
 
 
 # ---------------------------------------------------------------------------
-# PlanExecuteAgent — Plan-then-Execute 编排层
+# PlanExecuteAgent — Claude Code 风格 Plan-then-Execute
 # ---------------------------------------------------------------------------
+
+# 只读工具白名单（Phase 1 规划阶段可用）
+_READONLY_TOOLS = frozenset({
+    "file_read", "file_view", "find_files", "find_symbol",
+    "search_text", "git_status", "git_diff",
+    "web_search", "web_fetch",
+})
+
 
 class PlanExecuteAgent:
     """
-    先规划后执行的 Agent 编排器。
+    Claude Code 风格的 Plan-then-Execute Agent。
 
-    工作流程：
-    1. 调用 LLM 生成结构化执行计划（JSON 格式的 subtask 列表）
-    2. 按序执行每个 subtask，每个 subtask 由 ReActAgent 独立完成
-    3. 首个 subtask 失败即停止，返回汇总结果
-    4. 计划生成失败时降级为直接 ReActAgent.run()
+    两阶段同上下文设计：
+    - Phase 1（规划）: 只读探索 → 生成 markdown 计划 → 用户审批
+    - Phase 2（执行）: 全工具权限 → 在同一对话上下文中执行计划
+
+    与旧设计的区别：
+    - 规划阶段有工具访问权（只读），可以实际探索代码
+    - 计划是 markdown（人类可读），不是 JSON subtask 列表
+    - 需要用户审批后才执行
+    - 执行阶段保留规划阶段的对话历史（不丢失探索上下文）
 
     用法：
-        agent = PlanExecuteAgent(backend, registry, config)
+        agent = PlanExecuteAgent(backend, registry, config, plan_config)
         result = agent.run(task, log)
     """
 
@@ -455,14 +467,12 @@ class PlanExecuteAgent:
         plan_config: "PlanExecuteConfig | None" = None,
         planning_backend: LLMBackend | None = None,
     ) -> None:
-        self._backend = backend            # 执行用
-        self._planning_backend = planning_backend or backend  # 规划用（可独立）
+        self._backend = backend
+        self._planning_backend = planning_backend or backend
         self._registry = registry
         self._cfg = agent_config or AgentConfig()
-        # 延迟 import，避免顶层循环依赖
         from agent.plan import PlanExecuteConfig as _PlanCfg
         self._plan_cfg = plan_config or _PlanCfg()
-        # 共享一个 ReActAgent，跨 subtask 复用 repo_map 缓存
         self._react_agent = ReActAgent(backend, registry, self._cfg)
 
     # ------------------------------------------------------------------
@@ -471,165 +481,147 @@ class PlanExecuteAgent:
 
     def run(self, task: Task, log: EventLog) -> RunResult:
         """
-        使用 Plan-then-Execute 策略执行任务。
+        两阶段 Plan-then-Execute。
 
-        Args:
-            task: 任务描述
-            log:  父级 EventLog（整个 PlanExecute 过程的事件写到这里）
-
-        Returns:
-            RunResult，汇总所有 subtask 的执行结果
+        Phase 1: 只读探索 + 计划生成
+        Phase 2: 用户审批后全权执行
         """
+        from agent.plan import Plan
+        from agent.prompt import get_plan_mode_injection, get_plan_execution_injection
+
         log.log_task_start(task)
         logger.info("PlanExecuteAgent starting task %s", task.task_id)
 
-        # ── Phase 1: 生成计划 ──────────────────────────────────────
-        try:
-            plan = self._generate_plan(task.description)
-        except Exception as exc:
-            logger.warning(
-                "Plan generation failed: %s — falling back to ReActAgent", exc
-            )
-            log.log_task_failed(steps=0, reason=f"Planning failed: {exc}")
+        # ── Phase 1: 只读规划 ──────────────────────────────────────
+        plan_steps = max(5, task.max_steps // 3)
+        plan_task = Task(
+            description=task.description,
+            repo_path=task.repo_path,
+            max_steps=plan_steps,
+            budget_tokens=task.budget_tokens // 3,
+        )
+
+        readonly_registry = self._make_readonly_registry()
+        plan_agent = ReActAgent(self._backend, readonly_registry, self._cfg)
+
+        plan_history = ConversationHistory(
+            max_messages=self._cfg.history_max_messages,
+        )
+        plan_injection = get_plan_mode_injection()
+        plan_history.add(LLMMessage(
+            role="user",
+            content=(
+                f"{plan_injection}\n\n"
+                f"## Repository\n{task.repo_path}\n\n"
+                f"## Task\n{task.description}\n\n"
+                f"Explore the codebase and produce an implementation plan. "
+                f"Call finish with your plan when ready."
+            ),
+        ))
+        plan_agent._pending_history = plan_history
+
+        plan_log = EventLog.create(plan_task, log_dir=self._plan_cfg.plan_subtask_log_dir)
+        plan_result = plan_agent.run(plan_task, plan_log)
+        plan_log.close()
+
+        if hasattr(plan_agent, "_pending_history"):
+            del plan_agent._pending_history
+
+        # 提取 plan 文本
+        plan_text = plan_result.summary or ""
+        if not plan_text.strip():
+            logger.warning("Plan generation produced empty result — falling back")
             return self._react_agent.run(task, log)
 
+        plan = Plan.from_markdown(plan_text, task.description)
         log.log_plan_generated(plan)
-        logger.info(
-            "Plan generated: %d subtasks — %s",
-            len(plan.subtasks), plan.reasoning[:80],
-        )
+        logger.info("Plan generated (%d chars): %s...", len(plan_text), plan_text[:100])
 
-        # ── Phase 2: 按序执行 ──────────────────────────────────────
-        results: list[RunResult] = []
-        total_tokens = 0
-
-        for i, subtask in enumerate(plan.subtasks, start=1):
-            log.log_subtask_start(subtask, index=i, total=len(plan.subtasks))
-            logger.info("Subtask %d/%d: %s", i, len(plan.subtasks), subtask.description[:60])
-
-            # 构建 subtask 描述（含前序结果上下文）
-            desc = subtask.description
-            if i > 1 and results:
-                prev_summaries = "\n".join(
-                    f"  Step {r_idx}: {r.summary}"
-                    for r_idx, r in enumerate(results, start=1) if r.is_success()
-                )
-                if prev_summaries:
-                    desc = (
-                        f"Context from previous steps:\n{prev_summaries}\n\n"
-                        f"Your task: {subtask.description}"
-                    )
-
-            # 动态分配 max_steps：父步数 / 子任务数，最少 5
-            sub_max_steps = max(5, task.max_steps // len(plan.subtasks))
-
-            sub_task = Task(
-                description=desc,
-                repo_path=task.repo_path,
-                max_steps=sub_max_steps,
-                budget_tokens=task.budget_tokens,
-            )
-
-            # 通过 _pending_history 注入简洁任务描述，
-            # 绕过 build_task_prompt 的 "Please fix the following issue" 模板
-            sub_history = ConversationHistory(
-                max_messages=self._cfg.history_max_messages,
-            )
-            sub_history.add(LLMMessage(
-                role="user",
-                content=(
-                    f"Repository: {task.repo_path}\n\n"
-                    f"Task: {subtask.description}\n\n"
-                    f"Complete this one subtask. When done, call finish."
-                ),
-            ))
-            self._react_agent._pending_history = sub_history
-
-            sub_log = EventLog.create(
-                sub_task, log_dir=self._plan_cfg.plan_subtask_log_dir,
-            )
-            result = self._react_agent.run(sub_task, sub_log)
-            sub_log.close()
-
-            # 清理 pending_history，避免影响下个 subtask
-            if hasattr(self._react_agent, "_pending_history"):
-                del self._react_agent._pending_history
-
-            # 收集 subtask 结果摘要
-            subtask.result_summary = result.summary
-
-            total_tokens += result.total_tokens
-            results.append(result)
-
-            if result.is_success():
-                log.log_subtask_complete(subtask, result)
-            else:
-                log.log_subtask_failed(subtask, result)
-                total_steps = sum(r.steps_taken for r in results)
-                summary = (
-                    f"Plan aborted at subtask {subtask.id}/{len(plan.subtasks)}: "
-                    f"{result.summary}"
-                )
-                log.log_task_failed(steps=total_steps, reason=summary)
+        # ── 用户审批 ──────────────────────────────────────────────
+        approval_cb = self._plan_cfg.plan_approval_callback
+        if approval_cb:
+            approved = approval_cb(plan_text)
+            if not approved:
+                reason = "Plan rejected by user"
+                log.log_task_failed(steps=plan_result.steps_taken, reason=reason)
                 return RunResult(
                     task_id=task.task_id,
-                    status=result.status,
-                    summary=summary,
-                    steps_taken=total_steps,
-                    total_tokens=total_tokens,
-                    error=result.error,
+                    status=RunStatus.GAVE_UP,
+                    summary=reason,
+                    steps_taken=plan_result.steps_taken,
+                    total_tokens=plan_result.total_tokens,
                 )
 
-        # 全部成功
-        total_steps = sum(r.steps_taken for r in results)
-        patch = self._get_git_diff(task.repo_path)
-        summary = (
-            f"Completed {len(results)}/{len(plan.subtasks)} subtasks. "
-            f"{plan.subtasks[-1].description[:80]}"
+        # ── Phase 2: 执行 ─────────────────────────────────────────
+        exec_steps = task.max_steps - plan_result.steps_taken
+        if exec_steps < 3:
+            exec_steps = 3
+
+        exec_task = Task(
+            description=task.description,
+            repo_path=task.repo_path,
+            max_steps=exec_steps,
+            budget_tokens=task.budget_tokens - plan_result.total_tokens,
         )
-        log.log_task_complete(steps=total_steps, summary=summary)
+
+        exec_history = ConversationHistory(
+            max_messages=self._cfg.history_max_messages,
+        )
+        # 注入执行上下文：携带 plan 内容
+        exec_injection = get_plan_execution_injection()
+        exec_history.add(LLMMessage(
+            role="user",
+            content=(
+                f"Repository: {task.repo_path}\n\n"
+                f"## Original Task\n{task.description}\n\n"
+                f"## Your Approved Plan\n{plan_text}\n\n"
+                f"{exec_injection}"
+            ),
+        ))
+
+        self._react_agent._pending_history = exec_history
+        exec_result = self._react_agent.run(exec_task, log)
+
+        if hasattr(self._react_agent, "_pending_history"):
+            del self._react_agent._pending_history
+
+        total_tokens = plan_result.total_tokens + exec_result.total_tokens
+        total_steps = plan_result.steps_taken + exec_result.steps_taken
+
+        if exec_result.is_success():
+            patch = _git_diff(task.repo_path)
+            summary = exec_result.summary or "Plan executed successfully"
+            log.log_task_complete(steps=total_steps, summary=summary)
+            return RunResult(
+                task_id=task.task_id,
+                status=RunStatus.SUCCESS,
+                summary=summary,
+                steps_taken=total_steps,
+                total_tokens=total_tokens,
+                patch=patch,
+            )
+
+        log.log_task_failed(steps=total_steps, reason=exec_result.summary)
         return RunResult(
             task_id=task.task_id,
-            status=RunStatus.SUCCESS,
-            summary=summary,
+            status=exec_result.status,
+            summary=exec_result.summary,
             steps_taken=total_steps,
             total_tokens=total_tokens,
-            patch=patch,
+            error=exec_result.error,
         )
 
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
 
-    def _generate_plan(self, task_description: str) -> "Plan":
-        """
-        调用 LLM 生成执行计划。
-
-        走纯文本路径（不传 tools）：LLM 以 TASK_COMPLETE: {json} 格式返回计划。
-        解析失败时抛出 PlanGenerationError。
-        """
-        from agent.plan import Plan, PlanGenerationError
-        from agent.prompt import build_planning_prompt
-
-        system_content = build_planning_prompt(task_description)
-        messages = [
-            LLMMessage(role="system", content=system_content),
-            LLMMessage(role="user", content=task_description),
-        ]
-
-        response = self._planning_backend.complete(messages, tools=[])
-
-        # 优先 raw_content（real backend），其次 action.message（MockBackend）
-        plan_text = response.raw_content or response.action.message or ""
-        # real backend 的 raw_content 可能以 TASK_COMPLETE: 开头；取其后的 JSON
-        # MockBackend 的 raw_content 是 "[mock] ..."，fallback 到 action.message
-        if not plan_text.strip().startswith("{"):
-            plan_text = response.action.message or ""
-        # 处理 TASK_COMPLETE: 前缀
-        if plan_text.strip().upper().startswith("TASK_COMPLETE:"):
-            plan_text = plan_text.strip()[len("TASK_COMPLETE:"):].strip()
-        return Plan.from_json(plan_text, task_description)
+    def _make_readonly_registry(self) -> ToolRegistry:
+        """构造只包含只读工具的注册表（Phase 1 用）。"""
+        readonly = ToolRegistry()
+        for name, tool in self._registry._tools.items():
+            if name in _READONLY_TOOLS:
+                readonly._tools[name] = tool
+        return readonly
 
     def _get_git_diff(self, repo_path: str) -> str | None:
-        """抓取 git diff HEAD 作为 patch，失败时静默返回 None。"""
         return _git_diff(repo_path)

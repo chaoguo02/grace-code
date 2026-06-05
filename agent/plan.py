@@ -3,10 +3,12 @@ agent/plan.py
 
 Plan-and-Execute 编排层的数据结构。
 
-Plan / SubTask 是 PlanExecuteAgent 使用的高层抽象，
-描述"要执行什么子任务"和"按什么顺序执行"。
+新设计（Claude Code 风格）：
+- Plan 现在支持 markdown 文本格式（人类可读的策略文档）
+- Phase 1（只读探索）→ Phase 2（执行），中间需要用户审批
+- 旧的 JSON subtask 格式保留向后兼容
 
-不是 ReAct 层的一部分——ReActAgent 不需要知道 Plan 的存在。
+Plan / SubTask 是 PlanExecuteAgent 使用的高层抽象。
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ class PlanExecuteConfig:
     """PlanExecuteAgent 专用配置。"""
     plan_max_subtasks: int = 10
     plan_subtask_log_dir: str = "./logs/subtasks"
+    plan_approval_callback: Any = None  # Callable[[str], bool] — 用户审批回调
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +139,40 @@ class Plan:
             reasoning=data.get("reasoning", ""),
         )
 
+    @classmethod
+    def from_markdown(cls, markdown_text: str, original_task: str) -> "Plan":
+        """
+        从 markdown 文本创建 Plan（Claude Code 风格）。
+
+        新模式下，plan 就是人类可读的 markdown 策略文档，
+        不需要解析为结构化 subtask。
+        """
+        return cls(
+            original_task=original_task,
+            subtasks=[],
+            reasoning=markdown_text,
+        )
+
+    @property
+    def is_markdown_plan(self) -> bool:
+        """判断是否为新式 markdown plan（无 subtask）。"""
+        return len(self.subtasks) == 0 and bool(self.reasoning)
+
+    @property
+    def plan_text(self) -> str:
+        """获取 plan 文本（markdown plan 用 reasoning 字段存储）。"""
+        if self.is_markdown_plan:
+            return self.reasoning
+        parts = [f"Reasoning: {self.reasoning}\n"]
+        for st in self.subtasks:
+            parts.append(f"  {st.id}. {st.description}")
+            if st.expected_outcome:
+                parts.append(f"     Expected: {st.expected_outcome}")
+        return "\n".join(parts)
+
     def __repr__(self) -> str:
+        if self.is_markdown_plan:
+            return f"Plan(markdown, len={len(self.reasoning)})"
         return (
             f"Plan(subtasks={len(self.subtasks)}, "
             f"reasoning={self.reasoning[:50]!r})"

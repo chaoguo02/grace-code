@@ -177,6 +177,7 @@ def cli(ctx: click.Context, config: str | None) -> None:
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "auto"]), help="Agent mode: react, plan, or auto (heuristic)")
+@click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -193,6 +194,7 @@ def run(
     confirm: bool,
     sandbox: bool,
     mode: str,
+    auto_approve: bool,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -256,36 +258,47 @@ def run(
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
     from agent.factory import create_agent
+    from entry.renderer import create_renderer
     try:
         from context.token_budget import is_tiktoken_available
     except ImportError:
         is_tiktoken_available = lambda: False
 
-    # 流式回调：最终回答正常亮色
-    def _stream_cb(text: str) -> None:
-        import sys
-        sys.stdout.write(text)
-        sys.stdout.flush()
-
-    # 推理回调：思考过程 dim 暗色
-    def _thought_cb(text: str) -> None:
-        import sys
-        sys.stdout.write(dim(text))
-        sys.stdout.flush()
+    # 创建渲染器
+    rend = create_renderer(model=config.llm.model, mode=mode)
 
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
         history_max_messages=config.context.history_window * 2,
         stream=stream,
-        stream_callback=_stream_cb if stream else None,
-        thought_callback=_thought_cb if stream else None,
+        stream_callback=rend.stream_text if stream else None,
+        thought_callback=rend.stream_thought if stream else None,
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
     )
+    # Plan 审批回调
+    def _plan_approval_cb(plan_text: str) -> bool:
+        if auto_approve:
+            rend.on_plan_generated(plan_text)
+            rend.on_plan_approved()
+            return True
+        rend.on_plan_generated(plan_text)
+        try:
+            resp = input("  [approve(y)/reject(n)] > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            rend.on_plan_rejected()
+            return False
+        if resp in ("y", "yes", "approve", "a", ""):
+            rend.on_plan_approved()
+            return True
+        rend.on_plan_rejected()
+        return False
+
     agent = create_agent(
         mode, backend, registry, agent_config,
         task_description=description,
+        plan_approval_callback=_plan_approval_cb,
     )
     click.echo(dim(f"  Mode    : {mode}"))
 
@@ -305,10 +318,40 @@ def run(
     t0 = time.time()
     with EventLog.create(task_obj, log_dir=config.agent.log_dir) as log:
         click.echo(dim(f"  Log: {log.path}\n"))
+
+        # 实时事件输出（monkey-patch EventLog）
+        from agent.task import EventType
+        _original_append = log._append
+        _last_tool = [""]
+
+        def _live_append(event):
+            _original_append(event)
+            etype = event.event_type
+            p = event.payload
+            if etype == EventType.ACTION:
+                action = p["action"]
+                tc = action.get("tool_call")
+                if tc:
+                    _last_tool[0] = tc["name"]
+                    rend.on_tool_call(p["step"], tc["name"], tc.get("params", {}))
+                elif action.get("action_type") == "finish":
+                    rend.on_finish(p["step"], action.get("message", ""))
+                elif action.get("action_type") == "give_up":
+                    rend.on_give_up(p["step"], action.get("message", ""))
+            elif etype == EventType.OBSERVATION:
+                obs = p["observation"]
+                rend.on_observation(
+                    p["step"],
+                    obs.get("tool_name", _last_tool[0]),
+                    obs.get("status", ""),
+                    obs.get("output", ""),
+                    obs.get("error"),
+                )
+            elif etype == EventType.REFLECTION:
+                rend.on_reflection(p.get("reason", ""))
+
+        log._append = _live_append
         result = agent.run(task_obj, log)
-        # 打印所有 events
-        for event in log.replay():
-            _print_step(event)
 
     elapsed = time.time() - t0
 
@@ -384,8 +427,8 @@ def chat(
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
-    from entry.renderer import Renderer
-    rend = Renderer(model=config.llm.model, mode="react")
+    from entry.renderer import create_renderer
+    rend = create_renderer(model=config.llm.model, mode="react")
     session = ChatSession(
         backend=backend,
         registry=registry,
@@ -572,6 +615,102 @@ def log_list(log_dir: str) -> None:
         size_kb = f.stat().st_size / 1024
         click.echo(f"  {f.name}  ({size_kb:.1f} KB)")
     click.echo()
+
+
+# ---------------------------------------------------------------------------
+# history 子命令组 — 对话历史可视化
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def history() -> None:
+    """View and search conversation history (~/.forge-agent/history/)."""
+
+
+@history.command("list")
+@click.option("--limit", "-n", default=20, help="Max entries to show")
+def history_list(limit: int) -> None:
+    """List recent conversation sessions."""
+    from entry.history_viewer import list_history
+
+    sessions = list_history(limit=limit)
+    if not sessions:
+        click.echo(dim("  No history found. Run some chat sessions first."))
+        return
+
+    click.echo(bold(f"\n  Recent Sessions ({len(sessions)}):\n"))
+    for s in sessions:
+        ts = s["timestamp"][:19] if s["timestamp"] else "?"
+        status_icon = green("✓") if s["status"] == "success" else (
+            red("✗") if s["status"] == "failed" else dim("?")
+        )
+        task = s["task"][:50] if s["task"] else "(no description)"
+        click.echo(f"  {status_icon} {dim(ts)}  {task}")
+        click.echo(dim(f"      {s['steps']} steps · {s['file']}"))
+    click.echo()
+
+
+@history.command("show")
+@click.argument("session_file")
+def history_show(session_file: str) -> None:
+    """Show detailed view of a session log file."""
+    from entry.history_viewer import render_history_detail, get_history_dir
+
+    path = Path(session_file)
+    if not path.exists():
+        # try in history dir
+        path = get_history_dir() / session_file
+    if not path.exists():
+        click.echo(red(f"  File not found: {session_file}"), err=True)
+        sys.exit(1)
+
+    output = render_history_detail(path)
+    click.echo(output)
+
+
+@history.command("search")
+@click.argument("query")
+@click.option("--limit", "-n", default=10, help="Max results")
+def history_search(query: str, limit: int) -> None:
+    """Search history for sessions containing a query string."""
+    from entry.history_viewer import search_history
+
+    results = search_history(query, limit=limit)
+    if not results:
+        click.echo(dim(f"  No sessions found matching: {query}"))
+        return
+
+    click.echo(bold(f"\n  Search results for '{query}' ({len(results)}):\n"))
+    for s in results:
+        ts = s["timestamp"][:19] if s["timestamp"] else "?"
+        task = s["task"][:50] if s["task"] else "(no description)"
+        click.echo(f"  {dim(ts)}  {task}")
+        click.echo(dim(f"      {s['file']}"))
+    click.echo()
+
+
+@history.command("archive")
+@click.option("--dir", "log_dir", default="./logs", help="Log directory to archive from")
+def history_archive(log_dir: str) -> None:
+    """Archive all log files from the logs directory to ~/.forge-agent/history/."""
+    from entry.history_viewer import archive_log
+
+    log_path = Path(log_dir)
+    if not log_path.exists():
+        click.echo(red(f"  Log directory not found: {log_path}"), err=True)
+        return
+
+    files = list(log_path.glob("*.jsonl"))
+    if not files:
+        click.echo(dim("  No log files to archive."))
+        return
+
+    archived = 0
+    for f in files:
+        result = archive_log(f)
+        if result:
+            archived += 1
+
+    click.echo(green(f"  Archived {archived} session(s) to ~/.forge-agent/history/"))
 
 
 # ---------------------------------------------------------------------------

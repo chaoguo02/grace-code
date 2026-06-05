@@ -35,6 +35,7 @@ def create_agent(
     agent_config: AgentConfig | None = None,
     plan_config: PlanExecuteConfig | None = None,
     task_description: str | None = None,
+    plan_approval_callback=None,
 ) -> AgentType:
     """
     根据 mode 创建对应的 Agent 实例。
@@ -46,6 +47,7 @@ def create_agent(
         agent_config:     Agent 配置（ReActAgent 和 PlanExecuteAgent 共用）
         plan_config:      PlanExecuteAgent 专用配置（mode="plan" 时生效）
         task_description: 任务描述（mode="auto" 时用于判断复杂度）
+        plan_approval_callback: Callable[[str], bool] 用户审批 plan 的回调
 
     Returns:
         ReActAgent 或 PlanExecuteAgent，两者都有 run(task, log) -> RunResult 接口
@@ -53,6 +55,10 @@ def create_agent(
     mode = _resolve_mode(mode, task_description)
 
     if mode == "plan":
+        if plan_config is None:
+            plan_config = PlanExecuteConfig()
+        if plan_approval_callback:
+            plan_config.plan_approval_callback = plan_approval_callback
         return PlanExecuteAgent(backend, registry, agent_config, plan_config)
     return ReActAgent(backend, registry, agent_config)
 
