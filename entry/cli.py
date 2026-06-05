@@ -170,7 +170,9 @@ def cli(ctx: click.Context, config: str | None) -> None:
 @click.option("--task-file", "-f", default=None, help="Read task description from file")
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
+@click.option("--base-url", default=None, help="Override LLM base URL")
 @click.option("--max-steps", default=None, type=int, help="Override max steps")
+@click.option("--max-tokens", default=None, type=int, help="Override max output tokens")
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
@@ -184,7 +186,9 @@ def run(
     task_file: str | None,
     model: str | None,
     provider: str | None,
+    base_url: str | None,
     max_steps: int | None,
+    max_tokens: int | None,
     stream: bool,
     confirm: bool,
     sandbox: bool,
@@ -202,7 +206,8 @@ def run(
     # 加载配置
     config = load_config(ctx.obj.get("config_path"))
     config = merge_cli_overrides(
-        config, provider=provider, model=model, max_steps=max_steps
+        config, provider=provider, model=model,
+        base_url=base_url, max_steps=max_steps, max_tokens=max_tokens,
     )
 
     # 解析任务描述
@@ -354,7 +359,7 @@ def chat(
     )
 
     config = load_config(ctx.obj.get("config_path"))
-    config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps)
+    config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps, max_tokens=None)
 
     repo_path = Path(repo).resolve()
     if not repo_path.exists():
@@ -463,6 +468,15 @@ def chat(
                         f"  Current mode: {current}\n"
                         f"  Usage: /mode react|plan|auto"
                     ))
+            elif cmd.startswith("/model"):
+                parts = user_input.strip().split(maxsplit=2)
+                if len(parts) >= 2:
+                    session.switch_model(parts[1])
+                    click.echo(dim(f"  Model switched to: {parts[1]}"))
+                else:
+                    m = getattr(session, "_model", "?")
+                    p = getattr(session, "_provider", "?")
+                    click.echo(dim(f"  Current: {m} (provider: {p})\n  Usage: /model <model-name>"))
             elif cmd == "/help":
                 click.echo(dim(
                     "  Commands:\n"
@@ -470,6 +484,7 @@ def chat(
                     "    /stats  — show session statistics\n"
                     "    /clear  — clear conversation history\n"
                     "    /mode   — show or switch agent mode (react|plan|auto)\n"
+                    "    /model  — show or switch LLM model\n"
                     "    /help   — show this help\n"
                     "  Anything else is sent to the agent."
                 ))

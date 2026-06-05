@@ -17,6 +17,7 @@ history 跨轮保留，像 Claude Code 一样可以持续对话。
 
 from __future__ import annotations
 
+import os
 import time
 import sys
 from pathlib import Path
@@ -63,10 +64,12 @@ class ChatSession:
         self.config = config
         self._confirm_callback = confirm_callback
         self._mode = "react"
+        self._model = getattr(backend, "model_name", "?")
+        self._provider = "?"
 
         self._backend = backend
         self._registry = registry
-        self._renderer = renderer or Renderer()
+        self._renderer = renderer or Renderer(model=self._model, mode=self._mode)
 
         # ── 流式回调（委托给 Renderer）────────────────────────────
         _stream_started = [False]
@@ -121,8 +124,38 @@ class ChatSession:
         if mode not in ("react", "plan", "auto"):
             raise ValueError(f"Unknown mode: {mode!r}")
         self._mode = mode
+        self._renderer.mode = mode
+        self._rebuild_agent()
+
+    def switch_model(
+        self, model: str,
+        provider: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        """运行时切换 LLM 模型（保持对话历史）。"""
+        from llm.router import create_backend
+
+        provider = provider or self._provider or "openai"
+        resolved_key = api_key or os.environ.get(
+            {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY",
+             "deepseek": "DEEPSEEK_API_KEY", "groq": "GROQ_API_KEY",
+             "ollama": "OLLAMA_API_KEY", "openai-compat": "OPENAI_API_KEY"}.get(provider, ""), "",
+        )
+        self._backend = create_backend(
+            provider=provider, model=model,
+            api_key=resolved_key or None,
+            base_url=base_url,
+        )
+        self._model = model
+        self._provider = provider
+        self._renderer.model = model
+        self._rebuild_agent()
+
+    def _rebuild_agent(self) -> None:
+        """用当前的 backend + mode 重建 agent 实例。"""
         self.agent = create_agent(
-            mode, self._backend, self._registry, self._agent_cfg,
+            self._mode, self._backend, self._registry, self._agent_cfg,
         )
 
     # ------------------------------------------------------------------

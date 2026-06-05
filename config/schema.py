@@ -26,11 +26,11 @@ import yaml
 
 @dataclass
 class LLMConfig:
-    provider: str = "anthropic"
-    model: str = "claude-sonnet-4-5"
+    provider: str = ""          # 空值表示未配置，必须通过 default.yaml 或 CLI 指定
+    model: str = ""
     api_key: str = ""
     base_url: str = ""
-    max_tokens: int = 4096
+    max_tokens: int = 8192
 
 
 @dataclass
@@ -133,11 +133,11 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     context_raw = data.get("context", {})
 
     llm = LLMConfig(
-        provider=llm_raw.get("provider", "anthropic"),
-        model=llm_raw.get("model", "claude-sonnet-4-5"),
+        provider=llm_raw.get("provider", ""),
+        model=llm_raw.get("model", ""),
         api_key=llm_raw.get("api_key", ""),
         base_url=llm_raw.get("base_url", "") or "",
-        max_tokens=int(llm_raw.get("max_tokens", 4096)),
+        max_tokens=int(llm_raw.get("max_tokens", 8192)),
     )
 
     agent = AgentCfg(
@@ -177,7 +177,9 @@ def merge_cli_overrides(
     provider: str | None = None,
     model: str | None = None,
     api_key: str | None = None,
+    base_url: str | None = None,
     max_steps: int | None = None,
+    max_tokens: int | None = None,
 ) -> AppConfig:
     """
     把 CLI 参数覆盖到已加载的 config 上。
@@ -189,6 +191,10 @@ def merge_cli_overrides(
         config.llm.model = model
     if api_key:
         config.llm.api_key = api_key
+    if base_url:
+        config.llm.base_url = base_url
     if max_steps is not None:
         config.agent.max_steps = max_steps
+    if max_tokens is not None:
+        config.llm.max_tokens = max_tokens
     return config

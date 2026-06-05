@@ -46,6 +46,10 @@ class AnthropicBackend(LLMBackend):
     def model_name(self) -> str:
         return self._model
 
+    @property
+    def max_context_window(self) -> int:
+        return 200_000
+
     def complete(
         self,
         messages: list[LLMMessage],

@@ -453,8 +453,10 @@ class PlanExecuteAgent:
         registry: ToolRegistry,
         agent_config: AgentConfig | None = None,
         plan_config: "PlanExecuteConfig | None" = None,
+        planning_backend: LLMBackend | None = None,
     ) -> None:
-        self._backend = backend
+        self._backend = backend            # 执行用
+        self._planning_backend = planning_backend or backend  # 规划用（可独立）
         self._registry = registry
         self._cfg = agent_config or AgentConfig()
         # 延迟 import，避免顶层循环依赖
@@ -615,7 +617,7 @@ class PlanExecuteAgent:
             LLMMessage(role="user", content=task_description),
         ]
 
-        response = self._backend.complete(messages, tools=[])
+        response = self._planning_backend.complete(messages, tools=[])
 
         # 优先 raw_content（real backend），其次 action.message（MockBackend）
         plan_text = response.raw_content or response.action.message or ""

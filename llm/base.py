@@ -103,10 +103,17 @@ class LLMBackend(ABC):
     def supports_function_calling(self) -> bool:
         """
         是否支持 function calling。
-        默认 True；不支持的模型（如 DeepSeek R1）覆盖返回 False，
-        core.py 会切换到文本解析路径（暂未实现，v2 补充）。
+        默认 True；不支持的模型（如 DeepSeek R1）覆盖返回 False。
         """
         return True
+
+    @property
+    def max_context_window(self) -> int:
+        """
+        模型的最大上下文窗口大小（token 数）。
+        默认 128K，子类覆盖。TokenBudget 据此动态分配预算。
+        """
+        return 128_000
 
     def stream(
         self,

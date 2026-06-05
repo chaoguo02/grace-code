@@ -70,6 +70,12 @@ class OpenAICompatBackend(LLMBackend):
     def supports_function_calling(self) -> bool:
         return self._use_function_calling
 
+    @property
+    def max_context_window(self) -> int:
+        # 常见模型的上下文窗口：gpt-4o=128K, deepseek=128K, groq=128K, ollama=varies
+        # 保守默认 128K，子类可按需覆盖
+        return 128_000
+
     def complete(
         self,
         messages: list[LLMMessage],

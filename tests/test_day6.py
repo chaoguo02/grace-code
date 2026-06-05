@@ -45,7 +45,7 @@ class TestExpandEnv:
 class TestParseConfig:
     def test_defaults_when_empty(self):
         config = _parse({})
-        assert config.llm.provider == "anthropic"
+        assert config.llm.provider == ""       # empty = must configure
         assert config.agent.max_steps == 40
         assert config.tools.shell.timeout == 30
         assert config.context.history_window == 20
@@ -71,7 +71,7 @@ class TestParseConfig:
     def test_partial_section_uses_defaults(self):
         config = _parse({"llm": {"provider": "openai"}})
         assert config.llm.provider == "openai"
-        assert config.llm.model == "claude-sonnet-4-5"   # default
+        assert config.llm.model == ""                     # not specified = empty default
 
     def test_base_url_none_becomes_empty(self):
         config = _parse({"llm": {"base_url": None}})
@@ -105,7 +105,7 @@ agent:
     def test_missing_file_returns_defaults(self, tmp_path):
         config = load_config(tmp_path / "nonexistent.yaml")
         assert isinstance(config, AppConfig)
-        assert config.llm.provider == "anthropic"
+        assert config.llm.provider == ""           # empty defaults when config missing
 
     def test_none_path_returns_defaults(self, tmp_path, monkeypatch):
         # 确保当前目录没有 default.yaml
