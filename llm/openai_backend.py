@@ -192,17 +192,17 @@ def _to_openai_messages(messages: list[LLMMessage]) -> list[dict]:
             # Native: assistant message with tool_calls
             d: dict = {
                 "role": "assistant",
-                "content": msg.content or None,
+                "content": msg.content or "",
                 "tool_calls": [
                     {
-                        "id": tc.id,
+                        "id": tc.id or f"call_{i}",
                         "type": "function",
                         "function": {
                             "name": tc.name,
                             "arguments": json.dumps(tc.params, ensure_ascii=False),
                         },
                     }
-                    for tc in msg.tool_calls
+                    for i, tc in enumerate(msg.tool_calls)
                 ],
             }
             result.append(d)
@@ -214,7 +214,7 @@ def _to_openai_messages(messages: list[LLMMessage]) -> list[dict]:
                 "content": msg.content if isinstance(msg.content, str) else str(msg.content),
             })
         else:
-            result.append({"role": msg.role, "content": msg.content})
+            result.append({"role": msg.role, "content": msg.content or ""})
     return result
 
 
@@ -244,7 +244,8 @@ def _parse_openai_response(choice: Any, thought: str) -> Action:
                 params = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 params = {"raw": tc.function.arguments}
-            tool_calls.append(ToolCall(name=tc.function.name, params=params))
+            tc_id = getattr(tc, "id", None) or f"call_{id(tc)}"
+            tool_calls.append(ToolCall(name=tc.function.name, params=params, id=tc_id))
 
         return Action(
             action_type=ActionType.TOOL_CALL,
@@ -463,7 +464,9 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
             for tc_delta in delta.tool_calls:
                 idx = tc_delta.index
                 while len(tool_calls_raw) <= idx:
-                    tool_calls_raw.append({"name": "", "arguments": ""})
+                    tool_calls_raw.append({"id": "", "name": "", "arguments": ""})
+                if tc_delta.id:
+                    tool_calls_raw[idx]["id"] = tc_delta.id
                 if tc_delta.function.name:
                     tool_calls_raw[idx]["name"] += tc_delta.function.name
                 if tc_delta.function.arguments:
@@ -475,13 +478,14 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
 
     if tool_calls_raw and finish_reason == "tool_calls":
         tcs = []
-        for tc in tool_calls_raw:
+        for i, tc in enumerate(tool_calls_raw):
             try:
                 params = _json.loads(tc["arguments"])
             except Exception:
                 params = {"raw": tc["arguments"]}
             fn = SimpleNamespace(name=tc["name"], arguments=tc["arguments"])
-            tcs.append(SimpleNamespace(function=fn))
+            tc_id = tc.get("id") or f"call_stream_{i}"
+            tcs.append(SimpleNamespace(id=tc_id, function=fn))
         mock_message = SimpleNamespace(content=full_text or None, tool_calls=tcs)
     else:
         mock_message = SimpleNamespace(content=full_text or None, tool_calls=None)

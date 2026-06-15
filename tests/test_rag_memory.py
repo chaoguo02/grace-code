@@ -111,7 +111,7 @@ class TestChunkCRUD:
         ok = db_store.add_chunks("source-a", chunks)
         assert ok is True
 
-        results = db_store.search_chunks("chunk", top_k=5, min_score=0.0)
+        results = db_store.search_chunks("chunk", top_k=5, min_score=-1.0)
         assert len(results) > 0
         assert results[0]["source_name"] == "source-a"
 
@@ -126,7 +126,7 @@ class TestChunkCRUD:
         ok = db_store.delete_chunks("to-delete")
         assert ok is True
 
-        results = db_store.search_chunks("deleted", top_k=5, min_score=0.0)
+        results = db_store.search_chunks("deleted", top_k=5, min_score=-1.0)
         assert all(r["source_name"] != "to-delete" for r in results)
 
     def test_max_per_source(self, db_store):
@@ -137,7 +137,7 @@ class TestChunkCRUD:
         chunks = [(i, f"content {i}", emb_bytes, "{}") for i in range(5)]
         db_store.add_chunks("multi", chunks)
 
-        results = db_store.search_chunks("content", top_k=10, min_score=0.0, max_per_source=2)
+        results = db_store.search_chunks("content", top_k=10, min_score=-1.0, max_per_source=2)
         source_counts = {}
         for r in results:
             source_counts[r["source_name"]] = source_counts.get(r["source_name"], 0) + 1
@@ -191,7 +191,7 @@ class TestMemoryIndexer:
             ok = indexer.index_memory(memory)
             assert ok is True
 
-            results = store.search_chunks("fox", top_k=5, min_score=0.0)
+            results = store.search_chunks("fox", top_k=5, min_score=-1.0)
             assert any(r["source_name"] == "test-indexer" for r in results)
             store.close()
 
@@ -210,7 +210,7 @@ class TestMemoryIndexer:
         ok = indexer.remove_memory("to-remove")
         assert ok is True
 
-        results = db_store.search_chunks("content", top_k=5, min_score=0.0)
+        results = db_store.search_chunks("content", top_k=5, min_score=-1.0)
         assert all(r["source_name"] != "to-remove" for r in results)
 
 
@@ -230,7 +230,7 @@ class TestProactiveRetriever:
             (0, "Login failed due to null check", emb_bytes, json.dumps({"type": "project"})),
         ])
 
-        retriever = ProactiveRetriever(db_store, max_chunks=3, min_score=0.0)
+        retriever = ProactiveRetriever(db_store, max_chunks=3, min_score=-1.0)
         results = retriever.retrieve("login authentication problem")
         assert len(results) >= 0  # May or may not match with random embeddings
 

@@ -274,6 +274,12 @@ class ChatSession:
             elapsed=elapsed,
         )
 
+        # Plan 模式执行完成后自动切回 react，避免残留
+        if self._mode == "plan":
+            self._mode = "react"
+            self._renderer.mode = "react"
+            self._rebuild_agent()
+
         return result.is_success() or result.status.value == "gave_up"
 
     def _run_with_renderer(self, task, log):

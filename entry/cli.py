@@ -22,13 +22,25 @@ entry/cli.py
 
 from __future__ import annotations
 
+import io
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 
 import click
 from dotenv import load_dotenv
+
+# Windows 终端强制 UTF-8 输出（避免 GBK 编码错误）
+if sys.platform == "win32":
+    os.system("")  # 启用 VT100 转义序列支持
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    else:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # 把项目根加入 path（直接跑脚本时需要）
 _ROOT = Path(__file__).parent.parent
@@ -75,7 +87,6 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     from tools.shell_tool import ShellTool
     from tools.test_tool import PytestTool
     from tools.web_tool import WebSearchTool, WebFetchTool
-    from tools.mcp_client import create_manager_from_config
 
     web_cfg = cfg.tools.web
     registry = (
@@ -122,6 +133,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
         logger = logging.getLogger("cli")
         logger.info("Connecting to MCP servers: %s", list(mcp_servers_cfg.keys()))
         try:
+            from tools.mcp_client import create_manager_from_config
             manager = create_manager_from_config(mcp_servers_cfg)
             proxies = manager.connect_and_discover_sync()
             for proxy in proxies:
@@ -274,7 +286,7 @@ def run(
         sys.exit(1)
 
     # 打印运行信息
-    click.echo(bold(f"\n🤖 Coding Agent"))
+    click.echo(bold(f"\nCoding Agent"))
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
     click.echo(f"  Repo     : {repo_path}")
@@ -552,7 +564,7 @@ def chat(
     )
 
     # 欢迎信息
-    click.echo(bold(f"\n🤖 Coding Agent — Chat Mode"))
+    click.echo(bold(f"\nCoding Agent — Chat Mode"))
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
     click.echo(f"  Repo     : {repo_path}")

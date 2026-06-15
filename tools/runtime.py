@@ -179,6 +179,8 @@ class LocalRuntime(Runtime):
                 "stderr": subprocess.PIPE,
                 "text": True,
                 "cwd": cwd,
+                "encoding": "utf-8",
+                "errors": "replace",
             }
             # Unix: 创建新 session，后续 killpg 不会误杀父进程
             if os.name != "nt":
@@ -327,6 +329,8 @@ class DockerRuntime(Runtime):
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
                 "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
             }
             if os.name != "nt":
                 popen_kwargs["preexec_fn"] = os.setsid

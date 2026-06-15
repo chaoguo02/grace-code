@@ -118,6 +118,8 @@ def _run_git(args: list[str], cwd: str) -> tuple[bool, str]:
             text=True,
             timeout=60,
             cwd=cwd,
+            encoding="utf-8",
+            errors="replace",
         )
         output = (proc.stdout + proc.stderr).strip()
         return proc.returncode == 0, output

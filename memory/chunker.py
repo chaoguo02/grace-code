@@ -6,7 +6,7 @@ memory/chunker.py
 分块策略：
 - 短记忆 (<512 字符) 不分割，整条作为一个 chunk
 - 长记忆按 markdown 标题 / 双换行 分割为段落
-- 超长段落按滑动窗口切分（max=1000 字符，overlap=150）
+- 超长段落按滑动窗口切分（max=1500 字符，overlap=150）
 - 每个 chunk 附加 preamble (name + description) 以提升 embedding 质量
 """
 
@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-MAX_CHUNK_CHARS = 1000
+MAX_CHUNK_CHARS = 1500
 OVERLAP_CHARS = 150
 SHORT_THRESHOLD = 512
 

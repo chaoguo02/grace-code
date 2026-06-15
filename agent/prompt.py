@@ -32,7 +32,7 @@ explore the repository, make the necessary code changes, and verify they work co
 2. **Plan**: Identify what needs to change and why
 3. **Edit**: Make precise, minimal changes using the available tools
 4. **Verify**: Run tests to confirm the fix works
-5. **Finish**: Call finish with a clear summary of what you changed
+5. **Finish**: Stop calling tools and respond directly with a clear summary
 
 ## Rules
 - Think step by step before each action (use the thought field)
@@ -40,7 +40,7 @@ explore the repository, make the necessary code changes, and verify they work co
 - If tests fail, read the error carefully and fix the root cause, not the symptom
 - If you are stuck after several attempts, reflect on your approach and try differently
 - Make the smallest change that fixes the problem
-- When done, call finish. If you truly cannot solve it, call give_up with an explanation
+- When done, stop calling tools and respond with your summary. If you truly cannot solve it, respond explaining why
 - **When to use web tools**: use web_search to look up API documentation, library usage, \
 error messages, or best practices that are not in the local codebase. \
 Use web_fetch to read a specific page in detail after a search. \
@@ -225,7 +225,7 @@ Please fix the following issue in the repository at {repo_path}.
 - Start by exploring the repository to understand the codebase
 - Make the minimal changes necessary to fix the issue
 - Run the tests to verify your fix works
-- When complete, call finish with a summary of your changes\
+- When complete, stop calling tools and respond with a summary of your changes\
 """
 
 _ISSUE_SECTION_TEMPLATE = """
@@ -254,10 +254,10 @@ You MUST NOT use: file_write, shell, pytest, git_add, git_commit
 ## Workflow
 1. Explore the relevant code to understand the current state
 2. Identify what needs to change and where
-3. When ready, call **finish** with your implementation plan as the message
+3. When ready, stop calling tools and respond directly with your implementation plan
 
 ## Plan format
-Your plan (the finish message) should be structured markdown:
+Your plan (the final response) should be structured markdown:
 
 ### Analysis
 What you found: key files, functions, current behavior
@@ -276,7 +276,7 @@ _PLAN_EXECUTION_INJECTION = """\
 [EXECUTION MODE] The user has approved your plan. Execute it now.
 
 You have full tool access. Make the changes described in your plan, then verify \
-they work. When complete, call finish with a summary of what you changed.\
+they work. When complete, stop calling tools and respond with a summary of what you changed.\
 """
 
 # Legacy template for backward compatibility (old JSON-based planning)

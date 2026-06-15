@@ -186,12 +186,19 @@ class RepoMap:
 
     def _scan(self) -> list[FileInfo]:
         results: list[FileInfo] = []
-        for path in sorted(self._root.rglob("*")):
+        try:
+            paths = sorted(self._root.rglob("*"))
+        except OSError:
+            return results
+        for path in paths:
             if any(part in _SKIP_DIRS for part in path.parts):
                 continue
-            if not path.is_file():
+            try:
+                if not path.is_file():
+                    continue
+                size = path.stat().st_size
+            except OSError:
                 continue
-            size = path.stat().st_size
             if size > 500_000:
                 continue
 

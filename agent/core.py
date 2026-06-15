@@ -82,6 +82,7 @@ def _git_diff(repo_path: str) -> str | None:
         proc = subprocess.run(
             ["git", "diff", "HEAD"],
             capture_output=True, text=True, timeout=10, cwd=repo_path,
+            encoding="utf-8", errors="replace",
         )
         diff = proc.stdout.strip()
         return diff if diff else None
@@ -281,18 +282,16 @@ class ReActAgent:
                 else:
                     steps_without_edit += 1
 
-                log.log_observation(step=step, observation=observation)
-
                 # 把 action 和所有 observations 加入对话历史
                 if self._backend.supports_function_calling:
                     # Native tool_use mode: structured messages
                     history.add(LLMMessage(
                         role="assistant",
-                        content=action.thought,
+                        content=action.thought or "",
                         tool_calls=action.tool_calls,
                     ))
-                    for obs in observations:
-                        tc = next((t for t in action.tool_calls if t.name == obs.tool_name), None)
+                    for i, obs in enumerate(observations):
+                        tc = action.tool_calls[i] if i < len(action.tool_calls) else None
                         history.add(LLMMessage(
                             role="tool",
                             content=self._build_tool_result_content(obs),
