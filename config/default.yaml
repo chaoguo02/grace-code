@@ -1,8 +1,8 @@
 llm:
   provider: deepseek
-  model: deepseek/deepseek-v4-flash # 使用标准模型名称，兼容大多数API
-  api_key: ${DEEPSEEK_API_KEY} # 在终端 export DEEPSEEK_API_KEY=你的key
-  base_url: https://api.llm.mioffice.cn/v1/
+  model: deepseek/deepseek-v4-flash
+  api_key: ${DEEPSEEK_API_KEY}
+  base_url: ${FORGE_LLM_BASE_URL}
   max_tokens: 8192
 
 agent:
