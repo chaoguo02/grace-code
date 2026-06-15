@@ -177,14 +177,41 @@ class OpenAIBackend(LLMBackend):
 # ---------------------------------------------------------------------------
 
 def _to_openai_messages(messages: list[LLMMessage]) -> list[dict]:
-    """把 LLMMessage 列表转为 OpenAI messages 格式。"""
+    """
+    把 LLMMessage 列表转为 OpenAI messages 格式。
+
+    Native tool calling 模式：
+    - assistant + tool_calls → {"role": "assistant", "tool_calls": [...]}
+    - role="tool" + tool_call_id → {"role": "tool", "tool_call_id": ..., "content": ...}
+
+    Text fallback 模式：直接传递 role + content。
+    """
     result = []
     for msg in messages:
-        if msg.tool_call_id:
+        if msg.tool_calls:
+            # Native: assistant message with tool_calls
+            d: dict = {
+                "role": "assistant",
+                "content": msg.content or None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.params, ensure_ascii=False),
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            }
+            result.append(d)
+        elif msg.tool_call_id:
+            # Native: tool result
             result.append({
                 "role": "tool",
                 "tool_call_id": msg.tool_call_id,
-                "content": msg.content,
+                "content": msg.content if isinstance(msg.content, str) else str(msg.content),
             })
         else:
             result.append({"role": msg.role, "content": msg.content})
@@ -221,7 +248,7 @@ def _parse_openai_response(choice: Any, thought: str) -> Action:
         return Action(
             action_type=ActionType.TOOL_CALL,
             thought=thought,
-            tool_call=ToolCall(name=tc.function.name, params=params),
+            tool_call=ToolCall(name=tc.function.name, params=params, id=tc.id),
         )
 
     if finish_reason == "stop":

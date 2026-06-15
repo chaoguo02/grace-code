@@ -17,6 +17,7 @@ context/history.py
 
 from __future__ import annotations
 
+from agent.task import ToolCall
 from llm.base import LLMMessage
 
 
@@ -56,13 +57,33 @@ class ConversationHistory:
 
     def to_dicts(self) -> list[dict]:
         """转为 dict 列表，供 TokenBudget.trim_history() 使用。"""
-        return [{"role": m.role, "content": m.content} for m in self._messages]
+        result = []
+        for m in self._messages:
+            d: dict = {"role": m.role, "content": m.content}
+            if m.tool_call_id is not None:
+                d["tool_call_id"] = m.tool_call_id
+            if m.tool_calls is not None:
+                d["tool_calls"] = [tc.to_dict() for tc in m.tool_calls]
+            result.append(d)
+        return result
 
     @classmethod
     def from_dicts(cls, dicts: list[dict], max_messages: int = 40) -> "ConversationHistory":
         """从 dict 列表恢复（断点续跑时用）。"""
         h = cls(max_messages=max_messages)
-        h._messages = [LLMMessage(role=d["role"], content=d["content"]) for d in dicts]
+        for d in dicts:
+            tool_calls = None
+            if "tool_calls" in d:
+                tool_calls = [
+                    ToolCall(name=tc["name"], params=tc["params"], id=tc.get("id"))
+                    for tc in d["tool_calls"]
+                ]
+            h._messages.append(LLMMessage(
+                role=d["role"],
+                content=d["content"],
+                tool_call_id=d.get("tool_call_id"),
+                tool_calls=tool_calls,
+            ))
         return h
 
     @property

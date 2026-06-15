@@ -10,7 +10,7 @@
 
 ```bash
 # 安装
-git clone <repo-url> && cd coding-agent
+git clone <repo-url> && cd forge-agent
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
@@ -53,6 +53,15 @@ agent run --task "..." --confirm         # 危险命令需确认
 agent run --task "..." --sandbox         # Docker 沙箱
 ```
 
+### plan 模式
+
+复杂任务先拆解再执行，支持 DAG 依赖和自动/审批两种模式：
+
+```bash
+# chat 内切换
+/plan 重构 api.py，拆分成更小的函数并补测试
+```
+
 ### GitHub Issue 自动修复
 
 ```bash
@@ -61,7 +70,7 @@ python -m entry.github_issue \
     --repo owner/repo --issue 42 --local-path /tmp/myrepo
 ```
 
-自动拉取 Issue → 运行 agent → 提交 PR。
+自动拉取 Issue -> 运行 agent -> 提交 PR。
 
 ---
 
@@ -90,9 +99,11 @@ context:
 ## 项目结构
 
 ```
-coding-agent/
-├── agent/              # 核心：ReAct 主循环、事件日志、数据结构
-│   ├── core.py         # Agent 类，驱动整个运行循环
+forge-agent/
+├── agent/              # 核心：ReAct 主循环、Plan-and-Execute、事件日志
+│   ├── core.py         # Agent 类，驱动 ReAct 运行循环
+│   ├── plan.py         # Plan-and-Execute Agent + 计划解析
+│   ├── factory.py      # Agent 工厂（react/plan/auto 模式选择）
 │   ├── task.py         # Task / Action / Observation / RunResult 数据类
 │   ├── event_log.py    # JSONL append-only 事件流，支持回放
 │   └── prompt.py       # System prompt 模板
@@ -100,13 +111,13 @@ coding-agent/
 ├── llm/                # LLM 后端
 │   ├── base.py         # LLMBackend 抽象基类，含默认 stream()
 │   ├── anthropic_backend.py   # Claude 原生（tool_use + 流式）
-│   ├── openai_backend.py           # OpenAI / DeepSeek / Groq / Ollama
+│   ├── openai_backend.py      # OpenAI / DeepSeek / Groq / Ollama
 │   └── router.py       # 按配置选择 backend
 │
 ├── tools/              # 工具层（agent 可调用的操作）
 │   ├── base.py         # BaseTool + ToolRegistry
 │   ├── file_tool.py    # 文件读写查看
-│   ├── shell_tool.py   # Shell 执行（四层安全防护）
+│   ├── shell_tool.py   # Shell 执行（三层安全防护）
 │   ├── search_tool.py  # 文本搜索 / 文件查找 / 符号定位
 │   ├── test_tool.py    # pytest 执行 + 结构化结果解析
 │   ├── git_tool.py     # git status / diff / add / commit
@@ -114,22 +125,23 @@ coding-agent/
 │
 ├── context/            # 上下文管理
 │   ├── repo_map.py     # tree-sitter 多语言符号提取，生成 repo 摘要
-│   ├── token_budget.py # Token 预算分配与裁剪
-│   └── history.py      # 对话历史滑动窗口
+│   └── history.py      # 对话历史滑动窗口 + Token 预算管理
 │
 ├── entry/              # 入口层
 │   ├── cli.py          # Click CLI（run / chat / log 子命令）
 │   ├── chat.py         # ChatSession，跨轮持久化历史
-│   └── github_issue.py # GitHub Issue → PR 自动化
+│   ├── renderer.py     # TUI 渲染（流式 Markdown + 工具块 + 统计）
+│   ├── history_viewer.py # 历史对话查看器
+│   └── github_issue.py # GitHub Issue -> PR 自动化
 │
 ├── config/
 │   ├── default.yaml    # 默认配置
 │   └── schema.py       # 配置加载与校验
 │
-├── tests/              # 376 个测试，覆盖所有模块
+├── tests/              # 510+ 测试用例
 ├── smoke_test.py       # 端到端联通验证
-├── quicksort_task.py   # 示例任务脚本
-└── USAGE.md            # 完整使用教程
+├── USAGE.md            # 完整使用教程
+└── ROADMAP.md          # 迭代路线图
 ```
 
 ---
@@ -139,15 +151,22 @@ coding-agent/
 **多模型支持**
 - Anthropic Claude（原生 tool_use）
 - OpenAI、DeepSeek、Groq、Ollama（OpenAI-compatible）
-- DeepSeek R1 等不支持 function calling 的模型走文本解析 fallback
+- 不支持 function calling 的模型走文本解析 fallback
 - 配置文件一行切换，或 `--model` 参数临时覆盖
 
 **多语言 Repo-map**
 用 tree-sitter 精确提取符号（函数、类、方法），生成 repo 摘要注入 system prompt，
 支持 Python / JavaScript / TypeScript / Go / Rust / Java / C++ / C / Ruby。
 
+**记忆系统**
+- 短期记忆：对话历史滑动窗口 + token 预算管理
+- 长期记忆：关键事实持久化，跨会话复用
+
 **流式输出**
 模型 thought 逐 token 实时打印，工具调用实时显示，体验接近 Claude Code。
+
+**Plan-and-Execute**
+复杂任务先拆解为 DAG，再按依赖顺序执行，支持计划确认与重规划。
 
 **安全机制（三层）**
 - 硬拦截黑名单：`rm -rf /`、`mkfs` 等永不执行
@@ -159,27 +178,17 @@ coding-agent/
 repo 通过 bind mount 双向同步，默认断网。
 
 **Reflection 机制**
-- 测试失败 → 自动触发反思 prompt，重新分析错误原因
-- 连续 6 步无文件修改 → 触发反思，防止探索死循环
-- 连续 3 步相同操作 → 判定死循环，自动终止
+- 测试失败 -> 自动触发反思 prompt，重新分析错误原因
+- 连续 6 步无文件修改 -> 触发反思，防止探索死循环
+- 连续 3 步相同操作 -> 判定死循环，自动终止
+
+**Web 工具**
+- `web_search`：互联网搜索（SerpAPI）
+- `web_fetch`：URL 内容提取 + SSRF 防护 + 私有 IP 拦截
 
 **事件日志**
 每次运行生成 JSONL 日志，记录所有 action / observation / reflection，
 支持完整回放和统计分析。
-
----
-
-## 安全说明
-
-`--confirm` 模式（`run`）和 `chat` 模式默认对写操作要求确认，执行前显示：
-
-```
-  ⚠  Agent wants to run:
-     $ git commit -m "fix parser bug"
-  Allow? [y/N]
-```
-
-`--sandbox` 模式在 Docker 容器中执行，宿主机环境完全隔离。
 
 ---
 
@@ -190,7 +199,7 @@ repo 通过 bind mount 双向同步，默认断网。
 pip install -e ".[dev]"
 
 # 运行测试
-pytest                     # 全量（376 passed，7 skipped）
+pytest                     # 全量（510 passed，7 skipped）
 pytest tests/test_day3.py  # 单个文件
 
 # 可选：更多语言的 tree-sitter 支持

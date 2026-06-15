@@ -4,3 +4,7 @@
 logs/
 __pycache__/
 *.pyc
+*.pyo
+.python-version
+*.log
+.env

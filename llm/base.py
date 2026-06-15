@@ -27,12 +27,14 @@ class LLMMessage:
     """
     发送给 LLM 的单条消息。
     role: "system" | "user" | "assistant" | "tool"
-    content 是纯文本；
-    tool_call_id 仅在 role=="tool" 时使用（OpenAI 格式）。
+    content: 纯文本 str，或 content blocks 列表（Anthropic cache_control 格式）。
+    tool_call_id 仅在 role=="tool" 时使用（工具执行结果关联到对应的 tool_use）。
+    tool_calls 仅在 role=="assistant" 时使用（native function calling 模式）。
     """
     role: str
-    content: str
-    tool_call_id: str | None = None     # OpenAI function calling 回传结果时需要
+    content: "str | list[dict[str, Any]]"
+    tool_call_id: str | None = None     # role=="tool" 时关联对应的 tool_use id
+    tool_calls: "list[ToolCall] | None" = None  # role=="assistant" 时的 native tool calls
 
 
 @dataclass
@@ -180,6 +182,8 @@ class MockBackend(LLMBackend):
         messages: list[LLMMessage],
         tools: list[LLMToolSchema],
     ) -> LLMResponse:
+        import uuid
+
         self.call_count += 1
         self.received_messages.append(messages)
 
@@ -193,6 +197,10 @@ class MockBackend(LLMBackend):
                 thought="MockBackend script exhausted.",
                 message="No more scripted actions.",
             )
+
+        # Assign synthetic ID for tool calls without one (native tool_use round-trip)
+        if action.tool_call and action.tool_call.id is None:
+            action.tool_call.id = f"mock_{uuid.uuid4().hex[:8]}"
 
         return LLMResponse(
             action=action,

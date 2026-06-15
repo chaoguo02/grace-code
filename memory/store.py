@@ -47,9 +47,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_BASE_DIR = "~/.forge-agent/projects"
+_GLOBAL_MEMORY_DIR = "~/.forge-agent/global/memory"
 _INDEX_FILENAME = "MEMORY.md"
 _FRONTMATTER_SEP = "---"
 _MAX_INDEX_LINES = 200  # MEMORY.md 默认最大行数
+
+# user 和 feedback 类型默认存储到全局（跨项目共享）
+_GLOBAL_MEMORY_TYPES = frozenset({"user", "feedback"})
 
 # ---------------------------------------------------------------------------
 # YAML frontmatter 解析
@@ -88,6 +92,7 @@ def _build_frontmatter(memory: Memory) -> str:
         "metadata": {
             "type": memory.metadata.type,
         },
+        "updated_at": memory.updated_at,
     }
     return yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
 
@@ -269,8 +274,9 @@ class MemoryStore:
         limit = max_lines if max_lines is not None else self._max_index_lines
         lines = text.splitlines()
         if len(lines) > limit:
+            omitted = len(lines) - limit
             lines = lines[:limit]
-            lines.append(f"... [{len(lines) - limit} lines omitted]")
+            lines.append(f"... [{omitted} lines omitted]")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -338,3 +344,106 @@ class MemoryStore:
                     type=m.group(4) or "reference",
                 ))
         return summaries
+
+
+# ---------------------------------------------------------------------------
+# TwoTierMemoryStore — 项目层 + 全局层
+# ---------------------------------------------------------------------------
+
+class TwoTierMemoryStore(MemoryStore):
+    """
+    双层记忆存储：项目级 + 全局级。
+
+    - user/feedback 类型记忆默认存储到全局目录（跨项目共享）
+    - project/reference 类型记忆存储到项目目录
+    - 读取和列表操作合并两层结果
+    """
+
+    def __init__(
+        self,
+        repo_path: str,
+        base_dir: str | None = None,
+        memory_dir: str | None = None,
+        global_dir: str | None = None,
+        max_index_lines: int = _MAX_INDEX_LINES,
+    ) -> None:
+        super().__init__(repo_path, base_dir, memory_dir, max_index_lines)
+        global_path = Path(global_dir or _GLOBAL_MEMORY_DIR).expanduser().resolve()
+        self._global_store = MemoryStore(
+            repo_path="__global__",
+            memory_dir=str(global_path),
+            max_index_lines=max_index_lines,
+        )
+
+    @property
+    def global_store(self) -> MemoryStore:
+        """全局记忆存储。"""
+        return self._global_store
+
+    def write_memory(self, memory: Memory) -> bool:
+        """
+        写入记忆，按类型自动分流。
+
+        user/feedback → 全局层（跨项目共享）
+        project/reference → 项目层
+        """
+        if memory.metadata.type in _GLOBAL_MEMORY_TYPES:
+            return self._global_store.write_memory(memory)
+        return super().write_memory(memory)
+
+    def read_memory(self, name: str) -> Memory | None:
+        """先查项目层，再查全局层。"""
+        result = super().read_memory(name)
+        if result is None:
+            result = self._global_store.read_memory(name)
+        return result
+
+    def delete_memory(self, name: str) -> bool:
+        """先尝试项目层删除，失败时尝试全局层。"""
+        # 检查哪一层有这个记忆
+        if super().read_memory(name) is not None:
+            return super().delete_memory(name)
+        if self._global_store.read_memory(name) is not None:
+            return self._global_store.delete_memory(name)
+        return True  # 都不存在，视为成功
+
+    def list_memories(self) -> list[MemorySummary]:
+        """合并两层记忆列表（去重：同名优先项目层）。"""
+        project_memories = super().list_memories()
+        global_memories = self._global_store.list_memories()
+
+        # 去重
+        seen = {s.name for s in project_memories}
+        merged = list(project_memories)
+        for s in global_memories:
+            if s.name not in seen:
+                merged.append(s)
+                seen.add(s.name)
+        return merged
+
+    def get_index_content(self, max_lines: int | None = None) -> str:
+        """合并两层索引内容。"""
+        project_content = super().get_index_content(max_lines)
+        global_content = self._global_store.get_index_content(max_lines)
+
+        if not project_content.strip() and not global_content.strip():
+            return ""
+
+        parts: list[str] = []
+        if project_content.strip():
+            parts.append(project_content)
+        if global_content.strip():
+            # 给全局记忆加标题区分
+            # 去掉全局的 "# Memory Index" 标题行
+            global_lines = global_content.splitlines()
+            global_lines = [l for l in global_lines if not l.startswith("# Memory Index")]
+            if global_lines:
+                parts.append("\n### Global Memories (shared across projects)")
+                parts.append("\n".join(global_lines))
+
+        result = "\n".join(parts)
+        limit = max_lines if max_lines is not None else self._max_index_lines
+        lines = result.splitlines()
+        if len(lines) > limit:
+            lines = lines[:limit]
+        return "\n".join(lines)

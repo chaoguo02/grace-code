@@ -89,6 +89,10 @@ class ChatSession:
         # ── 记忆系统 ──────────────────────────────────────────────────
         self._memory_store = memory_store
         self._memory_context = memory_context
+        self._proactive_memory = None
+        if memory_store:
+            from memory.proactive import ProactiveMemory
+            self._proactive_memory = ProactiveMemory(memory_store)
 
         # ── 流式回调（委托给 Renderer）────────────────────────────
         _stream_started = [False]
@@ -134,6 +138,9 @@ class ChatSession:
         self._shared_history = ConversationHistory(
             max_messages=config.context.history_window * 2,
         )
+
+        # ── 跨 session 上下文恢复（从持久化的 compaction 摘要）─────
+        self._inject_session_summary()
 
         self.total_tokens = 0
         self.total_steps = 0
@@ -220,6 +227,14 @@ class ChatSession:
         self.round_count += 1
         self._shared_history.add(LLMMessage(role="user", content=user_input))
 
+        # 用户新一轮输入，重置 compaction thrashing 计数器
+        if hasattr(self.agent, "compactor") and hasattr(self.agent.compactor, "reset_thrashing_counter"):
+            self.agent.compactor.reset_thrashing_counter()
+
+        # 主动记忆：检测用户修正/偏好模式
+        if self._proactive_memory:
+            self._proactive_memory.check_user_message(user_input)
+
         task = Task(
             description=user_input,
             repo_path=self.repo_path,
@@ -266,8 +281,9 @@ class ChatSession:
         from agent.task import EventType
 
         original_append = log._append
-        # 记录当前工具名，供 observation 使用
+        # 记录当前工具名和参数，供 observation 使用
         _last_tool_name = [""]
+        _last_tool_params: list[dict] = [{}]
 
         def _handle_event(event):
             etype = event.event_type
@@ -280,6 +296,7 @@ class ChatSession:
 
                 if tc:
                     _last_tool_name[0] = tc["name"]
+                    _last_tool_params[0] = tc.get("params", {})
                     self._renderer.on_tool_call(
                         step=p["step"],
                         name=tc["name"],
@@ -298,13 +315,22 @@ class ChatSession:
 
             elif etype == EventType.OBSERVATION:
                 obs = p["observation"]
+                tool_name = obs.get("tool_name", _last_tool_name[0])
                 self._renderer.on_observation(
                     step=p["step"],
-                    tool_name=obs.get("tool_name", _last_tool_name[0]),
+                    tool_name=tool_name,
                     status=obs.get("status", ""),
                     output=obs.get("output", ""),
                     error=obs.get("error"),
                 )
+                # 主动记忆：检测成功的构建/测试命令
+                if self._proactive_memory and obs.get("status") == "success":
+                    self._proactive_memory.check_tool_result(
+                        tool_name=tool_name,
+                        params=_last_tool_params[0],
+                        output=obs.get("output", ""),
+                        success=True,
+                    )
 
             elif etype == EventType.REFLECTION:
                 self._renderer.on_reflection(
@@ -336,18 +362,19 @@ class ChatSession:
         压缩当前对话历史（/compact 命令）。
         调用 ConversationCompactor 把 shared_history 压缩，
         保留首条消息，其余生成 compact 摘要块。
+        同时将摘要持久化到磁盘，以便跨 session 恢复上下文。
 
         Returns:
             提示文本（用于显示给用户）
         """
-        from context.compaction import ConversationCompactor
+        from context.compaction import ConversationCompactor, persist_compaction_summary
         from llm.base import LLMMessage
 
         history_dicts = self._shared_history.to_dicts()
         if len(history_dicts) < 4:
             return "Conversation is too short to compact (minimum 4 messages)."
 
-        compactor = ConversationCompactor()
+        compactor = ConversationCompactor(backend=self._backend)
         compacted = compactor.build_compact_block_for_history(history_dicts)
 
         # 重建 shared_history
@@ -358,8 +385,39 @@ class ChatSession:
             content=compacted["content"],
         ))
 
+        # 持久化摘要到磁盘
+        if self._memory_store:
+            persist_compaction_summary(
+                compacted["content"],
+                str(self._memory_store.store_dir.parent),
+            )
+
         count = len(history_dicts)
         return f"Conversation compacted: {count} messages → 2 messages."
+
+    def _inject_session_summary(self) -> None:
+        """
+        启动时注入上次 session 的 compaction 摘要（如果存在）。
+        实现跨 session 上下文续传。
+        """
+        if not self._memory_store:
+            return
+
+        from context.compaction import load_session_summary
+        from llm.base import LLMMessage
+
+        summary = load_session_summary(str(self._memory_store.store_dir.parent))
+        if not summary:
+            return
+
+        self._shared_history.add(LLMMessage(
+            role="user",
+            content=(
+                "[Previous session context — restored from disk]\n\n"
+                f"{summary}\n\n"
+                "[End of previous session context. New conversation begins below.]"
+            ),
+        ))
 
     def print_stats(self) -> None:
         """打印会话总统计。"""

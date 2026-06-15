@@ -100,9 +100,13 @@ class ToolCall:
     """
     name: str                   # 工具名称，如 "shell", "file_read"
     params: dict[str, Any]      # 工具参数，由各 Tool 自己定义 schema
+    id: str | None = None       # Provider-assigned tool call ID (for native tool_use round-trip)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = {"name": self.name, "params": self.params}
+        if self.id is not None:
+            d["id"] = self.id
+        return d
 
 
 # ---------------------------------------------------------------------------

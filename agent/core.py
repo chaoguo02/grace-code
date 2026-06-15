@@ -29,6 +29,7 @@ from context.repo_map import RepoMap
 from context.token_budget import TokenBudget
 from agent.prompt import (
     build_system_prompt,
+    build_system_prompt_structured,
     build_task_prompt,
     reflection_no_edit,
     reflection_test_failed,
@@ -149,6 +150,11 @@ class ReActAgent:
             if hasattr(self, "_repo_map_cache"):
                 del self._repo_map_cache
             self._repo_map_cache_key = cache_key
+
+        # 设置任务上下文，用于记忆相关性过滤
+        if self._memory_context:
+            self._memory_context.set_task_context(task.description)
+
         log.log_task_start(task)
         logger.info("Agent starting task %s", task.task_id)
 
@@ -253,14 +259,28 @@ class ReActAgent:
                 log.log_observation(step=step, observation=observation)
 
                 # 把 action 和 observation 加入对话历史
-                history.add(LLMMessage(
-                    role="assistant",
-                    content=self._format_action_for_history(action),
-                ))
-                history.add(LLMMessage(
-                    role="user",
-                    content=self._format_observation_for_history(observation),
-                ))
+                if self._backend.supports_function_calling:
+                    # Native tool_use mode: structured messages
+                    history.add(LLMMessage(
+                        role="assistant",
+                        content=action.thought,
+                        tool_calls=[action.tool_call],
+                    ))
+                    history.add(LLMMessage(
+                        role="tool",
+                        content=self._build_tool_result_content(observation),
+                        tool_call_id=action.tool_call.id,
+                    ))
+                else:
+                    # Text fallback mode (e.g. DeepSeek R1)
+                    history.add(LLMMessage(
+                        role="assistant",
+                        content=self._format_action_for_history(action),
+                    ))
+                    history.add(LLMMessage(
+                        role="user",
+                        content=self._format_observation_for_history(observation),
+                    ))
 
                 # ── 6. Reflection 触发判断 ──────────────────────────────
 
@@ -320,6 +340,11 @@ class ReActAgent:
     ) -> list[LLMMessage]:
         """
         组装发给 LLM 的完整 messages，含 token 裁剪。
+
+        消息结构：
+        [system] — 稳定 prompt（core 部分加 cache_control + auto_memory 指导）
+        [user: project context] — 记忆索引 + 项目规则（变动不影响 system cache）
+        [user/assistant...] — 对话历史
         """
         schemas = self._registry.get_schemas()
 
@@ -329,24 +354,22 @@ class ReActAgent:
                 budget=token_budget.default_plan().repo_map
             )
 
-        # 生成 Memory Section
-        memory_section = ""
-        auto_memory_enabled = False
-        if self._memory_context and self._memory_context.enabled:
-            memory_section = self._memory_context.build_memory_section()
-            auto_memory_enabled = True
-
-        system_content = build_system_prompt(
+        # System prompt: Anthropic 用 structured format（带 cache_control），其他用纯字符串
+        enable_caching = self._is_anthropic_backend()
+        system_content = build_system_prompt_structured(
             repo_path=getattr(self, "_current_repo_path", "."),
             tools=schemas,
             repo_summary=self._repo_map_cache,
-            memory_section=memory_section,
-            auto_memory_enabled=auto_memory_enabled,
+            memory_section="",
+            auto_memory_enabled=bool(self._memory_context and self._memory_context.enabled),
+            enable_caching=enable_caching,
         )
 
         # 检查是否需要自动 compaction（在 token 裁剪之前）
         if self._should_compact(history):
-            history = self._compact_history(history)
+            compacted = self._compact_history(history)
+            # 写回共享 history，避免下一步重复触发 compaction
+            history._messages = compacted._messages
             logger.info("Auto-compaction triggered at step %d", self._current_step)
 
         # 裁剪历史
@@ -355,11 +378,73 @@ class ReActAgent:
             token_budget.default_plan().history,
         )
 
-        # 组装：system + 裁剪后的 history
+        # 组装：system + project context + 裁剪后的 history
         messages = [LLMMessage(role="system", content=system_content)]
+
+        # Project context message: 记忆索引 + 项目规则（独立于 system，不影响 cache）
+        project_context = self._build_project_context()
+        if project_context:
+            messages.append(LLMMessage(role="user", content=project_context))
+            messages.append(LLMMessage(role="assistant", content="Understood. I have the project context and memory index. Proceeding with the task."))
+
         for d in trimmed_history_dicts:
-            messages.append(LLMMessage(role=d["role"], content=d["content"]))
+            tool_calls = None
+            if "tool_calls" in d:
+                tool_calls = [
+                    ToolCall(name=tc["name"], params=tc["params"], id=tc.get("id"))
+                    for tc in d["tool_calls"]
+                ]
+            messages.append(LLMMessage(
+                role=d["role"],
+                content=d["content"],
+                tool_call_id=d.get("tool_call_id"),
+                tool_calls=tool_calls,
+            ))
         return messages
+
+    def _is_anthropic_backend(self) -> bool:
+        """判断当前 backend 是否为 Anthropic（支持 prompt cache）。"""
+        backend_type = type(self._backend).__name__
+        return "anthropic" in backend_type.lower()
+
+    def _build_project_context(self) -> str:
+        """
+        构建项目上下文消息（记忆索引 + 项目规则）。
+        独立于 system prompt，变动不影响 prompt cache。
+        """
+        parts: list[str] = []
+
+        # 记忆索引
+        if self._memory_context and self._memory_context.enabled:
+            memory_section = self._memory_context.build_memory_section()
+            if memory_section:
+                parts.append(memory_section)
+
+        # 项目规则文件
+        rules_content = self._load_project_rules()
+        if rules_content:
+            parts.append(f"## Project Rules\n{rules_content}")
+
+        if not parts:
+            return ""
+
+        return "[Project Context — memory index and project rules]\n\n" + "\n\n".join(parts)
+
+    def _load_project_rules(self) -> str:
+        """加载项目规则文件（.forge-agent/rules.md），不存在时返回空字符串。"""
+        import os
+        repo_path = getattr(self, "_current_repo_path", ".")
+        rules_path = os.path.join(repo_path, ".forge-agent", "rules.md")
+        try:
+            if os.path.isfile(rules_path):
+                with open(rules_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    logger.debug("Loaded project rules from %s", rules_path)
+                    return content
+        except OSError as exc:
+            logger.debug("Failed to load project rules: %s", exc)
+        return ""
 
     def _format_action_for_history(self, action: Action) -> str:
         """把 Action 格式化为 assistant 消息，写入对话历史。"""
@@ -372,7 +457,7 @@ class ReActAgent:
         return "\n".join(parts)
 
     def _format_observation_for_history(self, observation: Observation) -> str:
-        """把 Observation 格式化为 user 消息，写入对话历史。"""
+        """把 Observation 格式化为 user 消息，写入对话历史（text fallback mode）。"""
         status = "SUCCESS" if observation.is_success() else "ERROR"
         lines = [f"[Tool: {observation.tool_name} | {status}]"]
         if observation.output:
@@ -380,6 +465,15 @@ class ReActAgent:
         if observation.error and not observation.is_success():
             lines.append(f"Error: {observation.error}")
         return "\n".join(lines)
+
+    def _build_tool_result_content(self, observation: Observation) -> str:
+        """构建 native tool_use 模式下的工具结果内容（不含 [Tool:] 包装）。"""
+        parts: list[str] = []
+        if observation.output:
+            parts.append(observation.output)
+        if observation.error and not observation.is_success():
+            parts.append(f"Error: {observation.error}")
+        return "\n".join(parts) if parts else "(no output)"
 
     def _is_looping(self, log: EventLog) -> bool:
         """
@@ -485,7 +579,7 @@ class ReActAgent:
     @property
     def compactor(self) -> ConversationCompactor:
         if self._compactor is None:
-            self._compactor = ConversationCompactor()
+            self._compactor = ConversationCompactor(backend=self._backend)
         return self._compactor
 
     def _should_compact(self, history: ConversationHistory) -> bool:
@@ -497,13 +591,32 @@ class ReActAgent:
         """执行 compaction，返回新的 ConversationHistory。"""
         compacted_dicts = self.compactor.compact_history(history.to_dicts())
         new_history = ConversationHistory(max_messages=self._cfg.history_max_messages)
-        from llm.base import LLMMessage
         for d in compacted_dicts:
-            new_history.add(LLMMessage(role=d["role"], content=d["content"]))
+            tool_calls = None
+            if "tool_calls" in d:
+                tool_calls = [
+                    ToolCall(name=tc["name"], params=tc["params"], id=tc.get("id"))
+                    for tc in d["tool_calls"]
+                ]
+            new_history.add(LLMMessage(
+                role=d["role"],
+                content=d["content"],
+                tool_call_id=d.get("tool_call_id"),
+                tool_calls=tool_calls,
+            ))
         logger.info(
             "Compaction: %d messages → %d messages",
             len(history), len(new_history),
         )
+
+        # 持久化 session summary 到磁盘（供跨 session 恢复）
+        if self._memory_context and hasattr(self._memory_context, "_store"):
+            from context.compaction import persist_compaction_summary
+            summary_text = compacted_dicts[0]["content"] if compacted_dicts else ""
+            if summary_text:
+                store_dir = str(self._memory_context._store.store_dir.parent)
+                persist_compaction_summary(summary_text, store_dir)
+
         return new_history
 
 

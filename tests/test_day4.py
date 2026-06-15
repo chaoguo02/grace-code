@@ -204,6 +204,7 @@ class TestAnthropicBackend:
     def _make_tool_use_block(self, name, input_data):
         block = MagicMock()
         block.type = "tool_use"
+        block.id = "toolu_test123"
         block.name = name
         block.input = input_data
         return block
@@ -306,7 +307,7 @@ class TestOpenAIBackend:
 
     def _make_tool_call(self, name, args_dict):
         fn = SimpleNamespace(name=name, arguments=json.dumps(args_dict))
-        return SimpleNamespace(function=fn)
+        return SimpleNamespace(id="call_test123", function=fn)
 
     def _make_backend(self, model="gpt-4o"):
         with patch("openai.OpenAI"):

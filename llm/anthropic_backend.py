@@ -113,20 +113,36 @@ def _to_anthropic_messages(messages: list[LLMMessage]) -> list[dict]:
     """
     把 LLMMessage 列表转为 Anthropic API 的 messages 格式。
 
-    tool_result 消息（工具执行结果）需要特殊处理：
-    Anthropic 要求 role=user，content 是 tool_result block 列表。
-    我们约定：tool_call_id 非空时，这条消息是 tool_result。
+    Native tool_use 模式：
+    - assistant + tool_calls → content blocks: [text, tool_use, ...]
+    - role="tool" + tool_call_id → role=user, content=[tool_result block]
+
+    Text fallback 模式（tool_calls=None, tool_call_id=None）：
+    - 直接传递 role + content
     """
     result = []
     for msg in messages:
-        if msg.tool_call_id:
-            # 工具执行结果
+        if msg.tool_calls:
+            # Native: assistant message with tool_use blocks
+            content_blocks = []
+            if msg.content:
+                content_blocks.append({"type": "text", "text": msg.content})
+            for tc in msg.tool_calls:
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.name,
+                    "input": tc.params,
+                })
+            result.append({"role": "assistant", "content": content_blocks})
+        elif msg.tool_call_id:
+            # Native: tool result
             result.append({
                 "role": "user",
                 "content": [{
                     "type": "tool_result",
                     "tool_use_id": msg.tool_call_id,
-                    "content": msg.content,
+                    "content": msg.content if isinstance(msg.content, str) else str(msg.content),
                 }],
             })
         else:
@@ -174,6 +190,7 @@ def _parse_anthropic_response(response: Any) -> Action:
                     tool_call=ToolCall(
                         name=block.name,
                         params=dict(block.input),
+                        id=block.id,
                     ),
                 )
         # stop_reason 是 tool_use 但没找到 block（理论上不会发生）
