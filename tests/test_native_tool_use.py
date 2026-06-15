@@ -44,12 +44,12 @@ class TestToolCallId:
 
     def test_mock_backend_assigns_id(self):
         script = [
-            Action(ActionType.TOOL_CALL, "thinking", ToolCall("shell", {"cmd": "ls"})),
+            Action(ActionType.TOOL_CALL, "thinking", [ToolCall("shell", {"cmd": "ls"})]),
         ]
         backend = MockBackend(script)
         result = backend.complete([], [])
-        assert result.action.tool_call.id is not None
-        assert result.action.tool_call.id.startswith("mock_")
+        assert result.action.tool_calls[0].id is not None
+        assert result.action.tool_calls[0].id.startswith("mock_")
 
 
 class TestLLMMessageToolCalls:
@@ -436,7 +436,7 @@ class TestAgentCoreDualPath:
         registry.register(NoopTool("echo", output="hi"))
 
         script = [
-            Action(ActionType.TOOL_CALL, "let me echo", ToolCall("echo", {"text": "hi"})),
+            Action(ActionType.TOOL_CALL, "let me echo", [ToolCall("echo", {"text": "hi"})]),
             Action(ActionType.FINISH, "done", message="All done"),
         ]
         backend = MockBackend(script)

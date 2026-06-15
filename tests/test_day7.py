@@ -320,7 +320,7 @@ class TestIntegration:
             Action(ActionType.TOOL_CALL, "write", [ToolCall("file_write", {
                 "path": str(tmp_path / "main.py"),
                 "content": "def broken():\n    return 42\n",
-            })),
+            })]),
             Action(ActionType.FINISH, "Fixed broken()", message="Added return value"),
         ]
         backend = MockBackend(script)

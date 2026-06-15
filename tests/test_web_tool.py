@@ -13,10 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tools.web_tool import (
-    WebSearchTool, WebFetchTool,
-    _validate_url, _extract_content, _strip_tags,
-)
+from tools.web_tool import WebSearchTool, WebFetchTool
+from tools.web_utils import validate_url, extract_content, _strip_tags
 from tools.utils import truncate_output
 
 
@@ -27,55 +25,55 @@ from tools.utils import truncate_output
 class TestValidateURL:
 
     def test_https_ok(self):
-        safe, err = _validate_url("https://docs.python.org/3/library/re.html")
+        safe, err = validate_url("https://docs.python.org/3/library/re.html")
         assert safe
         assert err is None
 
     def test_http_ok(self):
-        safe, err = _validate_url("http://example.com/page")
+        safe, err = validate_url("http://example.com/page")
         assert safe
         assert err is None
 
     def test_file_scheme_blocked(self):
-        safe, err = _validate_url("file:///etc/passwd")
+        safe, err = validate_url("file:///etc/passwd")
         assert not safe
         assert "file" in err.lower()
 
     def test_localhost_blocked(self):
-        safe, err = _validate_url("http://localhost:8080/admin")
+        safe, err = validate_url("http://localhost:8080/admin")
         assert not safe
         assert "localhost" in err.lower()
 
     def test_loopback_ip_blocked(self):
-        safe, err = _validate_url("http://127.0.0.1/api")
+        safe, err = validate_url("http://127.0.0.1/api")
         assert not safe
 
     def test_private_10_blocked(self):
-        safe, err = _validate_url("http://10.0.0.5/internal")
+        safe, err = validate_url("http://10.0.0.5/internal")
         assert not safe
 
     def test_private_192_blocked(self):
-        safe, err = _validate_url("http://192.168.1.1/router")
+        safe, err = validate_url("http://192.168.1.1/router")
         assert not safe
 
     def test_private_172_blocked(self):
-        safe, err = _validate_url("http://172.16.0.1/admin")
+        safe, err = validate_url("http://172.16.0.1/admin")
         assert not safe
 
     def test_ipv6_loopback_blocked(self):
-        safe, err = _validate_url("http://[::1]:8080/")
+        safe, err = validate_url("http://[::1]:8080/")
         assert not safe
 
     def test_link_local_blocked(self):
-        safe, err = _validate_url("http://169.254.0.1/")
+        safe, err = validate_url("http://169.254.0.1/")
         assert not safe
 
     def test_ftp_scheme_blocked(self):
-        safe, err = _validate_url("ftp://example.com/file")
+        safe, err = validate_url("ftp://example.com/file")
         assert not safe
 
     def test_public_ip_ok(self):
-        safe, err = _validate_url("https://8.8.8.8/")
+        safe, err = validate_url("https://8.8.8.8/")
         assert safe
 
 
@@ -115,7 +113,7 @@ class TestStripTags:
 class TestExtractContent:
     def test_readability_preferred(self):
         html = "<html><head><title>Test</title></head><body><p>Hello world</p></body></html>"
-        text = _extract_content(html, "http://example.com")
+        text = extract_content(html, "http://example.com")
         assert "Test" in text or "Hello" in text
 
     def test_fallback_no_bs4(self):
@@ -235,7 +233,7 @@ def _make_fake_response(status_code=200, html=SIMPLE_HTML, side_effect=None):
 class TestWebFetchTool:
     tool = WebFetchTool()
 
-    @patch("tools.web_tool._resolve_and_check", return_value=(True, None))
+    @patch("tools.web_utils.resolve_and_check", return_value=(True, None))
     def test_fetch_extracts_content(self, _dns):
         with patch("requests.get", side_effect=_make_fake_response(200)):
             result = self.tool.execute({"url": "https://example.com/article"})
@@ -256,14 +254,14 @@ class TestWebFetchTool:
         assert not result.success
         assert "required" in result.error.lower()
 
-    @patch("tools.web_tool._resolve_and_check", return_value=(True, None))
+    @patch("tools.web_utils.resolve_and_check", return_value=(True, None))
     def test_fetch_404(self, _dns):
         with patch("requests.get", side_effect=_make_fake_response(404)):
             result = self.tool.execute({"url": "https://example.com/notfound"})
             assert not result.success
             assert "404" in result.error
 
-    @patch("tools.web_tool._resolve_and_check", return_value=(True, None))
+    @patch("tools.web_utils.resolve_and_check", return_value=(True, None))
     def test_fetch_timeout(self, _dns):
         import requests as req_mod
         with patch("requests.get", side_effect=_make_fake_response(
@@ -273,7 +271,7 @@ class TestWebFetchTool:
             assert not result.success
             assert "timed out" in result.error.lower()
 
-    @patch("tools.web_tool._resolve_and_check", return_value=(True, None))
+    @patch("tools.web_utils.resolve_and_check", return_value=(True, None))
     def test_fetch_connection_error(self, _dns):
         import requests as req_mod
         with patch("requests.get", side_effect=_make_fake_response(
@@ -288,7 +286,7 @@ class TestWebFetchTool:
         assert schema.name == "web_fetch"
         assert "url" in schema.parameters["required"]
 
-    @patch("tools.web_tool._resolve_and_check", return_value=(False, "Blocked: resolves to private IP"))
+    @patch("tools.web_utils.resolve_and_check", return_value=(False, "Blocked: resolves to private IP"))
     def test_dns_rebinding_blocked(self, _dns):
         """域名解析到内网 IP 时应被拦截。"""
         result = self.tool.execute({"url": "https://evil.internal.example.com/secret"})

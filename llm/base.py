@@ -199,8 +199,9 @@ class MockBackend(LLMBackend):
             )
 
         # Assign synthetic ID for tool calls without one (native tool_use round-trip)
-        if action.tool_call and action.tool_call.id is None:
-            action.tool_call.id = f"mock_{uuid.uuid4().hex[:8]}"
+        for tc in action.tool_calls:
+            if tc.id is None:
+                tc.id = f"mock_{uuid.uuid4().hex[:8]}"
 
         return LLMResponse(
             action=action,
