@@ -121,6 +121,7 @@ class MemoryStore:
         base_dir:     记忆根目录，默认 ~/.forge-agent/projects
         memory_dir:   可选，直接指定记忆目录（覆盖自动计算）
         max_index_lines: MEMORY.md 每次注入的最大行数
+        indexer:      可选，MemoryIndexer 实例，写入/删除时自动同步向量索引
     """
 
     def __init__(
@@ -129,6 +130,7 @@ class MemoryStore:
         base_dir: str | None = None,
         memory_dir: str | None = None,
         max_index_lines: int = _MAX_INDEX_LINES,
+        indexer: Any | None = None,
     ) -> None:
         if memory_dir:
             self._store_dir = Path(memory_dir).expanduser().resolve()
@@ -136,6 +138,7 @@ class MemoryStore:
             base = Path(base_dir or _DEFAULT_BASE_DIR).expanduser()
             self._store_dir = base / _project_hash(repo_path) / "memory"
         self._max_index_lines = max_index_lines
+        self._indexer = indexer
         self._ensure_dir()
 
     # ------------------------------------------------------------------
@@ -191,7 +194,7 @@ class MemoryStore:
         """
         写入一条记忆（创建或覆盖）。
 
-        自动更新 MEMORY.md 索引。
+        自动更新 MEMORY.md 索引，并同步向量索引（如有 indexer）。
 
         Args:
             memory: Memory 对象
@@ -207,6 +210,11 @@ class MemoryStore:
             logger.error("Failed to write memory %s: %s", memory.name, exc)
             return False
         self._rebuild_index()
+        if self._indexer is not None:
+            try:
+                self._indexer.index_memory(memory)
+            except Exception as exc:
+                logger.warning("Indexer failed for %s: %s", memory.name, exc)
         return True
 
     def list_memories(self) -> list[MemorySummary]:
@@ -244,6 +252,11 @@ class MemoryStore:
             logger.error("Failed to delete memory %s: %s", name, exc)
             return False
         self._rebuild_index()
+        if self._indexer is not None:
+            try:
+                self._indexer.remove_memory(name)
+            except Exception as exc:
+                logger.warning("Indexer remove failed for %s: %s", name, exc)
         return True
 
     # ------------------------------------------------------------------
@@ -366,13 +379,15 @@ class TwoTierMemoryStore(MemoryStore):
         memory_dir: str | None = None,
         global_dir: str | None = None,
         max_index_lines: int = _MAX_INDEX_LINES,
+        indexer: Any | None = None,
     ) -> None:
-        super().__init__(repo_path, base_dir, memory_dir, max_index_lines)
+        super().__init__(repo_path, base_dir, memory_dir, max_index_lines, indexer=indexer)
         global_path = Path(global_dir or _GLOBAL_MEMORY_DIR).expanduser().resolve()
         self._global_store = MemoryStore(
             repo_path="__global__",
             memory_dir=str(global_path),
             max_index_lines=max_index_lines,
+            indexer=indexer,
         )
 
     @property

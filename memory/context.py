@@ -11,10 +11,17 @@ MemoryContext — 管理记忆在 LLM 上下文中的注入。
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter
+from typing import TYPE_CHECKING
 
 from memory.store import MemoryStore
+
+if TYPE_CHECKING:
+    from memory.retriever import ProactiveRetriever
+
+logger = logging.getLogger(__name__)
 
 # 停用词（中英文常见词，不用于相关性匹配）
 _STOPWORDS = frozenset({
@@ -53,11 +60,14 @@ class MemoryContext:
         store: MemoryStore,
         max_lines: int = 50,
         enabled: bool = True,
+        retriever: ProactiveRetriever | None = None,
     ) -> None:
         self._store = store
         self._max_lines = max_lines
         self._enabled = enabled
         self._task_context: str = ""
+        self._retriever = retriever
+        self._user_message: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -76,6 +86,10 @@ class MemoryContext:
         """设置当前任务描述，用于记忆相关性过滤。"""
         self._task_context = task_description
 
+    def set_user_message(self, message: str) -> None:
+        """设置当前轮用户消息，用于 RAG 主动检索。"""
+        self._user_message = message
+
     def build_memory_section(self) -> str:
         """
         构建 Memory Section 文本。
@@ -87,11 +101,14 @@ class MemoryContext:
         当设置了 task_context 时，按相关性排序记忆条目，
         将最相关的记忆放在前面。
 
+        当配置了 retriever 且有 user_message 时，附加 RAG 检索结果。
+
         返回格式：
             ## Available Memories
             <按相关性排序的 MEMORY.md 条目>
 
-            Use memory_read to read a specific memory, memory_write to save new information.
+            ## Relevant Memory Content
+            <RAG 检索到的 chunk 内容>
 
         没有记忆时返回空字符串。
         """
@@ -100,21 +117,40 @@ class MemoryContext:
 
         # 如果有任务上下文，使用相关性过滤
         if self._task_context:
-            return self._build_filtered_section()
+            index_section = self._build_filtered_section()
+        else:
+            # 无任务上下文时，注入完整索引
+            index_content = self._store.get_index_content(max_lines=self._max_lines)
+            if not index_content.strip():
+                index_section = ""
+            else:
+                index_section = "\n".join([
+                    "## Available Memories",
+                    index_content,
+                    "",
+                    "Use memory_read to read a specific memory, memory_write to",
+                    "save new information you want to remember across sessions.",
+                ])
 
-        # 无任务上下文时，注入完整索引
-        index_content = self._store.get_index_content(max_lines=self._max_lines)
-        if not index_content.strip():
+        # RAG 主动检索
+        rag_section = self._build_rag_section()
+
+        parts = [p for p in (index_section, rag_section) if p]
+        return "\n\n".join(parts)
+
+    def _build_rag_section(self) -> str:
+        """用 ProactiveRetriever 检索相关 chunks 并格式化。"""
+        if not self._retriever or not self._user_message:
             return ""
-
-        lines = [
-            "## Available Memories",
-            index_content,
-            "",
-            "Use memory_read to read a specific memory, memory_write to",
-            "save new information you want to remember across sessions.",
-        ]
-        return "\n".join(lines)
+        try:
+            chunks = self._retriever.retrieve(
+                user_message=self._user_message,
+                task_description=self._task_context,
+            )
+            return self._retriever.format_for_injection(chunks)
+        except Exception as exc:
+            logger.debug("RAG retrieval failed: %s", exc)
+            return ""
 
     def _build_filtered_section(self) -> str:
         """按相关性过滤和排序记忆条目。"""

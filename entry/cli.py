@@ -304,18 +304,24 @@ def run(
         from memory.store import TwoTierMemoryStore
         from memory.context import MemoryContext
         from memory.external_store import ExternalMemoryStore
+        from memory.indexer import MemoryIndexer
+        from memory.retriever import ProactiveRetriever
 
+        external_store = ExternalMemoryStore()
+        indexer = MemoryIndexer(external_store)
         memory_store = TwoTierMemoryStore(
             repo_path=str(repo_path),
             memory_dir=config.memory.directory or None,
             max_index_lines=config.memory.max_index_lines,
+            indexer=indexer,
         )
+        retriever = ProactiveRetriever(external_store, max_chunks=5, max_tokens=2000)
         memory_context = MemoryContext(
             store=memory_store,
             max_lines=config.memory.max_index_lines,
             enabled=config.memory.enabled,
+            retriever=retriever,
         )
-        external_store = ExternalMemoryStore()
 
     registry = _build_registry(
         config,
@@ -502,18 +508,24 @@ def chat(
         from memory.store import TwoTierMemoryStore
         from memory.context import MemoryContext
         from memory.external_store import ExternalMemoryStore
+        from memory.indexer import MemoryIndexer
+        from memory.retriever import ProactiveRetriever
 
+        external_store = ExternalMemoryStore()
+        indexer = MemoryIndexer(external_store)
         memory_store = TwoTierMemoryStore(
             repo_path=str(repo_path),
             memory_dir=config.memory.directory or None,
             max_index_lines=config.memory.max_index_lines,
+            indexer=indexer,
         )
+        retriever = ProactiveRetriever(external_store, max_chunks=5, max_tokens=2000)
         memory_context = MemoryContext(
             store=memory_store,
             max_lines=config.memory.max_index_lines,
             enabled=config.memory.enabled,
+            retriever=retriever,
         )
-        external_store = ExternalMemoryStore()
 
     registry = _build_registry(config, memory_store=memory_store, external_store=external_store)
     from tools.shell_tool import terminal_confirm

@@ -68,14 +68,25 @@ def _get_embedding_model(model_name: str = _DEFAULT_MODEL):
 def _encode(text: str, model_name: str = _DEFAULT_MODEL) -> np.ndarray:
     """将文本编码为 embedding 向量。"""
     model = _get_embedding_model(model_name)
-    # fastembed 返回 list[ndarray]，每次处理一条
     embeddings = list(model.embed([text]))
     if not embeddings:
         raise RuntimeError(f"Embedding failed for: {text[:50]}")
     vec = embeddings[0]
-    # 归一化
     norm = np.linalg.norm(vec)
     return vec / norm if norm > 0 else vec
+
+
+def _encode_batch(texts: list[str], model_name: str = _DEFAULT_MODEL) -> list[np.ndarray]:
+    """批量编码多段文本为 embedding 向量（一次 model 调用，比逐条快）。"""
+    if not texts:
+        return []
+    model = _get_embedding_model(model_name)
+    embeddings = list(model.embed(texts))
+    result = []
+    for vec in embeddings:
+        norm = np.linalg.norm(vec)
+        result.append(vec / norm if norm > 0 else vec)
+    return result
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -285,6 +296,168 @@ class ExternalMemoryStore:
             for row in rows
         ]
 
+    # ------------------------------------------------------------------
+    # Chunk-level RAG API
+    # ------------------------------------------------------------------
+
+    def add_chunks(
+        self,
+        source_name: str,
+        chunks: list[tuple[int, str, bytes, str]],
+    ) -> bool:
+        """
+        批量写入 chunks（事务内先删旧再插新）。
+
+        Args:
+            source_name: 父记忆名
+            chunks: [(chunk_index, content, embedding_bytes, metadata_json), ...]
+        """
+        now = _now()
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "DELETE FROM memory_chunks WHERE source_name = ?",
+                (source_name,),
+            )
+            conn.executemany(
+                """INSERT INTO memory_chunks
+                   (source_name, chunk_index, content, embedding, metadata, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (source_name, idx, content, emb_bytes, meta_json, now, now)
+                    for idx, content, emb_bytes, meta_json in chunks
+                ],
+            )
+            conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("Failed to add chunks for %s: %s", source_name, exc)
+            return False
+
+    def delete_chunks(self, source_name: str) -> bool:
+        """删除某条记忆的所有 chunks。"""
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "DELETE FROM memory_chunks WHERE source_name = ?",
+                (source_name,),
+            )
+            conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("Failed to delete chunks for %s: %s", source_name, exc)
+            return False
+
+    def search_chunks(
+        self,
+        query: str,
+        top_k: int = 10,
+        min_score: float = 0.3,
+        max_per_source: int = 2,
+    ) -> list[dict[str, Any]]:
+        """
+        语义搜索 chunk 级别（比 memory 级别更精准）。
+
+        混合评分 = cosine_sim * 0.85 + recency_score * 0.1 + type_boost * 0.05
+
+        Args:
+            query: 搜索文本
+            top_k: 返回前 N 个 chunks
+            min_score: 最低相似度阈值
+            max_per_source: 每个 source_name 最多返回几个 chunk
+
+        Returns:
+            [{"source_name", "chunk_index", "content", "score", "metadata", "updated_at"}, ...]
+        """
+        if not query.strip():
+            return []
+
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT source_name, chunk_index, content, embedding, metadata, "
+            "updated_at, access_count FROM memory_chunks",
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        query_emb = _encode(query, self._model_name)
+        now_ts = datetime.now(timezone.utc)
+
+        type_boosts = {"feedback": 0.05, "user": 0.03}
+
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            source_name = row[0]
+            chunk_index = row[1]
+            content = row[2]
+            emb_bytes = row[3]
+            meta_json = row[4]
+            updated_at = row[5]
+            access_count = row[6] or 0
+
+            if not emb_bytes:
+                continue
+
+            emb = _bytes_to_embedding(emb_bytes)
+            cosine = _cosine_similarity(query_emb, emb)
+
+            if cosine < min_score:
+                continue
+
+            # Recency score: 越新越高
+            try:
+                updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                days_ago = (now_ts - updated_dt).days
+            except (ValueError, TypeError):
+                days_ago = 30
+            recency = 1.0 / (1.0 + days_ago)
+
+            # Type boost
+            meta = json.loads(meta_json) if meta_json else {}
+            mem_type = meta.get("type", "")
+            boost = type_boosts.get(mem_type, 0.0)
+
+            final_score = cosine * 0.85 + recency * 0.1 + boost
+
+            scored.append((final_score, {
+                "source_name": source_name,
+                "chunk_index": chunk_index,
+                "content": content,
+                "score": round(final_score, 4),
+                "cosine": round(cosine, 4),
+                "metadata": meta,
+                "updated_at": updated_at,
+            }))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # 每个 source 最多 max_per_source 个
+        result: list[dict[str, Any]] = []
+        source_counts: dict[str, int] = {}
+        for _, item in scored:
+            sn = item["source_name"]
+            if source_counts.get(sn, 0) >= max_per_source:
+                continue
+            source_counts[sn] = source_counts.get(sn, 0) + 1
+            result.append(item)
+            if len(result) >= top_k:
+                break
+
+        # 更新 access_count
+        if result:
+            try:
+                conn.executemany(
+                    "UPDATE memory_chunks SET access_count = access_count + 1 "
+                    "WHERE source_name = ? AND chunk_index = ?",
+                    [(r["source_name"], r["chunk_index"]) for r in result],
+                )
+                conn.commit()
+            except Exception:
+                pass
+
+        return result
+
     def close(self) -> None:
         """关闭数据库连接。"""
         if self._conn is not None:
@@ -324,6 +497,24 @@ class ExternalMemoryStore:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_name
             ON memories(name)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_name TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                embedding BLOB,
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                access_count INTEGER DEFAULT 0,
+                UNIQUE(source_name, chunk_index)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chunks_source
+            ON memory_chunks(source_name)
         """)
         conn.commit()
 

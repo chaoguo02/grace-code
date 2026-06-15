@@ -367,6 +367,27 @@ class MemorySearchTool(BaseTool):
 
         top_k: int = min(int(params.get("top_k", 5)), 20)
 
+        # 优先使用 chunk 级别搜索（更精准）
+        try:
+            chunk_results = self._store.search_chunks(
+                query=query, top_k=top_k, min_score=0.3, max_per_source=2,
+            )
+        except Exception:
+            chunk_results = []
+
+        if chunk_results:
+            lines = [f"Search results for: {query}\n"]
+            for i, r in enumerate(chunk_results, 1):
+                score_pct = int(r["score"] * 100)
+                lines.append(f"  {i}. [{r['source_name']}] (relevance: {score_pct}%)")
+                preview = r["content"][:200].replace("\n", " ")
+                if len(r["content"]) > 200:
+                    preview += "..."
+                lines.append(f"     {preview}")
+                lines.append("")
+            return ToolResult(success=True, output="\n".join(lines))
+
+        # 降级到 memory 级别搜索
         try:
             results = self._store.search(query=query, top_k=top_k)
         except Exception as exc:
@@ -386,7 +407,6 @@ class MemorySearchTool(BaseTool):
         for i, r in enumerate(results, 1):
             score_pct = int(r["score"] * 100)
             lines.append(f"  {i}. [{r['name']}] (relevance: {score_pct}%)")
-            # 显示内容前 200 字
             preview = r["content"][:200].replace("\n", " ")
             if len(r["content"]) > 200:
                 preview += "..."

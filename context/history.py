@@ -94,6 +94,13 @@ class ConversationHistory:
     def last_message(self) -> LLMMessage | None:
         return self._messages[-1] if self._messages else None
 
+    def get_last_user_message(self) -> str:
+        """返回最后一条 user role 消息的 content，不存在时返回空字符串。"""
+        for msg in reversed(self._messages):
+            if msg.role == "user" and msg.content:
+                return msg.content
+        return ""
+
     def clear_except_first(self) -> None:
         """保留首条任务描述，清除其余（紧急重置用）。"""
         if self._messages:

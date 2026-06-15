@@ -182,6 +182,12 @@ class ReActAgent:
             logger.debug("Step %d/%d", step, task.max_steps)
 
             # ── 1. 组装 messages，调用 LLM ──────────────────────────────
+            # 设置最新用户消息，供 RAG 主动检索使用
+            if self._memory_context:
+                last_user_msg = history.get_last_user_message()
+                if last_user_msg:
+                    self._memory_context.set_user_message(last_user_msg)
+
             messages = self._build_messages(
                 history, token_budget, repo_map,
                 consumed_tokens=total_tokens,
