@@ -28,11 +28,15 @@ import time
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
 
 # 把项目根加入 path（直接跑脚本时需要）
 _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+# 加载 .env 文件（项目根目录），已有环境变量不会被覆盖
+load_dotenv(_ROOT / ".env")
 
 from config.schema import load_config, merge_cli_overrides   # noqa: E402
 from llm.router import create_backend_from_config            # noqa: E402

@@ -13,6 +13,7 @@ dependencies = [
     "click>=8.1.0",
     "rich>=13.0.0",
     "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
     "tree-sitter>=0.22.0",
     "tree-sitter-python>=0.22.0",
     "PyGithub>=2.3.0",
