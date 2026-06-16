@@ -249,11 +249,10 @@ def _build_multi_config(config, auto_approve: bool = False) -> "MultiAgentConfig
     from agent.multi_agent import MultiAgentConfig
     ma = config.multi_agent
     return MultiAgentConfig(
-        coordinator_budget_ratio=ma.coordinator_budget_ratio,
-        sub_agent_budget_ratio=ma.sub_agent_budget_ratio,
-        max_retries=ma.max_retries,
+        budget_ratio=(ma.coordinator_budget_ratio, ma.sub_agent_budget_ratio),
+        max_agents=ma.max_retries + 6,
         coordinator_max_steps=ma.coordinator_max_steps,
-        max_parallel_executors=ma.max_parallel_executors,
+        max_parallel=ma.max_parallel_executors,
         worker_model=ma.worker_model or None,
         worker_provider=ma.worker_provider or None,
         merge_approval_callback=None if auto_approve else _merge_approval_cb,

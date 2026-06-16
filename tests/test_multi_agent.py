@@ -502,10 +502,10 @@ class TestBudgetIsolation:
         registry.register(NoopTool(tool_name="file_read"))
 
         coord = CoordinatorAgent(MagicMock(), registry)
-        coord._sub_budget = 70_000
+        coord._sub_budget = 200_000
         coord._tokens_used_by_subs = 0
 
-        # Coder gets most
+        # Coder gets most (0.35 * 200k = 70k > 0.30 * 200k = 60k)
         coder_budget = coord._budget_for_role(SubAgentRole.CODER)
         explorer_budget = coord._budget_for_role(SubAgentRole.EXPLORER)
         assert coder_budget > explorer_budget

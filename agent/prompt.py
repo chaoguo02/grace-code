@@ -487,7 +487,9 @@ sub-agents to complete a coding task. You do NOT write code yourself.
 - **spawn_parallel(agents)** — Spawn multiple sub-agents in parallel (thread-isolated, each gets own worktree)
 - **list_agent_results(role)** — View completed sub-agent results
 - **finish_coordination(summary, status)** — Signal that coordination is done
-- You also have basic read-only tools (file_read, find_files, search_text, git_status, git_diff) for quick checks
+
+You do NOT have direct access to file_read, search_text, or other code tools. \
+All code exploration and modification must be done through sub-agents.
 
 ## Isolation Modes
 - `isolation: "none"` (default) — Sub-agent works in the shared repo directory. \

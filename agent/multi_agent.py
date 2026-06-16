@@ -190,6 +190,7 @@ class SubAgentExecutor:
             max_steps=config.max_steps,
             budget_tokens=config.budget_tokens,
             history_max_messages=30,
+            compact_history=False,  # 子 agent 短生命周期，禁用积极压缩保留完整上下文
             llm_max_retries=self._parent_config.llm_max_retries if self._parent_config else 3,
             llm_retry_delay=self._parent_config.llm_retry_delay if self._parent_config else 2.0,
             stream=False if thread_isolated else (self._parent_config.stream if self._parent_config else False),
@@ -843,22 +844,18 @@ class CoordinatorAgent:
         )
 
     def _wrap_coordinator_tools(self) -> "ToolRegistry":
-        """将 Coordinator 专用工具注入到原工具注册表中。"""
+        """构建 Coordinator 专用工具集（只有调度工具，不含读写工具）。"""
         from tools.base import ToolRegistry
 
-        enhanced = ToolRegistry()
-        # 从原注册表复制所有工具
-        for tool_name in self._registry.tool_names:
-            tool = self._registry._tools[tool_name]
-            enhanced._tools[tool_name] = tool
+        coord_registry = ToolRegistry()
 
-        # 注入 coordinator 专用工具
-        enhanced._tools["spawn_agent"] = SpawnAgentTool(self)
-        enhanced._tools["spawn_parallel"] = SpawnParallelTool(self)
-        enhanced._tools["list_agent_results"] = ListAgentResultsTool(self)
-        enhanced._tools["finish_coordination"] = FinishCoordinationTool(self)
+        # 只注入 coordinator 调度工具 — 不给读写工具，强制通过子 agent 完成实际工作
+        coord_registry._tools["spawn_agent"] = SpawnAgentTool(self)
+        coord_registry._tools["spawn_parallel"] = SpawnParallelTool(self)
+        coord_registry._tools["list_agent_results"] = ListAgentResultsTool(self)
+        coord_registry._tools["finish_coordination"] = FinishCoordinationTool(self)
 
-        return enhanced
+        return coord_registry
 
     def run(
         self,
@@ -882,11 +879,18 @@ class CoordinatorAgent:
         # 用增强后的注册表创建 Coordinator ReActAgent
         enhanced_tools = self._wrap_coordinator_tools()
 
+        # Coordinator 用更大的 budget：它的上下文主要是子 agent 的结果摘要
+        from agent.core import AgentConfig
+        coord_cfg = AgentConfig(
+            max_steps=self._multi_cfg.coordinator_max_steps,
+            budget_tokens=max((self._config.budget_tokens if self._config else 80_000), 120_000),
+        )
+
         coordinator_agent = ReActAgent(
             backend=self._backend,
             registry=enhanced_tools,
-            config=self._config,
-            memory_context=self._memory_context,
+            config=coord_cfg,
+            memory_context=None,  # coordinator 不需要记忆检索
         )
 
         # 注入 Coordinator prompt
@@ -928,13 +932,13 @@ class CoordinatorAgent:
     def _steps_for_role(self, role: SubAgentRole) -> int:
         """根据角色返回建议的 max_steps。"""
         defaults = {
-            SubAgentRole.EXPLORER: 10,
-            SubAgentRole.PLANNER: 10,
-            SubAgentRole.CODER: 20,
-            SubAgentRole.REVIEWER: 10,
-            SubAgentRole.TESTER: 10,
+            SubAgentRole.EXPLORER: 15,
+            SubAgentRole.PLANNER: 15,
+            SubAgentRole.CODER: 30,
+            SubAgentRole.REVIEWER: 15,
+            SubAgentRole.TESTER: 15,
         }
-        return defaults.get(role, 15)
+        return defaults.get(role, 20)
 
     def _budget_for_role(self, role: SubAgentRole) -> int:
         """根据角色分配 token 预算（加权，受剩余预算约束）。"""
@@ -947,16 +951,16 @@ class CoordinatorAgent:
         remaining = sub_budget - tokens_used
 
         weights = {
-            SubAgentRole.EXPLORER: 0.15,
-            SubAgentRole.PLANNER: 0.15,
+            SubAgentRole.EXPLORER: 0.30,
+            SubAgentRole.PLANNER: 0.20,
             SubAgentRole.CODER: 0.35,
-            SubAgentRole.REVIEWER: 0.20,
-            SubAgentRole.TESTER: 0.15,
+            SubAgentRole.REVIEWER: 0.25,
+            SubAgentRole.TESTER: 0.20,
         }
-        weight = weights.get(role, 0.20)
+        weight = weights.get(role, 0.25)
         allocated = int(sub_budget * weight)
-        allocated = max(allocated, 12_000)
-        return min(allocated, remaining, 50_000)
+        allocated = max(allocated, 15_000)
+        return min(allocated, remaining, 80_000)
 
     def _get_result(self, agent_id: str) -> SubAgentResult | None:
         """按 agent_id 查找子 Agent 结果。"""

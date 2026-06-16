@@ -68,6 +68,7 @@ class AgentConfig:
     thought_callback: object = None        # StreamCallback，推理过程流式回调（推理模型专用）
     confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
+    compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
 
 
 
@@ -414,26 +415,28 @@ class ReActAgent:
             enable_caching=enable_caching,
         )
 
-        # Layer 2: Snip — 移除低价值轮次（零成本）
         history_dicts = history.to_dicts()
-        from context.compaction import snip_low_value_turns
-        history_dicts = snip_low_value_turns(history_dicts)
 
-        # Layer 3: 滑动窗口裁剪
-        from context.compaction import trim_sliding_window
-        history_dicts = trim_sliding_window(
-            history_dicts,
-            token_limit=plan.history,
-            keep_recent=3,
-        )
+        if self._cfg.compact_history:
+            # Layer 2: Snip — 移除低价值轮次（零成本）
+            from context.compaction import snip_low_value_turns
+            history_dicts = snip_low_value_turns(history_dicts)
 
-        # Layer 4: 检查是否需要 compaction
-        if self._should_compact(history_dicts, plan.history):
-            compacted_dicts = self._compact_history_from_dicts(history_dicts)
-            history_dicts = compacted_dicts
-            logger.info("Auto-compaction triggered at step %d", self._current_step)
+            # Layer 3: 滑动窗口裁剪
+            from context.compaction import trim_sliding_window
+            history_dicts = trim_sliding_window(
+                history_dicts,
+                token_limit=plan.history,
+                keep_recent=3,
+            )
 
-        # 最后的 token 配额检查兜底
+            # Layer 4: 检查是否需要 compaction
+            if self._should_compact(history_dicts, plan.history):
+                compacted_dicts = self._compact_history_from_dicts(history_dicts)
+                history_dicts = compacted_dicts
+                logger.info("Auto-compaction triggered at step %d", self._current_step)
+
+        # 最后的 token 配额检查兜底（所有模式都做，防止溢出）
         trimmed_history_dicts = token_budget.trim_history(
             history_dicts,
             plan.history,
@@ -551,8 +554,11 @@ class ReActAgent:
 
     def _is_looping(self, log: EventLog) -> bool:
         """
-        检测是否陷入死循环：最近 N 条 action 完全相同。
-        比较所有 tool_calls 的 (name, params) 序列。
+        检测是否陷入死循环。两级检测：
+
+        1. 严格匹配：最近 N 条 action 的 (tool_name, params) 完全相同
+        2. 语义匹配：最近 N+1 条 action 使用的 tool_name 多重集相同
+           （反复调用相同类型的工具，只是参数略有不同——需要更多证据）
         """
         n = self._cfg.loop_detection_window
         actions = log.get_actions()
@@ -560,21 +566,36 @@ class ReActAgent:
             return False
 
         recent = actions[-n:]
-        # 只对 TOOL_CALL 类型做检测
         if not all(a.action_type == ActionType.TOOL_CALL for a in recent):
             return False
         if not all(a.tool_calls for a in recent):
             return False
 
-        def _serialize(action: Action) -> tuple:
-            """把所有 tool_calls 序列化为可比较的元组。"""
+        def _serialize_exact(action: Action) -> tuple:
             return tuple(
                 (tc.name, tuple(sorted(tc.params.items())))
                 for tc in action.tool_calls
             )
 
-        first = _serialize(recent[0])
-        return all(_serialize(a) == first for a in recent[1:])
+        def _serialize_names(action: Action) -> tuple:
+            return tuple(sorted(tc.name for tc in action.tool_calls))
+
+        # Level 1: exact match (window = N)
+        first_exact = _serialize_exact(recent[0])
+        if all(_serialize_exact(a) == first_exact for a in recent[1:]):
+            return True
+
+        # Level 2: semantic loop — same tool name multiset repeated N+1 times
+        # Requires one more repetition than exact match to reduce false positives
+        semantic_window = n + 1
+        if len(actions) >= semantic_window:
+            semantic_recent = actions[-semantic_window:]
+            if all(a.action_type == ActionType.TOOL_CALL and a.tool_calls for a in semantic_recent):
+                first_names = _serialize_names(semantic_recent[0])
+                if all(_serialize_names(a) == first_names for a in semantic_recent[1:]):
+                    return True
+
+        return False
 
     def _call_with_retry(
         self,

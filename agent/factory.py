@@ -68,8 +68,6 @@ def create_agent(
     if mode == "multi-agent":
         if multi_config is None:
             multi_config = MultiAgentConfig()
-        if plan_approval_callback:
-            multi_config.plan_approval_callback = plan_approval_callback
         return CoordinatorAgent(
             backend, registry, agent_config, multi_config,
             memory_context=memory_context,
