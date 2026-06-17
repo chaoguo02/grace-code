@@ -510,6 +510,7 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
         max_tokens=self._max_tokens,
         messages=api_messages,
         stream=True,
+        stream_options={"include_usage": True},
     )
     if api_tools:
         kwargs["tools"] = api_tools
@@ -520,9 +521,12 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
     full_reasoning = ""  # reasoning_content（推理模型专有）
     finish_reason = None
     tool_calls_raw = []      # 收集 tool call deltas
+    stream_usage = None      # 最后一个 chunk 的 usage
 
     stream = self._client.chat.completions.create(**kwargs)
     for chunk in stream:
+        if getattr(chunk, "usage", None):
+            stream_usage = chunk.usage
         choice = chunk.choices[0] if chunk.choices else None
         if not choice:
             continue
@@ -588,16 +592,23 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
             message=action.message,
         )
 
-    # 流式模式拿不到精确 token 数，估算
+    # 从流式 usage 提取 token 数和 cache stats
     from context.token_budget import estimate_tokens
-    input_tokens = sum(estimate_tokens(m.get("content", "")) for m in api_messages)
-    output_tokens = estimate_tokens(full_text)
+    if stream_usage:
+        input_tokens = getattr(stream_usage, "prompt_tokens", 0) or 0
+        output_tokens = getattr(stream_usage, "completion_tokens", 0) or 0
+        cache_stats = _extract_openai_cache_stats(stream_usage)
+    else:
+        input_tokens = sum(estimate_tokens(m.get("content", "")) for m in api_messages)
+        output_tokens = estimate_tokens(full_text)
+        cache_stats = CacheStats()
 
     return LLMResponse(
         action=action,
         raw_content=full_text,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cache_stats=cache_stats,
     )
 
 
@@ -612,13 +623,17 @@ def _stream_text_only(self, api_messages, tools, on_text):
         }
 
     full_text = ""
+    stream_usage = None
     stream = self._client.chat.completions.create(
         model=self._model,
         max_tokens=self._max_tokens,
         messages=augmented,
         stream=True,
+        stream_options={"include_usage": True},
     )
     for chunk in stream:
+        if getattr(chunk, "usage", None):
+            stream_usage = chunk.usage
         choice = chunk.choices[0] if chunk.choices else None
         if not choice:
             continue
@@ -631,11 +646,21 @@ def _stream_text_only(self, api_messages, tools, on_text):
     action = _parse_text_response(full_text)
 
     from context.token_budget import estimate_tokens
+    if stream_usage:
+        input_tokens = getattr(stream_usage, "prompt_tokens", 0) or 0
+        output_tokens = getattr(stream_usage, "completion_tokens", 0) or 0
+        cache_stats = _extract_openai_cache_stats(stream_usage)
+    else:
+        input_tokens = sum(estimate_tokens(m.get("content", "")) for m in augmented)
+        output_tokens = estimate_tokens(full_text)
+        cache_stats = CacheStats()
+
     return LLMResponse(
         action=action,
         raw_content=full_text,
-        input_tokens=sum(estimate_tokens(m.get("content", "")) for m in augmented),
-        output_tokens=estimate_tokens(full_text),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_stats=cache_stats,
     )
 
 
