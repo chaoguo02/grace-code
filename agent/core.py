@@ -29,7 +29,8 @@ from context.repo_map import RepoMap
 from context.token_budget import TokenBudget
 from agent.prompt import (
     build_system_prompt,
-    build_system_prompt_structured,
+    build_system_prompt_core,
+    build_system_prompt_variable,
     build_task_prompt,
     reflection_no_edit,
     reflection_test_failed,
@@ -478,16 +479,36 @@ class ReActAgent:
                 budget=plan.repo_map,
             )
 
-        # System prompt: Anthropic 用 structured format（带 cache_control），其他用纯字符串
-        enable_caching = self._is_anthropic_backend()
-        system_content = build_system_prompt_structured(
-            repo_path=getattr(self, "_current_repo_path", "."),
-            tools=schemas,
-            repo_summary=self._repo_map_cache,
+        # System prompt: 使用 StructuredContext 分层构建
+        # - Layer 0 (SYSTEM, cacheable): 核心规则 + 工具定义 + repo summary
+        # - Layer 1 (PROJECT, cacheable): auto_memory 使用指导（session 内稳定）
+        # - Project context (memory/rules/skills) 在下面作为独立 user message 注入，不影响 system cache
+        from context.structured import ContextLayer, ContextPriority, StructuredContext
+
+        repo_path = getattr(self, "_current_repo_path", ".")
+        core_text = build_system_prompt_core(repo_path, schemas, self._repo_map_cache)
+        variable_text = build_system_prompt_variable(
             memory_section="",
             auto_memory_enabled=bool(self._memory_context and self._memory_context.enabled),
-            enable_caching=enable_caching,
         )
+
+        structured_ctx = StructuredContext()
+        structured_ctx.add_layer(ContextLayer(
+            name="system_core",
+            priority=ContextPriority.SYSTEM,
+            content=core_text,
+            cacheable=True,
+        ))
+        if variable_text:
+            structured_ctx.add_layer(ContextLayer(
+                name="memory_guidance",
+                priority=ContextPriority.PROJECT,
+                content=variable_text,
+                cacheable=True,
+            ))
+
+        enable_caching = self._is_anthropic_backend()
+        system_content = structured_ctx.build_system_content(enable_caching=enable_caching)
 
         history_dicts = history.to_dicts()
 
