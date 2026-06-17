@@ -184,6 +184,27 @@ class ReActAgent:
             self._current_step = step  # 用于 compaction 日志
             logger.debug("Step %d/%d", step, task.max_steps)
 
+            # ── 0. 步数压力注入：接近上限时通知 LLM 必须收敛 ─────────
+            remaining = task.max_steps - step
+            if remaining == 2:
+                history.add(LLMMessage(
+                    role="user",
+                    content=(
+                        f"[SYSTEM] WARNING: You have only {remaining} steps remaining "
+                        f"(step {step}/{task.max_steps}). "
+                        "You MUST produce your final answer on the NEXT step. "
+                        "Summarize what you have found so far and call the finish action."
+                    ),
+                ))
+            elif remaining == 0:
+                history.add(LLMMessage(
+                    role="user",
+                    content=(
+                        "[SYSTEM] This is your LAST step. Call finish NOW with whatever you have. "
+                        "Do NOT make any more tool calls."
+                    ),
+                ))
+
             # ── 1. 组装 messages，调用 LLM ──────────────────────────────
             # 设置最新用户消息，供 RAG 主动检索使用
             if self._memory_context:

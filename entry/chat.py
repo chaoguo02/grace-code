@@ -313,8 +313,9 @@ class ChatSession:
             elapsed=elapsed,
         )
 
-        # Plan/DAG/Multi-Agent 模式执行完成后自动切回 react，避免残留
-        if self._mode in ("plan", "dag", "multi-agent"):
+        # Plan/DAG 模式执行完成后自动切回 react（一次性规划任务）
+        # Multi-Agent 不切回：用户显式选择的持久对话模式
+        if self._mode in ("plan", "dag"):
             self._mode = "react"
             self._renderer.mode = "react"
             self._rebuild_agent()

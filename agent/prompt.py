@@ -529,12 +529,23 @@ For editing different files, use `isolation: "none"` — it's simpler and sees t
 - You will be told when budget is exhausted
 - Prefer fewer, more focused sub-agents over many small ones
 
-## Rules
+## Rules for Task Descriptions (CRITICAL)
+When writing the `task` field for spawn_agent, follow these rules STRICTLY:
+
+1. State the GOAL, not the steps. Bad: "1. search for X 2. read file Y 3. check Z". Good: "Find all loop detection code and explain the mechanism."
+2. Maximum 2 sentences. Do NOT write numbered step lists, shell commands, or file paths unless essential.
+3. Let the sub-agent decide HOW to search — it has tools and knows how to use them.
+4. Do NOT list specific line numbers, grep commands, or sed commands in the task.
+
+## Other Rules
 - ALWAYS pass relevant depends_on IDs so sub-agents receive upstream context
-- Give sub-agents specific, detailed instructions (file paths, function names, expected outcomes)
 - Max {max_retries} retry cycles if reviewer rejects
-- If a sub-agent fails, decide: retry with different instructions, or try a different approach
 - Do NOT write code yourself — delegate all code changes to coder sub-agents
+
+## Convergence Rules (CRITICAL)
+- If a sub-agent fails or returns partial results, USE what it found — do NOT blindly retry the same task
+- You may spawn at most 2 explorers for the same topic. After that, call finish_coordination with whatever you have
+- If list_agent_results shows ANY successful results, synthesize them and finish — do NOT keep spawning
 - Call finish_coordination when the task is done or you've exhausted options\
 """
 
@@ -545,11 +556,14 @@ _SUB_AGENT_PROMPT_TEMPLATE = """\
 {task_prompt}
 
 {upstream_section}
-## CRITICAL: Termination Rules
-- You have limited steps. Be efficient — every tool call must directly advance your task.
-- As soon as your task is done (or you determine it's impossible), STOP IMMEDIATELY.
-- Do NOT explore unrelated code or make changes beyond your specific task.
-- When done, respond with a clear, structured summary of what you found/did.\
+## CRITICAL: Efficiency Rules
+- You have very limited steps. Target: 2-5 steps total.
+- Step 1: search/find to locate relevant code. Step 2: read key sections if needed. Final step: finish with summary.
+- NEVER read the same file twice. NEVER repeat a search you already did.
+- NEVER read entire large files — use search_text to find relevant lines, then file_view with start_line/end_line for specific sections only.
+- As soon as you have enough information to answer the task, STOP and produce your summary.
+- Do NOT try to be exhaustive — a focused answer from 2 searches is better than an incomplete answer from 15 searches.
+- When done, call the finish action with a clear, structured summary of what you found.\
 """
 
 

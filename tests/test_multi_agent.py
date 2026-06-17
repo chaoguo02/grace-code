@@ -1183,3 +1183,28 @@ class TestParallelExecution:
         from agent.prompt import build_coordinator_system_prompt
         prompt = build_coordinator_system_prompt("test", ".", 100000, 70000, 2)
         assert "spawn_parallel" in prompt
+
+    def test_role_spawn_limit_blocks_excessive_retries(self):
+        """同一 role 超过 2 次 spawn 应被拒绝。"""
+        from tools.base import ToolRegistry
+        from agent.multi_agent import SpawnAgentTool, CoordinatorAgent, MultiAgentConfig
+
+        registry = ToolRegistry()
+        backend = MagicMock()
+        backend.supports_function_calling = True
+        backend.max_context_window = 128_000
+        backend.model_name = "test"
+
+        multi_cfg = MultiAgentConfig()
+        coord = CoordinatorAgent(backend, registry, multi_config=multi_cfg)
+        coord._repo_path = "."
+        coord._log_dir = "."
+
+        # 模拟已经 spawn 了 2 个 explorer
+        coord._role_spawn_counts["explorer"] = 2
+
+        tool = SpawnAgentTool(coord)
+        result = tool.execute({"role": "explorer", "task": "find something"})
+
+        assert not result.success
+        assert "Already spawned 2 explorer" in result.error

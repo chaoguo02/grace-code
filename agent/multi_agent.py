@@ -462,6 +462,16 @@ class SpawnAgentTool(BaseTool):
                 error="Sub-agent token budget exhausted. Finish coordination or reduce scope.",
             )
 
+        # 检查同一 role 的 spawn 次数（防止 coordinator 对失败结果无限重试）
+        count = self._coordinator._role_spawn_counts.get(role_str, 0)
+        max_per_role = 2
+        if count >= max_per_role:
+            return ToolResult(
+                success=False, output="",
+                error=f"Already spawned {count} {role_str} agents (max {max_per_role}). "
+                      f"Use list_agent_results to see their output and call finish_coordination.",
+            )
+
         # 收集上游上下文
         upstream_context = ""
         if depends_on:
@@ -510,6 +520,10 @@ class SpawnAgentTool(BaseTool):
 
         self._coordinator._spawn_count += 1
         self._coordinator._results.append(result)
+
+        # 递增 role spawn 计数
+        self._coordinator._role_spawn_counts[role_str] = self._coordinator._role_spawn_counts.get(role_str, 0) + 1
+
         return ToolResult(
             success=True,
             output=f"Agent #{result.agent_id} ({result.role.value}) completed: "
@@ -714,6 +728,7 @@ class SpawnParallelTool(BaseTool):
             )
 
             self._coordinator._spawn_count += 1
+            self._coordinator._role_spawn_counts[role_str] = self._coordinator._role_spawn_counts.get(role_str, 0) + 1
 
             if worktree is not None and self._coordinator._worktree_mgr is not None:
                 try:
@@ -829,6 +844,7 @@ class CoordinatorAgent:
         # 子 Agent 管理和状态追踪
         self._results: list[SubAgentResult] = []
         self._spawn_count = 0
+        self._role_spawn_counts: dict[str, int] = {}
         self._final_finished = False
         self._final_summary = ""
         self._final_status = ""
@@ -866,6 +882,14 @@ class CoordinatorAgent:
         """启动 Multi-Agent 协调器。"""
         from agent.prompt import build_coordinator_prompt
 
+        # 重置每轮状态（同一个 CoordinatorAgent 实例可能跨轮复用）
+        self._results = []
+        self._spawn_count = 0
+        self._role_spawn_counts = {}
+        self._final_finished = False
+        self._final_summary = ""
+        self._final_status = ""
+
         # 构建 Coordinator 的 system prompt
         coordinator_prompt = build_coordinator_prompt(
             task_description=task.description,
@@ -893,8 +917,28 @@ class CoordinatorAgent:
             memory_context=None,  # coordinator 不需要记忆检索
         )
 
-        # 注入 Coordinator prompt
+        # 注入 Coordinator prompt + 对话上下文
         coordinator_agent._pending_history = ConversationHistory(max_messages=50)
+
+        # 如果有跨轮对话历史（来自 ChatSession），注入摘要作为前置上下文
+        if hasattr(self, "_pending_history") and self._pending_history:
+            prior_msgs = self._pending_history.to_dicts()
+            # 取之前轮次的 assistant 回复摘要（跳过当前轮的 user 消息）
+            prior_summaries = [
+                m["content"] for m in prior_msgs
+                if m.get("role") == "assistant" and m.get("content")
+            ]
+            if prior_summaries:
+                context_text = "\n---\n".join(prior_summaries[-3:])  # 最近 3 轮
+                coordinator_agent._pending_history.add(LLMMessage(
+                    role="user",
+                    content=f"[Previous conversation context]\n{context_text}",
+                ))
+                coordinator_agent._pending_history.add(LLMMessage(
+                    role="assistant",
+                    content="Understood. I have the previous conversation context.",
+                ))
+
         coordinator_agent._pending_history.add(start_msg)
 
         # 执行
@@ -932,13 +976,13 @@ class CoordinatorAgent:
     def _steps_for_role(self, role: SubAgentRole) -> int:
         """根据角色返回建议的 max_steps。"""
         defaults = {
-            SubAgentRole.EXPLORER: 15,
-            SubAgentRole.PLANNER: 15,
-            SubAgentRole.CODER: 30,
-            SubAgentRole.REVIEWER: 15,
-            SubAgentRole.TESTER: 15,
+            SubAgentRole.EXPLORER: 8,
+            SubAgentRole.PLANNER: 8,
+            SubAgentRole.CODER: 25,
+            SubAgentRole.REVIEWER: 10,
+            SubAgentRole.TESTER: 10,
         }
-        return defaults.get(role, 20)
+        return defaults.get(role, 10)
 
     def _budget_for_role(self, role: SubAgentRole) -> int:
         """根据角色分配 token 预算（加权，受剩余预算约束）。"""
