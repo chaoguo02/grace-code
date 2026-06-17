@@ -1185,7 +1185,7 @@ class TestParallelExecution:
         assert "spawn_parallel" in prompt
 
     def test_role_spawn_limit_blocks_excessive_retries(self):
-        """同一 role 超过 2 次 spawn 应被拒绝。"""
+        """同一 role 超过 2 次 spawn 应被拒绝（归一化后按 canonical 角色名计数）。"""
         from tools.base import ToolRegistry
         from agent.multi_agent import SpawnAgentTool, CoordinatorAgent, MultiAgentConfig
 
@@ -1200,11 +1200,11 @@ class TestParallelExecution:
         coord._repo_path = "."
         coord._log_dir = "."
 
-        # 模拟已经 spawn 了 2 个 explorer
-        coord._role_spawn_counts["explorer"] = 2
+        # 模拟已经 spawn 了 2 个 reader（explorer 归一化为 reader）
+        coord._role_spawn_counts["reader"] = 2
 
         tool = SpawnAgentTool(coord)
         result = tool.execute({"role": "explorer", "task": "find something"})
 
         assert not result.success
-        assert "Already spawned 2 explorer" in result.error
+        assert "Already spawned 2 reader" in result.error

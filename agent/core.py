@@ -373,29 +373,42 @@ class ReActAgent:
     def _extract_summary_from_history(self, history: ConversationHistory) -> str:
         """从对话历史中提取有意义的 summary（用于 max_steps 截断时）。
 
-        策略：倒序扫描 history，找最后一条有实质内容的 assistant 消息。
-        如果找不到，拼接最后几条 tool results 的首行作为摘要。
+        策略：
+        1. 倒序扫描 assistant messages，跳过规划性文本（"Let me", "I'll" 等）
+        2. 找到含实质内容的 assistant 消息则返回
+        3. 如果所有 assistant 都是规划文本，fallback 到 tool results（最可靠的信息源）
         """
+        _PLANNING_PREFIXES = (
+            "Let me", "I'll", "I need to", "Now let me", "Good,",
+            "Now I'll", "Next,", "OK,", "Alright,", "First,",
+        )
         msgs = history.to_dicts()
-        # 优先：最后一条 assistant 的 thought/content
+
+        # Pass 1: 找实质性 assistant 内容（跳过规划文本）
         for msg in reversed(msgs):
             if msg.get("role") == "assistant":
                 content = msg.get("content", "").strip()
-                if content and len(content) > 20:
-                    return content[:2000]
+                if not content or len(content) <= 20:
+                    continue
+                if any(content.startswith(p) for p in _PLANNING_PREFIXES):
+                    continue
+                return content[:2000]
 
-        # fallback：拼接最后几条 tool results
-        tool_snippets = []
+        # Pass 2: 提取 tool results（原始工具返回数据，不依赖模型总结）
+        tool_contents = []
         for msg in reversed(msgs):
-            if msg.get("role") in ("tool", "user") and msg.get("content", "").startswith("[Tool:"):
-                first_line = msg["content"].split("\n")[0][:200]
-                tool_snippets.append(first_line)
-                if len(tool_snippets) >= 3:
-                    break
-        if tool_snippets:
-            return "Partial results collected:\n" + "\n".join(reversed(tool_snippets))
+            if msg.get("role") == "tool":
+                content = msg.get("content", "").strip()
+                if content and len(content) > 10:
+                    tool_contents.append(content[:500])
+                    if len(tool_contents) >= 5:
+                        break
 
-        return f"Reached max_steps limit ({history.count()}+ messages in history)"
+        if tool_contents:
+            combined = "\n---\n".join(reversed(tool_contents))
+            return f"Raw tool results (max_steps reached):\n{combined}"[:2000]
+
+        return f"Reached max_steps limit ({len(history)}+ messages in history)"
 
     def _build_messages(
         self,

@@ -499,30 +499,29 @@ Use this for most tasks, especially when editing files with uncommitted changes.
 Only use when spawning multiple coders that edit the SAME committed files in parallel. \
 For editing different files, use `isolation: "none"` — it's simpler and sees the full working directory.
 
-## Sub-Agent Roles
+## Sub-Agent Roles (3 Capability Tiers)
 | Role | Capabilities | Use for |
 |------|-------------|---------|
-| explorer | Read-only: file_read, find_files, search_text, git_diff | Understanding codebase structure |
-| planner | Read-only: same as explorer | Creating detailed implementation plans |
-| coder | Read+Write: file_write, shell, git_add, git_commit | Making code changes |
-| reviewer | Read + Test: shell, pytest, git_diff | Reviewing changes + running tests |
-| tester | Read + Test: shell, pytest | Running test suites |
+| reader | Read-only: file_read, find_files, search_text, git_diff | Understanding code, exploration, planning |
+| writer | Read+Write: file_write, shell, git_add, git_commit | Making code changes |
+| verifier | Read+Test: shell, pytest, git_diff | Reviewing changes, running tests |
+
+Legacy names accepted: explorer/planner → reader, coder → writer, reviewer/tester → verifier.
 
 ## Workflow Strategy
-1. First spawn an **explorer** to understand the relevant code
-2. Based on findings, spawn a **planner** (or plan yourself if simple)
-3. Spawn **coder** to make changes (pass explorer findings + plan as context via depends_on)
-   - Use `isolation: "worktree"` when spawning a single coder in parallel-safe mode
-   - Use **spawn_parallel** when multiple coders can work on different files simultaneously
-4. Spawn **reviewer** to verify changes (independent verification)
-5. If reviewer requests changes → spawn another coder with the feedback
-6. Call **finish_coordination** when done
+1. First spawn a **reader** to understand the relevant code
+2. Based on findings, spawn a **writer** to make changes (pass reader findings via depends_on)
+   - Use `isolation: "worktree"` when spawning a writer in parallel-safe mode
+   - Use **spawn_parallel** when multiple writers work on different files simultaneously
+3. Spawn a **verifier** to review changes and run tests
+4. If verifier requests changes → spawn another writer with feedback
+5. Call **finish_coordination** when done
 
 ## When to Use spawn_parallel
-- Multiple coders editing **different** files (e.g., fix auth.py AND update config.py)
-- Running reviewer + tester simultaneously after a coder finishes
+- Multiple writers editing **different** files (e.g., fix auth.py AND update config.py)
+- Multiple readers exploring independent code areas simultaneously
 - Any set of agents that have NO dependency on each other's output
-- Do NOT use for sequential work (e.g., explorer → planner → coder)
+- Do NOT use for sequential work (e.g., reader → writer → verifier)
 
 ## Budget
 - Total sub-agent budget: {sub_agent_budget} tokens
@@ -544,9 +543,10 @@ When writing the `task` field for spawn_agent, follow these rules STRICTLY:
 
 ## Convergence Rules (CRITICAL)
 - If a sub-agent fails or returns partial results, USE what it found — do NOT blindly retry the same task
-- You may spawn at most 2 explorers for the same topic. After that, call finish_coordination with whatever you have
+- You may spawn at most 2 readers for the same topic. After that, call finish_coordination with whatever you have
 - If list_agent_results shows ANY successful results, synthesize them and finish — do NOT keep spawning
-- For understanding/explanation questions: ONLY use explorers. Do NOT spawn planner/coder/reviewer for read-only tasks
+- For understanding/explanation questions: ONLY use readers. Do NOT spawn writer/verifier for read-only tasks
+- When previous conversation context is provided above, INCLUDE relevant prior findings in the task description when spawning sub-agents. Do NOT re-explore topics already covered
 - Call finish_coordination when the task is done or you've exhausted options\
 """
 
@@ -557,13 +557,14 @@ _SUB_AGENT_PROMPT_TEMPLATE = """\
 {task_prompt}
 
 {upstream_section}
-## Execution Rules
-- Be efficient: search → read key sections → produce your answer.
+## Execution Rules (CRITICAL)
+- You have a STRICT BUDGET of ~6 tool calls. After 5 tool calls, you MUST produce your final answer.
+- Strategy: 2-3 searches to locate code → 2-3 reads of key sections → final answer. That's it.
+- Do NOT try to read everything. Read only the most relevant 2-3 files/sections.
 - NEVER read the same file twice. NEVER repeat a search you already did.
-- Use search_text to find relevant lines, then file_view with start_line/end_line.
-- When you have enough information, produce your final answer as a plain text response (no tool call). \
-Your text output becomes the result returned to the coordinator.
-- Your tool call results are in the conversation above. Synthesize them in your answer.\
+- Use search_text to find relevant lines, then file_view with specific start_line/end_line (not entire files).
+- Your final answer is a plain text response (no tool call). It becomes the result returned to the coordinator.
+- Synthesize ALL tool results in your answer — include file paths, key classes/functions, and how they connect.\
 """
 
 

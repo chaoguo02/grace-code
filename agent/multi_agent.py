@@ -49,7 +49,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class SubAgentRole(str, Enum):
-    """子 Agent 角色。每个角色有独立的工具权限和 prompt。"""
+    """子 Agent 角色 — 3 个能力层级 + 兼容旧名。"""
+    # 新三层级
+    READER = "reader"
+    WRITER = "writer"
+    VERIFIER = "verifier"
+    # 旧角色别名（保持向后兼容）
     EXPLORER = "explorer"
     PLANNER = "planner"
     CODER = "coder"
@@ -57,34 +62,52 @@ class SubAgentRole(str, Enum):
     TESTER = "tester"
 
 
-# 每个角色可用的工具白名单
+# 旧角色 → 新层级映射（用于归一化）
+_ROLE_ALIAS_MAP: dict[str, str] = {
+    "explorer": "reader",
+    "planner": "reader",
+    "coder": "writer",
+    "reviewer": "verifier",
+    "tester": "verifier",
+    # 新角色名映射到自身
+    "reader": "reader",
+    "writer": "writer",
+    "verifier": "verifier",
+}
+
+
+def _normalize_role(role_str: str) -> SubAgentRole:
+    """将任意角色名归一化为三层级角色。"""
+    canonical = _ROLE_ALIAS_MAP.get(role_str, role_str)
+    return SubAgentRole(canonical)
+
+
+# 每个角色可用的工具白名单（按三层级定义）
 ROLE_TOOL_WHITELIST: dict[SubAgentRole, frozenset[str]] = {
-    SubAgentRole.EXPLORER: frozenset({
+    SubAgentRole.READER: frozenset({
         "file_read", "file_view", "find_files", "find_symbol",
         "search_text", "git_status", "git_diff",
         "web_search", "web_fetch",
     }),
-    SubAgentRole.PLANNER: frozenset({
-        "file_read", "file_view", "find_files", "find_symbol",
-        "search_text", "git_status", "git_diff",
-        "web_search", "web_fetch",
-    }),
-    SubAgentRole.CODER: frozenset({
+    SubAgentRole.WRITER: frozenset({
         "file_read", "file_view", "file_write", "find_files",
         "find_symbol", "search_text", "shell",
         "git_status", "git_diff", "git_add", "git_commit",
         "web_search", "web_fetch",
     }),
-    SubAgentRole.REVIEWER: frozenset({
+    SubAgentRole.VERIFIER: frozenset({
         "file_read", "file_view", "find_files", "find_symbol",
         "search_text", "git_status", "git_diff",
         "shell", "pytest",
     }),
-    SubAgentRole.TESTER: frozenset({
-        "file_read", "file_view", "find_files", "search_text",
-        "shell", "pytest", "git_status", "git_diff",
-    }),
 }
+
+# 旧角色名的工具白名单（映射到对应新层级）
+ROLE_TOOL_WHITELIST[SubAgentRole.EXPLORER] = ROLE_TOOL_WHITELIST[SubAgentRole.READER]
+ROLE_TOOL_WHITELIST[SubAgentRole.PLANNER] = ROLE_TOOL_WHITELIST[SubAgentRole.READER]
+ROLE_TOOL_WHITELIST[SubAgentRole.CODER] = ROLE_TOOL_WHITELIST[SubAgentRole.WRITER]
+ROLE_TOOL_WHITELIST[SubAgentRole.REVIEWER] = ROLE_TOOL_WHITELIST[SubAgentRole.VERIFIER]
+ROLE_TOOL_WHITELIST[SubAgentRole.TESTER] = ROLE_TOOL_WHITELIST[SubAgentRole.VERIFIER]
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +231,7 @@ class SubAgentExecutor:
         )
 
         # 只读角色：切换到 plan mode
-        if config.role in (SubAgentRole.EXPLORER, SubAgentRole.PLANNER):
+        if config.role in (SubAgentRole.READER, SubAgentRole.EXPLORER, SubAgentRole.PLANNER):
             agent.switch_to_plan_mode()
 
         # 构建任务 prompt
@@ -400,8 +423,9 @@ class SpawnAgentTool(BaseTool):
     def description(self) -> str:
         return (
             "Spawn a sub-agent with a specific role to perform a task. "
-            "Roles: explorer (read-only code search), planner (create execution plan), "
-            "coder (edit files), reviewer (review changes + run tests), tester (run tests only). "
+            "Roles: reader (read-only: search, read, git_diff — for exploration and planning), "
+            "writer (read+write: file_write, shell, git — for code changes), "
+            "verifier (read+test: shell, pytest — for review and testing). "
             "The sub-agent runs in an isolated context and returns a summary of its work."
         )
 
@@ -412,8 +436,8 @@ class SpawnAgentTool(BaseTool):
             "properties": {
                 "role": {
                     "type": "string",
-                    "enum": ["explorer", "planner", "coder", "reviewer", "tester"],
-                    "description": "The role/specialization of the sub-agent",
+                    "enum": ["reader", "writer", "verifier", "explorer", "planner", "coder", "reviewer", "tester"],
+                    "description": "The role: reader (search/read), writer (edit code), verifier (review/test). Legacy names also accepted.",
                 },
                 "task": {
                     "type": "string",
@@ -427,7 +451,7 @@ class SpawnAgentTool(BaseTool):
                 "isolation": {
                     "type": "string",
                     "enum": ["worktree", "none"],
-                    "description": "Isolation mode. Use 'worktree' for coder agents that may edit files in parallel. Default: none.",
+                    "description": "Isolation mode. Use 'worktree' for writer agents that may edit files in parallel. Default: none.",
                 },
                 "model": {
                     "type": "string",
@@ -447,30 +471,19 @@ class SpawnAgentTool(BaseTool):
         if not task_prompt:
             return ToolResult(success=False, output="", error="'task' is required")
 
-        try:
-            role = SubAgentRole(role_str)
-        except ValueError:
+        # 归一化角色名（explorer→reader, coder→writer 等）
+        canonical = _ROLE_ALIAS_MAP.get(role_str)
+        if canonical is None:
             return ToolResult(
                 success=False, output="",
-                error=f"Unknown role '{role_str}'. Valid: explorer, planner, coder, reviewer, tester",
+                error=f"Unknown role '{role_str}'. Valid: reader, writer, verifier",
             )
+        role = _normalize_role(role_str)
 
-        # 检查预算
-        if not self._coordinator._has_budget_for_spawn():
-            return ToolResult(
-                success=False, output="",
-                error="Sub-agent token budget exhausted. Finish coordination or reduce scope.",
-            )
-
-        # 检查同一 role 的 spawn 次数（防止 coordinator 对失败结果无限重试）
-        count = self._coordinator._role_spawn_counts.get(role_str, 0)
-        max_per_role = 2
-        if count >= max_per_role:
-            return ToolResult(
-                success=False, output="",
-                error=f"Already spawned {count} {role_str} agents (max {max_per_role}). "
-                      f"Use list_agent_results to see their output and call finish_coordination.",
-            )
+        # 集中化限额检查（按归一化后的角色计数）
+        error = self._coordinator._check_spawn_allowed(canonical)
+        if error:
+            return ToolResult(success=False, output="", error=error)
 
         # 收集上游上下文
         upstream_context = ""
@@ -521,8 +534,8 @@ class SpawnAgentTool(BaseTool):
         self._coordinator._spawn_count += 1
         self._coordinator._results.append(result)
 
-        # 递增 role spawn 计数
-        self._coordinator._role_spawn_counts[role_str] = self._coordinator._role_spawn_counts.get(role_str, 0) + 1
+        # 递增 role spawn 计数（按归一化角色名计数）
+        self._coordinator._role_spawn_counts[canonical] = self._coordinator._role_spawn_counts.get(canonical, 0) + 1
 
         return ToolResult(
             success=True,
@@ -557,7 +570,7 @@ class ListAgentResultsTool(BaseTool):
             "properties": {
                 "role": {
                     "type": "string",
-                    "enum": ["explorer", "planner", "coder", "reviewer", "tester"],
+                    "enum": ["reader", "writer", "verifier", "explorer", "planner", "coder", "reviewer", "tester"],
                     "description": "Filter by role (optional)",
                 }
             },
@@ -653,7 +666,7 @@ class SpawnParallelTool(BaseTool):
                         "properties": {
                             "role": {
                                 "type": "string",
-                                "enum": ["explorer", "planner", "coder", "reviewer", "tester"],
+                                "enum": ["reader", "writer", "verifier", "explorer", "planner", "coder", "reviewer", "tester"],
                             },
                             "task": {"type": "string"},
                             "isolation": {
@@ -675,28 +688,46 @@ class SpawnParallelTool(BaseTool):
         if not agents_spec:
             return ToolResult(success=False, output="", error="'agents' list is empty")
 
-        if not self._coordinator._has_budget_for_spawn():
+        # 集中化限额检查：提交线程池前过滤不合格的 spec（按归一化角色计数）
+        allowed_specs = []
+        rejected_msgs = []
+        for spec in agents_spec:
+            role_str = spec.get("role", "reader")
+            canonical = _ROLE_ALIAS_MAP.get(role_str, role_str)
+            error = self._coordinator._check_spawn_allowed(canonical)
+            if error:
+                rejected_msgs.append(f"✗ {role_str}: {error}")
+            else:
+                # 预扣 spawn 计数，防止同一批次内超额
+                self._coordinator._role_spawn_counts[canonical] = (
+                    self._coordinator._role_spawn_counts.get(canonical, 0) + 1
+                )
+                self._coordinator._spawn_count += 1
+                allowed_specs.append(spec)
+
+        if not allowed_specs:
             return ToolResult(
                 success=False, output="",
-                error="Sub-agent budget exhausted. Call finish_coordination.",
+                error="All agents rejected:\n" + "\n".join(rejected_msgs),
             )
 
         results = []
 
         def _run_one(spec: dict) -> SubAgentResult:
-            role_str = spec.get("role", "explorer")
+            role_str = spec.get("role", "reader")
             task_prompt = spec.get("task", "")
             isolation = spec.get("isolation", "none")
             model = spec.get("model") or None
 
-            try:
-                role = SubAgentRole(role_str)
-            except ValueError:
+            # 归一化角色名
+            canonical = _ROLE_ALIAS_MAP.get(role_str)
+            if canonical is None:
                 return SubAgentResult(
-                    agent_id="error", role=SubAgentRole.EXPLORER,
+                    agent_id="error", role=SubAgentRole.READER,
                     status=RunStatus.FAILED,
                     summary=f"Unknown role: {role_str}",
                 )
+            role = _normalize_role(role_str)
 
             worktree = None
             working_dir = self._coordinator._repo_path
@@ -727,8 +758,7 @@ class SpawnParallelTool(BaseTool):
                 thread_isolated=True,
             )
 
-            self._coordinator._spawn_count += 1
-            self._coordinator._role_spawn_counts[role_str] = self._coordinator._role_spawn_counts.get(role_str, 0) + 1
+            # spawn_count 和 role_spawn_counts 已在 execute() 中预扣，此处不再递增
 
             if worktree is not None and self._coordinator._worktree_mgr is not None:
                 try:
@@ -741,11 +771,11 @@ class SpawnParallelTool(BaseTool):
 
             return result
 
-        # 并行执行
-        max_workers = min(len(agents_spec), self._coordinator._multi_cfg.max_parallel)
+        # 并行执行（只执行通过限额检查的 specs）
+        max_workers = min(len(allowed_specs), self._coordinator._multi_cfg.max_parallel)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures: list[Future] = []
-            for spec in agents_spec:
+            for spec in allowed_specs:
                 futures.append(pool.submit(_run_one, spec))
 
             for future in as_completed(futures):
@@ -764,6 +794,9 @@ class SpawnParallelTool(BaseTool):
         succeeded = sum(1 for r in results if r.status == RunStatus.SUCCESS)
         failed = len(results) - succeeded
         lines = [f"Parallel spawn complete: {len(results)} agents finished ({succeeded} succeeded, {failed} failed)"]
+        if rejected_msgs:
+            lines.append(f"Rejected ({len(rejected_msgs)}):")
+            lines.extend(f"  {m}" for m in rejected_msgs)
         for r in results:
             lines.append(f"  {r.to_display()}")
         return ToolResult(success=True, output="\n".join(lines))
@@ -886,6 +919,7 @@ class CoordinatorAgent:
         self._results = []
         self._spawn_count = 0
         self._role_spawn_counts = {}
+        self._consecutive_rejections = 0
         self._final_finished = False
         self._final_summary = ""
         self._final_status = ""
@@ -973,9 +1007,41 @@ class CoordinatorAgent:
                 return False
         return True
 
+    def _check_spawn_allowed(self, role_str: str) -> str | None:
+        """集中化 spawn 限额检查。返回 None 表示允许，否则返回错误信息。
+
+        被 SpawnAgentTool 和 SpawnParallelTool 共同调用。
+        """
+        if not self._has_budget_for_spawn():
+            return (
+                "BUDGET EXHAUSTED. You MUST call finish_coordination NOW "
+                "with a summary of what was accomplished."
+            )
+        count = self._role_spawn_counts.get(role_str, 0)
+        max_per_role = 2
+        if count >= max_per_role:
+            self._consecutive_rejections = getattr(self, "_consecutive_rejections", 0) + 1
+            if self._consecutive_rejections >= 2:
+                return (
+                    f"REJECTED: Already spawned {count} {role_str} agents (max {max_per_role}). "
+                    f"You have been rejected multiple times. STOP trying to spawn. "
+                    f"Call finish_coordination IMMEDIATELY with the results you already have."
+                )
+            return (
+                f"Already spawned {count} {role_str} agents (max {max_per_role}). "
+                f"Do NOT retry. Call finish_coordination now with results from list_agent_results."
+            )
+        # 成功 spawn 时重置拒绝计数
+        self._consecutive_rejections = 0
+        return None
+
     def _steps_for_role(self, role: SubAgentRole) -> int:
         """根据角色返回建议的 max_steps。"""
         defaults = {
+            SubAgentRole.READER: 8,
+            SubAgentRole.WRITER: 25,
+            SubAgentRole.VERIFIER: 10,
+            # 兼容旧角色名
             SubAgentRole.EXPLORER: 8,
             SubAgentRole.PLANNER: 8,
             SubAgentRole.CODER: 25,
@@ -986,7 +1052,6 @@ class CoordinatorAgent:
 
     def _budget_for_role(self, role: SubAgentRole) -> int:
         """根据角色分配 token 预算（加权，受剩余预算约束）。"""
-        # 使用 _sub_budget（如果由测试设置）或从配置计算
         sub_budget = getattr(self, "_sub_budget", None)
         if sub_budget is None:
             total = self._config.budget_tokens or 80_000
@@ -995,11 +1060,15 @@ class CoordinatorAgent:
         remaining = sub_budget - tokens_used
 
         weights = {
+            SubAgentRole.READER: 0.30,
+            SubAgentRole.WRITER: 0.35,
+            SubAgentRole.VERIFIER: 0.25,
+            # 兼容旧角色名
             SubAgentRole.EXPLORER: 0.30,
-            SubAgentRole.PLANNER: 0.20,
+            SubAgentRole.PLANNER: 0.30,
             SubAgentRole.CODER: 0.35,
             SubAgentRole.REVIEWER: 0.25,
-            SubAgentRole.TESTER: 0.20,
+            SubAgentRole.TESTER: 0.25,
         }
         weight = weights.get(role, 0.25)
         allocated = int(sub_budget * weight)
