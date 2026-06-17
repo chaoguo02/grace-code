@@ -194,6 +194,11 @@ class FileWriteTool(BaseTool):
         return "file_write"
 
     @property
+    def risk_level(self) -> str:
+        from tools.base import RiskLevel
+        return RiskLevel.MEDIUM
+
+    @property
     def description(self) -> str:
         return (
             "Write content to a file, replacing its entire contents. "

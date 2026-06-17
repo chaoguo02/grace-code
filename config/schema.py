@@ -100,6 +100,14 @@ class ContextConfig:
 
 
 @dataclass
+class HitlConfig:
+    enabled: bool = True
+    min_risk_for_confirm: str = "medium"
+    policy_file: str = ".forge-agent/hitl/policies.yaml"
+    learn_threshold: int = 3
+
+
+@dataclass
 class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentCfg = field(default_factory=AgentCfg)
@@ -107,6 +115,7 @@ class AppConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     multi_agent: MultiAgentCfg = field(default_factory=MultiAgentCfg)
     context: ContextConfig = field(default_factory=ContextConfig)
+    hitl: HitlConfig = field(default_factory=HitlConfig)
     mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 

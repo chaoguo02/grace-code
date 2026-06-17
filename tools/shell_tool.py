@@ -106,9 +106,9 @@ class ShellTool(BaseTool):
         timeout (int): 超时秒数（默认 30）
         cwd (str):     工作目录（默认使用当前目录）
 
-    构造参数:
-        confirm_callback: 需要确认时调用，返回 True 表示用户允许执行。
-                          None 表示跳过确认（run 模式默认）。
+    安全模型：
+        - L0 黑名单硬拦截：execute() 内 _check_blocked()，永远不执行
+        - L1+ 确认：通过 classify_risk() 上报风险等级，由 HitlManager 统一处理
     """
 
     def __init__(
@@ -116,6 +116,7 @@ class ShellTool(BaseTool):
         confirm_callback: ConfirmCallback | None = None,
         runtime: Runtime | None = None,
     ) -> None:
+        # confirm_callback 保留用于向后兼容（无 HitlManager 时的降级路径）
         self._confirm_callback = confirm_callback
         self._runtime = runtime or LocalRuntime()
 
@@ -152,6 +153,23 @@ class ShellTool(BaseTool):
             "required": ["cmd"],
         }
 
+    @property
+    def risk_level(self) -> str:
+        from tools.base import RiskLevel
+        return RiskLevel.HIGH
+
+    def classify_risk(self, params: dict[str, Any]) -> str:
+        """动态风险分类：根据命令内容决定实际风险等级。"""
+        from tools.base import RiskLevel
+        cmd = params.get("cmd", "").strip()
+        if not cmd:
+            return RiskLevel.NONE
+        if _is_readonly(cmd):
+            return RiskLevel.NONE
+        if _needs_confirm(cmd):
+            return RiskLevel.HIGH
+        return RiskLevel.LOW
+
     def execute(self, params: dict[str, Any]) -> ToolResult:
         cmd: str = params.get("cmd", "").strip()
         timeout: int = int(params.get("timeout", 30))
@@ -160,7 +178,7 @@ class ShellTool(BaseTool):
         if not cmd:
             return ToolResult(success=False, output="", error="cmd is required")
 
-        # 层 1：黑名单硬拦截
+        # L0 黑名单硬拦截（永远在 execute 内，不可被 policy 覆盖）
         blocked = _check_blocked(cmd)
         if blocked:
             return ToolResult(
@@ -169,12 +187,9 @@ class ShellTool(BaseTool):
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
 
-        # 层 2：白名单免确认
-        if not _needs_confirm(cmd):
-            return self._run(cmd, timeout, cwd)
-
-        # 层 3：权限确认
-        if self._confirm_callback is not None:
+        # 如果有 HitlManager（通过 ToolRegistry 接入），确认已在 execute 前完成。
+        # 降级路径：无 HitlManager 时使用内部 confirm_callback（兼容旧代码/测试）
+        if self._confirm_callback is not None and _needs_confirm(cmd):
             allowed = self._confirm_callback(cmd)
             if not allowed:
                 return ToolResult(
@@ -182,7 +197,6 @@ class ShellTool(BaseTool):
                     output="",
                     error=f"Command rejected by user: {cmd!r}",
                 )
-        # confirm_callback 为 None → 跳过确认直接执行（run 模式）
 
         return self._run(cmd, timeout, cwd)
 

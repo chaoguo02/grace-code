@@ -288,7 +288,7 @@ class ReActAgent:
                 any_edit = False
 
                 for tc in action.tool_calls:
-                    result = self._registry.execute_tool(tc.name, tc.params)
+                    result = self._registry.execute_tool(tc.name, tc.params, thought=action.thought or "")
                     observation = result.to_observation(tc.name)
                     observations.append(observation)
 

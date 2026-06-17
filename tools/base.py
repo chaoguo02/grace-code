@@ -16,10 +16,23 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from agent.task import Observation, ObservationStatus
 from llm.base import LLMToolSchema
+
+
+# ---------------------------------------------------------------------------
+# RiskLevel — 工具风险分级
+# ---------------------------------------------------------------------------
+
+class RiskLevel(str, Enum):
+    """工具风险等级。HitlManager 根据此决定是否需要人工确认。"""
+    NONE = "none"       # file_read, git_status — 只读，永不提示
+    LOW = "low"         # git_add, memory_write — 可逆，通常跳过
+    MEDIUM = "medium"   # file_write — 覆盖文件，可配置
+    HIGH = "high"       # shell(dangerous), git_commit — 不可逆，总是提示
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +100,18 @@ class BaseTool(ABC):
         """
         ...
 
+    @property
+    def risk_level(self) -> str:
+        """静态风险等级。子类可覆写。默认 NONE（只读工具）。"""
+        return RiskLevel.NONE
+
+    def classify_risk(self, params: dict[str, Any]) -> str:
+        """
+        动态风险分类。根据参数决定实际风险等级。
+        默认返回 self.risk_level。ShellTool 覆写此方法实现命令级分类。
+        """
+        return self.risk_level
+
     @abstractmethod
     def execute(self, params: dict[str, Any]) -> ToolResult:
         """执行工具，返回 ToolResult。不抛异常，错误封装在 ToolResult.error 里。"""
@@ -114,8 +139,9 @@ class ToolRegistry:
     线程安全：当前 v1 单线程，不加锁。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hitl_manager: Any = None) -> None:
         self._tools: dict[str, BaseTool] = {}
+        self._hitl_manager = hitl_manager
 
     def register(self, tool: BaseTool) -> "ToolRegistry":
         """
@@ -127,9 +153,10 @@ class ToolRegistry:
         self._tools[tool.name] = tool
         return self
 
-    def execute_tool(self, name: str, params: dict[str, Any]) -> ToolResult:
+    def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
         """
         按名称查找工具并执行。
+        如果有 HitlManager，先经过 HITL 审批。
         工具不存在时返回 error ToolResult（不抛异常，让 agent 继续运行）。
         """
         if name not in self._tools:
@@ -141,6 +168,17 @@ class ToolRegistry:
             )
 
         tool = self._tools[name]
+
+        # HITL 审批门控
+        if self._hitl_manager is not None:
+            hitl_result = self._hitl_manager.check(tool, params, thought=thought)
+            if hitl_result.is_denied:
+                note = hitl_result.feedback_note
+                error_msg = f"Tool '{name}' denied by user."
+                if note:
+                    error_msg += f" Feedback: {note}"
+                return ToolResult(success=False, output="", error=error_msg)
+
         try:
             return tool.execute(params)
         except Exception as exc:

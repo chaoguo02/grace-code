@@ -88,10 +88,31 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     from tools.test_tool import PytestTool
     from tools.web_tool import WebSearchTool, WebFetchTool
 
+    # 构建 HitlManager（如果启用且有确认回调）
+    hitl_manager = None
+    hitl_cfg = getattr(cfg, "hitl", None)
+    if confirm_callback is not None and hitl_cfg and hitl_cfg.enabled:
+        from hitl.manager import HitlManager
+        from hitl.policy import PolicyEngine
+        from entry.renderer import hitl_terminal_confirm
+
+        policy_engine = PolicyEngine(policies_path=hitl_cfg.policy_file)
+
+        def _hitl_confirm_adapter(request):
+            return hitl_terminal_confirm(request)
+
+        hitl_manager = HitlManager(
+            confirm_callback=_hitl_confirm_adapter,
+            policy_engine=policy_engine,
+            min_risk_for_confirm=hitl_cfg.min_risk_for_confirm,
+        )
+
     web_cfg = cfg.tools.web
+    # ShellTool: 无 HitlManager 时保留 confirm_callback 降级路径
+    shell_cb = confirm_callback if hitl_manager is None else None
     registry = (
-        ToolRegistry()
-        .register(ShellTool(confirm_callback=confirm_callback, runtime=runtime))
+        ToolRegistry(hitl_manager=hitl_manager)
+        .register(ShellTool(confirm_callback=shell_cb, runtime=runtime))
         .register(FileReadTool())
         .register(FileViewTool())
         .register(FileWriteTool())
@@ -593,15 +614,22 @@ def chat(
     skills_dir = os.path.join(str(repo_path), ".forge-agent", "skills")
     skill_registry = SkillRegistry(skills_dir)
 
-    registry = _build_registry(config, memory_store=memory_store, external_store=external_store)
+    from tools.shell_tool import terminal_confirm
+    from tools.runtime import create_runtime
+    runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
+
+    registry = _build_registry(
+        config,
+        confirm_callback=terminal_confirm,
+        runtime=runtime,
+        memory_store=memory_store,
+        external_store=external_store,
+    )
 
     # 注册 SkillTool（如果有已发现的 skills）
     if skill_registry.list_skills():
         from skills.tool import SkillTool
         registry.register(SkillTool(skill_registry))
-    from tools.shell_tool import terminal_confirm
-    from tools.runtime import create_runtime
-    runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
     from entry.renderer import create_renderer

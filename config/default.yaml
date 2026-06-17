@@ -36,6 +36,12 @@ multi_agent:
   max_retries: 2 # Reviewer 拒绝后最大重试次数
   coordinator_max_steps: 25
 
+hitl:
+  enabled: true
+  min_risk_for_confirm: medium   # none / low / medium / high
+  policy_file: .forge-agent/hitl/policies.yaml
+  learn_threshold: 3             # 连续 N 次相同决策后自动学习为 policy
+
 context:
   repo_map_budget: 8000 # repo-map 最大 token 数
   history_window: 20 # 保留最近 N 轮对话

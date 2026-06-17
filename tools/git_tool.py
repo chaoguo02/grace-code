@@ -186,6 +186,11 @@ class GitAddTool(BaseTool):
         return "git_add"
 
     @property
+    def risk_level(self) -> str:
+        from tools.base import RiskLevel
+        return RiskLevel.LOW
+
+    @property
     def description(self) -> str:
         return (
             "Stage files for commit. "
@@ -239,6 +244,11 @@ class GitCommitTool(BaseTool):
     @property
     def name(self) -> str:
         return "git_commit"
+
+    @property
+    def risk_level(self) -> str:
+        from tools.base import RiskLevel
+        return RiskLevel.HIGH
 
     @property
     def description(self) -> str:

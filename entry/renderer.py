@@ -500,6 +500,91 @@ def create_renderer(
 
 
 # ---------------------------------------------------------------------------
+# HITL 确认 UI
+# ---------------------------------------------------------------------------
+
+def hitl_terminal_confirm(request: "Any") -> tuple[bool, str]:
+    """
+    终端 HITL 确认 UI。接收 HitlRequest，返回 (approved, note)。
+
+    显示格式：
+      ┌─ Confirmation Required ──────────────
+      │  Tool:   file_write
+      │  Risk:   medium
+      │  Params: path="src/main.py"
+      │  Agent:  "I need to update..."
+      └──────────────────────────────────────
+      [y]approve / [n]deny / [n: reason] >
+    """
+    import sys
+
+    if not sys.stdin.isatty():
+        return (False, "Non-interactive terminal, auto-denied")
+
+    # 格式化参数展示
+    params_display = ""
+    params = request.params
+    if "cmd" in params:
+        params_display = f'cmd="{params["cmd"]}"'
+    elif "path" in params:
+        params_display = f'path="{params["path"]}"'
+    else:
+        params_str = str(params)
+        if len(params_str) > 80:
+            params_str = params_str[:80] + "..."
+        params_display = params_str
+
+    # 渲染确认框
+    sys.stdout.write("\n")
+    sys.stdout.write(_yellow("  ┌─ Confirmation Required ") + _yellow("─" * 34) + "\n")
+    sys.stdout.write(_yellow("  │  ") + f"Tool:   {_bold(request.tool_name)}\n")
+    sys.stdout.write(_yellow("  │  ") + f"Risk:   {_risk_color(request.risk_level)}\n")
+    sys.stdout.write(_yellow("  │  ") + f"Params: {params_display}\n")
+    if request.thought and request.thought != "(no thought)":
+        thought_short = request.thought[:80]
+        if len(request.thought) > 80:
+            thought_short += "..."
+        sys.stdout.write(_yellow("  │  ") + _dim(f'Agent:  "{thought_short}"') + "\n")
+    sys.stdout.write(_yellow("  └") + _yellow("─" * 60) + "\n")
+    sys.stdout.flush()
+
+    # 等待用户输入
+    while True:
+        try:
+            ans = input(_cyan("  [y]approve / [n]deny / [n: reason] > ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.stdout.write("\n")
+            return (False, "")
+
+        if ans.lower() in ("y", "yes", ""):
+            sys.stdout.write(_green("  ✓ Approved\n\n"))
+            sys.stdout.flush()
+            return (True, "")
+        elif ans.lower() in ("n", "no"):
+            sys.stdout.write(_red("  ✗ Denied\n\n"))
+            sys.stdout.flush()
+            return (False, "")
+        elif ans.lower().startswith("n:") or ans.lower().startswith("n "):
+            note = ans[2:].strip()
+            sys.stdout.write(_red(f"  ✗ Denied") + _dim(f" ({note})\n\n"))
+            sys.stdout.flush()
+            return (False, note)
+        else:
+            sys.stdout.write(_dim("  (enter y, n, or n: <reason>)\n"))
+
+
+def _risk_color(risk: str) -> str:
+    """根据风险等级返回带颜色的标签。"""
+    if risk == "high":
+        return _red(_bold("HIGH"))
+    elif risk == "medium":
+        return _yellow("MEDIUM")
+    elif risk == "low":
+        return _dim("low")
+    return _dim("none")
+
+
+# ---------------------------------------------------------------------------
 # diff 高亮（rich 可用时）
 # ---------------------------------------------------------------------------
 
