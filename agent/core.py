@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -61,6 +62,7 @@ class AgentConfig:
     loop_detection_window: int = 3       # 连续 N 步完全相同 action 判定死循环
     test_tool_names: tuple[str, ...] = ("test", "pytest")  # 触发 Reflection 的工具名
     budget_tokens: int = 80_000            # 总 token 预算
+    missing_test_target_max_followups: int = 2  # pytest 路径缺失后最多允许的确认性探索步数
     history_max_messages: int = 40         # 历史最大条数
     llm_max_retries: int = 3               # LLM 调用失败最大重试次数
     llm_retry_delay: float = 2.0           # 重试间隔（秒，指数退避）
@@ -148,6 +150,7 @@ class ReActAgent:
         """
         self._current_repo_path = task.repo_path
         self._current_task_description = task.description
+        self._task_intent = getattr(task, "intent", "edit")
         # 按 repo_path 隔离 repo_map 缓存，换 repo 时自动重建
         cache_key = task.repo_path
         if getattr(self, "_repo_map_cache_key", None) != cache_key:
@@ -174,19 +177,29 @@ class ReActAgent:
             from agent.prompt import build_task_prompt
             history.add(LLMMessage(
                 role="user",
-                content=build_task_prompt(task.description, task.repo_path, task.issue_url),
+                content=build_task_prompt(
+                    task.description, task.repo_path, task.issue_url,
+                    intent=self._task_intent,
+                ),
             ))
         token_budget = TokenBudget(total=self._cfg.budget_tokens)
         repo_map = RepoMap(task.repo_path)
 
         total_tokens = 0
         steps_without_edit = 0
+        consecutive_failures = 0
+        _max_consecutive_failures = 3
+        reflection_counts: dict[str, int] = {}  # reason -> count
+        missing_test_target_followups: int | None = None
+        missing_test_target_message: str | None = None
+        missing_test_target_detected_step: int | None = None
         # 累计 prompt caching 统计
         from llm.base import CacheStats
         cumulative_cache = CacheStats()
 
         for step in range(1, task.max_steps + 1):
             self._current_step = step  # 用于 compaction 日志
+            self.compactor.tick_step()
             logger.debug("Step %d/%d", step, task.max_steps)
 
             # ── 1. 组装 messages，调用 LLM ──────────────────────────────
@@ -218,10 +231,30 @@ class ReActAgent:
                     cache_stats=cumulative_cache,
                 )
 
-            total_tokens += response.total_tokens
+            billable_tokens = response.total_tokens
             if response.cache_stats and response.cache_stats.has_cache_activity:
                 cumulative_cache.cache_read_tokens += response.cache_stats.cache_read_tokens
                 cumulative_cache.cache_creation_tokens += response.cache_stats.cache_creation_tokens
+                # Cached prompt tokens still appear in provider usage, but they should not
+                # trip this run's hard exploration budget on repeated short tasks.
+                billable_tokens = max(0, billable_tokens - response.cache_stats.cache_read_tokens)
+            total_tokens += billable_tokens
+
+            # ── Token budget 硬上限 ────────────────────────────────────
+            if total_tokens > self._cfg.budget_tokens:
+                reason = (
+                    f"Token budget exceeded: {total_tokens} > {self._cfg.budget_tokens}. "
+                    f"Stopping to prevent unbounded cost."
+                )
+                logger.warning(reason)
+                log.log_task_failed(steps=step, reason=reason)
+                return RunResult(
+                    task_id=task.task_id, status=RunStatus.GAVE_UP,
+                    summary=reason, steps_taken=step,
+                    total_tokens=total_tokens,
+                    cache_stats=cumulative_cache,
+                )
+
             action = response.action
 
             # ── 2. 写入 Action event ────────────────────────────────────
@@ -287,6 +320,7 @@ class ReActAgent:
             if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
                 observations: list[Observation] = []
                 any_test_failed = False
+                missing_test_target_observation: Observation | None = None
                 any_edit = False
 
                 for tc in action.tool_calls:
@@ -301,14 +335,66 @@ class ReActAgent:
                     # 追踪测试是否失败
                     if tc.name in self._cfg.test_tool_names and not observation.is_success():
                         any_test_failed = True
+                        if self._is_missing_test_target_observation(observation):
+                            missing_test_target_observation = observation
 
                     log.log_observation(step=step, observation=observation)
+
+                    if missing_test_target_observation is not None:
+                        missing_test_target_message = self._format_missing_test_target_summary(
+                            missing_test_target_observation
+                        )
+                        logger.info("Stopping immediately after missing pytest target")
+                        log.log_task_complete(steps=step, summary=missing_test_target_message)
+                        return RunResult(
+                            task_id=task.task_id,
+                            status=RunStatus.SUCCESS,
+                            summary=missing_test_target_message,
+                            steps_taken=step,
+                            total_tokens=total_tokens,
+                            cache_stats=cumulative_cache,
+                        )
 
                 # 更新 steps_without_edit（整体判断）
                 if any_edit:
                     steps_without_edit = 0
                 else:
                     steps_without_edit += 1
+
+                # 缺失的指定测试文件是阻塞条件，不是自动创建测试的授权。
+                if missing_test_target_observation is not None:
+                    if missing_test_target_message is None:
+                        missing_test_target_message = self._format_missing_test_target_summary(
+                            missing_test_target_observation
+                        )
+                        missing_test_target_followups = self._cfg.missing_test_target_max_followups
+                        missing_test_target_detected_step = step
+                    else:
+                        missing_test_target_followups = 0
+
+                # 连续失败计数器
+                all_failed = all(not obs.is_success() for obs in observations)
+                if all_failed:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
+
+                # 连续失败超过阈值：强制终止
+                if consecutive_failures >= _max_consecutive_failures:
+                    reason = (
+                        f"Aborting: {consecutive_failures} consecutive tool failures. "
+                        f"Last error: {observations[-1].error or observations[-1].output[:200]}"
+                    )
+                    logger.warning(reason)
+                    log.log_task_failed(steps=step, reason=reason)
+                    return RunResult(
+                        task_id=task.task_id,
+                        status=RunStatus.GAVE_UP,
+                        summary=reason,
+                        steps_taken=step,
+                        total_tokens=total_tokens,
+                        cache_stats=cumulative_cache,
+                    )
 
                 # 把 action 和所有 observations 加入对话历史
                 if self._backend.supports_function_calling:
@@ -339,6 +425,29 @@ class ReActAgent:
                         content=self._format_observations_for_history(observations),
                     ))
 
+                # 缺失测试目标后，只允许少量确认性搜索，随后强制停止。
+                if (
+                    missing_test_target_message is not None
+                    and missing_test_target_followups is not None
+                    and missing_test_target_detected_step != step
+                ):
+                    if self._is_confirmation_search_action(action):
+                        missing_test_target_followups -= 1
+                    else:
+                        missing_test_target_followups = 0
+
+                    if missing_test_target_followups <= 0:
+                        logger.info("Stopping after missing pytest target guardrail")
+                        log.log_task_complete(steps=step, summary=missing_test_target_message)
+                        return RunResult(
+                            task_id=task.task_id,
+                            status=RunStatus.SUCCESS,
+                            summary=missing_test_target_message,
+                            steps_taken=step,
+                            total_tokens=total_tokens,
+                            cache_stats=cumulative_cache,
+                        )
+
                 # ── 6. Reflection 触发判断 ──────────────────────────────
 
                 # Task anchor 用于 reflection，防止 LLM 在反射后丢失当前任务
@@ -346,6 +455,30 @@ class ReActAgent:
 
                 # 触发条件 A：任一测试工具失败
                 if any_test_failed:
+                    if missing_test_target_message is not None:
+                        reflect_prompt = self._missing_test_target_reflection(missing_test_target_message) + _task_anchor
+                        log.log_reflection(
+                            step=step,
+                            reason="missing_test_target",
+                            prompt=reflect_prompt,
+                        )
+                        history.add(LLMMessage(role="user", content=reflect_prompt))
+                        logger.debug("Reflection triggered: missing_test_target at step %d", step)
+                        continue
+
+                    reflection_counts["test_failed"] = reflection_counts.get("test_failed", 0) + 1
+                    if reflection_counts["test_failed"] >= 3:
+                        reason = "Aborting: test failures repeated 3 times without resolution."
+                        logger.warning(reason)
+                        log.log_task_failed(steps=step, reason=reason)
+                        return RunResult(
+                            task_id=task.task_id,
+                            status=RunStatus.GAVE_UP,
+                            summary=reason,
+                            steps_taken=step,
+                            total_tokens=total_tokens,
+                            cache_stats=cumulative_cache,
+                        )
                     reflect_prompt = reflection_test_failed() + _task_anchor
                     log.log_reflection(
                         step=step,
@@ -355,8 +488,22 @@ class ReActAgent:
                     history.add(LLMMessage(role="user", content=reflect_prompt))
                     logger.debug("Reflection triggered: test_failed at step %d", step)
 
-                # 触发条件 B：连续 N 步无编辑
-                elif steps_without_edit >= self._cfg.reflection_no_edit_steps:
+                # 触发条件 B：连续 N 步无编辑（仅 edit 类型任务触发）
+                elif (steps_without_edit >= self._cfg.reflection_no_edit_steps
+                      and self._task_intent == "edit"):
+                    reflection_counts["no_edit"] = reflection_counts.get("no_edit", 0) + 1
+                    if reflection_counts["no_edit"] >= 2:
+                        reason = "Aborting: stuck in exploration without making progress."
+                        logger.warning(reason)
+                        log.log_task_failed(steps=step, reason=reason)
+                        return RunResult(
+                            task_id=task.task_id,
+                            status=RunStatus.GAVE_UP,
+                            summary=reason,
+                            steps_taken=step,
+                            total_tokens=total_tokens,
+                            cache_stats=cumulative_cache,
+                        )
                     reflect_prompt = reflection_no_edit(steps_without_edit) + _task_anchor
                     log.log_reflection(
                         step=step,
@@ -389,6 +536,62 @@ class ReActAgent:
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
+
+    def _is_missing_test_target_observation(self, observation: Observation) -> bool:
+        """识别 pytest exit code 4 中的缺失目标，避免进入修复代码流程。"""
+        text = f"{observation.error or ''}\n{observation.output or ''}".lower()
+        return (
+            observation.tool_name in self._cfg.test_tool_names
+            and "pytest" in text
+            and (
+                "requested test target is missing" in text
+                or "file or directory not found" in text
+                or "no such file or directory" in text
+            )
+        )
+
+    def _format_missing_test_target_summary(self, observation: Observation) -> str:
+        requested_path = "(unknown)"
+        match = re.search(r"Requested path:\s*(.+)", observation.output)
+        if match:
+            requested_path = match.group(1).strip()
+        return (
+            f"`pytest {requested_path}` could not run because the requested test path "
+            f"`{requested_path}` does not exist. Pytest reported exit code 4 "
+            "(usage error / missing path), so this is not an existing failing test. "
+            "I did not modify code or create tests. Please provide the correct test path, "
+            "or explicitly ask me to add a new test file."
+        )
+
+    def _missing_test_target_reflection(self, summary: str) -> str:
+        return (
+            "[SYSTEM] Pytest failed because the requested test target is missing.\n"
+            "This is a blocker, not permission to create a test file.\n"
+            "Do NOT inspect unrelated implementation files or start writing tests/code.\n"
+            "You may perform at most targeted confirmation searches for the missing path.\n"
+            "Then finish with this conclusion:\n"
+            f"{summary}"
+        )
+
+    def _is_confirmation_search_action(self, action: Action) -> bool:
+        """缺失测试路径后，仅允许查找/搜索类工具做有限确认。"""
+        allowed_tools = {"find_files", "search_text", "shell"}
+        if action.action_type != ActionType.TOOL_CALL or not action.tool_calls:
+            return False
+        return all(
+            tc.name in allowed_tools and self._is_targeted_confirmation_call(tc)
+            for tc in action.tool_calls
+        )
+
+    def _is_targeted_confirmation_call(self, tc: ToolCall) -> bool:
+        if tc.name in {"find_files", "search_text"}:
+            return True
+        if tc.name != "shell":
+            return False
+        cmd = str(tc.params.get("cmd", "")).lower()
+        if not any(token in cmd for token in ("test_compaction", "compaction", "tests")):
+            return False
+        return any(cmd.strip().startswith(prefix) for prefix in ("rg", "find", "dir", "ls", "python -c"))
 
     def _extract_summary_from_history(self, history: ConversationHistory) -> str:
         """从对话历史中提取有意义的 summary（用于 max_steps 截断时）。
@@ -586,6 +789,16 @@ class ReActAgent:
         if task_desc:
             parts.append(f"## Current Task\n{task_desc}")
 
+        # Analysis 类型任务：注入行为覆盖，引导快速完成
+        if getattr(self, "_task_intent", "edit") == "analysis":
+            parts.append(
+                "## Task Mode: Analysis\n"
+                "This is a read-only analysis task. Your workflow is:\n"
+                "1. Read the relevant code using targeted tools (file_read, file_view, search_text, find_symbol)\n"
+                "2. Once you have sufficient information, respond directly with your answer\n"
+                "Do NOT edit files. Do NOT run tests. Respond as soon as you can answer the question."
+            )
+
         # 记忆索引
         if self._memory_context and self._memory_context.enabled:
             memory_section = self._memory_context.build_memory_section()
@@ -648,10 +861,21 @@ class ReActAgent:
         """构建 native tool_use 模式下的工具结果内容（不含 [Tool:] 包装）。"""
         parts: list[str] = []
         if observation.output:
-            parts.append(observation.output)
+            parts.append(self._truncate_output(observation.output))
         if observation.error and not observation.is_success():
             parts.append(f"Error: {observation.error}")
         return "\n".join(parts) if parts else "(no output)"
+
+    @staticmethod
+    def _truncate_output(text: str, max_chars: int = 8000) -> str:
+        """对超长 tool output 做预截断，保留首尾关键部分。"""
+        if len(text) <= max_chars:
+            return text
+        keep = max_chars // 2
+        head = text[:keep]
+        tail = text[-keep:]
+        omitted = len(text) - max_chars
+        return f"{head}\n\n... [{omitted} chars omitted] ...\n\n{tail}"
 
     def _format_observations_for_history(self, observations: list[Observation]) -> str:
         """把多条 Observation 格式化为一条 user 消息（并行 tool_calls 用，text fallback mode）。"""
@@ -660,7 +884,7 @@ class ReActAgent:
             status = "SUCCESS" if obs.is_success() else "ERROR"
             lines.append(f"[Tool: {obs.tool_name} | {status}]")
             if obs.output:
-                lines.append(obs.output)
+                lines.append(self._truncate_output(obs.output))
             if obs.error and not obs.is_success():
                 lines.append(f"Error: {obs.error}")
         return "\n".join(lines)

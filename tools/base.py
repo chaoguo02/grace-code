@@ -14,6 +14,7 @@ tools/base.py
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -48,6 +49,7 @@ class ToolResult:
     success: bool
     output: str                         # 工具的文本输出，已做截断处理
     error: str | None = None            # 失败时的错误信息
+    duration_ms: float = 0.0            # 工具执行耗时（毫秒），由 ToolRegistry 填充
 
     def to_observation(self, tool_name: str) -> Observation:
         """转换为 Observation，供 core.py 写入 EventLog 和注入上下文。"""
@@ -114,7 +116,7 @@ class BaseTool(ABC):
 
     @abstractmethod
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        """执行工具，返回 ToolResult。不抛异常，错误封装在 ToolResult.error 里。"""
+        """执行工具，返回 ToolResult。不抛异常——所有异常已在内部处理。"""
         ...
 
     def to_llm_schema(self) -> LLMToolSchema:
@@ -135,13 +137,13 @@ class ToolRegistry:
     工具注册表。core.py 持有一个 registry 实例，通过它：
     1. 查找工具并执行（execute_tool）
     2. 生成所有工具的 schema 列表注入 LLM（get_schemas）
-
-    线程安全：当前 v1 单线程，不加锁。
+    3. 记录每个工具的执行耗时统计（get_timing_stats）
     """
 
     def __init__(self, hitl_manager: Any = None) -> None:
         self._tools: dict[str, BaseTool] = {}
         self._hitl_manager = hitl_manager
+        self._timing_stats: dict[str, dict[str, float | int]] = {}
 
     def register(self, tool: BaseTool) -> "ToolRegistry":
         """
@@ -159,13 +161,18 @@ class ToolRegistry:
         如果有 HitlManager，先经过 HITL 审批。
         工具不存在时返回 error ToolResult（不抛异常，让 agent 继续运行）。
         """
+        start = time.perf_counter()
+        result: ToolResult
+
         if name not in self._tools:
             available = ", ".join(self._tools.keys()) or "none"
-            return ToolResult(
+            result = ToolResult(
                 success=False,
                 output="",
                 error=f"Unknown tool '{name}'. Available tools: {available}",
             )
+            self._record_timing(name, start, result)
+            return result
 
         tool = self._tools[name]
 
@@ -177,17 +184,22 @@ class ToolRegistry:
                 error_msg = f"Tool '{name}' denied by user."
                 if note:
                     error_msg += f" Feedback: {note}"
-                return ToolResult(success=False, output="", error=error_msg)
+                result = ToolResult(success=False, output="", error=error_msg)
+                self._record_timing(name, start, result)
+                return result
 
         try:
-            return tool.execute(params)
+            result = tool.execute(params)
         except Exception as exc:
             # 工具内部未捕获的异常，降级为 error 结果
-            return ToolResult(
+            result = ToolResult(
                 success=False,
                 output="",
                 error=f"Tool '{name}' raised an unexpected error: {exc}",
             )
+
+        self._record_timing(name, start, result)
+        return result
 
     def get_schemas(self) -> list[LLMToolSchema]:
         """返回所有已注册工具的 schema（按 name 排序，确保 prompt caching 稳定性）。"""
@@ -207,6 +219,51 @@ class ToolRegistry:
 
     def __repr__(self) -> str:
         return f"ToolRegistry(tools={self.tool_names})"
+
+    def _record_timing(self, name: str, start: float, result: ToolResult) -> None:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        result.duration_ms = elapsed_ms
+        stats = self._timing_stats.setdefault(
+            name,
+            {
+                "calls": 0,
+                "failures": 0,
+                "total_duration_ms": 0.0,
+                "min_duration_ms": 0.0,
+                "max_duration_ms": 0.0,
+            },
+        )
+        calls = int(stats["calls"])
+        stats["calls"] = calls + 1
+        stats["failures"] = int(stats["failures"]) + (0 if result.success else 1)
+        stats["total_duration_ms"] = float(stats["total_duration_ms"]) + elapsed_ms
+        stats["min_duration_ms"] = elapsed_ms if calls == 0 else min(float(stats["min_duration_ms"]), elapsed_ms)
+        stats["max_duration_ms"] = elapsed_ms if calls == 0 else max(float(stats["max_duration_ms"]), elapsed_ms)
+
+    # ── 统计接口 ──────────────────────────────────────────────────────
+
+    def get_timing_stats(self) -> dict[str, dict[str, float | int]]:
+        """
+        返回工具执行耗时统计快照。
+        格式：{tool_name: {calls, failures, total/avg/min/max_duration_ms}}
+        """
+        snapshot: dict[str, dict[str, float | int]] = {}
+        for name, stats in self._timing_stats.items():
+            calls = int(stats["calls"])
+            total = float(stats["total_duration_ms"])
+            snapshot[name] = {
+                "calls": calls,
+                "failures": int(stats["failures"]),
+                "total_duration_ms": total,
+                "avg_duration_ms": total / calls if calls else 0.0,
+                "min_duration_ms": float(stats["min_duration_ms"]),
+                "max_duration_ms": float(stats["max_duration_ms"]),
+            }
+        return snapshot
+
+    def reset_timing_stats(self) -> None:
+        """清空所有工具执行耗时统计。"""
+        self._timing_stats.clear()
 
 
 # ---------------------------------------------------------------------------

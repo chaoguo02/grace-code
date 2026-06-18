@@ -124,3 +124,40 @@ def _resolve_mode(mode: str, task_description: str | None) -> str:
     if mode not in ("react", "plan", "dag", "multi-agent"):
         raise ValueError(f"Unknown mode: {mode!r}, expected 'react', 'plan', 'dag', 'multi-agent', or 'auto'")
     return mode
+
+
+# ---------------------------------------------------------------------------
+# 任务意图分类
+# ---------------------------------------------------------------------------
+
+_EDIT_SIGNALS = re.compile(
+    r"(fix|bug|error|implement|feature|add|create|write|modify|change|update|refactor|"
+    r"rewrite|delete|remove|rename|move|replace|"
+    r"修复|修改|添加|新增|实现|重构|删除|移动|替换|创建|写入)",
+    re.IGNORECASE,
+)
+
+_ANALYSIS_SIGNALS = re.compile(
+    r"(什么|哪些|如何|为什么|多少|几个|是否|有没有|"
+    r"explain|what|which|how|why|where|who|when|"
+    r"list|describe|tell\s*me|show\s*me|count|"
+    r"分析|解释|列出|说明|总结|描述|查看|读取|了解|搜索|找到|找出|"
+    r"summarize|analyze|find.*and\s*(tell|explain|describe|list)|search|look\s*for|find)",
+    re.IGNORECASE,
+)
+
+
+def classify_task_intent(description: str) -> str:
+    """
+    根据任务描述判断意图。
+
+    Returns:
+        "edit"     — 需要修改文件的任务
+        "analysis" — 纯阅读/分析/问答类任务
+    """
+    text = description.strip()
+    if _EDIT_SIGNALS.search(text):
+        return "edit"
+    if _ANALYSIS_SIGNALS.search(text):
+        return "analysis"
+    return "edit"

@@ -7,6 +7,7 @@ pytest 执行工具，返回结构化的测试结果。
 - 不只返回原始 stdout，而是解析出"哪些测试失败了 + 错误信息"
 - 失败时 output 包含精简的 failure summary，避免把整个 traceback 塞进上下文
 - 通过 exit code 判断成功/失败，不依赖字符串匹配
+- 对 pytest exit code 做确定性分类，避免把路径/参数错误误判成代码失败
 """
 
 from __future__ import annotations
@@ -22,6 +23,16 @@ from tools.runtime import LocalRuntime, Runtime
 
 PYTEST_TIMEOUT = 120        # pytest 默认超时，比 shell 工具更长
 MAX_OUTPUT_CHARS = 50_000   # 测试输出可能很长（大 diff 等）
+
+
+PYTEST_EXIT_MEANINGS = {
+    0: "all tests passed",
+    1: "tests failed",
+    2: "pytest was interrupted",
+    3: "pytest internal error",
+    4: "pytest usage error",
+    5: "no tests collected",
+}
 
 
 class PytestTool(BaseTool):
@@ -106,14 +117,82 @@ class PytestTool(BaseTool):
         raw = run_result.output
         success = run_result.returncode == 0
 
-        # 解析并格式化输出
-        output = _format_pytest_output(raw, success)
+        output, error = _classify_pytest_result(run_result.returncode, raw, test_path, success)
 
         return ToolResult(
             success=success,
             output=output,
-            error=None if success else f"pytest exited with code {run_result.returncode}",
+            error=error,
         )
+
+
+# ---------------------------------------------------------------------------
+# 结果分类与输出格式化
+# ---------------------------------------------------------------------------
+
+def _classify_pytest_result(
+    returncode: int,
+    raw: str,
+    test_path: str,
+    success: bool,
+) -> tuple[str, str | None]:
+    """按 pytest exit code 生成确定性摘要，减少 LLM 猜测空间。"""
+    meaning = PYTEST_EXIT_MEANINGS.get(returncode, "unknown pytest exit code")
+
+    if success:
+        return _format_pytest_output(raw, success=True), None
+
+    if returncode == 4:
+        if _looks_like_missing_pytest_target(raw):
+            return (
+                "Pytest did not run because the requested test target is missing.\n"
+                f"Requested path: {test_path}\n"
+                "Classification: pytest exit code 4 (usage error / missing path).\n"
+                "Do not create this missing test file unless the user explicitly asks for new tests.",
+                "pytest usage error: requested test target is missing",
+            )
+        return (
+            _join_nonempty(
+                f"Classification: pytest exit code 4 ({meaning}).",
+                "This is a command/path/argument problem, not an existing failing test.",
+                _truncate_raw(raw),
+            ),
+            "pytest usage error",
+        )
+
+    if returncode == 5:
+        return (
+            _join_nonempty(
+                f"Classification: pytest exit code 5 ({meaning}).",
+                "No tests were collected. Do not create tests unless the user explicitly asks for new tests.",
+                _truncate_raw(raw),
+            ),
+            "pytest collected no tests",
+        )
+
+    error = f"pytest exited with code {returncode} ({meaning})"
+    return _format_pytest_output(raw, success=False), error
+
+
+def _looks_like_missing_pytest_target(raw: str) -> bool:
+    lower = raw.lower()
+    patterns = (
+        "file or directory not found",
+        "not found:",
+        "error: file or directory not found",
+        "no such file or directory",
+    )
+    return any(pattern in lower for pattern in patterns)
+
+
+def _truncate_raw(raw: str) -> str:
+    if len(raw) > MAX_OUTPUT_CHARS:
+        return "...[output truncated]...\n" + raw[-MAX_OUTPUT_CHARS:]
+    return raw.strip()
+
+
+def _join_nonempty(*parts: str) -> str:
+    return "\n".join(part for part in parts if part)
 
 
 # ---------------------------------------------------------------------------

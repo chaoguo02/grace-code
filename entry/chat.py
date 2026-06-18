@@ -278,9 +278,11 @@ class ChatSession:
         if self._proactive_memory:
             self._proactive_memory.check_user_message(user_input)
 
+        from agent.factory import classify_task_intent
         task = Task(
             description=user_input,
             repo_path=self.repo_path,
+            intent=classify_task_intent(user_input),
             max_steps=self.config.agent.max_steps,
             budget_tokens=self.config.agent.budget_tokens,
         )
@@ -304,7 +306,7 @@ class ChatSession:
         if result.summary:
             self._shared_history.add(LLMMessage(
                 role="assistant",
-                content=f"[Round {self.round_count} complete]\n{result.summary}",
+                content=result.summary,
             ))
 
         sys.stdout.write("\n")

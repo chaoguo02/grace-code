@@ -36,6 +36,7 @@ _COMPACTION_TRIGGER_RATIO = 0.80  # 历史 token 超过预算的 80% 时触发
 _COMPACTION_BLOCK_TOKEN_BUDGET = 2000  # compaction 块的目标 token 数
 _MIN_HISTORY_BEFORE_COMPACT = 6  # 少于 N 条消息时不做 compaction
 _MAX_CONSECUTIVE_COMPACTIONS = 3  # 连续 compaction 次数上限（thrashing 保护）
+_COMPACTION_COOLDOWN_STEPS = 3  # compaction 后冷却步数，期间不再触发
 
 _SUMMARIZE_SYSTEM_PROMPT = """\
 You are a conversation summarizer. Condense the given conversation into a \
@@ -91,13 +92,16 @@ class ConversationCompactor:
         min_history: int = _MIN_HISTORY_BEFORE_COMPACT,
         backend: "LLMBackend | None" = None,
         max_consecutive: int = _MAX_CONSECUTIVE_COMPACTIONS,
+        cooldown_steps: int = _COMPACTION_COOLDOWN_STEPS,
     ) -> None:
         self._trigger_ratio = trigger_ratio
         self._compact_budget = compact_budget
         self._min_history = min_history
         self._backend = backend
         self._max_consecutive = max_consecutive
+        self._cooldown_steps = cooldown_steps
         self._consecutive_compactions = 0
+        self._steps_since_last_compact = cooldown_steps  # 初始允许触发
 
     # ------------------------------------------------------------------
     # 判断是否需要 compaction
@@ -111,6 +115,10 @@ class ConversationCompactor:
     def reset_thrashing_counter(self) -> None:
         """重置 thrashing 计数器（用户主动输入后调用）。"""
         self._consecutive_compactions = 0
+
+    def tick_step(self) -> None:
+        """每步调用一次，推进冷却计数器。"""
+        self._steps_since_last_compact += 1
 
     def should_compact(
         self,
@@ -139,6 +147,10 @@ class ConversationCompactor:
                 self._consecutive_compactions,
             )
             return False
+
+        if self._steps_since_last_compact < self._cooldown_steps:
+            return False
+
         total_tokens = sum(
             estimate_tokens(m.get("content", "")) for m in history_dicts
         )
@@ -175,6 +187,7 @@ class ConversationCompactor:
             return history_dicts
 
         self._consecutive_compactions += 1
+        self._steps_since_last_compact = 0
 
         budget = max_tokens or self._compact_budget
         first = history_dicts[0]  # 保留首条任务描述

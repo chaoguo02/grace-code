@@ -53,10 +53,6 @@ load_dotenv(_ROOT / ".env")
 from config.schema import load_config, merge_cli_overrides   # noqa: E402
 from llm.router import create_backend_from_config            # noqa: E402
 
-# 模块级 import（供 patch 使用）
-from config.schema import load_config, merge_cli_overrides  # noqa: E402
-from llm.router import create_backend_from_config           # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # 辅助：彩色输出
@@ -72,6 +68,55 @@ def cyan(t: str) -> str:   return _c(t, "36")
 def bold(t: str) -> str:   return _c(t, "1")
 def dim(t: str) -> str:    return _c(t, "2")
 def magenta(t: str) -> str: return _c(t, "35")
+
+
+# ---------------------------------------------------------------------------
+# 初始化记忆系统
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+def _init_memory(repo_path: str, config) -> tuple:
+    """
+    初始化记忆系统，返回 (memory_store, memory_context, external_store)。
+    fastembed 不可用时优雅降级：禁用语义搜索，仅保留文件索引。
+    """
+    from memory.store import TwoTierMemoryStore
+    from memory.context import MemoryContext
+
+    retriever = None
+    external_store = None
+    indexer = None
+
+    try:
+        import fastembed as _  # noqa: F401
+        from memory.external_store import ExternalMemoryStore
+        from memory.indexer import MemoryIndexer
+        from memory.retriever import ProactiveRetriever
+
+        external_store = ExternalMemoryStore()
+        indexer = MemoryIndexer(external_store)
+        retriever = ProactiveRetriever(external_store, max_chunks=5, max_tokens=2000)
+    except ImportError:
+        logger.info(
+            "fastembed not installed — semantic memory search disabled. "
+            "Install: pip install 'coding-agent[rag]'"
+        )
+
+    memory_store = TwoTierMemoryStore(
+        repo_path=repo_path,
+        memory_dir=config.memory.directory or None,
+        max_index_lines=config.memory.max_index_lines,
+        indexer=indexer,
+    )
+    memory_context = MemoryContext(
+        store=memory_store,
+        max_lines=config.memory.max_index_lines,
+        enabled=config.memory.enabled,
+        retriever=retriever,
+    )
+    return memory_store, memory_context, external_store
 
 
 # ---------------------------------------------------------------------------
@@ -381,27 +426,7 @@ def run(
     memory_context = None
     external_store = None
     if config.memory.enabled:
-        from memory.store import TwoTierMemoryStore
-        from memory.context import MemoryContext
-        from memory.external_store import ExternalMemoryStore
-        from memory.indexer import MemoryIndexer
-        from memory.retriever import ProactiveRetriever
-
-        external_store = ExternalMemoryStore()
-        indexer = MemoryIndexer(external_store)
-        memory_store = TwoTierMemoryStore(
-            repo_path=str(repo_path),
-            memory_dir=config.memory.directory or None,
-            max_index_lines=config.memory.max_index_lines,
-            indexer=indexer,
-        )
-        retriever = ProactiveRetriever(external_store, max_chunks=5, max_tokens=2000)
-        memory_context = MemoryContext(
-            store=memory_store,
-            max_lines=config.memory.max_index_lines,
-            enabled=config.memory.enabled,
-            retriever=retriever,
-        )
+        memory_store, memory_context, external_store = _init_memory(str(repo_path), config)
 
     registry = _build_registry(
         config,
@@ -462,9 +487,11 @@ def run(
     )
     click.echo(dim(f"  Mode    : {mode}"))
 
+    from agent.factory import classify_task_intent
     task_obj = Task(
         description=description,
         repo_path=str(repo_path),
+        intent=classify_task_intent(description),
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
     )
@@ -589,27 +616,7 @@ def chat(
     memory_context = None
     external_store = None
     if config.memory.enabled:
-        from memory.store import TwoTierMemoryStore
-        from memory.context import MemoryContext
-        from memory.external_store import ExternalMemoryStore
-        from memory.indexer import MemoryIndexer
-        from memory.retriever import ProactiveRetriever
-
-        external_store = ExternalMemoryStore()
-        indexer = MemoryIndexer(external_store)
-        memory_store = TwoTierMemoryStore(
-            repo_path=str(repo_path),
-            memory_dir=config.memory.directory or None,
-            max_index_lines=config.memory.max_index_lines,
-            indexer=indexer,
-        )
-        retriever = ProactiveRetriever(external_store, max_chunks=5, max_tokens=2000)
-        memory_context = MemoryContext(
-            store=memory_store,
-            max_lines=config.memory.max_index_lines,
-            enabled=config.memory.enabled,
-            retriever=retriever,
-        )
+        memory_store, memory_context, external_store = _init_memory(str(repo_path), config)
 
     # Skill 系统初始化
     from skills.registry import SkillRegistry

@@ -30,8 +30,12 @@ dev = [
 mcp = [
     "mcp>=1.0.0",
 ]
+rag = [
+    "fastembed>=0.3.0",
+]
 full = [
     "tiktoken>=0.7.0",
+    "fastembed>=0.3.0",
     "tree-sitter-javascript>=0.22.0",
     "tree-sitter-typescript>=0.22.0",
     "tree-sitter-go>=0.22.0",

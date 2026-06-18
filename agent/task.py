@@ -76,6 +76,7 @@ class Task:
 
     # 可选
     task_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    intent: str = "edit"                # 任务意图: "edit" (编辑型) | "analysis" (分析型)
     issue_url: str | None = None        # GitHub issue URL，自动修复模式时填入
     test_cmd: str | None = None         # 运行测试的命令，如 "pytest tests/"
     max_steps: int = 40                 # 最大循环步数，超出则熔断

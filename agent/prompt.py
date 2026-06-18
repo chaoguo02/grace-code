@@ -133,14 +133,16 @@ def build_task_prompt(
     description: str,
     repo_path: str,
     issue_url: str | None = None,
+    intent: str = "edit",
 ) -> str:
     """构建任务描述的用户消息。"""
     issue_section = ""
     if issue_url:
         issue_section = _ISSUE_SECTION_TEMPLATE.format(issue_url=issue_url)
 
+    template = "task-analysis.md" if intent == "analysis" else "task.md"
     return _get_assembler().render(
-        "task.md",
+        template,
         repo_path=repo_path,
         description=description.strip(),
         issue_section=issue_section,
