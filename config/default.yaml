@@ -77,4 +77,7 @@ context:
 #     args: ["-y", "@anthropic/mcp-server-brave-search"]
 #     env:
 #       BRAVE_API_KEY: "${BRAVE_API_KEY}"
-mcp_servers: {}
+mcp_servers:
+  demo:
+    command: python
+    args: ["-m", "mcp_servers.demo_server"]

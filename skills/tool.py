@@ -15,6 +15,7 @@ from tools.base import BaseTool, ToolResult
 
 if TYPE_CHECKING:
     from skills.registry import SkillRegistry
+    from skills.buffer import SkillContextBuffer
 
 
 class SkillTool(BaseTool):
@@ -24,12 +25,18 @@ class SkillTool(BaseTool):
     LLM 通过此工具触发 skill：
     1. 调用 use_skill(skill_name="code-review", arguments="...")
     2. SkillTool 从 SkillRegistry 加载并渲染 skill
-    3. 返回 ToolResult，渲染后的 skill 内容作为 output
-    4. Agent 在下一轮看到 skill 内容，按照指示执行
+    3. 通过 SkillContextBuffer 管理上下文用量
+    4. 返回 ToolResult，渲染后的 skill 内容作为 output
+    5. Agent 在下一轮看到 skill 内容，按照指示执行
     """
 
-    def __init__(self, skill_registry: "SkillRegistry") -> None:
+    def __init__(
+        self,
+        skill_registry: "SkillRegistry",
+        buffer: "SkillContextBuffer | None" = None,
+    ) -> None:
         self._registry = skill_registry
+        self._buffer = buffer
 
     @property
     def name(self) -> str:
@@ -81,6 +88,10 @@ class SkillTool(BaseTool):
                 success=False, output="",
                 error=f"Skill '{skill_name}' not found. Available: {', '.join(available)}",
             )
+
+        # 通过 buffer 管理上下文用量
+        if self._buffer:
+            rendered = self._buffer.activate(skill_name, rendered)
 
         return ToolResult(
             success=True,

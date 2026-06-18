@@ -72,7 +72,7 @@ def empty_skills_dir(tmp_path):
 class TestSkillRegistry:
     def test_discover_finds_skills(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         skills = reg.list_skills()
         names = [s.name for s in skills]
         assert "code-review" in names
@@ -84,24 +84,24 @@ class TestSkillRegistry:
 
     def test_discover_empty_dir(self, empty_skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(empty_skills_dir)
+        reg = SkillRegistry(empty_skills_dir, include_builtin=False)
         assert reg.list_skills() == []
 
     def test_discover_nonexistent_dir(self):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry("/nonexistent/path/to/skills")
+        reg = SkillRegistry("/nonexistent/path/to/skills", include_builtin=False)
         assert reg.list_skills() == []
 
     def test_has_skill(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         assert reg.has_skill("code-review")
         assert reg.has_skill("explain-error")
         assert not reg.has_skill("nonexistent")
 
     def test_metadata_parsing(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         skills = {s.name: s for s in reg.list_skills()}
         cr = skills["code-review"]
         assert cr.display_name == "code-review"
@@ -110,7 +110,7 @@ class TestSkillRegistry:
 
     def test_metadata_no_frontmatter(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         skills = {s.name: s for s in reg.list_skills()}
         bare = skills["bare-skill"]
         assert bare.display_name == "bare-skill"
@@ -118,7 +118,7 @@ class TestSkillRegistry:
 
     def test_load_and_render_basic(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         rendered = reg.load_and_render("code-review", "def foo(): pass")
         assert rendered is not None
         assert "def foo(): pass" in rendered
@@ -127,19 +127,19 @@ class TestSkillRegistry:
 
     def test_load_and_render_empty_args(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         rendered = reg.load_and_render("code-review", "")
         assert rendered is not None
         assert "$ARGUMENTS" not in rendered
 
     def test_load_and_render_nonexistent(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         assert reg.load_and_render("nonexistent") is None
 
     def test_load_and_render_no_frontmatter(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         rendered = reg.load_and_render("bare-skill", "hello")
         assert rendered is not None
         assert "hello" in rendered
@@ -147,7 +147,7 @@ class TestSkillRegistry:
 
     def test_format_for_prompt(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         prompt = reg.format_for_prompt()
         assert "## Available Skills" in prompt
         assert "code-review" in prompt
@@ -156,12 +156,12 @@ class TestSkillRegistry:
 
     def test_format_for_prompt_empty(self, empty_skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(empty_skills_dir)
+        reg = SkillRegistry(empty_skills_dir, include_builtin=False)
         assert reg.format_for_prompt() == ""
 
     def test_refresh(self, skills_dir):
         from skills.registry import SkillRegistry
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         assert len(reg.list_skills()) == 3
 
         # 添加新 skill
@@ -186,7 +186,7 @@ class TestSkillTool:
     def test_execute_success(self, skills_dir):
         from skills.registry import SkillRegistry
         from skills.tool import SkillTool
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         tool = SkillTool(reg)
 
         result = tool.execute({"skill_name": "code-review", "arguments": "x = 1"})
@@ -197,7 +197,7 @@ class TestSkillTool:
     def test_execute_not_found(self, skills_dir):
         from skills.registry import SkillRegistry
         from skills.tool import SkillTool
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         tool = SkillTool(reg)
 
         result = tool.execute({"skill_name": "nonexistent"})
@@ -207,7 +207,7 @@ class TestSkillTool:
     def test_execute_no_skill_name(self, skills_dir):
         from skills.registry import SkillRegistry
         from skills.tool import SkillTool
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         tool = SkillTool(reg)
 
         result = tool.execute({"skill_name": ""})
@@ -216,7 +216,7 @@ class TestSkillTool:
     def test_schema_includes_skill_names(self, skills_dir):
         from skills.registry import SkillRegistry
         from skills.tool import SkillTool
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         tool = SkillTool(reg)
 
         schema = tool.parameters_schema
@@ -227,7 +227,7 @@ class TestSkillTool:
     def test_tool_name_and_description(self, skills_dir):
         from skills.registry import SkillRegistry
         from skills.tool import SkillTool
-        reg = SkillRegistry(skills_dir)
+        reg = SkillRegistry(skills_dir, include_builtin=False)
         tool = SkillTool(reg)
 
         assert tool.name == "use_skill"
@@ -247,7 +247,7 @@ class TestFrontmatterParsing:
             '---\nname: "quoted-name"\ndescription: \'single quoted\'\n---\nBody.',
             encoding="utf-8",
         )
-        reg = SkillRegistry(str(tmp_path))
+        reg = SkillRegistry(str(tmp_path), include_builtin=False)
         skills = reg.list_skills()
         assert len(skills) == 1
         assert skills[0].display_name == "quoted-name"
@@ -261,7 +261,7 @@ class TestFrontmatterParsing:
             "---\nname: multi\ndescription: test\n---\n\nLine 1\nLine 2\n$ARGUMENTS\nLine 3",
             encoding="utf-8",
         )
-        reg = SkillRegistry(str(tmp_path))
+        reg = SkillRegistry(str(tmp_path), include_builtin=False)
         rendered = reg.load_and_render("multi", "REPLACED")
         assert "Line 1" in rendered
         assert "REPLACED" in rendered
@@ -276,7 +276,7 @@ class TestFrontmatterParsing:
             "---\nname: broken\nThis has no closing ---\nJust body text.",
             encoding="utf-8",
         )
-        reg = SkillRegistry(str(tmp_path))
+        reg = SkillRegistry(str(tmp_path), include_builtin=False)
         # 没有闭合的 --- 应该把整个内容当作 body
         skills = reg.list_skills()
         assert len(skills) == 1

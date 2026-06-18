@@ -149,21 +149,23 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
         registry.register(MemorySearchTool(external_store))
 
     # 注册 MCP 工具（从配置中读取 mcp_servers 并连接）
+    mcp_manager = None
     mcp_servers_cfg = getattr(cfg, "mcp_servers", {}) or {}
     if mcp_servers_cfg:
         logger = logging.getLogger("cli")
         logger.info("Connecting to MCP servers: %s", list(mcp_servers_cfg.keys()))
         try:
             from tools.mcp_client import create_manager_from_config
-            manager = create_manager_from_config(mcp_servers_cfg)
-            proxies = manager.connect_and_discover_sync()
+            mcp_manager = create_manager_from_config(mcp_servers_cfg)
+            proxies = mcp_manager.connect_and_discover_sync()
             for proxy in proxies:
                 registry.register(proxy)
             logger.info("MCP tools registered: %s", [p.name for p in proxies])
         except Exception as exc:
             logger.warning("Failed to connect MCP servers: %s", exc)
-            # MCP 连接失败不阻塞 agent 启动，继续使用本地工具
+            mcp_manager = None
 
+    registry._mcp_manager = mcp_manager
     return registry
 
 
@@ -736,6 +738,84 @@ def chat(
                     m = getattr(session, "_model", "?")
                     p = getattr(session, "_provider", "?")
                     click.echo(dim(f"  Current: {m} (provider: {p})\n  Usage: /model <model-name>"))
+            elif cmd.startswith("/skill"):
+                parts = user_input.strip().split(maxsplit=2)
+                subcmd = parts[1] if len(parts) > 1 else "list"
+                if subcmd == "list":
+                    skills = skill_registry.list_skills()
+                    if not skills:
+                        click.echo(dim("  No skills available."))
+                    else:
+                        click.echo(dim(f"  Available skills ({len(skills)}):"))
+                        for s in skills:
+                            triggers = ", ".join(s.triggers[:3]) if s.triggers else ""
+                            trigger_info = f" [triggers: {triggers}]" if triggers else ""
+                            click.echo(dim(f"    /{s.name:<14} — {s.description or '(no description)'}{trigger_info}"))
+                elif subcmd == "show":
+                    skill_name = parts[2] if len(parts) > 2 else ""
+                    if not skill_name:
+                        click.echo(dim("  Usage: /skill show <name>"))
+                    else:
+                        body = skill_registry.get_skill_detail(skill_name)
+                        if body:
+                            click.echo(f"\n{body}\n")
+                        else:
+                            click.echo(dim(f"  Skill '{skill_name}' not found."))
+                elif subcmd == "reload":
+                    skill_registry.refresh()
+                    click.echo(dim(f"  Reloaded. {len(skill_registry.list_skills())} skills discovered."))
+                else:
+                    click.echo(dim("  Usage: /skill list | /skill show <name> | /skill reload"))
+            elif cmd.startswith("/mcp"):
+                parts = user_input.strip().split(maxsplit=2)
+                subcmd = parts[1] if len(parts) > 1 else ""
+                if hasattr(registry, '_mcp_manager') and registry._mcp_manager:
+                    mgr = registry._mcp_manager
+                    if not subcmd:
+                        click.echo(dim(f"  MCP servers: {len(mgr._configs)} configured, {len(mgr.proxies)} tools loaded"))
+                        for cfg in mgr._configs:
+                            tool_count = sum(1 for p in mgr.proxies if getattr(p, '_server_name', None) == cfg.name)
+                            click.echo(dim(f"    {cfg.name}: {tool_count} tools"))
+                        resources_count = sum(len(v) for v in getattr(mgr, '_resources', {}).values())
+                        templates_count = sum(len(v) for v in getattr(mgr, '_resource_templates', {}).values())
+                        if resources_count or templates_count:
+                            click.echo(dim(f"  Resources: {resources_count} static, {templates_count} templates"))
+                    elif subcmd == "resources":
+                        resources = getattr(mgr, '_resources', {})
+                        templates = getattr(mgr, '_resource_templates', {})
+                        has_any = any(resources.values()) or any(templates.values())
+                        if not has_any:
+                            click.echo(dim("  No resources available."))
+                        else:
+                            for server, res_list in resources.items():
+                                if res_list:
+                                    click.echo(dim(f"  [{server}] Resources:"))
+                                    for r in res_list:
+                                        uri = getattr(r, 'uri', str(r))
+                                        name = getattr(r, 'name', '')
+                                        click.echo(dim(f"    {uri}  {name}"))
+                            for server, tpl_list in templates.items():
+                                if tpl_list:
+                                    click.echo(dim(f"  [{server}] Templates:"))
+                                    for t in tpl_list:
+                                        uri_tpl = getattr(t, 'uriTemplate', str(t))
+                                        name = getattr(t, 'name', '')
+                                        click.echo(dim(f"    {uri_tpl}  {name}"))
+                    elif subcmd == "prompts":
+                        prompts = getattr(mgr, '_prompts', {})
+                        if not prompts:
+                            click.echo(dim("  No prompts available."))
+                        else:
+                            for server, prompt_list in prompts.items():
+                                click.echo(dim(f"  [{server}]"))
+                                for p in prompt_list:
+                                    pname = getattr(p, 'name', str(p))
+                                    pdesc = getattr(p, 'description', '')
+                                    click.echo(dim(f"    {pname}: {pdesc}"))
+                    else:
+                        click.echo(dim("  Usage: /mcp | /mcp resources | /mcp prompts"))
+                else:
+                    click.echo(dim("  No MCP servers configured."))
             elif cmd == "/help":
                 help_lines = [
                     "  Commands:",
@@ -745,14 +825,16 @@ def chat(
                     "    /compact — compress conversation to save context",
                     "    /mode    — show or switch agent mode (react|plan|dag|multi-agent|auto)",
                     "    /model   — show or switch LLM model",
+                    "    /skill   — list/show/reload skills",
+                    "    /mcp     — show MCP server status",
                     "    /help    — show this help",
                 ]
                 # 列出可用 skills
                 skills = skill_registry.list_skills()
                 if skills:
-                    help_lines.append("  Skills:")
+                    help_lines.append("  Skills (type /name to activate):")
                     for s in skills:
-                        help_lines.append(f"    /{s.name:<12} — {s.description or '(no description)'}")
+                        help_lines.append(f"    /{s.name:<14} — {s.description or '(no description)'}")
                 help_lines.append("  Anything else is sent to the agent.")
                 click.echo(dim("\n".join(help_lines)))
             else:
