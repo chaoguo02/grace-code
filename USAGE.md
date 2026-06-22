@@ -412,6 +412,17 @@ cat logs/abc12345_*.jsonl | jq 'select(.event_type=="action") | .payload.action.
 cat logs/abc12345_*.jsonl | jq 'select(.event_type=="action") | .payload.action.tool_call.name' | sort | uniq -c
 ```
 
+### 工具耗时统计
+
+`ToolRegistry` 会自动记录工具执行耗时。适合定位慢工具、异常重试或不必要的探索：
+
+```python
+stats = registry.get_timing_stats()
+registry.reset_timing_stats()
+```
+
+每个工具包含 `calls`、`failures`、`total_duration_ms`、`avg_duration_ms`、`min_duration_ms`、`max_duration_ms`。单次执行结果的耗时也保存在 `ToolResult.duration_ms`。
+
 ---
 
 ## 8. 安全机制
@@ -592,8 +603,13 @@ agent chat --verbose
 
 **Q：测试失败后 agent 怎么处理**
 
-内置 Reflection 机制：测试失败时 agent 会自动重新分析错误原因，
-尝试不同的修复策略，最多继续尝试直到达到 `max_steps` 上限。
+内置 Reflection 机制会先区分 pytest 退出码，再决定是否进入修复流程：
+
+- `exit code 1`：现有测试失败，agent 会分析 traceback 并尝试修复根因。
+- `exit code 4`：pytest 使用错误，常见于指定测试路径不存在；agent 会停止并报告缺失路径，不会擅自创建测试文件。
+- `exit code 5`：未收集到测试；agent 会报告 no tests collected，不会擅自补测试。
+
+真正的测试失败会继续尝试修复，直到完成或达到 `max_steps` / token 预算上限。
 
 **Q：修改了文件但不满意，怎么撤销**
 
@@ -609,6 +625,11 @@ git checkout -- src/foo.py # 撤销特定文件
 ```bash
 # 用 flash 版本替代 pro 版本
 agent chat --model deepseek-v4-flash
+
+# 尽量指定文件、函数、测试路径，避免全仓库探索
+agent run --task "只修改 tools/base.py 的 ToolRegistry，添加工具耗时统计"
+
+# 如果任务指向单个文件，agent 会优先只读该文件；若功能已存在，会直接结束
 
 # 缩小 repo-map 预算（减少上下文注入量）
 # 编辑 config/default.yaml：

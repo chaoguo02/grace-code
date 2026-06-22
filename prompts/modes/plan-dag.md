@@ -19,10 +19,10 @@ Respond with ONLY a JSON object in this exact format:
 {{
   "reasoning": "Brief explanation of your approach",
   "plan": [
-    {{"id": "1", "description": "Specific action...", "expected_outcome": "...", "depends_on": []}},
-    {{"id": "2", "description": "Specific action...", "expected_outcome": "...", "depends_on": ["1"]}},
-    {{"id": "3", "description": "Another action...", "expected_outcome": "...", "depends_on": ["1"]}},
-    {{"id": "4", "description": "Final verify...", "expected_outcome": "...", "depends_on": ["2", "3"]}}
+    {{"id": "1", "type": "analysis", "description": "Specific analysis...", "expected_outcome": "...", "depends_on": []}},
+    {{"id": "2", "type": "file_write", "description": "Specific file edit...", "expected_outcome": "...", "depends_on": ["1"]}},
+    {{"id": "3", "type": "command", "description": "Run a targeted command...", "expected_outcome": "...", "depends_on": ["1"]}},
+    {{"id": "4", "type": "verification", "description": "Final verify...", "expected_outcome": "...", "depends_on": ["2", "3"]}}
   ]
 }}
 ```
@@ -30,9 +30,11 @@ Respond with ONLY a JSON object in this exact format:
 ## Rules
 - 2-7 subtasks total
 - Each subtask MUST have a unique "id" (string)
+- "type" MUST be one of: planning, file_read, file_write, command, analysis, verification
+- Use planning for planning/decision nodes, file_read for information gathering, file_write for edits, command for shell/test commands, analysis for intermediate reasoning, verification for final checks
 - "depends_on" is a list of subtask ids that must complete before this one starts
 - Subtasks with empty depends_on run in the first layer (no prerequisites)
 - Each description MUST mention specific files or functions
-- The last subtask should verify changes (run tests)
+- The last subtask should be type verification and verify changes (run tests or targeted checks)
 - Use depends_on to express true data/order dependencies, NOT artificial sequencing
 - Subtasks that can run independently SHOULD have no dependency between them

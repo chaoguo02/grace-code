@@ -81,6 +81,14 @@ class CodeIndexConfig:
 
 
 @dataclass
+class PlanCfg:
+    enable_replan: bool = False
+    max_replans: int = 1
+    allow_parallel_verification: bool = False
+    allow_parallel_commands: bool = False
+
+
+@dataclass
 class MultiAgentCfg:
     worker_model: str = ""
     worker_provider: str = ""
@@ -113,6 +121,7 @@ class AppConfig:
     agent: AgentCfg = field(default_factory=AgentCfg)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    plan: PlanCfg = field(default_factory=PlanCfg)
     multi_agent: MultiAgentCfg = field(default_factory=MultiAgentCfg)
     context: ContextConfig = field(default_factory=ContextConfig)
     hitl: HitlConfig = field(default_factory=HitlConfig)
@@ -171,6 +180,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     agent_raw = data.get("agent", {})
     tools_raw = data.get("tools", {})
     memory_raw = data.get("memory", {})
+    plan_raw = data.get("plan", {})
     multi_agent_raw = data.get("multi_agent", {})
     context_raw = data.get("context", {})
 
@@ -213,6 +223,13 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         auto_memory=bool(memory_raw.get("auto_memory", True)),
     )
 
+    plan = PlanCfg(
+        enable_replan=bool(plan_raw.get("enable_replan", False)),
+        max_replans=int(plan_raw.get("max_replans", 1)),
+        allow_parallel_verification=bool(plan_raw.get("allow_parallel_verification", False)),
+        allow_parallel_commands=bool(plan_raw.get("allow_parallel_commands", False)),
+    )
+
     multi_agent = MultiAgentCfg(
         worker_model=multi_agent_raw.get("worker_model", "") or "",
         worker_provider=multi_agent_raw.get("worker_provider", "") or "",
@@ -240,7 +257,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
 
     return AppConfig(
         llm=llm, agent=agent, tools=tools,
-        memory=memory, multi_agent=multi_agent,
+        memory=memory, plan=plan, multi_agent=multi_agent,
         context=context, mcp_servers=mcp_servers,
     )
 

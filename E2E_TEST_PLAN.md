@@ -105,7 +105,7 @@ grep -i "TASK ANCHOR\|Current Task" logs/*.jsonl | tail -5
 
 ## D. 循环检测 + Reflection
 
-### D1. Reflection 触发（测试失败场景）
+### D1. Pytest guardrail（指定测试路径不存在）
 **命令：**
 ```bash
 python -m entry.cli run --repo . --task "运行 pytest tests/test_compaction.py 如果有失败就修复" --max-steps 20
@@ -119,9 +119,10 @@ python -m entry.cli log show logs/<最新文件>.jsonl
 ```
 
 **预期：**
-- [ ] 如果测试通过：agent 正常 finish
-- [ ] 如果测试失败：日志中出现 `reflection` 类型事件
-- [ ] reflection 内容包含对失败原因的分析
+- [ ] pytest 返回 exit code 4 时，agent 报告 `tests/test_compaction.py` 不存在
+- [ ] agent 不创建 `tests/test_compaction.py`
+- [ ] agent 不把缺失测试文件扩展成“补测试”任务
+- [ ] agent 不继续读取无关实现文件或反复搜索到 token 熔断
 
 ### D2. 循环检测
 **命令：**

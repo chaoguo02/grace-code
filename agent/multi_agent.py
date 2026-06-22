@@ -387,14 +387,7 @@ class SubAgentExecutor:
         from tools.base import ToolRegistry
 
         allowed = ROLE_TOOL_WHITELIST.get(role, frozenset())
-        filtered = ToolRegistry()
-
-        for tool_name in self._full_registry.tool_names:
-            if tool_name in allowed:
-                tool = self._full_registry._tools[tool_name]
-                filtered._tools[tool_name] = tool
-
-        return filtered
+        return self._full_registry.filtered(allowed)
 
 
 # ---------------------------------------------------------------------------

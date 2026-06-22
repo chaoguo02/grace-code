@@ -27,6 +27,12 @@ memory:
   max_index_lines: 50 # MEMORY.md 每次注入上下文的最大行数
   auto_memory: true # 是否允许 agent 自主写入记忆
 
+plan:
+  enable_replan: false # DAG 失败后是否自动重新规划剩余任务
+  max_replans: 1 # 单次 DAG 执行最多重新规划次数
+  allow_parallel_verification: false # 是否允许 verification 同层并行（默认关闭）
+  allow_parallel_commands: false # 是否允许 command 同层并行（默认关闭）
+
 multi_agent:
   worker_model: "" # 子 Agent 使用的模型（空=与 Coordinator 同款）
   worker_provider: "" # 子 Agent 的 provider（空=与 Coordinator 同款）

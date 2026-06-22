@@ -211,6 +211,14 @@ class ToolRegistry:
     def tool_names(self) -> list[str]:
         return list(self._tools.keys())
 
+    def filtered(self, allowed_tools: set[str] | frozenset[str]) -> "ToolRegistry":
+        """返回只包含指定工具的新注册表，保留 HITL 管理器但不共享统计数据。"""
+        filtered = ToolRegistry(hitl_manager=self._hitl_manager)
+        for tool_name in self.tool_names:
+            if tool_name in allowed_tools:
+                filtered._tools[tool_name] = self._tools[tool_name]
+        return filtered
+
     def __contains__(self, name: str) -> bool:
         return name in self._tools
 

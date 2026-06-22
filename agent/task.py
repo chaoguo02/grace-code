@@ -30,9 +30,12 @@ class EventType(str, Enum):
     OBSERVATION      = "observation"
     REFLECTION       = "reflection"
     PLAN_GENERATED   = "plan_generated"
+    REPLAN_GENERATED = "replan_generated"
+    DAG_GRAPH        = "dag_graph"
     SUBTASK_START    = "subtask_start"
     SUBTASK_COMPLETE = "subtask_complete"
     SUBTASK_FAILED   = "subtask_failed"
+    SUBTASK_SKIPPED  = "subtask_skipped"
     TASK_COMPLETE    = "task_complete"
     TASK_FAILED      = "task_failed"
 

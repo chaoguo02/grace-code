@@ -346,6 +346,8 @@ def _build_multi_config(config, auto_approve: bool = False) -> "MultiAgentConfig
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto"]), help="Agent mode: react, plan, dag, multi-agent, or auto")
 @click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
+@click.option("--replan", is_flag=True, default=False, help="Enable one or more DAG replans after subtask failure")
+@click.option("--max-replans", default=None, type=int, help="Maximum DAG replan attempts")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -363,6 +365,8 @@ def run(
     sandbox: bool,
     mode: str,
     auto_approve: bool,
+    replan: bool,
+    max_replans: int | None,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -477,9 +481,20 @@ def run(
         rend.on_plan_rejected()
         return False
 
+    from agent.plan import PlanExecuteConfig
+    plan_cfg = PlanExecuteConfig(
+        plan_subtask_log_dir=f"{config.agent.log_dir}/subtasks",
+        plan_approval_callback=_plan_approval_cb,
+        enable_replan=bool(replan or config.plan.enable_replan),
+        max_replans=max_replans if max_replans is not None else config.plan.max_replans,
+        allow_parallel_verification=config.plan.allow_parallel_verification,
+        allow_parallel_commands=config.plan.allow_parallel_commands,
+    )
+
     multi_cfg = _build_multi_config(config, auto_approve=auto_approve) if mode == "multi-agent" else None
     agent = create_agent(
         mode, backend, registry, agent_config,
+        plan_config=plan_cfg,
         task_description=description,
         plan_approval_callback=_plan_approval_cb,
         memory_context=memory_context,

@@ -10,11 +10,13 @@ DAG-based Plan Executor.
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
 from agent.event_log import EventLog
-from agent.plan import Plan, PlanGenerationError, SubTask
+from agent.plan import Plan, PlanGenerationError, SubTask, SubTaskStatus, SubTaskType
 from agent.task import RunResult, RunStatus, Task
 from context.history import ConversationHistory
 from llm.base import LLMMessage
@@ -27,6 +29,29 @@ if TYPE_CHECKING:
     from tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+_READONLY_TOOLS = frozenset({
+    "file_read", "file_view", "find_files", "find_symbol", "search_text",
+    "git_status", "git_diff", "web_search", "web_fetch",
+})
+
+SUBTASK_TOOL_WHITELIST: dict[SubTaskType, frozenset[str]] = {
+    SubTaskType.PLANNING: _READONLY_TOOLS,
+    SubTaskType.FILE_READ: frozenset({
+        "file_read", "file_view", "find_files", "find_symbol", "search_text", "git_status", "git_diff",
+    }),
+    SubTaskType.ANALYSIS: _READONLY_TOOLS,
+    SubTaskType.FILE_WRITE: _READONLY_TOOLS | frozenset({"file_write", "file_edit", "edit"}),
+    SubTaskType.COMMAND: _READONLY_TOOLS | frozenset({"shell", "test", "pytest"}),
+    SubTaskType.VERIFICATION: _READONLY_TOOLS | frozenset({"shell", "test", "pytest"}),
+}
+
+PARALLEL_SAFE_TYPES = frozenset({
+    SubTaskType.PLANNING,
+    SubTaskType.FILE_READ,
+    SubTaskType.ANALYSIS,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +127,110 @@ def validate_dag(subtasks: list[SubTask]) -> None:
 # 拓扑分层
 # ---------------------------------------------------------------------------
 
+def normalize_dag(subtasks: list[SubTask]) -> None:
+    """根据 depends_on 自动补齐 dependents，避免要求 LLM 维护双向依赖。"""
+    id_to_task = {st.id: st for st in subtasks}
+    for st in subtasks:
+        st.dependents = []
+    for st in subtasks:
+        for dep in st.depends_on:
+            if dep in id_to_task and st.id not in id_to_task[dep].dependents:
+                id_to_task[dep].dependents.append(st.id)
+
+
+def compute_critical_path(subtasks: list[SubTask]) -> tuple[list[str], float]:
+    """基于 subtask.duration_ms 计算 DAG 最长耗时路径。"""
+    if not subtasks:
+        return [], 0.0
+
+    id_to_task = {st.id: st for st in subtasks}
+    layers = topological_layers(subtasks)
+    best_duration: dict[str, float] = {}
+    previous: dict[str, str | None] = {}
+
+    for layer in layers:
+        for st in layer:
+            upstream = [dep for dep in st.depends_on if dep in id_to_task]
+            if upstream:
+                best_dep = max(upstream, key=lambda dep: best_duration.get(dep, 0.0))
+                best_duration[st.id] = best_duration.get(best_dep, 0.0) + st.duration_ms
+                previous[st.id] = best_dep
+            else:
+                best_duration[st.id] = st.duration_ms
+                previous[st.id] = None
+
+    end_id = max(best_duration, key=best_duration.get)
+    path = []
+    cursor: str | None = end_id
+    while cursor is not None:
+        path.append(cursor)
+        cursor = previous.get(cursor)
+    path.reverse()
+    return path, best_duration[end_id]
+
+
+def _extract_declared_paths(subtask: SubTask) -> set[str]:
+    """从子任务描述中保守提取文件路径，用于冲突检测辅助。"""
+    pattern = r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+|[A-Za-z0-9_.-]+\.[A-Za-z0-9_]+"
+    return {match.replace("\\", "/") for match in re.findall(pattern, subtask.description)}
+
+
+def _has_path_conflicts(layer: list[SubTask]) -> bool:
+    seen: set[str] = set()
+    for subtask in layer:
+        if subtask.type != SubTaskType.FILE_WRITE:
+            continue
+        paths = _extract_declared_paths(subtask)
+        if seen.intersection(paths):
+            return True
+        seen.update(paths)
+    return False
+
+
+def build_replan_context(plan: Plan, failure_reason: str) -> str:
+    """构建重新规划上下文：已完成、失败、跳过和失败原因。"""
+    completed = [st for st in plan.subtasks if st.status == SubTaskStatus.COMPLETED]
+    failed = [st for st in plan.subtasks if st.status == SubTaskStatus.FAILED]
+    skipped = [st for st in plan.subtasks if st.status == SubTaskStatus.SKIPPED]
+
+    parts = [f"Failure reason:\n{failure_reason}"]
+    if completed:
+        parts.append("Completed subtasks:")
+        parts.extend(f"- {st.id} ({st.type.value}): {st.result_summary[:200]}" for st in completed)
+    if failed:
+        parts.append("Failed subtasks:")
+        parts.extend(f"- {st.id} ({st.type.value}): {(st.error or st.result_summary)[:200]}" for st in failed)
+    if skipped:
+        parts.append("Skipped downstream subtasks:")
+        parts.extend(f"- {st.id} ({st.type.value}): {st.skip_reason[:200]}" for st in skipped)
+    parts.append("Replan constraints:\n- Do not repeat completed subtasks.\n- Plan only the remaining work.\n- Keep dependencies valid and minimal.")
+    return "\n".join(parts)
+
+
+def render_dag_mermaid(subtasks: list[SubTask], critical_path: list[str] | None = None) -> str:
+    """生成 Mermaid DAG 文本，用于日志/摘要中的依赖图展示。"""
+    critical_edges = set()
+    if critical_path:
+        critical_edges = set(zip(critical_path, critical_path[1:]))
+
+    lines = ["graph TD"]
+    for st in subtasks:
+        label = f"{st.id} {st.type.value}\\n{st.status.value} {st.duration_ms:.0f}ms"
+        lines.append(f"  {st.id}[\"{label}\"]")
+    edge_index = 0
+    critical_edge_indexes = []
+    for st in subtasks:
+        for dep in st.depends_on:
+            edge = f"  {dep} --> {st.id}"
+            lines.append(edge)
+            if (dep, st.id) in critical_edges:
+                critical_edge_indexes.append(edge_index)
+            edge_index += 1
+    for idx in critical_edge_indexes:
+        lines.append(f"  linkStyle {idx} stroke:#f66,stroke-width:3px")
+    return "\n".join(lines)
+
+
 def topological_layers(subtasks: list[SubTask]) -> list[list[SubTask]]:
     """
     将 subtask 列表按拓扑排序分层。
@@ -134,6 +263,105 @@ def topological_layers(subtasks: list[SubTask]) -> list[list[SubTask]]:
         current = next_level
 
     return layers
+
+
+# ---------------------------------------------------------------------------
+# DAGPlanner
+# ---------------------------------------------------------------------------
+
+class DAGPlanner:
+    """负责生成和重新生成 DAG Plan，执行器只消费已解析的 Plan。"""
+
+    def __init__(
+        self,
+        backend: "LLMBackend",
+        registry: "ToolRegistry",
+        agent_config: "AgentConfig",
+        plan_config: "PlanExecuteConfig",
+        memory_context: "MemoryContext | None" = None,
+    ) -> None:
+        self._backend = backend
+        self._registry = registry
+        self._cfg = agent_config
+        self._plan_cfg = plan_config
+        self._memory_context = memory_context
+
+    def create_plan(self, task: Task) -> tuple[Plan | None, int, int]:
+        """用只读 ReActAgent 探索并生成结构化 DAG Plan。"""
+        from agent.prompt import get_dag_plan_prompt
+
+        prompt = (
+            f"{get_dag_plan_prompt()}\n\n"
+            f"## Repository\n{task.repo_path}\n\n"
+            f"## Task\n{task.description}\n\n"
+            f"Explore the codebase and produce a DAG execution plan. "
+            f"Stop calling tools and respond with the JSON plan when ready."
+        )
+        return self._run_planning_agent(task, prompt)
+
+    def replan(
+        self,
+        original_task: Task,
+        failed_plan: Plan,
+        failure_reason: str,
+    ) -> tuple[Plan | None, int, int]:
+        """基于已完成进度和失败原因，为剩余工作重新规划。"""
+        from agent.prompt import get_dag_plan_prompt
+
+        context = build_replan_context(failed_plan, failure_reason)
+        prompt = (
+            f"{get_dag_plan_prompt()}\n\n"
+            "[REPLAN MODE] Replan ONLY the remaining work. Do not repeat completed subtasks.\n\n"
+            f"## Original Task\n{original_task.description}\n\n"
+            f"## Current Execution Context\n{context}\n\n"
+            "Produce a new JSON DAG plan for the remaining work only."
+        )
+        return self._run_planning_agent(original_task, prompt)
+
+    def _run_planning_agent(self, task: Task, prompt: str) -> tuple[Plan | None, int, int]:
+        from agent.core import ReActAgent
+
+        agent = ReActAgent(
+            self._backend, self._registry, self._cfg,
+            memory_context=self._memory_context,
+        )
+        history = ConversationHistory(max_messages=self._cfg.history_max_messages)
+        history.add(LLMMessage(role="user", content=prompt))
+        agent._pending_history = history
+
+        plan_steps = min(8, max(5, task.max_steps // 3))
+        plan_task = Task(
+            description=task.description,
+            repo_path=task.repo_path,
+            max_steps=plan_steps,
+            budget_tokens=task.budget_tokens // 3,
+        )
+
+        agent.switch_to_plan_mode()
+        plan_log = EventLog.create(plan_task, log_dir=self._plan_cfg.plan_subtask_log_dir)
+        plan_result = agent.run(plan_task, plan_log)
+        plan_log.close()
+
+        plan_text = plan_result.summary or ""
+        if not plan_text.strip():
+            logger.warning("DAG plan generation produced empty result")
+            return None, 0, 0
+
+        try:
+            plan = Plan.from_dag_json(plan_text, task.description)
+            validate_dag(plan.subtasks)
+            normalize_dag(plan.subtasks)
+        except (PlanGenerationError, DAGValidationError) as e:
+            logger.warning("DAG plan validation failed: %s — trying fallback JSON parse", e)
+            try:
+                plan = Plan.from_json(plan_text, task.description)
+                validate_dag(plan.subtasks)
+                normalize_dag(plan.subtasks)
+            except (PlanGenerationError, DAGValidationError):
+                logger.warning("Fallback JSON parse also failed — falling back to react")
+                return None, plan_result.total_tokens, plan_result.steps_taken
+
+        return plan, plan_result.total_tokens, plan_result.steps_taken
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +405,11 @@ class DAGPlanExecutor:
         logger.info("DAGPlanExecutor starting task %s", task.task_id)
 
         # Phase 1: 生成 DAG Plan
-        plan, plan_tokens, plan_steps = self._generate_plan(task, log)
+        planner = DAGPlanner(
+            self._backend, self._registry, self._cfg, self._plan_cfg,
+            memory_context=self._memory_context,
+        )
+        plan, plan_tokens, plan_steps = planner.create_plan(task)
         if plan is None:
             return self._fallback_react(task, log)
 
@@ -205,6 +437,29 @@ class DAGPlanExecutor:
 
         # Phase 3: 执行 DAG
         exec_result = self._execute_dag(plan, task, log, plan_tokens, plan_steps)
+        if (
+            exec_result.status == RunStatus.FAILED
+            and self._plan_cfg.enable_replan
+            and self._plan_cfg.max_replans > 0
+        ):
+            replan_reason = exec_result.summary or exec_result.error or "DAG execution failed"
+            replan, replan_tokens, replan_steps = planner.replan(task, plan, replan_reason)
+            if replan is not None:
+                logger.info("Executing replan with %d subtasks", len(replan.subtasks))
+                log.log_replan_generated(replan, attempt=1, reason=replan_reason)
+                replan_result = self._execute_dag(
+                    replan,
+                    task,
+                    log,
+                    plan_tokens + exec_result.total_tokens + replan_tokens,
+                    plan_steps + exec_result.steps_taken + replan_steps,
+                )
+                replan_result.summary = (
+                    "Original DAG failed; replan #1 executed.\n"
+                    f"Original failure:\n{replan_reason}\n\n"
+                    f"Replan result:\n{replan_result.summary}"
+                )
+                return replan_result
         return exec_result
 
     # ------------------------------------------------------------------
@@ -220,58 +475,11 @@ class DAGPlanExecutor:
         Returns:
             (plan, tokens_used, steps_taken) 或 (None, 0, 0)
         """
-        from agent.core import ReActAgent
-        from agent.prompt import get_dag_plan_prompt
-
-        agent = ReActAgent(
-            self._backend, self._registry, self._cfg,
+        planner = DAGPlanner(
+            self._backend, self._registry, self._cfg, self._plan_cfg,
             memory_context=self._memory_context,
         )
-
-        history = ConversationHistory(max_messages=self._cfg.history_max_messages)
-        dag_prompt = get_dag_plan_prompt()
-        history.add(LLMMessage(
-            role="user",
-            content=(
-                f"{dag_prompt}\n\n"
-                f"## Repository\n{task.repo_path}\n\n"
-                f"## Task\n{task.description}\n\n"
-                f"Explore the codebase and produce a DAG execution plan. "
-                f"Stop calling tools and respond with the JSON plan when ready."
-            ),
-        ))
-        agent._pending_history = history
-
-        plan_steps = min(8, max(5, task.max_steps // 3))
-        plan_task = Task(
-            description=task.description,
-            repo_path=task.repo_path,
-            max_steps=plan_steps,
-            budget_tokens=task.budget_tokens // 3,
-        )
-
-        agent.switch_to_plan_mode()
-        plan_log = EventLog.create(plan_task, log_dir=self._plan_cfg.plan_subtask_log_dir)
-        plan_result = agent.run(plan_task, plan_log)
-        plan_log.close()
-
-        plan_text = plan_result.summary or ""
-        if not plan_text.strip():
-            logger.warning("DAG plan generation produced empty result")
-            return None, 0, 0
-
-        try:
-            plan = Plan.from_dag_json(plan_text, task.description)
-            validate_dag(plan.subtasks)
-        except (PlanGenerationError, DAGValidationError) as e:
-            logger.warning("DAG plan validation failed: %s — trying fallback JSON parse", e)
-            try:
-                plan = Plan.from_json(plan_text, task.description)
-            except PlanGenerationError:
-                logger.warning("Fallback JSON parse also failed — falling back to react")
-                return None, plan_result.total_tokens, plan_result.steps_taken
-
-        return plan, plan_result.total_tokens, plan_result.steps_taken
+        return planner.create_plan(task)
 
     # ------------------------------------------------------------------
     # Phase 3: DAG 执行
@@ -303,45 +511,38 @@ class DAGPlanExecutor:
         for layer_idx, layer in enumerate(layers):
             logger.info("Executing DAG layer %d (%d subtasks)", layer_idx, len(layer))
 
-            for subtask in layer:
-                # 检查上游依赖是否有失败
-                upstream_failed = any(dep in failed_ids for dep in subtask.depends_on)
-                if upstream_failed:
-                    subtask.status = "skipped"
-                    failed_ids.add(subtask.id)
-                    logger.info("Skipping subtask %s (upstream failed)", subtask.id)
-                    continue
-
-                subtask.status = "running"
-                result = self._execute_single_subtask(
-                    subtask, task, id_to_task,
+            runnable = self._prepare_layer(layer, failed_ids, log)
+            if self._can_run_layer_parallel(runnable):
+                results = self._execute_layer_parallel(
+                    runnable, task, id_to_task,
                     budget_tokens=budget_per_subtask,
                     max_steps=steps_per_subtask,
+                    log=log,
+                    total_subtasks=len(plan.subtasks),
                 )
-                total_tokens += result.total_tokens
-                total_steps += result.steps_taken
-
-                if result.is_success():
-                    subtask.status = "done"
-                    subtask.result_summary = result.summary or ""
-                else:
-                    subtask.status = "failed"
-                    subtask.result_summary = result.summary or result.error or "Failed"
-                    failed_ids.add(subtask.id)
-                    logger.warning("Subtask %s failed: %s", subtask.id, subtask.result_summary[:100])
+                for subtask, result in results:
+                    total_tokens += result.total_tokens
+                    total_steps += result.steps_taken
+                    self._finalize_subtask(subtask, result, failed_ids, log)
+            else:
+                for subtask in runnable:
+                    subtask.mark_started()
+                    log.log_subtask_start(subtask, index=total_steps + 1, total=len(plan.subtasks))
+                    result = self._execute_single_subtask(
+                        subtask, task, id_to_task,
+                        budget_tokens=budget_per_subtask,
+                        max_steps=steps_per_subtask,
+                    )
+                    total_tokens += result.total_tokens
+                    total_steps += result.steps_taken
+                    self._finalize_subtask(subtask, result, failed_ids, log)
 
         # 汇总结果
-        done_tasks = [st for st in plan.subtasks if st.status == "done"]
-        failed_tasks = [st for st in plan.subtasks if st.status == "failed"]
-        skipped_tasks = [st for st in plan.subtasks if st.status == "skipped"]
+        completed_tasks = [st for st in plan.subtasks if st.status == SubTaskStatus.COMPLETED]
+        failed_tasks = [st for st in plan.subtasks if st.status == SubTaskStatus.FAILED]
+        skipped_tasks = [st for st in plan.subtasks if st.status == SubTaskStatus.SKIPPED]
 
-        summary_parts = [f"DAG execution complete: {len(done_tasks)} done, "
-                         f"{len(failed_tasks)} failed, {len(skipped_tasks)} skipped."]
-        for st in done_tasks:
-            if st.result_summary:
-                summary_parts.append(f"  [{st.id}] {st.result_summary[:100]}")
-
-        summary = "\n".join(summary_parts)
+        summary = self._build_execution_summary(plan, completed_tasks, failed_tasks, skipped_tasks, log)
 
         if failed_tasks:
             from agent.core import _git_diff
@@ -375,6 +576,7 @@ class DAGPlanExecutor:
         id_to_task: dict[str, SubTask],
         budget_tokens: int,
         max_steps: int,
+        thread_isolated: bool = False,
     ) -> RunResult:
         """在独立 ReActAgent 中执行单个 subtask."""
         from agent.core import AgentConfig, ReActAgent
@@ -388,16 +590,16 @@ class DAGPlanExecutor:
             history_max_messages=self._cfg.history_max_messages,
             llm_max_retries=self._cfg.llm_max_retries,
             llm_retry_delay=self._cfg.llm_retry_delay,
-            stream=self._cfg.stream,
-            stream_callback=self._cfg.stream_callback,
-            thought_callback=self._cfg.thought_callback,
+            stream=False if thread_isolated else self._cfg.stream,
+            stream_callback=None if thread_isolated else self._cfg.stream_callback,
+            thought_callback=None if thread_isolated else self._cfg.thought_callback,
             confirm_dangerous=self._cfg.confirm_dangerous,
             confirm_callback=self._cfg.confirm_callback,
         )
 
         agent = ReActAgent(
-            self._backend, self._registry, cfg,
-            memory_context=self._memory_context,
+            self._backend, self._registry_for_subtask(subtask), cfg,
+            memory_context=None if thread_isolated else self._memory_context,
         )
 
         prompt = build_dag_subtask_prompt(
@@ -424,6 +626,169 @@ class DAGPlanExecutor:
     # 工具方法
     # ------------------------------------------------------------------
 
+    def _prepare_layer(self, layer: list[SubTask], failed_ids: set[str], log: EventLog) -> list[SubTask]:
+        """处理依赖失败的 skipped 节点，返回本层仍需执行的节点。"""
+        runnable = []
+        for subtask in layer:
+            failed_deps = [dep for dep in subtask.depends_on if dep in failed_ids]
+            if failed_deps:
+                reason = f"Skipped because dependency failed: {', '.join(failed_deps)}"
+                subtask.mark_skipped(reason)
+                failed_ids.add(subtask.id)
+                log.log_subtask_skipped(subtask, reason)
+                logger.info("Skipping subtask %s (%s)", subtask.id, reason)
+            else:
+                runnable.append(subtask)
+        return runnable
+
+    def _can_run_layer_parallel(self, layer: list[SubTask]) -> bool:
+        """仅并行明确安全的层；写入/命令并行默认关闭并受冲突检测保护。"""
+        if len(layer) <= 1 or _has_path_conflicts(layer):
+            return False
+        layer_types = {st.type for st in layer}
+        if layer_types.issubset(PARALLEL_SAFE_TYPES):
+            return True
+        if layer_types == {SubTaskType.VERIFICATION}:
+            return self._plan_cfg.allow_parallel_verification
+        if layer_types == {SubTaskType.COMMAND}:
+            return self._plan_cfg.allow_parallel_commands
+        return False
+
+    def _execute_layer_parallel(
+        self,
+        layer: list[SubTask],
+        parent_task: Task,
+        id_to_task: dict[str, SubTask],
+        budget_tokens: int,
+        max_steps: int,
+        log: EventLog,
+        total_subtasks: int,
+    ) -> list[tuple[SubTask, RunResult]]:
+        """并行执行同一拓扑层中的安全子任务。"""
+        results: list[tuple[SubTask, RunResult]] = []
+        max_workers = min(len(layer), 4)
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="dag-layer") as pool:
+            future_to_subtask = {}
+            for subtask in layer:
+                subtask.mark_started()
+                log.log_subtask_start(subtask, index=0, total=total_subtasks)
+                future = pool.submit(
+                    self._execute_single_subtask,
+                    subtask,
+                    parent_task,
+                    id_to_task,
+                    budget_tokens,
+                    max_steps,
+                    True,
+                )
+                future_to_subtask[future] = subtask
+
+            for future in as_completed(future_to_subtask):
+                subtask = future_to_subtask[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = RunResult(
+                        task_id=subtask.id,
+                        status=RunStatus.FAILED,
+                        summary=f"Parallel subtask raised: {exc}",
+                        steps_taken=0,
+                        error=str(exc),
+                    )
+                results.append((subtask, result))
+        return results
+
+    def _finalize_subtask(
+        self,
+        subtask: SubTask,
+        result: RunResult,
+        failed_ids: set[str],
+        log: EventLog,
+    ) -> None:
+        if result.is_success():
+            subtask.mark_completed(result.summary or "")
+            log.log_subtask_complete(subtask, result)
+        else:
+            error = result.summary or result.error or "Failed"
+            subtask.mark_failed(error)
+            log.log_subtask_failed(subtask, result)
+            failed_ids.add(subtask.id)
+            logger.warning("Subtask %s failed: %s", subtask.id, subtask.result_summary[:100])
+
+    def _registry_for_subtask(self, subtask: SubTask) -> "ToolRegistry":
+        """按 SubTaskType 过滤工具，给 DAG 节点提供硬权限边界。"""
+        from tools.base import ToolRegistry
+
+        allowed = SUBTASK_TOOL_WHITELIST.get(subtask.type, _READONLY_TOOLS)
+        return self._registry.filtered(allowed)
+
+    def _build_execution_summary(
+        self,
+        plan: Plan,
+        completed_tasks: list[SubTask],
+        failed_tasks: list[SubTask],
+        skipped_tasks: list[SubTask],
+        log: EventLog,
+    ) -> str:
+        """生成紧凑但可诊断的 DAG 执行摘要。"""
+        summary_parts = [
+            f"DAG execution complete: {len(completed_tasks)} completed, "
+            f"{len(failed_tasks)} failed, {len(skipped_tasks)} skipped."
+        ]
+
+        for st in plan.subtasks:
+            detail = st.result_summary or st.error or st.skip_reason
+            duration = f"{st.duration_ms:.0f}ms" if st.duration_ms else "0ms"
+            line = f"  [{st.id}] {st.type.value} {st.status.value} in {duration}"
+            if detail:
+                line += f": {detail[:120]}"
+            summary_parts.append(line)
+
+        slowest = sorted(
+            [st for st in plan.subtasks if st.duration_ms],
+            key=lambda st: st.duration_ms,
+            reverse=True,
+        )[:3]
+        if slowest:
+            summary_parts.append("Slowest subtasks:")
+            for st in slowest:
+                summary_parts.append(f"  [{st.id}] {st.type.value}: {st.duration_ms:.0f}ms")
+
+        type_stats = self._build_type_stats(plan)
+        if type_stats:
+            summary_parts.append("By type:")
+            summary_parts.extend(type_stats)
+
+        critical_path, critical_duration = compute_critical_path(plan.subtasks)
+        if critical_path:
+            summary_parts.append(
+                f"Critical path: {' -> '.join(critical_path)} ({critical_duration:.0f}ms)"
+            )
+            log.log_dag_graph(
+                render_dag_mermaid(plan.subtasks, critical_path),
+                critical_path,
+                critical_duration,
+            )
+
+        for st in failed_tasks:
+            affected = [dep for dep in st.dependents if dep]
+            if affected:
+                summary_parts.append(f"Subtask {st.id} affected downstream: {', '.join(affected)}")
+
+        return "\n".join(summary_parts)
+
+    def _build_type_stats(self, plan: Plan) -> list[str]:
+        totals: dict[str, dict[str, float | int]] = {}
+        for st in plan.subtasks:
+            stats = totals.setdefault(st.type.value, {"count": 0, "failed": 0, "duration": 0.0})
+            stats["count"] = int(stats["count"]) + 1
+            stats["failed"] = int(stats["failed"]) + (1 if st.status == SubTaskStatus.FAILED else 0)
+            stats["duration"] = float(stats["duration"]) + st.duration_ms
+        return [
+            f"  {typ}: {int(stats['count'])} tasks, {float(stats['duration']):.0f}ms, {int(stats['failed'])} failed"
+            for typ, stats in sorted(totals.items())
+        ]
+
     def _build_upstream_context(
         self, subtask: SubTask, id_to_task: dict[str, SubTask]
     ) -> str:
@@ -431,7 +796,7 @@ class DAGPlanExecutor:
         parts = []
         for dep_id in subtask.depends_on:
             dep = id_to_task.get(dep_id)
-            if dep and dep.status == "done" and dep.result_summary:
+            if dep and dep.status == SubTaskStatus.COMPLETED and dep.result_summary:
                 parts.append(f"[Subtask {dep.id}] {dep.result_summary}")
         return "\n".join(parts)
 

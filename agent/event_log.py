@@ -130,6 +130,30 @@ class EventLog:
             payload={"plan": plan.to_dict()},
         ))
 
+    def log_replan_generated(self, plan: Plan, attempt: int, reason: str) -> None:
+        """DAG 执行失败后生成重新规划。"""
+        self._append(Event(
+            event_type=EventType.REPLAN_GENERATED,
+            task_id=self._current_task_id,
+            payload={
+                "attempt": attempt,
+                "reason": reason,
+                "plan": plan.to_dict(),
+            },
+        ))
+
+    def log_dag_graph(self, mermaid: str, critical_path: list[str], critical_duration_ms: float) -> None:
+        """记录 DAG Mermaid 图和关键路径信息，避免塞进最终 summary。"""
+        self._append(Event(
+            event_type=EventType.DAG_GRAPH,
+            task_id=self._current_task_id,
+            payload={
+                "mermaid": mermaid,
+                "critical_path": critical_path,
+                "critical_duration_ms": critical_duration_ms,
+            },
+        ))
+
     def log_subtask_start(
         self, subtask: SubTask, index: int, total: int
     ) -> None:
@@ -167,6 +191,17 @@ class EventLog:
             payload={
                 "subtask_id": subtask.id,
                 "result": result.to_dict(),
+            },
+        ))
+
+    def log_subtask_skipped(self, subtask: SubTask, reason: str) -> None:
+        """子任务因上游失败等原因被跳过。"""
+        self._append(Event(
+            event_type=EventType.SUBTASK_SKIPPED,
+            task_id=self._current_task_id,
+            payload={
+                "subtask": subtask.to_dict(),
+                "reason": reason,
             },
         ))
 
@@ -316,6 +351,7 @@ def summarize_run(log: EventLog) -> dict:
         "total_events":    len(events),
         "actions":         0,
         "reflections":     0,
+        "subtasks_skipped": 0,
         "tool_calls":      {},   # tool_name -> count
         "observations_ok": 0,
         "observations_err": 0,
@@ -339,6 +375,9 @@ def summarize_run(log: EventLog) -> dict:
 
         elif event.event_type == EventType.REFLECTION:
             stats["reflections"] += 1
+
+        elif event.event_type == EventType.SUBTASK_SKIPPED:
+            stats["subtasks_skipped"] += 1
 
         elif event.event_type in (EventType.TASK_COMPLETE, EventType.TASK_FAILED):
             stats["final_status"] = event.event_type.value
