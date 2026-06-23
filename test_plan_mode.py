@@ -4,6 +4,7 @@ from pathlib import Path
 
 from agent.core import AgentConfig, PlanExecuteAgent
 from agent.event_log import EventLog
+from agent.factory import classify_task_intent
 from agent.plan import PlanApproval, PlanExecuteConfig
 from agent.task import Action, ActionType, RunStatus, Task, ToolCall
 from llm.base import MockBackend
@@ -138,6 +139,10 @@ def test_analysis_execution_cannot_use_disallowed_tool(tmp_path: Path) -> None:
     assert write_tool.calls == []
     errors = [event.payload["observation"].get("error", "") for event in log.replay() if event.event_type.value == "observation"]
     assert any("Tool 'find_files' is blocked by the user's single-file constraint" in error for error in errors)
+
+
+def test_chinese_readme_addition_is_classified_as_edit() -> None:
+    assert classify_task_intent("请给 README 增加一个“本地测试”小节") == "edit"
 
 
 def test_edit_plan_executes_with_full_tools(tmp_path: Path) -> None:

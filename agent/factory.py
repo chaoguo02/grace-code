@@ -133,7 +133,7 @@ def _resolve_mode(mode: str, task_description: str | None) -> str:
 _EDIT_SIGNALS = re.compile(
     r"(fix|bug|error|implement|feature|add|create|write|modify|change|update|refactor|"
     r"rewrite|delete|remove|rename|move|replace|"
-    r"修复|修改|添加|新增|实现|重构|删除|移动|替换|创建|写入)",
+    r"修复|修改|添加|新增|增加|插入|补充|实现|重构|删除|移动|替换|创建|写入|改写|更新)",
     re.IGNORECASE,
 )
 
