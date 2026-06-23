@@ -48,7 +48,7 @@ def test_analysis_plan_executes_with_readonly_tools(tmp_path: Path) -> None:
     registry, read_tool, write_tool = make_registry()
     backend = MockBackend([
         Action(ActionType.FINISH, "plan", message="### Goal\nAnswer from README after approval.\n\n### Constraints\nOnly read README.\n\n### Steps\nRead README and answer.\n\n### Verification\nCite README."),
-        Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": "README.md"})]),
+        Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": str(tmp_path / "README.md")})]),
         Action(ActionType.FINISH, "answer", message="Forge Agent — a local autonomous coding agent."),
     ])
     task = Task(
@@ -72,15 +72,15 @@ def test_analysis_plan_executes_with_readonly_tools(tmp_path: Path) -> None:
 
     assert result.status == RunStatus.SUCCESS
     assert result.summary == "Forge Agent — a local autonomous coding agent."
-    assert read_tool.calls == [{"path": "README.md"}]
+    assert read_tool.calls == [{"path": str(tmp_path / "README.md")}]
     assert write_tool.calls == []
     assert "Forge Agent — a local autonomous coding agent." not in backend.received_messages[0][-1].content
 
 
-def test_single_file_constraint_blocks_discovery_tools_in_planning(tmp_path: Path) -> None:
+def test_analysis_planning_phase_has_no_tools(tmp_path: Path) -> None:
     registry, read_tool, write_tool = make_registry()
     backend = MockBackend([
-        Action(ActionType.TOOL_CALL, "discover", [ToolCall("find_files", {"pattern": "README*"})]),
+        Action(ActionType.TOOL_CALL, "premature read", [ToolCall("file_read", {"path": "README.md"})]),
         Action(ActionType.FINISH, "plan", message="### Goal\nRead README after approval."),
         Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": "README.md"})]),
         Action(ActionType.FINISH, "done", message="Answered from README."),
@@ -110,18 +110,18 @@ def test_single_file_constraint_blocks_discovery_tools_in_planning(tmp_path: Pat
     subtask_logs = sorted((tmp_path / "subtasks").glob("*.jsonl"))
     assert subtask_logs
     blocked_log = subtask_logs[-1].read_text(encoding="utf-8")
-    assert "Tool 'find_files' is blocked by the user's single-file constraint" in blocked_log
+    assert "Unknown tool 'file_read'. Available tools: none" in blocked_log
 
 
 
-def test_analysis_execution_cannot_use_write_tool(tmp_path: Path) -> None:
+def test_analysis_execution_cannot_use_disallowed_tool(tmp_path: Path) -> None:
     registry, _read_tool, write_tool = make_registry()
     backend = MockBackend([
         Action(ActionType.FINISH, "plan", message="### Goal\nAnswer read-only.\n\n### Steps\nRead allowed file."),
-        Action(ActionType.TOOL_CALL, "bad write", [ToolCall("file_write", {"path": "README.md"})]),
-        Action(ActionType.FINISH, "done", message="No write happened."),
+        Action(ActionType.TOOL_CALL, "bad discovery", [ToolCall("find_files", {"pattern": "README*"})]),
+        Action(ActionType.FINISH, "done", message="No discovery happened."),
     ])
-    task = Task("read-only task", str(tmp_path), intent="analysis", max_steps=9, budget_tokens=9000)
+    task = Task("只允许读取 README，不要查看其他文件", str(tmp_path), intent="analysis", max_steps=9, budget_tokens=9000)
     cfg = PlanExecuteConfig(
         plan_subtask_log_dir=str(tmp_path / "subtasks"),
         plan_approval_callback=lambda plan: True,
@@ -137,7 +137,7 @@ def test_analysis_execution_cannot_use_write_tool(tmp_path: Path) -> None:
     assert result.status == RunStatus.SUCCESS
     assert write_tool.calls == []
     errors = [event.payload["observation"].get("error", "") for event in log.replay() if event.event_type.value == "observation"]
-    assert any("Unknown tool 'file_write'" in error for error in errors)
+    assert any("Tool 'find_files' is blocked by the user's single-file constraint" in error for error in errors)
 
 
 def test_edit_plan_executes_with_full_tools(tmp_path: Path) -> None:

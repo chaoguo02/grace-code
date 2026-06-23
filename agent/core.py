@@ -22,6 +22,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agent.event_log import EventLog
@@ -125,13 +126,25 @@ def _extract_single_file_constraint(description: str) -> str | None:
     return _normalize_allowed_path(match.group(1))
 
 
+def _normalize_constraint_candidate(path_text: str, repo_path: str) -> str:
+    normalized = _normalize_allowed_path(path_text)
+    candidate = Path(normalized)
+    if candidate.is_absolute():
+        try:
+            normalized = candidate.resolve().relative_to(Path(repo_path).resolve()).as_posix()
+        except ValueError:
+            normalized = candidate.as_posix()
+    return _normalize_allowed_path(normalized)
+
+
 class _SingleFileReadOnlyRegistry(ToolRegistry):
     """Restrict plan/analysis execution to reading one explicitly allowed file."""
 
-    def __init__(self, base: ToolRegistry, allowed_path: str) -> None:
+    def __init__(self, base: ToolRegistry, allowed_path: str, repo_path: str) -> None:
         super().__init__(hitl_manager=getattr(base, "_hitl_manager", None))
         self._base = base
-        self._allowed_path = _normalize_allowed_path(allowed_path)
+        self._repo_path = repo_path
+        self._allowed_path = _normalize_constraint_candidate(allowed_path, repo_path)
         for tool_name in ("file_read", "file_view"):
             if tool_name in base._tools:
                 self._tools[tool_name] = base._tools[tool_name]
@@ -146,7 +159,7 @@ class _SingleFileReadOnlyRegistry(ToolRegistry):
                     f"Only file_read/file_view on '{self._allowed_path}' are allowed."
                 ),
             )
-        requested = _normalize_allowed_path(str(params.get("path", "")))
+        requested = _normalize_constraint_candidate(str(params.get("path", "")), self._repo_path)
         if requested != self._allowed_path:
             return ToolResult(
                 success=False,
@@ -1053,6 +1066,11 @@ class ReActAgent:
         self._registry = self._full_registry
         logger.info("Switched to execute mode (full tools)")
 
+    def switch_to_no_tool_mode(self) -> None:
+        """切换到无工具模式（用于只读问答任务的纯计划阶段）。"""
+        self._registry = ToolRegistry()
+        logger.info("Switched to no-tool mode")
+
     def _build_readonly_registry(self) -> ToolRegistry:
         """从完整注册表构建只读版本（仅含 _READONLY_TOOLS 白名单中的工具）。"""
         from tools.base import ToolRegistry
@@ -1192,7 +1210,7 @@ class PlanExecuteAgent:
 
         constrained_path = _extract_single_file_constraint(task.description)
         active_registry = (
-            _SingleFileReadOnlyRegistry(self._registry, constrained_path)
+            _SingleFileReadOnlyRegistry(self._registry, constrained_path, task.repo_path)
             if constrained_path and task.intent == "analysis"
             else self._registry
         )
@@ -1311,12 +1329,12 @@ class PlanExecuteAgent:
             revision_section = f"\n\n## User Revision Feedback\n{revision_feedback}\nRevise the plan to address this feedback."
         constrained_path = _extract_single_file_constraint(task.description)
         constraint_section = ""
-        if constrained_path and task.intent == "analysis":
-            constraint_section = (
-                f"\n\n## Enforced Tool Constraint\n"
-                f"Only file_read/file_view on `{constrained_path}` are available. "
-                "Do not use find_files/search_text/git/web/memory tools for this task."
-            )
+        if task.intent == "analysis":
+            constraint_section = "\n\n## Enforced Planning Constraint\nNo tools are available during planning for read-only answer tasks."
+            if constrained_path:
+                constraint_section += (
+                    f" After approval, execution may only use file_read/file_view on `{constrained_path}`."
+                )
         history.add(LLMMessage(
             role="user",
             content=(
@@ -1343,7 +1361,10 @@ class PlanExecuteAgent:
             budget_tokens=max(1, task.budget_tokens // 3),
         )
 
-        agent.switch_to_plan_mode()
+        if task.intent == "analysis":
+            agent.switch_to_no_tool_mode()
+        else:
+            agent.switch_to_plan_mode()
         plan_log = EventLog.create(plan_task, log_dir=self._plan_cfg.plan_subtask_log_dir)
         try:
             return agent.run(plan_task, plan_log)
