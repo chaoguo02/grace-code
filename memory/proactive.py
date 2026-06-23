@@ -27,18 +27,17 @@ logger = logging.getLogger(__name__)
 
 # 用户修正模式（中英文）
 _CORRECTION_PATTERNS = [
-    re.compile(r"不要.{2,20}", re.UNICODE),
-    re.compile(r"别再.{2,20}", re.UNICODE),
+    re.compile(r"(?:不要|请不要|别再)(?:这样|那样|再|继续|总是)"),
     re.compile(r"不[是对].*[应该而]", re.UNICODE),
-    re.compile(r"以后.{2,20}", re.UNICODE),
-    re.compile(r"记住.{2,20}", re.UNICODE),
-    re.compile(r"\bdon'?t\b.{3,}", re.IGNORECASE),
+    re.compile(r"(?:以后|今后|之后|下次)(?:都|请|要|可以)"),
+    re.compile(r"记住(?:这个|这一点|了)"),
+    re.compile(r"\bdon'?t\b\s+(?:do|say|use|write|run|call|edit|change|modify|add|remove|create|delete|read|open|try|forget|repeat)"),
     re.compile(r"\bstop\b\s+\w+ing\b", re.IGNORECASE),
-    re.compile(r"\bnever\b\s+\w+", re.IGNORECASE),
-    re.compile(r"\balways\b\s+\w+", re.IGNORECASE),
+    re.compile(r"\bnever\b\s+(?:do|say|use|write|run|call|edit|change|modify|add|remove|create|delete)"),
+    re.compile(r"\balways\b\s+(?:do|say|use|write|run|call|edit)"),
     re.compile(r"\binstead\b.{5,}", re.IGNORECASE),
     re.compile(r"\bprefer\b.{5,}", re.IGNORECASE),
-    re.compile(r"\bremember\b.{5,}", re.IGNORECASE),
+    re.compile(r"\bremember\b\s+(?:that|this|to|the)", re.IGNORECASE),
 ]
 
 # 构建/测试命令模式（从 shell 工具输出中检测）
@@ -72,7 +71,8 @@ class ProactiveMemory:
 
     def __init__(self, store: "MemoryStore") -> None:
         self._store = store
-        self._saved_corrections: set[str] = set()  # 避免重复保存
+        self._saved_corrections: set[str] = set()
+        self._saved_commands: set[str] = set()
 
     def check_user_message(self, user_input: str) -> None:
         """
@@ -157,6 +157,11 @@ class ProactiveMemory:
     def _save_build_command(self, cmd: str) -> None:
         """保存成功的构建命令为 project 记忆。"""
         from memory.models import Memory, MemoryMetadata
+
+        cmd_key = cmd.strip().lower()
+        if cmd_key in self._saved_commands:
+            return
+        self._saved_commands.add(cmd_key)
 
         # 检查是否已存在 build-commands 记忆
         existing = self._store.read_memory("build-commands")

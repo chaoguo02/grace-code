@@ -139,6 +139,7 @@ class MemoryStore:
             self._store_dir = base / _project_hash(repo_path) / "memory"
         self._max_index_lines = max_index_lines
         self._indexer = indexer
+        self._dirty = False
         self._ensure_dir()
 
     # ------------------------------------------------------------------
@@ -209,7 +210,7 @@ class MemoryStore:
         except OSError as exc:
             logger.error("Failed to write memory %s: %s", memory.name, exc)
             return False
-        self._rebuild_index()
+        self._dirty = True
         if self._indexer is not None:
             try:
                 self._indexer.index_memory(memory)
@@ -226,6 +227,9 @@ class MemoryStore:
         Returns:
             MemorySummary 列表
         """
+        if self._dirty or not self.index_path.exists():
+            self._rebuild_index()
+            self._dirty = False
         if self.index_path.exists():
             summaries = self._parse_index(self.index_path.read_text(encoding="utf-8"))
             if summaries:
@@ -251,7 +255,7 @@ class MemoryStore:
         except OSError as exc:
             logger.error("Failed to delete memory %s: %s", name, exc)
             return False
-        self._rebuild_index()
+        self._dirty = True
         if self._indexer is not None:
             try:
                 self._indexer.remove_memory(name)
@@ -273,9 +277,10 @@ class MemoryStore:
         Returns:
             MEMORY.md 的纯文本内容，空 store 返回空字符串
         """
-        if not self.index_path.exists():
-            # 索引不存在但可能有记忆文件
+        if self._dirty or not self.index_path.exists():
+            # 索引脏了或不存在：重建
             self._rebuild_index()
+            self._dirty = False
         if not self.index_path.exists():
             return ""
 

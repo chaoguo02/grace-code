@@ -68,6 +68,7 @@ class MemoryContext:
         self._task_context: str = ""
         self._retriever = retriever
         self._user_message: str = ""
+        self._cached_section: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -88,7 +89,9 @@ class MemoryContext:
 
     def set_user_message(self, message: str) -> None:
         """设置当前轮用户消息，用于 RAG 主动检索。"""
-        self._user_message = message
+        if message != self._user_message:
+            self._user_message = message
+            self._cached_section = None  # invalidate step-level cache
 
     def build_memory_section(self) -> str:
         """
@@ -115,6 +118,10 @@ class MemoryContext:
         if not self._enabled:
             return ""
 
+        # 步骤级缓存：同一步内重复调用直接返回缓存结果
+        if self._cached_section is not None:
+            return self._cached_section
+
         # 如果有任务上下文，使用相关性过滤
         if self._task_context:
             index_section = self._build_filtered_section()
@@ -136,7 +143,8 @@ class MemoryContext:
         rag_section = self._build_rag_section()
 
         parts = [p for p in (index_section, rag_section) if p]
-        return "\n\n".join(parts)
+        self._cached_section = "\n\n".join(parts)
+        return self._cached_section
 
     def _build_rag_section(self) -> str:
         """用 ProactiveRetriever 检索相关 chunks 并格式化。"""

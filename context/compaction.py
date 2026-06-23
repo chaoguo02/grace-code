@@ -866,15 +866,13 @@ def trim_sliding_window(
             result.extend(sum(recent_rounds, []))
             return result
 
-        # 还不够：进一步压缩，对旧轮次只保留 thought
+        # 还不够：进一步压缩，对旧轮次仅保留 thought 文本（去掉 tool_calls）
         compressed_old_thoughts = []
         for msg in compressed_old:
             if msg.get("role") == "assistant":
-                thought = _extract_thought_only(msg.get("content", ""))
-                if thought:
-                    compressed_old_thoughts.append({"role": "assistant", "content": thought})
-                # 丢弃 thought 也为空的消息
-            # user 消息（tool result）直接丢弃
+                content = msg.get("content", "").strip()
+                if content:
+                    compressed_old_thoughts.append({"role": "assistant", "content": content})
 
         old_tokens_2 = sum(estimate_tokens(m.get("content", "")) for m in compressed_old_thoughts)
         total_2 = first_tokens + old_tokens_2 + recent_tokens
@@ -898,26 +896,5 @@ def trim_sliding_window(
 
 
 def _compress_round(round_msgs: list[dict]) -> list[dict]:
-    """
-    压缩一轮消息：丢弃 user 的 tool_result，但保留 assistant 的 thought。
-    """
-    result = []
-    for msg in round_msgs:
-        if msg.get("role") == "assistant":
-            # 保留 thought，丢弃 Action/Params 只占位置的细节
-            thought = _extract_thought_only(msg.get("content", ""))
-            if thought:
-                result.append({"role": "assistant", "content": thought})
-        # user 消息（tool result）丢弃
-    return result
-
-
-def _extract_thought_only(content: str) -> str | None:
-    """从 assistant 消息中提取 thought 部分，去掉 Action/Params。"""
-    idx = content.find("Action:")
-    if idx == -1:
-        return content.strip() or None
-    thought = content[:idx].strip()
-    if thought and not thought.startswith("[Earlier"):
-        return thought
-    return None
+    """压缩一轮消息：丢弃 tool_result，保留 assistant 消息。"""
+    return [msg for msg in round_msgs if msg.get("role") == "assistant"]

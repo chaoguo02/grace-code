@@ -1080,39 +1080,16 @@ class ReActAgent:
             "Compaction: %d messages → %d messages",
             len(history_dicts), len(compacted),
         )
-        return compacted
-
-    def _compact_history(self, history: ConversationHistory) -> ConversationHistory:
-        """执行 compaction，返回新的 ConversationHistory（保持向后兼容）。"""
-        compacted_dicts = self._compact_history_from_dicts(history.to_dicts())
-        new_history = ConversationHistory(max_messages=self._cfg.history_max_messages)
-        for d in compacted_dicts:
-            tool_calls = None
-            if "tool_calls" in d:
-                tool_calls = [
-                    ToolCall(name=tc["name"], params=tc["params"], id=tc.get("id"))
-                    for tc in d["tool_calls"]
-                ]
-            new_history.add(LLMMessage(
-                role=d["role"],
-                content=d["content"],
-                tool_call_id=d.get("tool_call_id"),
-                tool_calls=tool_calls,
-            ))
-        logger.info(
-            "Compaction: %d messages → %d messages",
-            len(history), len(new_history),
-        )
 
         # 持久化 session summary 到磁盘（供跨 session 恢复）
         if self._memory_context and hasattr(self._memory_context, "_store"):
             from context.compaction import persist_compaction_summary
-            summary_text = compacted_dicts[0]["content"] if compacted_dicts else ""
+            summary_text = compacted[0]["content"] if compacted else ""
             if summary_text:
                 store_dir = str(self._memory_context._store.store_dir.parent)
                 persist_compaction_summary(summary_text, store_dir)
 
-        return new_history
+        return compacted
 
 
 # ---------------------------------------------------------------------------

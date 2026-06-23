@@ -1,4 +1,4 @@
-"""
+﻿"""
 context/structured.py
 
 结构化上下文分层系统。
@@ -7,11 +7,10 @@ context/structured.py
 - Layer 0 (System Identity): 极稳定，可缓存
 - Layer 1 (Project Context): session 级稳定
 - Layer 2 (Task Context): 轮次级变化
-- Layer 3 (Ephemeral): 单步级，最短生命周期
 
 设计原则：
 - Layer 0 + Layer 1 = Prompt Cache 稳定前缀（最大化 cache hit rate）
-- Layer 2 + Layer 3 = 动态后缀（每轮重建）
+- Layer 2 = 动态后缀（每轮重建）
 - 工具定义排序确定化（按 name 字典序）
 """
 
@@ -27,7 +26,6 @@ class ContextPriority(IntEnum):
     SYSTEM = 0       # 角色定义、安全约束、工具规则
     PROJECT = 1      # RepoMap、Skills、Memory
     TASK = 2         # 当前任务、对话历史
-    EPHEMERAL = 3    # 工具结果、诊断、临时 skill body
 
 
 @dataclass
@@ -73,7 +71,7 @@ class StructuredContext:
         return "\n\n".join(parts)
 
     def get_dynamic_suffix(self) -> str:
-        """返回动态后缀（Layer 2 + Layer 3）。"""
+        """返回动态后缀（Layer 2）。"""
         parts = []
         for layer in self._sorted_layers():
             if not layer.cacheable and not layer.is_empty:
@@ -113,28 +111,6 @@ class StructuredContext:
     def total_content_length(self) -> int:
         return sum(len(layer.content) for layer in self.layers if not layer.is_empty)
 
-    def trim_to_budget(self, budget_tokens: int, estimate_fn=None) -> None:
-        """
-        裁剪低优先级层以适应 token 预算。
-        从 EPHEMERAL 层开始裁剪，然后 TASK，保留 SYSTEM 和 PROJECT。
-        """
-        if estimate_fn is None:
-            estimate_fn = lambda text: len(text) // 4
-
-        total = sum(estimate_fn(l.content) for l in self.layers if not l.is_empty)
-        if total <= budget_tokens:
-            return
-
-        for priority in reversed(ContextPriority):
-            if priority <= ContextPriority.PROJECT:
-                break
-            for layer in self.layers:
-                if layer.priority == priority and not layer.is_empty:
-                    layer.content = ""
-                    total = sum(estimate_fn(l.content) for l in self.layers if not l.is_empty)
-                    if total <= budget_tokens:
-                        return
-
     def layer_summary(self) -> list[dict[str, Any]]:
         """返回各层摘要信息（用于调试/统计）。"""
         return [
@@ -151,70 +127,3 @@ class StructuredContext:
     def _sorted_layers(self) -> list[ContextLayer]:
         """按优先级排序（稳定的在前）。"""
         return sorted(self.layers, key=lambda l: (l.priority, l.name))
-
-
-# ---------------------------------------------------------------------------
-# 工厂函数：构建标准的 4 层上下文
-# ---------------------------------------------------------------------------
-
-def build_structured_context(
-    system_core: str,
-    tool_descriptions: str = "",
-    project_context: str = "",
-    memory_section: str = "",
-    skills_prompt: str = "",
-    task_context: str = "",
-) -> StructuredContext:
-    """
-    构建标准的结构化上下文。
-
-    Args:
-        system_core: 角色定义 + 工作流规则 + 安全约束
-        tool_descriptions: 工具列表描述
-        project_context: RepoMap + 项目规则
-        memory_section: 记忆上下文
-        skills_prompt: Skills 列表
-        task_context: 当前轮次的任务相关上下文
-
-    Returns:
-        StructuredContext，已按层分好
-    """
-    ctx = StructuredContext()
-
-    # Layer 0: System Identity (cacheable)
-    core_parts = [system_core]
-    if tool_descriptions:
-        core_parts.append(f"## Available Tools\n\n{tool_descriptions}")
-    ctx.add_layer(ContextLayer(
-        name="system_core",
-        priority=ContextPriority.SYSTEM,
-        content="\n\n".join(core_parts),
-        cacheable=True,
-    ))
-
-    # Layer 1: Project Context (cacheable within session)
-    if project_context or memory_section or skills_prompt:
-        project_parts = []
-        if memory_section:
-            project_parts.append(memory_section)
-        if project_context:
-            project_parts.append(project_context)
-        if skills_prompt:
-            project_parts.append(skills_prompt)
-        ctx.add_layer(ContextLayer(
-            name="project_context",
-            priority=ContextPriority.PROJECT,
-            content="\n\n".join(project_parts),
-            cacheable=True,
-        ))
-
-    # Layer 2: Task Context (dynamic, per-round)
-    if task_context:
-        ctx.add_layer(ContextLayer(
-            name="task_context",
-            priority=ContextPriority.TASK,
-            content=task_context,
-            cacheable=False,
-        ))
-
-    return ctx

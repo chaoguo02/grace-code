@@ -381,6 +381,9 @@ class ExternalMemoryStore:
         if not rows:
             return []
 
+        # Fast-path guard: max possible boosted score = cosine*0.85 + 0.15
+        min_cosine = max(0.0, (min_score - 0.15) / 0.85)
+
         query_emb = _encode(query, self._model_name)
         now_ts = datetime.now(timezone.utc)
 
@@ -401,6 +404,10 @@ class ExternalMemoryStore:
 
             emb = _bytes_to_embedding(emb_bytes)
             cosine = _cosine_similarity(query_emb, emb)
+
+            # Quick-reject: even max boost can't save this cosine
+            if cosine < min_cosine:
+                continue
 
             if cosine < min_score:
                 continue
