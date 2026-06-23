@@ -22,9 +22,11 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from agent.completion import CompletionValidator
+from agent.policy import TaskPolicy, build_task_policy
+from agent.policy_registry import PolicyAwareToolRegistry
 from agent.event_log import EventLog
 from context.history import ConversationHistory
 from context.repo_map import RepoMap
@@ -43,7 +45,7 @@ from agent.task import (
 )
 from context.compaction import ConversationCompactor
 from llm.base import LLMBackend, LLMMessage, LLMToolSchema
-from tools.base import ToolRegistry, ToolResult
+from tools.base import ToolRegistry
 
 if TYPE_CHECKING:
     from memory.context import MemoryContext
@@ -102,75 +104,6 @@ _READONLY_TOOLS = frozenset({
     "web_search", "web_fetch",
     "memory_read", "memory_list",
 })
-
-_PATH_CONSTRAINT_RE = re.compile(
-    r"(?:只允许|仅允许|只能|只准|不要查看其他文件|do not (?:read|inspect|view|open) other files|only (?:read|inspect|view|open))"
-    r"[^\n。；;]*?"
-    r"([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+|README(?:\.md)?)",
-    re.IGNORECASE,
-)
-
-
-def _normalize_allowed_path(path_text: str) -> str:
-    normalized = path_text.strip().strip("`'\"，,。.;；:：")
-    normalized = normalized.replace("\\", "/")
-    if normalized.lower() == "readme":
-        normalized = "README.md"
-    return normalized.lstrip("./")
-
-
-def _extract_single_file_constraint(description: str) -> str | None:
-    match = _PATH_CONSTRAINT_RE.search(description)
-    if not match:
-        return None
-    return _normalize_allowed_path(match.group(1))
-
-
-def _normalize_constraint_candidate(path_text: str, repo_path: str) -> str:
-    normalized = _normalize_allowed_path(path_text)
-    candidate = Path(normalized)
-    if candidate.is_absolute():
-        try:
-            normalized = candidate.resolve().relative_to(Path(repo_path).resolve()).as_posix()
-        except ValueError:
-            normalized = candidate.as_posix()
-    return _normalize_allowed_path(normalized)
-
-
-class _SingleFileReadOnlyRegistry(ToolRegistry):
-    """Restrict plan/analysis execution to reading one explicitly allowed file."""
-
-    def __init__(self, base: ToolRegistry, allowed_path: str, repo_path: str) -> None:
-        super().__init__(hitl_manager=getattr(base, "_hitl_manager", None))
-        self._base = base
-        self._repo_path = repo_path
-        self._allowed_path = _normalize_constraint_candidate(allowed_path, repo_path)
-        for tool_name in ("file_read", "file_view"):
-            if tool_name in base._tools:
-                self._tools[tool_name] = base._tools[tool_name]
-
-    def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
-        if name not in {"file_read", "file_view"}:
-            return ToolResult(
-                success=False,
-                output="",
-                error=(
-                    f"Tool '{name}' is blocked by the user's single-file constraint. "
-                    f"Only file_read/file_view on '{self._allowed_path}' are allowed."
-                ),
-            )
-        requested = _normalize_constraint_candidate(str(params.get("path", "")), self._repo_path)
-        if requested != self._allowed_path:
-            return ToolResult(
-                success=False,
-                output="",
-                error=(
-                    f"Path '{requested}' is blocked by the user's single-file constraint. "
-                    f"Only '{self._allowed_path}' may be read."
-                ),
-            )
-        return self._base.execute_tool(name, params, thought=thought)
-
 
 # ---------------------------------------------------------------------------
 # ReActAgent — ReAct (Reasoning + Acting) 主循环
@@ -1074,8 +1007,8 @@ class ReActAgent:
     def _build_readonly_registry(self) -> ToolRegistry:
         """从完整注册表构建只读版本（仅含 _READONLY_TOOLS 白名单中的工具）。"""
         from tools.base import ToolRegistry
-        if isinstance(self._full_registry, _SingleFileReadOnlyRegistry):
-            return self._full_registry
+        if isinstance(self._full_registry, PolicyAwareToolRegistry):
+            return self._full_registry.with_allowed_tools(_READONLY_TOOLS)
         readonly = ToolRegistry()
         for name, tool in self._full_registry._tools.items():
             if name in _READONLY_TOOLS:
@@ -1208,14 +1141,15 @@ class PlanExecuteAgent:
         log.log_task_start(task)
         logger.info("PlanExecuteAgent starting task %s", task.task_id)
 
-        constrained_path = _extract_single_file_constraint(task.description)
-        active_registry = (
-            _SingleFileReadOnlyRegistry(self._registry, constrained_path, task.repo_path)
-            if constrained_path and task.intent == "analysis"
-            else self._registry
+        policy = build_task_policy(task)
+        execution_registry = PolicyAwareToolRegistry(
+            base=self._registry,
+            phase_policy=policy.execution,
+            repo_path=task.repo_path,
+            phase_name="execution",
         )
         agent = ReActAgent(
-            self._backend, active_registry, self._cfg,
+            self._backend, execution_registry, self._cfg,
             memory_context=self._memory_context,
         )
         history = ConversationHistory(
@@ -1232,7 +1166,7 @@ class PlanExecuteAgent:
 
         for attempt in range(1, max_plan_attempts + 1):
             plan_result = self._run_planning_phase(
-                agent, history, task, log, get_plan_mode_injection(), revision_feedback
+                agent, history, task, log, get_plan_mode_injection(), policy, revision_feedback
             )
             total_plan_tokens += plan_result.total_tokens
             total_plan_steps += plan_result.steps_taken
@@ -1279,6 +1213,7 @@ class PlanExecuteAgent:
             plan_text=plan_text,
             plan_result=plan_result,
             exec_injection=get_plan_execution_injection(),
+            policy=policy,
             consumed_plan_steps=total_plan_steps,
             consumed_plan_tokens=total_plan_tokens,
         )
@@ -1291,6 +1226,23 @@ class PlanExecuteAgent:
 
         if exec_result.is_success():
             patch = _git_diff(task.repo_path) if task.intent == "edit" else None
+            verdict = CompletionValidator().validate(log, policy, task.repo_path)
+            if not verdict.success:
+                legacy_reason = verdict.reason
+                if legacy_reason.startswith("Approved analysis plan finished without reading required source file"):
+                    legacy_reason = "Approved analysis plan finished without reading the allowed source file."
+                elif legacy_reason.startswith("Approved edit plan finished without writing required file"):
+                    legacy_reason = "Approved edit plan finished without performing any file write."
+                log.log_task_failed(steps=total_steps, reason=legacy_reason)
+                return RunResult(
+                    task_id=task.task_id,
+                    status=RunStatus.GAVE_UP,
+                    summary=legacy_reason,
+                    steps_taken=total_steps,
+                    total_tokens=total_tokens,
+                    patch=patch,
+                    cache_stats=exec_result.cache_stats,
+                )
             summary = exec_result.summary or "Plan executed successfully"
             log.log_task_complete(steps=total_steps, summary=summary)
             return RunResult(
@@ -1321,20 +1273,19 @@ class PlanExecuteAgent:
         task: Task,
         log: EventLog,
         plan_injection: str,
+        policy: TaskPolicy,
         revision_feedback: str = "",
     ) -> RunResult:
         intent_label = "read-only answer" if task.intent == "analysis" else "implementation"
         revision_section = ""
         if revision_feedback:
             revision_section = f"\n\n## User Revision Feedback\n{revision_feedback}\nRevise the plan to address this feedback."
-        constrained_path = _extract_single_file_constraint(task.description)
         constraint_section = ""
+        prompt_constraints = policy.to_prompt_section("planning")
         if task.intent == "analysis":
             constraint_section = "\n\n## Enforced Planning Constraint\nNo tools are available during planning for read-only answer tasks."
-            if constrained_path:
-                constraint_section += (
-                    f" After approval, execution may only use file_read/file_view on `{constrained_path}`."
-                )
+        if prompt_constraints:
+            constraint_section += f"\n\n{prompt_constraints}"
         history.add(LLMMessage(
             role="user",
             content=(
@@ -1409,6 +1360,7 @@ class PlanExecuteAgent:
         plan_text: str,
         plan_result: RunResult,
         exec_injection: str,
+        policy: TaskPolicy,
         consumed_plan_steps: int | None = None,
         consumed_plan_tokens: int | None = None,
     ) -> RunResult:
@@ -1426,18 +1378,18 @@ class PlanExecuteAgent:
             budget_tokens=exec_budget,
         )
 
-        constrained_path = _extract_single_file_constraint(task.description)
         mode_instruction = (
-            "This is a read-only answer task. Keep read-only permissions active and obtain the answer now."
+            "This is a read-only answer task in the execution phase. You must read the approved source file now and answer from that content; do not produce another plan."
             if task.intent == "analysis"
-            else "This is an implementation task. Use full execution permissions to implement the approved plan."
+            else "This is an implementation task. You must perform the approved edit now; do not produce another plan or finish until the required file write is done."
         )
-        if constrained_path and task.intent == "analysis":
-            mode_instruction += (
-                f" Only file_read/file_view on `{constrained_path}` are available; "
-                "do not use discovery/search tools or read any other path."
-            )
-        history.add(LLMMessage(
+        prompt_constraints = policy.to_prompt_section("execution")
+        if prompt_constraints:
+            mode_instruction += "\n\n" + prompt_constraints
+        exec_history = ConversationHistory(max_messages=self._cfg.history_max_messages)
+        agent._pending_history = exec_history
+
+        exec_history.add(LLMMessage(
             role="user",
             content=(
                 f"## Original Task\n{task.description}\n\n"
