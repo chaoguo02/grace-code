@@ -230,30 +230,38 @@ class ChatSession:
             return False
         return resp in ("y", "yes", "")
 
-    def _plan_approval(self, plan_text: str) -> bool:
+    def _plan_approval(self, plan_text: str):
         """
-        交互式 Plan 审批。展示 plan，等待用户 approve/reject。
-        返回 True 表示批准，False 表示拒绝。
+        交互式 Plan 审批。展示 plan，等待用户 approve/reject/revise。
+        返回 PlanApproval，避免把未知输入或 edit(e) 误当成批准。
         """
-        self._renderer.on_plan_generated(plan_text)
-        try:
-            response = input(
-                _cyan_prompt("  [approve(y)/reject(n)/edit(e)] > ")
-            ).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            self._renderer.on_plan_rejected()
-            return False
+        from agent.plan import PlanApproval
 
-        if response in ("y", "yes", "approve", "a", ""):
-            self._renderer.on_plan_approved()
-            return True
-        elif response in ("n", "no", "reject", "r"):
-            self._renderer.on_plan_rejected()
-            return False
-        else:
-            # 任何其他输入视为批准（宽容处理）
-            self._renderer.on_plan_approved()
-            return True
+        self._renderer.on_plan_generated(plan_text)
+        while True:
+            try:
+                response = input(
+                    _cyan_prompt("  [approve(y)/reject(n)/revise(e)] > ")
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                self._renderer.on_plan_rejected()
+                return PlanApproval(approved=False, feedback="Plan approval interrupted")
+
+            if response in ("y", "yes", "approve", "a", ""):
+                self._renderer.on_plan_approved()
+                return PlanApproval(approved=True)
+            if response in ("n", "no", "reject", "r"):
+                self._renderer.on_plan_rejected()
+                return PlanApproval(approved=False, feedback="Plan rejected by user")
+            if response in ("e", "edit", "revise", "feedback", "f"):
+                try:
+                    feedback = input(_cyan_prompt("  Revision feedback > ")).strip()
+                except (EOFError, KeyboardInterrupt):
+                    feedback = "Plan revision requested by user"
+                self._renderer.on_plan_rejected()
+                return PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
+
+            print("  Please enter y to approve, n to reject, or e to request revision.")
 
     # ------------------------------------------------------------------
     # 核心循环

@@ -464,22 +464,34 @@ def run(
         confirm_callback=confirm_cb,
     )
     # Plan 审批回调
-    def _plan_approval_cb(plan_text: str) -> bool:
+    from agent.plan import PlanApproval
+
+    def _plan_approval_cb(plan_text: str):
         if auto_approve:
             rend.on_plan_generated(plan_text)
             rend.on_plan_approved()
-            return True
+            return PlanApproval(approved=True)
         rend.on_plan_generated(plan_text)
-        try:
-            resp = input("  [approve(y)/reject(n)] > ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            rend.on_plan_rejected()
-            return False
-        if resp in ("y", "yes", "approve", "a", ""):
-            rend.on_plan_approved()
-            return True
-        rend.on_plan_rejected()
-        return False
+        while True:
+            try:
+                resp = input("  [approve(y)/reject(n)/revise(e)] > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                rend.on_plan_rejected()
+                return PlanApproval(approved=False, feedback="Plan approval interrupted")
+            if resp in ("y", "yes", "approve", "a", ""):
+                rend.on_plan_approved()
+                return PlanApproval(approved=True)
+            if resp in ("n", "no", "reject", "r"):
+                rend.on_plan_rejected()
+                return PlanApproval(approved=False, feedback="Plan rejected by user")
+            if resp in ("e", "edit", "revise", "feedback", "f"):
+                try:
+                    feedback = input("  Revision feedback > ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    feedback = "Plan revision requested by user"
+                rend.on_plan_rejected()
+                return PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
+            click.echo("  Please enter y to approve, n to reject, or e to request revision.")
 
     from agent.plan import PlanExecuteConfig
     plan_cfg = PlanExecuteConfig(

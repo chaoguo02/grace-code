@@ -25,11 +25,19 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 @dataclass
+class PlanApproval:
+    """用户对计划的审批结果。"""
+    approved: bool
+    action: str = "execute"  # execute | revise
+    feedback: str = ""
+
+
+@dataclass
 class PlanExecuteConfig:
     """PlanExecuteAgent 专用配置。"""
     plan_max_subtasks: int = 10
     plan_subtask_log_dir: str = "./logs/subtasks"
-    plan_approval_callback: Any = None  # Callable[[str], bool] — 用户审批回调
+    plan_approval_callback: Any = None  # Callable[[str], bool | PlanApproval] — 用户审批回调
     enable_replan: bool = False
     max_replans: int = 1
     allow_parallel_verification: bool = False

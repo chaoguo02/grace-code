@@ -22,7 +22,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from agent.event_log import EventLog
 from context.history import ConversationHistory
@@ -42,7 +42,7 @@ from agent.task import (
 )
 from context.compaction import ConversationCompactor
 from llm.base import LLMBackend, LLMMessage, LLMToolSchema
-from tools.base import ToolRegistry
+from tools.base import ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
     from memory.context import MemoryContext
@@ -101,6 +101,62 @@ _READONLY_TOOLS = frozenset({
     "web_search", "web_fetch",
     "memory_read", "memory_list",
 })
+
+_PATH_CONSTRAINT_RE = re.compile(
+    r"(?:只允许|仅允许|只能|只准|不要查看其他文件|do not (?:read|inspect|view|open) other files|only (?:read|inspect|view|open))"
+    r"[^\n。；;]*?"
+    r"([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+|README(?:\.md)?)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_allowed_path(path_text: str) -> str:
+    normalized = path_text.strip().strip("`'\"，,。.;；:：")
+    normalized = normalized.replace("\\", "/")
+    if normalized.lower() == "readme":
+        normalized = "README.md"
+    return normalized.lstrip("./")
+
+
+def _extract_single_file_constraint(description: str) -> str | None:
+    match = _PATH_CONSTRAINT_RE.search(description)
+    if not match:
+        return None
+    return _normalize_allowed_path(match.group(1))
+
+
+class _SingleFileReadOnlyRegistry(ToolRegistry):
+    """Restrict plan/analysis execution to reading one explicitly allowed file."""
+
+    def __init__(self, base: ToolRegistry, allowed_path: str) -> None:
+        super().__init__(hitl_manager=getattr(base, "_hitl_manager", None))
+        self._base = base
+        self._allowed_path = _normalize_allowed_path(allowed_path)
+        for tool_name in ("file_read", "file_view"):
+            if tool_name in base._tools:
+                self._tools[tool_name] = base._tools[tool_name]
+
+    def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
+        if name not in {"file_read", "file_view"}:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Tool '{name}' is blocked by the user's single-file constraint. "
+                    f"Only file_read/file_view on '{self._allowed_path}' are allowed."
+                ),
+            )
+        requested = _normalize_allowed_path(str(params.get("path", "")))
+        if requested != self._allowed_path:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Path '{requested}' is blocked by the user's single-file constraint. "
+                    f"Only '{self._allowed_path}' may be read."
+                ),
+            )
+        return self._base.execute_tool(name, params, thought=thought)
 
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +1056,8 @@ class ReActAgent:
     def _build_readonly_registry(self) -> ToolRegistry:
         """从完整注册表构建只读版本（仅含 _READONLY_TOOLS 白名单中的工具）。"""
         from tools.base import ToolRegistry
+        if isinstance(self._full_registry, _SingleFileReadOnlyRegistry):
+            return self._full_registry
         readonly = ToolRegistry()
         for name, tool in self._full_registry._tools.items():
             if name in _READONLY_TOOLS:
@@ -1121,13 +1179,10 @@ class PlanExecuteAgent:
         """
         两阶段 Plan-then-Execute（同实例切换权限）。
 
-        Phase 1: 只读探索 → 生成 markdown 计划
-        Phase 2: 用户审批后全权执行
-
-        与旧设计的区别：
-        - 同一个 ReActAgent 实例，同一个 ConversationHistory
-        - Phase 1 的探索上下文在 Phase 2 完全保留
-        - 通过 switch_to_plan_mode() / switch_to_execute_mode() 切换权限
+        Phase 1: 只读规划 → 生成 markdown 计划
+        Phase 2: 用户审批后按任务意图执行
+          - edit: 切换到完整工具权限实施修改
+          - analysis: 继续只读执行并生成答案
         """
         from agent.plan import Plan
         from agent.prompt import get_plan_mode_injection, get_plan_execution_injection
@@ -1135,108 +1190,89 @@ class PlanExecuteAgent:
         log.log_task_start(task)
         logger.info("PlanExecuteAgent starting task %s", task.task_id)
 
-        # ── 创建同一个 agent + 同一个 history ──────────────────
+        constrained_path = _extract_single_file_constraint(task.description)
+        active_registry = (
+            _SingleFileReadOnlyRegistry(self._registry, constrained_path)
+            if constrained_path and task.intent == "analysis"
+            else self._registry
+        )
         agent = ReActAgent(
-            self._backend, self._registry, self._cfg,
+            self._backend, active_registry, self._cfg,
             memory_context=self._memory_context,
         )
         history = ConversationHistory(
             max_messages=self._cfg.history_max_messages,
         )
-
-        plan_injection = get_plan_mode_injection()
-        history.add(LLMMessage(
-            role="user",
-            content=(
-                f"{plan_injection}\n\n"
-                f"## Repository\n{task.repo_path}\n\n"
-                f"## Task\n{task.description}\n\n"
-                f"Explore the codebase and produce an implementation plan. "
-                f"Call finish with your plan when ready."
-            ),
-        ))
         agent._pending_history = history
 
-        # ── Phase 1: 只读规划（切换到只读注册表）─────────────
-        plan_steps = max(5, task.max_steps // 3)
-        plan_task = Task(
-            description=task.description,
-            repo_path=task.repo_path,
-            max_steps=plan_steps,
-            budget_tokens=task.budget_tokens // 3,
-        )
+        total_plan_tokens = 0
+        total_plan_steps = 0
+        revision_feedback = ""
+        max_plan_attempts = max(1, self._plan_cfg.max_replans + 1)
+        plan_result: RunResult | None = None
+        plan_text = ""
 
-        agent.switch_to_plan_mode()
-        plan_log = EventLog.create(plan_task, log_dir=self._plan_cfg.plan_subtask_log_dir)
-        plan_result = agent.run(plan_task, plan_log)
-        plan_log.close()
-
-        # 提取 plan 文本
-        plan_text = plan_result.summary or ""
-        if not plan_text.strip():
-            logger.warning("Plan generation produced empty result — falling back")
-            agent.switch_to_execute_mode()
-            fallback_task = Task(
-                description=task.description,
-                repo_path=task.repo_path,
-                max_steps=task.max_steps,
-                budget_tokens=task.budget_tokens,
+        for attempt in range(1, max_plan_attempts + 1):
+            plan_result = self._run_planning_phase(
+                agent, history, task, log, get_plan_mode_injection(), revision_feedback
             )
-            return agent.run(fallback_task, log)
+            total_plan_tokens += plan_result.total_tokens
+            total_plan_steps += plan_result.steps_taken
+            plan_text = plan_result.summary or ""
+            if not plan_text.strip():
+                return self._fallback_after_empty_plan(agent, task, log)
 
-        plan = Plan.from_markdown(plan_text, task.description)
-        log.log_plan_generated(plan)
-        logger.info("Plan generated (%d chars): %s...", len(plan_text), plan_text[:100])
+            plan = Plan.from_markdown(plan_text, task.description)
+            log.log_plan_generated(plan)
+            logger.info("Plan generated (%d chars): %s...", len(plan_text), plan_text[:100])
 
-        # ── 用户审批 ──────────────────────────────────────────────
-        approval_cb = self._plan_cfg.plan_approval_callback
-        if approval_cb:
-            approved = approval_cb(plan_text)
-            if not approved:
-                reason = "Plan rejected by user"
-                log.log_task_failed(steps=plan_result.steps_taken, reason=reason)
+            approval = self._request_plan_approval(plan_text)
+            if not approval.approved:
+                reason = approval.feedback or "Plan rejected by user"
+                log.log_task_failed(steps=total_plan_steps, reason=reason)
                 return RunResult(
                     task_id=task.task_id,
                     status=RunStatus.GAVE_UP,
                     summary=reason,
-                    steps_taken=plan_result.steps_taken,
-                    total_tokens=plan_result.total_tokens,
+                    steps_taken=total_plan_steps,
+                    total_tokens=total_plan_tokens,
+                )
+            if approval.action != "revise":
+                break
+            revision_feedback = approval.feedback or "Please revise the plan before execution."
+            if attempt == max_plan_attempts:
+                reason = f"Plan revision requested but max revisions reached: {revision_feedback}"
+                log.log_task_failed(steps=total_plan_steps, reason=reason)
+                return RunResult(
+                    task_id=task.task_id,
+                    status=RunStatus.GAVE_UP,
+                    summary=reason,
+                    steps_taken=total_plan_steps,
+                    total_tokens=total_plan_tokens,
                 )
 
-        # ── Phase 2: 执行（切换到完整注册表，复用 history）───
-        exec_steps = task.max_steps - plan_result.steps_taken
-        if exec_steps < 3:
-            exec_steps = 3
+        assert plan_result is not None
 
-        exec_task = Task(
-            description=task.description,
-            repo_path=task.repo_path,
-            max_steps=exec_steps,
-            budget_tokens=task.budget_tokens - plan_result.total_tokens,
+        exec_result = self._run_execution_phase(
+            agent=agent,
+            history=history,
+            task=task,
+            log=log,
+            plan_text=plan_text,
+            plan_result=plan_result,
+            exec_injection=get_plan_execution_injection(),
+            consumed_plan_steps=total_plan_steps,
+            consumed_plan_tokens=total_plan_tokens,
         )
 
-        # 在同一个 history 中追加 plan 确认和执行指令
-        exec_injection = get_plan_execution_injection()
-        history.add(LLMMessage(
-            role="user",
-            content=(
-                f"## Your Approved Plan\n{plan_text}\n\n"
-                f"{exec_injection}"
-            ),
-        ))
-
-        agent.switch_to_execute_mode()
-        exec_result = agent.run(exec_task, log)
-
-        # ── 清理 ──────────────────────────────────────────────────
         if hasattr(agent, "_pending_history"):
             del agent._pending_history
 
-        total_tokens = plan_result.total_tokens + exec_result.total_tokens
-        total_steps = plan_result.steps_taken + exec_result.steps_taken
+        total_tokens = total_plan_tokens + exec_result.total_tokens
+        total_steps = total_plan_steps + exec_result.steps_taken
 
         if exec_result.is_success():
-            patch = _git_diff(task.repo_path)
+            patch = _git_diff(task.repo_path) if task.intent == "edit" else None
             summary = exec_result.summary or "Plan executed successfully"
             log.log_task_complete(steps=total_steps, summary=summary)
             return RunResult(
@@ -1246,6 +1282,7 @@ class PlanExecuteAgent:
                 steps_taken=total_steps,
                 total_tokens=total_tokens,
                 patch=patch,
+                cache_stats=exec_result.cache_stats,
             )
 
         log.log_task_failed(steps=total_steps, reason=exec_result.summary)
@@ -1256,7 +1293,144 @@ class PlanExecuteAgent:
             steps_taken=total_steps,
             total_tokens=total_tokens,
             error=exec_result.error,
+            cache_stats=exec_result.cache_stats,
         )
+
+    def _run_planning_phase(
+        self,
+        agent: ReActAgent,
+        history: ConversationHistory,
+        task: Task,
+        log: EventLog,
+        plan_injection: str,
+        revision_feedback: str = "",
+    ) -> RunResult:
+        intent_label = "read-only answer" if task.intent == "analysis" else "implementation"
+        revision_section = ""
+        if revision_feedback:
+            revision_section = f"\n\n## User Revision Feedback\n{revision_feedback}\nRevise the plan to address this feedback."
+        constrained_path = _extract_single_file_constraint(task.description)
+        constraint_section = ""
+        if constrained_path and task.intent == "analysis":
+            constraint_section = (
+                f"\n\n## Enforced Tool Constraint\n"
+                f"Only file_read/file_view on `{constrained_path}` are available. "
+                "Do not use find_files/search_text/git/web/memory tools for this task."
+            )
+        history.add(LLMMessage(
+            role="user",
+            content=(
+                f"{plan_injection}\n\n"
+                f"## Repository\n{task.repo_path}\n\n"
+                f"## Task Type\n{intent_label}\n\n"
+                f"## Task\n{task.description}"
+                f"{constraint_section}"
+                f"{revision_section}\n\n"
+                "Produce only an approval plan for the execution phase. "
+                "Do not include the final answer or completed work in the plan. "
+                "Call finish with the plan when ready."
+            ),
+        ))
+
+        plan_steps = max(3, task.max_steps // 3)
+        plan_task = Task(
+            description=task.description,
+            repo_path=task.repo_path,
+            intent=task.intent,
+            issue_url=task.issue_url,
+            test_cmd=task.test_cmd,
+            max_steps=plan_steps,
+            budget_tokens=max(1, task.budget_tokens // 3),
+        )
+
+        agent.switch_to_plan_mode()
+        plan_log = EventLog.create(plan_task, log_dir=self._plan_cfg.plan_subtask_log_dir)
+        try:
+            return agent.run(plan_task, plan_log)
+        finally:
+            plan_log.close()
+
+    def _fallback_after_empty_plan(self, agent: ReActAgent, task: Task, log: EventLog) -> RunResult:
+        logger.warning("Plan generation produced empty result — falling back")
+        if task.intent == "analysis":
+            agent.switch_to_plan_mode()
+        else:
+            agent.switch_to_execute_mode()
+        fallback_task = Task(
+            description=task.description,
+            repo_path=task.repo_path,
+            intent=task.intent,
+            issue_url=task.issue_url,
+            test_cmd=task.test_cmd,
+            max_steps=task.max_steps,
+            budget_tokens=task.budget_tokens,
+        )
+        return agent.run(fallback_task, log)
+
+    def _request_plan_approval(self, plan_text: str):
+        from agent.plan import PlanApproval
+
+        approval_cb = self._plan_cfg.plan_approval_callback
+        if not approval_cb:
+            return PlanApproval(approved=True)
+
+        raw = approval_cb(plan_text)
+        if isinstance(raw, PlanApproval):
+            return raw
+        return PlanApproval(approved=bool(raw))
+
+    def _run_execution_phase(
+        self,
+        agent: ReActAgent,
+        history: ConversationHistory,
+        task: Task,
+        log: EventLog,
+        plan_text: str,
+        plan_result: RunResult,
+        exec_injection: str,
+        consumed_plan_steps: int | None = None,
+        consumed_plan_tokens: int | None = None,
+    ) -> RunResult:
+        used_steps = plan_result.steps_taken if consumed_plan_steps is None else consumed_plan_steps
+        used_tokens = plan_result.total_tokens if consumed_plan_tokens is None else consumed_plan_tokens
+        exec_steps = max(3, task.max_steps - used_steps)
+        exec_budget = max(1, task.budget_tokens - used_tokens)
+        exec_task = Task(
+            description=task.description,
+            repo_path=task.repo_path,
+            intent=task.intent,
+            issue_url=task.issue_url,
+            test_cmd=task.test_cmd,
+            max_steps=exec_steps,
+            budget_tokens=exec_budget,
+        )
+
+        constrained_path = _extract_single_file_constraint(task.description)
+        mode_instruction = (
+            "This is a read-only answer task. Keep read-only permissions active and obtain the answer now."
+            if task.intent == "analysis"
+            else "This is an implementation task. Use full execution permissions to implement the approved plan."
+        )
+        if constrained_path and task.intent == "analysis":
+            mode_instruction += (
+                f" Only file_read/file_view on `{constrained_path}` are available; "
+                "do not use discovery/search tools or read any other path."
+            )
+        history.add(LLMMessage(
+            role="user",
+            content=(
+                f"## Original Task\n{task.description}\n\n"
+                f"## Approved Plan\n{plan_text}\n\n"
+                f"{exec_injection}\n\n"
+                f"## Execution Permission\n{mode_instruction}"
+            ),
+        ))
+
+        if task.intent == "analysis":
+            agent.switch_to_plan_mode()
+        else:
+            agent.switch_to_execute_mode()
+        return agent.run(exec_task, log)
 
     def _get_git_diff(self, repo_path: str) -> str | None:
         return _git_diff(repo_path)
