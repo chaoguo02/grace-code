@@ -237,6 +237,19 @@ class MemoryStore:
         # 降级：扫描目录
         return self._scan_dir()
 
+    def count_by_type(self) -> dict[str, int]:
+        """
+        统计每种类型的记忆数量。
+
+        Returns:
+            {type_name: count, ...} 例如 {"episodic": 3, "semantic": 5, "procedural": 2}
+        """
+        counts: dict[str, int] = {}
+        for summary in self.list_memories():
+            t = summary.type
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
     def delete_memory(self, name: str) -> bool:
         """
         删除一条记忆。

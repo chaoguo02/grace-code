@@ -14,7 +14,7 @@ from pathlib import Path
 from agent.task import Task
 
 READ_TOOLS = frozenset({"file_read", "file_view"})
-WRITE_TOOLS = frozenset({"file_write"})
+WRITE_TOOLS = frozenset({"file_write", "file_edit"})
 DISCOVERY_TOOLS = frozenset({"find_files", "find_symbol", "search_text"})
 GIT_TOOLS = frozenset({"git_status", "git_diff", "git_add", "git_commit"})
 WEB_TOOLS = frozenset({"web_search", "web_fetch"})

@@ -127,6 +127,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     """根据配置组装工具注册表。"""
     from tools.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
+    from tools.file_edit_tool import FileEditTool
     from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
     from tools.search_tool import FindFilesTool, FindSymbolTool, SearchTextTool
     from tools.shell_tool import ShellTool
@@ -161,6 +162,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
         .register(FileReadTool())
         .register(FileViewTool())
         .register(FileWriteTool())
+        .register(FileEditTool())
         .register(SearchTextTool())
         .register(FindFilesTool())
         .register(FindSymbolTool())
@@ -446,6 +448,17 @@ def run(
         external_store=external_store,
     )
 
+    # ProactiveMemory（run 模式）
+    proactive_memory = None
+    if memory_store is not None:
+        from memory.proactive import ProactiveMemory
+        proactive_memory = ProactiveMemory(memory_store)
+        proactive_memory.check_user_message(description)
+
+    # memory 模块日志可见性
+    if config.memory.enabled:
+        logging.getLogger("memory").setLevel(logging.INFO)
+
     from agent.core import AgentConfig
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
@@ -546,6 +559,7 @@ def run(
         from agent.task import EventType
         _original_append = log._append
         _last_tool = [""]
+        _last_tool_params = [{}]
 
         def _live_append(event):
             _original_append(event)
@@ -557,6 +571,7 @@ def run(
                 if tcs:
                     for tc in tcs:
                         _last_tool[0] = tc["name"]
+                        _last_tool_params[0] = tc.get("params", {})
                         rend.on_tool_call(p["step"], tc["name"], tc.get("params", {}))
                 elif action.get("action_type") == "finish":
                     rend.on_finish(p["step"], action.get("message", ""))
@@ -564,13 +579,24 @@ def run(
                     rend.on_give_up(p["step"], action.get("message", ""))
             elif etype == EventType.OBSERVATION:
                 obs = p["observation"]
+                tool_name = obs.get("tool_name", _last_tool[0])
+                status = obs.get("status", "")
+                output = obs.get("output", "")
                 rend.on_observation(
                     p["step"],
-                    obs.get("tool_name", _last_tool[0]),
-                    obs.get("status", ""),
-                    obs.get("output", ""),
+                    tool_name,
+                    status,
+                    output,
                     obs.get("error"),
                 )
+                # ProactiveMemory：检查工具结果
+                if proactive_memory is not None:
+                    proactive_memory.check_tool_result(
+                        tool_name=tool_name,
+                        params=_last_tool_params[0],
+                        output=output,
+                        success=(status == "success"),
+                    )
             elif etype == EventType.REFLECTION:
                 rend.on_reflection(p.get("reason", ""))
 

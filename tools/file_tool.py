@@ -227,6 +227,19 @@ class FileWriteTool(BaseTool):
         path = Path(params.get("path", ""))
         content = params.get("content", "")
 
+        # 覆盖大文件时发出警告
+        warning = ""
+        if path.exists() and path.is_file():
+            try:
+                existing_lines = path.read_text(encoding="utf-8", errors="replace").count("\n")
+                if existing_lines > 50:
+                    warning = (
+                        f"\n⚠️  WARNING: Overwrote existing file with {existing_lines}+ lines. "
+                        "For targeted edits, use file_edit instead of file_write to avoid data loss."
+                    )
+            except OSError:
+                pass
+
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
@@ -236,5 +249,5 @@ class FileWriteTool(BaseTool):
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return ToolResult(
             success=True,
-            output=f"Written {line_count} lines to {path}",
+            output=f"Written {line_count} lines to {path}{warning}",
         )

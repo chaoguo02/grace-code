@@ -136,6 +136,11 @@ class ReActAgent:
         self._cfg = config or AgentConfig()
         self._memory_context = memory_context
 
+    @property
+    def step_count(self) -> int:
+        """返回当前执行的步数（第几步）。"""
+        return getattr(self, "_current_step", 0)
+
     # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------

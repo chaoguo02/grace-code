@@ -139,6 +139,7 @@ class ChatSession:
         self.agent = create_agent(
             self._mode, self._backend, self._registry, self._agent_cfg,
             plan_approval_callback=self._plan_approval,
+            memory_context=self._memory_context,
             multi_config=multi_cfg,
         )
         self._shared_history = ConversationHistory(

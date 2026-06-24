@@ -116,3 +116,15 @@ python -m entry.github_issue \
   --issue 42 \
   --local-path /path/to/local/repo
 ```
+
+---
+
+## 本地测试
+
+### Plan Mode 回归测试
+
+项目根目录下的 `test_plan_mode.py` 包含 Plan-and-Execute 模式的回归测试用例，使用 `MockBackend` 模拟 LLM 响应：
+
+```bash
+pytest test_plan_mode.py -v
+```
