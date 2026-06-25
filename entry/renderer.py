@@ -156,8 +156,10 @@ class InlineRenderer(RendererBase):
     - 工具调用黄色可折叠面板（Ctrl+O 展开/折叠）
     - diff 语法高亮（rich）
     - 诊断块红/黄 ANSI 渲染
-    - 流式文本实时输出
+    - 流式文本实时输出 + 完成后 markdown 重渲染
     """
+
+    _MD_THEME = None
 
     def __init__(self, model: str = "?", mode: str = "react") -> None:
         super().__init__(model, mode)
@@ -166,11 +168,42 @@ class InlineRenderer(RendererBase):
         self._panels_collapsed = True
         self._streaming = False
         self._stream_line_count = 0
+        self._stream_buffer: list[str] = []
+        self._stream_rendered_lines: int = 0
         self._status_visible = False
         self._lock = threading.Lock()
         self._round_tokens = 0
         self._round_steps = 0
         self._round_start = time.time()
+        self._init_md_theme()
+
+    @classmethod
+    def _init_md_theme(cls) -> None:
+        if cls._MD_THEME is not None:
+            return
+        try:
+            from rich.theme import Theme
+            from rich.markdown import Markdown
+
+            cls._MD_THEME = Theme({
+                "markdown.h1": "bold blue",
+                "markdown.h2": "bold dark_red",
+                "markdown.h3": "bold dark_magenta",
+                "markdown.h4": "bold black",
+                "markdown.h5": "dim black",
+                "markdown.h6": "dim black",
+                "markdown.code": "grey37 on grey93",
+                "markdown.codeblock": "grey15 on grey93",
+                "markdown.block": "grey37 on grey89",
+                "markdown.item.bullet": "dark_red",
+                "markdown.item.number": "dark_red",
+                "markdown.str": "green",
+                "markdown.link": "blue underline",
+                "markdown.bold": "bold black",
+                "markdown.italic": "italic grey19",
+            })
+        except Exception:
+            cls._MD_THEME = False
 
     # ── 状态栏 ─────────────────────────────────────────────────────
 
@@ -228,8 +261,9 @@ class InlineRenderer(RendererBase):
             if not self._streaming:
                 self._streaming = True
                 self._clear_status_bar()
-            sys.stdout.write(token)
-            sys.stdout.flush()
+                self._stream_rendered_lines = 0
+            self._stream_buffer.append(token)
+            self._stream_line_count += token.count("\n")
 
     def stream_thought(self, token: str) -> None:
         with self._lock:
@@ -238,6 +272,54 @@ class InlineRenderer(RendererBase):
                 self._clear_status_bar()
             sys.stdout.write(_dim(token))
             sys.stdout.flush()
+
+    def _render_markdown(self, text: str, *, indent: str = "") -> str:
+        """Render markdown for terminal output with a polished theme."""
+        if not text:
+            return ""
+        try:
+            from rich.console import Console
+            from rich.markdown import Markdown
+            import io
+
+            width = self._terminal_width()
+            if indent:
+                width = max(40, width - len(indent))
+
+            buf = io.StringIO()
+            kwargs: dict[str, Any] = {
+                "file": buf,
+                "force_terminal": _IS_TTY,
+                "width": width,
+                "legacy_windows": False,
+            }
+            if self._MD_THEME and self._MD_THEME is not False:
+                kwargs["theme"] = self._MD_THEME
+
+            console = Console(**kwargs)
+            console.print(Markdown(text))
+            rendered = buf.getvalue().rstrip("\n")
+
+            if indent:
+                lines = rendered.splitlines()
+                indented = []
+                for line in lines:
+                    if line.strip():
+                        indented.append(f"{indent}{line}")
+                    else:
+                        indented.append("")
+                rendered = "\n".join(indented)
+        except Exception:
+            rendered = text
+        return rendered
+
+    def _erase_rendered_lines(self, line_count: int) -> None:
+        """Erase previously streamed lines so markdown re-render can replace them."""
+        if not _IS_TTY or line_count <= 0:
+            return
+        for _ in range(line_count):
+            sys.stdout.write(f"\033[A\033[2K")
+        sys.stdout.flush()
 
     # ── 工具面板 ──────────────────────────────────────────────────
 
@@ -248,6 +330,28 @@ class InlineRenderer(RendererBase):
         if key_info:
             label += _dim(f" {key_info}")
         return f"{prefix}{label}"
+
+    def _format_file_read_summary(self, tool_name: str, output: str) -> str:
+        """Summarize file read/view output without dumping file contents."""
+        import re
+
+        if output.startswith("Skipped duplicate"):
+            return _dim(f"    │ {output}") + "\n" + _green("    ╰─ ✓")
+
+        first_line = output.splitlines()[0] if output else ""
+        if tool_name == "file_read":
+            match = re.match(r"File: (.+) \((\d+) lines total\)", first_line)
+            if match:
+                path, total = match.groups()
+                shown = min(int(total), 500)
+                return _dim(f"    │ {path}: lines 1-{shown} of {total}") + "\n" + _green("    ╰─ ✓")
+        if tool_name == "file_view":
+            nav_line = next((line for line in output.splitlines() if line.startswith("[Lines ")), "")
+            match = re.search(r"\[Lines (\d+)[–-](\d+) of (\d+)", nav_line)
+            if match:
+                start, end, total = match.groups()
+                return _dim(f"    │ lines {start}-{end} of {total}") + "\n" + _green("    ╰─ ✓")
+        return _green("    ╰─ ✓")
 
     def _format_tool_output(self, status: str, output: str, error: str | None) -> str:
         lines: list[str] = []
@@ -272,7 +376,8 @@ class InlineRenderer(RendererBase):
             self._round_steps = step
 
             if self._streaming:
-                sys.stdout.write("\n\n")
+                self._stream_buffer.clear()
+                self._stream_rendered_lines = 0
                 self._streaming = False
 
             self._clear_status_bar()
@@ -288,7 +393,7 @@ class InlineRenderer(RendererBase):
             sys.stdout.flush()
 
             self._tool_panels.append({
-                "step": step, "name": name, "key": key,
+                "step": step, "name": name, "key": key, "params": params,
                 "output": None, "status": None,
             })
 
@@ -307,7 +412,9 @@ class InlineRenderer(RendererBase):
             }
 
             if status == "success":
-                if silent:
+                if tool_name in {"file_read", "file_view"}:
+                    sys.stdout.write(f"{self._format_file_read_summary(tool_name, output)}\n")
+                elif silent:
                     sys.stdout.write(_green("    ╰─ ✓\n"))
                 else:
                     formatted = self._format_tool_output(status, output, error)
@@ -344,7 +451,10 @@ class InlineRenderer(RendererBase):
         with self._lock:
             self._clear_status_bar()
             if self._streaming:
-                sys.stdout.write("\n")
+                if self._stream_rendered_lines > 0:
+                    self._erase_rendered_lines(self._stream_rendered_lines)
+                self._stream_buffer.clear()
+                self._stream_rendered_lines = 0
                 self._streaming = False
             sys.stdout.write(
                 _yellow(f"\n  ⟳ Reflection ({reason}) — reconsidering...\n\n")
@@ -355,21 +465,35 @@ class InlineRenderer(RendererBase):
     def on_finish(self, step: int, message: str) -> None:
         with self._lock:
             self._clear_status_bar()
-            if self._streaming:
-                sys.stdout.write("\n")
+            streamed_text = "".join(self._stream_buffer)
+            was_streaming = self._streaming
+            if was_streaming:
                 self._streaming = False
+                self._stream_buffer.clear()
+
+            display_text = streamed_text or message
+            if display_text:
+                rendered = self._render_markdown(display_text, indent="  ")
+                if rendered:
+                    sys.stdout.write(f"\n{rendered}\n")
             sys.stdout.write(_green(f"\n  ✓ Done (step {step})\n"))
             sys.stdout.flush()
 
     def on_give_up(self, step: int, message: str) -> None:
         with self._lock:
             self._clear_status_bar()
-            if self._streaming:
-                sys.stdout.write("\n")
+            streamed_text = "".join(self._stream_buffer)
+            was_streaming = self._streaming
+            if was_streaming:
                 self._streaming = False
+                self._stream_buffer.clear()
+
             sys.stdout.write(_red(f"\n  ✗ Gave up (step {step})\n"))
-            if message:
-                sys.stdout.write(_red(f"  {message}\n"))
+            display_text = streamed_text or message
+            if display_text:
+                rendered = self._render_markdown(display_text, indent="  ")
+                if rendered:
+                    sys.stdout.write(f"{rendered}\n")
             sys.stdout.flush()
 
     def on_error(self, message: str) -> None:
@@ -389,6 +513,8 @@ class InlineRenderer(RendererBase):
             self._total_tokens += tokens
             self._round_tokens = 0
             self._round_steps = 0
+            self._stream_buffer.clear()
+            self._stream_rendered_lines = 0
             self._clear_status_bar()
 
             w = self._terminal_width()
@@ -449,7 +575,10 @@ class InlineRenderer(RendererBase):
         with self._lock:
             self._clear_status_bar()
             if self._streaming:
-                sys.stdout.write("\n")
+                if self._stream_rendered_lines > 0:
+                    self._erase_rendered_lines(self._stream_rendered_lines)
+                self._stream_buffer.clear()
+                self._stream_rendered_lines = 0
                 self._streaming = False
 
             w = self._terminal_width()
@@ -457,8 +586,9 @@ class InlineRenderer(RendererBase):
             sys.stdout.write(f"\n{border}\n")
             sys.stdout.write(_bold(_cyan("  📋 Implementation Plan\n")))
             sys.stdout.write(_cyan(f"  {'─' * (w - 4)}\n"))
-            for line in plan_text.splitlines():
-                sys.stdout.write(f"  {line}\n")
+            rendered = self._render_markdown(plan_text, indent="  ")
+            if rendered:
+                sys.stdout.write(f"{rendered}\n")
             sys.stdout.write(f"{border}\n\n")
             sys.stdout.flush()
 

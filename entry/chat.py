@@ -133,7 +133,7 @@ class ChatSession:
             llm_retry_delay=1.0,
             stream=True,
             stream_callback=_stream_cb,
-            thought_callback=_thought_cb,
+            thought_callback=None,
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
         )

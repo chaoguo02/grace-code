@@ -53,11 +53,12 @@ class CacheStats:
     """Prompt caching 统计信息。"""
     cache_read_tokens: int = 0          # 从缓存读取的 token 数
     cache_creation_tokens: int = 0      # 写入缓存的 token 数（首次缓存成本稍高）
+    non_cached_input_tokens: int = 0    # 未命中缓存的输入 token 数
 
     @property
     def cache_hit_rate(self) -> float:
-        """缓存命中率 = cached / (cached + non-cached input)。"""
-        total = self.cache_read_tokens + self.cache_creation_tokens
+        """缓存命中率 = cached / total input tokens。"""
+        total = self.cache_read_tokens + self.cache_creation_tokens + self.non_cached_input_tokens
         if total == 0:
             return 0.0
         return self.cache_read_tokens / total

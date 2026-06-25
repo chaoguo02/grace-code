@@ -200,8 +200,16 @@ def _extract_openai_cache_stats(usage: Any) -> CacheStats:
     if not cached:
         cached = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
 
-    if cached:
-        return CacheStats(cache_read_tokens=cached, cache_creation_tokens=0)
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    miss_tokens = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+    non_cached = miss_tokens or max(0, prompt_tokens - cached)
+
+    if cached or non_cached:
+        return CacheStats(
+            cache_read_tokens=cached,
+            cache_creation_tokens=0,
+            non_cached_input_tokens=non_cached,
+        )
     return CacheStats()
 
 

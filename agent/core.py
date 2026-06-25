@@ -217,6 +217,7 @@ class ReActAgent:
         self._loop_break_injected = False
         self._accessed_files: set[str] = set()
         self._procedural_injected_files: set[str] = set()
+        self._read_file_ranges: set[tuple[str, int, int | None]] = set()
         log.log_task_start(task)
         logger.info("Agent starting task %s", task.task_id)
 
@@ -289,6 +290,7 @@ class ReActAgent:
             if response.cache_stats and response.cache_stats.has_cache_activity:
                 cumulative_cache.cache_read_tokens += response.cache_stats.cache_read_tokens
                 cumulative_cache.cache_creation_tokens += response.cache_stats.cache_creation_tokens
+                cumulative_cache.non_cached_input_tokens += response.cache_stats.non_cached_input_tokens
                 # Cached prompt tokens still appear in provider usage, but they should not
                 # trip this run's hard exploration budget on repeated short tasks.
                 billable_tokens = max(0, billable_tokens - response.cache_stats.cache_read_tokens)
@@ -395,8 +397,12 @@ class ReActAgent:
                 any_edit = False
 
                 for tc in action.tool_calls:
-                    result = self._registry.execute_tool(tc.name, tc.params, thought=action.thought or "")
-                    observation = result.to_observation(tc.name)
+                    duplicate_observation = self._duplicate_file_read_observation(tc, task.repo_path)
+                    if duplicate_observation is not None:
+                        observation = duplicate_observation
+                    else:
+                        result = self._registry.execute_tool(tc.name, tc.params, thought=action.thought or "")
+                        observation = result.to_observation(tc.name)
                     observations.append(observation)
 
                     # 追踪文件读取路径（用于 procedural 记忆触发）
@@ -937,6 +943,47 @@ class ReActAgent:
             logger.debug("Failed to load project rules: %s", exc)
         return ""
 
+    def _file_read_range_key(self, tool_call: ToolCall, repo_path: str) -> tuple[str, int, int | None] | None:
+        """Return a normalized file read range key for duplicate-read suppression."""
+        if tool_call.name not in ("file_read", "file_view"):
+            return None
+        file_path = tool_call.params.get("path") or tool_call.params.get("file_path") or ""
+        if not file_path:
+            return None
+        from agent.policy import normalize_repo_path
+        normalized = normalize_repo_path(file_path, repo_path)
+        if tool_call.name == "file_view":
+            start_line = max(1, int(tool_call.params.get("start_line", 1)))
+            from tools.file_tool import VIEW_WINDOW_LINES
+            return (normalized, start_line, start_line + VIEW_WINDOW_LINES - 1)
+        return (normalized, 1, None)
+
+    def _duplicate_file_read_observation(
+        self,
+        tool_call: ToolCall,
+        repo_path: str,
+    ) -> Observation | None:
+        """Return a synthetic observation when an identical file read was already done."""
+        key = self._file_read_range_key(tool_call, repo_path)
+        if key is None:
+            return None
+        if key not in self._read_file_ranges:
+            self._read_file_ranges.add(key)
+            return None
+        path, start_line, end_line = key
+        if end_line is None:
+            range_text = "the full file"
+        else:
+            range_text = f"lines {start_line}-{end_line}"
+        return Observation(
+            status=ObservationStatus.SUCCESS,
+            tool_name=tool_call.name,
+            output=(
+                f"Skipped duplicate {tool_call.name}: {path} {range_text} was already read in this run. "
+                "Use the earlier observation instead of reading it again."
+            ),
+        )
+
     def _format_action_for_history(self, action: Action) -> str:
         """把 Action 格式化为 assistant 消息，写入对话历史。支持并行 tool_calls。"""
         parts = [f"Thought: {action.thought}"]
@@ -1049,7 +1096,13 @@ class ReActAgent:
             )
 
         def _serialize_names(action: Action) -> tuple:
-            return tuple(sorted(tc.name for tc in action.tool_calls))
+            names = []
+            for tool_call in action.tool_calls:
+                # Sequentially paging through file_view ranges is progress, not a loop.
+                if tool_call.name == "file_view":
+                    continue
+                names.append(tool_call.name)
+            return tuple(sorted(names))
 
         # Level 1: exact match (window = N)
         first_exact = _serialize_exact(recent[0])
@@ -1063,7 +1116,7 @@ class ReActAgent:
             semantic_recent = actions[-semantic_window:]
             if all(a.action_type == ActionType.TOOL_CALL and a.tool_calls for a in semantic_recent):
                 first_names = _serialize_names(semantic_recent[0])
-                if all(_serialize_names(a) == first_names for a in semantic_recent[1:]):
+                if first_names and all(_serialize_names(a) == first_names for a in semantic_recent[1:]):
                     return True
 
         return False

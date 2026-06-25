@@ -8,7 +8,7 @@ from agent.core import AgentConfig, PlanExecuteAgent, ReActAgent
 from agent.event_log import EventLog
 from agent.factory import classify_task_intent
 from agent.plan import PlanApproval, PlanExecuteConfig
-from agent.policy import build_task_policy
+from agent.policy import build_task_policy, extract_explicit_read_paths
 from agent.policy_registry import PolicyAwareToolRegistry
 from agent.task import Action, ActionType, RunStatus, Task, ToolCall
 from llm.base import MockBackend
@@ -93,6 +93,42 @@ def test_policy_normalizes_explicit_paths(tmp_path: Path) -> None:
         explicit_read_paths=frozenset({normalized}),
     ))
     assert policy.execution.allowed_read_paths == frozenset({"config/default.yaml"})
+
+
+def test_policy_extracts_only_read_paths_from_user_text(tmp_path: Path) -> None:
+    """Strict only-read wording becomes an enforced read path scope."""
+    description = "只阅读 agent/core.py 和 agent/event_log.py，说明 Action.thought 是否仍会写入内部日志。"
+
+    assert extract_explicit_read_paths(description, str(tmp_path)) == frozenset({
+        "agent/core.py",
+        "agent/event_log.py",
+    })
+
+    policy = build_task_policy(Task(description, str(tmp_path), intent="analysis"))
+    assert policy.execution.strict_file_scope is True
+    assert policy.execution.allowed_read_paths == frozenset({"agent/core.py", "agent/event_log.py"})
+    assert policy.execution.allowed_tools == frozenset({"file_read", "file_view"})
+
+
+def test_policy_blocks_unlisted_file_under_only_read_scope(tmp_path: Path) -> None:
+    """Only-read scopes prevent reading or discovering unrelated files."""
+    read_tool = RecordingTool("file_read", "read")
+    symbol_tool = RecordingTool("find_symbol", "symbol")
+    registry = ToolRegistry().register(read_tool).register(symbol_tool)
+    task = Task(
+        "只阅读 agent/core.py 和 agent/event_log.py，说明 Action.thought 是否仍会写入内部日志。",
+        str(tmp_path),
+        intent="analysis",
+    )
+    policy = build_task_policy(task)
+    wrapped = PolicyAwareToolRegistry(registry, policy.execution, str(tmp_path), "execution")
+
+    assert "find_symbol" not in wrapped.tool_names
+    result = wrapped.execute_tool("file_read", {"path": "agent/task.py"})
+
+    assert not result.success
+    assert "allows only" in (result.error or "")
+    assert read_tool.calls == []
 
 
 def test_policy_registry_hides_and_blocks_denied_tools(tmp_path: Path) -> None:
@@ -701,6 +737,67 @@ def test_extractor_no_block_on_llm_failure(tmp_path: Path) -> None:
 
     assert result.status == RunStatus.SUCCESS
     assert read_tool.calls == [{"path": "README.md"}]
+
+
+def test_file_view_paging_is_not_semantic_loop(tmp_path: Path) -> None:
+    """Sequential file_view windows are progress, not a semantic tool loop."""
+    registry, _read_tool, _write_tool = make_registry()
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
+    task = Task("查看长文件", str(tmp_path), intent="analysis")
+    log = make_log(tmp_path, task)
+    try:
+        log.log_task_start(task)
+        for step, start_line in enumerate((1, 101, 201, 301), start=1):
+            log.log_action(step, Action(
+                ActionType.TOOL_CALL,
+                "page",
+                [ToolCall("file_view", {"path": "entry/chat.py", "start_line": start_line})],
+            ))
+        assert agent._is_looping(log) is False
+    finally:
+        log.close()
+
+
+def test_repeated_same_file_view_range_is_exact_loop(tmp_path: Path) -> None:
+    """Repeating the same file_view range is still detected as an exact loop."""
+    registry, _read_tool, _write_tool = make_registry()
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
+    task = Task("查看长文件", str(tmp_path), intent="analysis")
+    log = make_log(tmp_path, task)
+    try:
+        log.log_task_start(task)
+        for step in range(1, 4):
+            log.log_action(step, Action(
+                ActionType.TOOL_CALL,
+                "same page",
+                [ToolCall("file_view", {"path": "entry/chat.py", "start_line": 101})],
+            ))
+        assert agent._is_looping(log) is True
+    finally:
+        log.close()
+
+
+def test_duplicate_file_read_is_not_executed_twice(tmp_path: Path) -> None:
+    """Identical file reads are converted to synthetic observations after first read."""
+    registry, read_tool, _write_tool = make_registry()
+    backend = MockBackend([
+        Action(ActionType.TOOL_CALL, "read once", [ToolCall("file_read", {"path": "README.md"})]),
+        Action(ActionType.TOOL_CALL, "read duplicate", [ToolCall("file_read", {"path": "README.md"})]),
+        Action(ActionType.FINISH, "done", message="Read README.md."),
+    ])
+    agent = ReActAgent(backend, registry, AgentConfig(stream=False))
+    task = Task("读取 README.md", str(tmp_path), intent="analysis", max_steps=5, budget_tokens=5000)
+
+    log = make_log(tmp_path, task)
+    try:
+        result = agent.run(task, log)
+        observations = [event.payload["observation"] for event in log.replay() if event.event_type.value == "observation"]
+    finally:
+        log.close()
+
+    assert result.status == RunStatus.SUCCESS
+    assert read_tool.calls == [{"path": "README.md"}]
+    assert any("Skipped duplicate file_read" in obs["output"] for obs in observations)
 
 
 # ===========================================================================

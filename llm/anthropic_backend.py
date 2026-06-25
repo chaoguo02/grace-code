@@ -164,9 +164,13 @@ def _to_anthropic_tool(schema: LLMToolSchema) -> dict:
 
 def _extract_cache_stats(usage: Any) -> CacheStats:
     """从 Anthropic usage 对象中提取 prompt caching 统计。"""
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    input_tokens = getattr(usage, "input_tokens", 0) or 0
     return CacheStats(
-        cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-        cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        cache_read_tokens=cache_read,
+        cache_creation_tokens=cache_creation,
+        non_cached_input_tokens=max(0, input_tokens - cache_read - cache_creation),
     )
 
 

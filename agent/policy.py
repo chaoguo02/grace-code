@@ -31,6 +31,11 @@ NO_SHELL_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:运行|�
 NO_TEST_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:运行|执行|跑)?\s*(?:测试|test|pytest)", re.IGNORECASE)
 NO_WEB_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:联网|使用网络|web|搜索网页|web_search|web_fetch)", re.IGNORECASE)
 NO_MEMORY_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:使用)?\s*(?:记忆|memory)", re.IGNORECASE)
+ONLY_READ_SEGMENT_RE = re.compile(
+    r"(?:只(?:能|允许)?(?:阅读|读取|查看|读)|only\s+(?:read|inspect|view))\s*([^。；;\n]+)",
+    re.IGNORECASE,
+)
+PATH_TOKEN_RE = re.compile(r"`([^`]+)`|([\w.\\/-]+\.[A-Za-z0-9_]+)")
 
 
 def normalize_repo_path(path_text: str, repo_path: str) -> str:
@@ -156,6 +161,20 @@ class TaskPolicy:
         return "## Task Policy\n" + "\n".join(lines)
 
 
+def extract_explicit_read_paths(description: str, repo_path: str) -> frozenset[str]:
+    """Extract explicitly allowed read paths from strict user wording."""
+    paths: set[str] = set()
+    for segment_match in ONLY_READ_SEGMENT_RE.finditer(description):
+        segment = segment_match.group(1)
+        segment = re.split(r"(?:不要|不得|禁止|别|do not|don't|最多|最多|最多列|最多用|说明|回答)", segment, maxsplit=1, flags=re.IGNORECASE)[0]
+        for path_match in PATH_TOKEN_RE.finditer(segment):
+            path = path_match.group(1) or path_match.group(2) or ""
+            normalized = normalize_repo_path(path, repo_path)
+            if normalized:
+                paths.add(normalized)
+    return frozenset(paths)
+
+
 def _blocked_tools_from_text(description: str) -> tuple[set[str], list[str]]:
     blocked_tools: set[str] = set()
     notes: list[str] = []
@@ -178,9 +197,9 @@ def build_task_policy(task: Task) -> TaskPolicy:
     description = task.description
     intent = task.intent
 
-    explicit_read_paths = task.explicit_read_paths
+    explicit_read_paths = task.explicit_read_paths or extract_explicit_read_paths(description, task.repo_path) or None
     explicit_write_paths = task.explicit_write_paths
-    strict_file_scope = bool(NO_OTHER_FILES_RE.search(description))
+    strict_file_scope = bool(NO_OTHER_FILES_RE.search(description) or explicit_read_paths)
 
     blocked_tools, notes = _blocked_tools_from_text(description)
     if strict_file_scope:
