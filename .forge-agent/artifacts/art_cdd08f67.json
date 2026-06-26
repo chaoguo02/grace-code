@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_cdd08f67",
+  "tool_name": "find_symbol",
+  "full_content": "D:\\gc\\forge-agent\\agent\\core.py:1182: def _materialize_analysis_history (method)",
+  "summary": "D:\\gc\\forge-agent\\agent\\core.py:1182: def _materialize_analysis_history (method)",
+  "token_count": 23,
+  "char_count": 80,
+  "line_count": 1,
+  "created_at": 1782389010.7157767
+}

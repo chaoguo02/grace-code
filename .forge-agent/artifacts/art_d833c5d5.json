@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_d833c5d5",
+  "tool_name": "find_symbol",
+  "full_content": "D:\\gc\\forge-agent\\context\\evidence.py:104: class EvidenceLedger (method)",
+  "summary": "D:\\gc\\forge-agent\\context\\evidence.py:104: class EvidenceLedger (method)",
+  "token_count": 21,
+  "char_count": 72,
+  "line_count": 1,
+  "created_at": 1782389061.029699
+}

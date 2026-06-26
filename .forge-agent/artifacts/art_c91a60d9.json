@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_c91a60d9",
+  "tool_name": "find_symbol",
+  "full_content": "D:\\gc\\forge-agent\\agent\\core.py:1203: def _build_analysis_phase_anchor (method)",
+  "summary": "D:\\gc\\forge-agent\\agent\\core.py:1203: def _build_analysis_phase_anchor (method)",
+  "token_count": 23,
+  "char_count": 79,
+  "line_count": 1,
+  "created_at": 1782389061.0483413
+}

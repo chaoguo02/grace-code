@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_cc2f5073",
+  "tool_name": "find_symbol",
+  "full_content": "context\\evidence.py:89: class PhaseSummary (top-level)",
+  "summary": "context\\evidence.py:89: class PhaseSummary (top-level)",
+  "token_count": 14,
+  "char_count": 54,
+  "line_count": 1,
+  "created_at": 1782440962.7027874
+}

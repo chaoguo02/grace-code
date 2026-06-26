@@ -76,6 +76,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_V2_DELEGATION_BLOCK_PREFIX = "BLOCKED_BY_DELEGATION_POLICY:"
+
 AnalysisPhase = Literal["plan_reads", "discover", "inspect", "synthesize", "verify", "answer"]
 
 _BROAD_ANALYSIS_RE = re.compile(
@@ -179,7 +181,7 @@ def _coerce_finish_tool_call(action: Action) -> Action:
     params = tool_call.params or {}
     message = action.message
     if isinstance(params, dict):
-        for key in ("summary", "message", "result", "answer", "final_answer"):
+        for key in ("summary", "message", "result", "answer", "final_answer", "action"):
             value = params.get(key)
             if isinstance(value, str) and value.strip():
                 message = value.strip()
@@ -194,6 +196,7 @@ def _coerce_finish_tool_call(action: Action) -> Action:
         thought=action.thought,
         message=message or "Task complete.",
     )
+
 
 
 class ReActAgent:
@@ -267,6 +270,7 @@ class ReActAgent:
         self._artifact_store.set_storage_dir(Path(task.repo_path) / self._cfg.artifact_storage_dir)
         self._task_shape = self._ensure_task_shape(task)
         self._current_task_description = task.description
+        self._current_task_metadata = dict(task.metadata or {})
         self._task_intent = getattr(task, "intent", "edit")
         set_project_dir(task.repo_path)
 
@@ -322,9 +326,15 @@ class ReActAgent:
         evidence_ledger_ref = getattr(self._full_registry, "_evidence_ledger_ref", None)
         if evidence_ledger_ref is not None:
             evidence_ledger_ref.ledger = self._evidence_ledger
+        self._submit_plan_ref = getattr(self._full_registry, "_submit_plan_ref", None)
+        if self._submit_plan_ref is not None:
+            self._submit_plan_ref.pending_plan = None
+            self._submit_plan_ref.task_id = task.task_id
+            self._submit_plan_ref.repo_path = task.repo_path
         self._analysis_tool_decision_count = 0
         self._analysis_recovery_action_count = 0
         self._analysis_deferred_read_count = 0
+        self._plan_reads_budget_warning_injected = False
         self._analysis_logged_claim_ids: set[str] = set()
         self._analysis_phase_state = self._init_analysis_phase_state(task, policy)
         observer = get_observer()
@@ -443,6 +453,26 @@ class ReActAgent:
                 consumed_tokens=total_tokens,
                 max_context_window=self._backend.max_context_window,
             )
+
+            state = getattr(self, "_analysis_phase_state", None)
+            if state is not None and state.enabled and state.phase == "plan_reads":
+                plan_reads_token_budget = int(self._cfg.budget_tokens * 0.15)
+                plan_reads_tokens_used = int(state.phase_token_usage.get("plan_reads", 0))
+                # Warn when 80% of plan_reads budget consumed
+                if (
+                    plan_reads_tokens_used >= int(plan_reads_token_budget * 0.8)
+                    and not getattr(self, "_plan_reads_budget_warning_injected", False)
+                ):
+                    self._plan_reads_budget_warning_injected = True
+                    remaining = max(0, plan_reads_token_budget - plan_reads_tokens_used)
+                    history.add(LLMMessage(
+                        role="user",
+                        content=(
+                            f"[SYSTEM] plan_reads token budget is nearly exhausted ({plan_reads_tokens_used}/{plan_reads_token_budget} tokens used, ~{remaining} remaining). "
+                            "Call submit_read_plan now with your structured read plan."
+                        ),
+                    ))
+
             tools = self._schemas_for_current_phase()
 
             try:
@@ -498,6 +528,8 @@ class ReActAgent:
 
             if getattr(self, "_analysis_answer_phase_forced", False) and action.action_type == ActionType.TOOL_CALL:
                 summary = self._analysis_answer_boundary_summary(len(action.tool_calls or []))
+                finish_action = Action(action_type=ActionType.FINISH, thought="", message=summary)
+                log.log_action(step=step, action=finish_action, raw_content=summary)
                 log.log_task_complete(steps=step, summary=summary)
                 self._extract_success_memories(task, log, summary)
                 return _finish_run(
@@ -536,57 +568,6 @@ class ReActAgent:
                 )
 
             # ── 4. 终止 action ──────────────────────────────────────────
-            state = getattr(self, "_analysis_phase_state", None)
-            if (
-                action.action_type == ActionType.FINISH
-                and state is not None
-                and state.enabled
-                and state.phase == "plan_reads"
-            ):
-                try:
-                    plan = self._approve_read_plan_from_message(action.message, task)
-                except Exception as exc:
-                    reflect_prompt = self._read_plan_retry_prompt(str(exc), task)
-                    log.log_reflection(
-                        step=step,
-                        reason="analysis_read_plan_required",
-                        prompt=reflect_prompt,
-                    )
-                    history.add(LLMMessage(role="user", content=reflect_prompt))
-                    logger.debug("Reflection triggered: analysis_read_plan_required at step %d", step)
-                    continue
-
-                self._analysis_read_plan = plan
-                state.read_plan_ready = True
-                previous_phase = state.phase
-                self._end_analysis_phase_span(
-                    log,
-                    task_obs,
-                    step=step,
-                    phase=previous_phase,
-                    reason="read_plan_approved",
-                )
-                state.phase = "inspect"
-                self._start_analysis_phase_span(
-                    log,
-                    task_obs,
-                    step=step,
-                    phase=state.phase,
-                    reason="read_plan_approved",
-                )
-                log.log_analysis_phase(
-                    step=step,
-                    previous_phase=previous_phase,
-                    current_phase=state.phase,
-                    reason="read_plan_approved",
-                    files_read=len(state.files_read),
-                    inspect_reads=state.inspect_reads,
-                    verify_reads=state.verify_reads,
-                )
-                history.add(LLMMessage(role="user", content=self._read_plan_feedback_prompt(task, plan)))
-                logger.debug("Read plan approved at step %d with %d planned paths", step, len(plan.items))
-                continue
-
             if action.action_type == ActionType.FINISH:
                 summary = action.message or "Task complete."
                 patch = self._get_git_diff(task.repo_path)
@@ -734,9 +715,44 @@ class ReActAgent:
                                     metadata={"tool_name": tc.name, "duration_ms": result.duration_ms},
                                 )
                             observation = result.to_observation(tc.name)
+                            if (
+                                observation.error
+                                and observation.error.startswith(_V2_DELEGATION_BLOCK_PREFIX)
+                            ):
+                                observation.metadata["expected_block"] = True
+                                observation.metadata["block_kind"] = "v2_delegation_policy"
                     observations.append(observation)
 
                     if observation.is_success() and gated_decision is None:
+                        # submit_read_plan: consume pending plan and transition
+                        if tc.name == "submit_read_plan":
+                            plan = self._consume_submitted_plan(task)
+                            if plan is not None:
+                                state = self._analysis_phase_state
+                                previous_phase = state.phase
+                                self._end_analysis_phase_span(
+                                    log, task_obs, step=step,
+                                    phase=previous_phase, reason="read_plan_approved",
+                                )
+                                state.phase = "inspect"
+                                self._start_analysis_phase_span(
+                                    log, task_obs, step=step,
+                                    phase=state.phase, reason="read_plan_approved",
+                                )
+                                log.log_analysis_phase(
+                                    step=step,
+                                    previous_phase=previous_phase,
+                                    current_phase=state.phase,
+                                    reason="read_plan_approved",
+                                    files_read=len(state.files_read),
+                                    inspect_reads=state.inspect_reads,
+                                    verify_reads=state.verify_reads,
+                                )
+                                history.add(LLMMessage(
+                                    role="user",
+                                    content=self._read_plan_feedback_prompt(task, plan),
+                                ))
+
                         transition = self._update_analysis_phase(tc, task.repo_path)
                         evidence_phase = None
                         if transition is not None:
@@ -833,7 +849,8 @@ class ReActAgent:
 
                 # 连续失败计数器
                 all_failed = all(not obs.is_success() for obs in observations)
-                if all_failed:
+                expected_blocked = all(obs.is_expected_block() for obs in observations)
+                if all_failed and not expected_blocked:
                     consecutive_failures += 1
                 else:
                     consecutive_failures = 0
@@ -884,11 +901,10 @@ class ReActAgent:
                     ))
 
                 if gated_read_count:
-                    state = getattr(self, "_analysis_phase_state", None)
-                    if state is not None and state.enabled and state.phase == "plan_reads":
-                        continue
                     if getattr(self, "_deferred_read_reflection_injected", False):
                         summary = self._analysis_answer_boundary_summary(gated_read_count)
+                        finish_action = Action(action_type=ActionType.FINISH, thought="", message=summary)
+                        log.log_action(step=step, action=finish_action, raw_content=summary)
                         log.log_task_complete(steps=step, summary=summary)
                         self._extract_success_memories(task, log, summary)
                         return _finish_run(
@@ -1249,6 +1265,7 @@ class ReActAgent:
         if state.phase == "answer":
             return []
         if state.phase == "plan_reads":
+            # Hide file_read/file_view, keep discovery tools + submit_read_plan
             return [schema for schema in schemas if schema.name not in _READ_TOOL_NAMES]
         return schemas
 
@@ -1331,6 +1348,8 @@ class ReActAgent:
     def _init_analysis_phase_state(self, task: Task, policy: TaskPolicy) -> AnalysisPhaseState:
         """Enable phased analysis only for broad unscoped read-only analysis tasks."""
         shape = self._ensure_task_shape(task)
+        if task.metadata.get("v2_disable_legacy_analysis_prompting"):
+            return AnalysisPhaseState(enabled=False, phase="answer", task_shape=shape.kind)
         if task.intent != "analysis":
             return AnalysisPhaseState(enabled=False, phase="answer")
         if policy.execution.allowed_read_paths or policy.execution.strict_file_scope:
@@ -1366,6 +1385,19 @@ class ReActAgent:
             approved=plan.approved,
         )
 
+    def _consume_submitted_plan(self, task: Task) -> ReadPlan | None:
+        """Consume a pending plan from the submit_read_plan tool ref."""
+        ref = self._submit_plan_ref
+        if ref is None or ref.pending_plan is None:
+            return None
+        plan = self._normalize_read_plan(ref.pending_plan, task.repo_path)
+        self._analysis_read_plan = plan
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is not None:
+            state.read_plan_ready = True
+        ref.pending_plan = None
+        return plan
+
     def _approve_read_plan_from_message(self, message: str | None, task: Task) -> ReadPlan:
         if not message or not message.strip():
             raise ValueError("read plan submission is empty")
@@ -1382,25 +1414,18 @@ class ReActAgent:
             f"[TASK ANCHOR] Your current task is: {task.description}"
         )
 
-    def _read_plan_retry_prompt(self, error: str, task: Task) -> str:
-        return (
-            "[SYSTEM] Broad analysis read planning is required before source reads.\n"
-            f"Your previous read plan was invalid: {error}\n"
-            "Use discovery tools first if needed, then submit a FINISH action whose message is valid JSON only:\n"
-            '{"subsystem":"...","stop_condition":"...","items":[{"path":"...","reason":"...","closes_gap":"...","priority":1,"max_ranges":1}]}\n\n'
-            f"[TASK ANCHOR] Your current task is: {task.description}"
-        )
-
     def _analysis_answer_grounding_retry_prompt(self, task: Task, reason: str) -> str:
         ledger = getattr(self, "_evidence_ledger", None)
         summary = ledger.latest_phase_summary_text() if ledger is not None else ""
         claims = self._build_grounding_claims_summary()
         return (
-            "[SYSTEM] Analysis answer grounding failed.\n"
-            f"{reason}\n"
-            "Revise the final answer now. Every confirmed claim must cite recorded evidence ids like [ev_xxx]. "
-            "If a point does not have evidence support, move it under 'Hypotheses / Needs verification'. "
-            "Do not cite file paths, line numbers, or method names unless they appear in evidence.\n\n"
+            "[SYSTEM] Analysis answer grounding FAILED — your answer was rejected.\n"
+            f"Reason: {reason}\n\n"
+            "FIX REQUIRED: Rewrite your answer and embed [ev_xxx] citations from the list below.\n"
+            "- Pick evidence IDs from the list below and write them inline like: 'The system uses X [ev_abc123].'\n"
+            "- You need AT LEAST ONE [ev_xxx] citation in your answer\n"
+            "- Points without evidence support must go under 'Hypotheses / Needs verification'\n"
+            "- Do NOT invent evidence IDs — only use the exact IDs listed below\n\n"
             f"{summary}\n\n"
             f"{claims}\n\n"
             f"[TASK ANCHOR] Your current task is: {task.description}"
@@ -1645,9 +1670,13 @@ class ReActAgent:
         return (
             "[SYSTEM] Phased analysis answer boundary:\n"
             f"{gated_read_count} source read(s) were deferred after the synthesis boundary.\n"
-            "The next turn is answer phase: no tools will be available. Produce the final answer now from the phase summary, "
-            "evidence references, and confidence boundaries. Every confirmed claim must cite recorded evidence ids like [ev_xxx]. "
-            "If evidence is incomplete, state the uncertainty instead of reading more.\n\n"
+            "The next turn is answer phase: no tools will be available. Produce the final answer now.\n\n"
+            "CRITICAL CITATION REQUIREMENT:\n"
+            "- You MUST embed at least one [ev_xxx] citation in your answer text\n"
+            "- Use the exact evidence IDs listed below (e.g. [ev_abc123])\n"
+            "- Every confirmed architectural finding must have a citation\n"
+            "- Points without evidence support go under 'Hypotheses / Needs verification'\n"
+            "- Do NOT invent evidence IDs — only use IDs from the list below\n\n"
             f"{summary}\n\n"
             f"{claims}\n\n"
             f"[TASK ANCHOR] Your current task is: {task_desc}"
@@ -1684,6 +1713,7 @@ class ReActAgent:
                     task_description=getattr(self, "_current_task_description", ""),
                 )
             task_desc = getattr(self, "_current_task_description", "")
+            claims = self._build_grounding_claims_summary()
             return (
                 "[SYSTEM] Phased analysis controller:\n"
                 f"You have completed the Inspect phase after reading {len(state.files_read)} files.\n"
@@ -1693,8 +1723,10 @@ class ReActAgent:
                 "- confirmed issues\n"
                 "- uncertainty\n"
                 "- named gaps\n"
-                "Then either answer or request one specific verification read. "
-                "Any confirmed answer claim must cite recorded evidence ids like [ev_xxx].\n\n"
+                "Then either answer or request one specific verification read.\n\n"
+                "IMPORTANT: When you produce the final answer, you MUST cite evidence IDs inline like [ev_xxx]. "
+                "Use only the IDs listed below.\n\n"
+                f"{claims}\n\n"
                 f"[TASK ANCHOR] Your current task is: {task_desc}"
             )
 
@@ -1727,10 +1759,17 @@ class ReActAgent:
         parts: list[str] = []
 
         task_desc = getattr(self, "_current_task_description", "")
+        task_metadata = getattr(self, "_current_task_metadata", {}) or {}
+        legacy_analysis_prompting_disabled = bool(
+            task_metadata.get("v2_disable_legacy_analysis_prompting")
+        )
         if task_desc:
             parts.append(f"## Current Task\n{task_desc}")
 
-        if getattr(self, "_task_intent", "edit") == "analysis":
+        if (
+            getattr(self, "_task_intent", "edit") == "analysis"
+            and not legacy_analysis_prompting_disabled
+        ):
             parts.append(
                 "## Task Mode: Analysis\n"
                 "This is a read-only analysis task. Classify the task shape first, then follow the active phase.\n"
@@ -1741,12 +1780,12 @@ class ReActAgent:
                 "Do NOT edit files. Do NOT run tests. Answer from evidence as soon as you can."
             )
 
-        phase_section = self._build_analysis_phase_anchor()
+        phase_section = "" if legacy_analysis_prompting_disabled else self._build_analysis_phase_anchor()
         if phase_section:
             parts.append(phase_section)
 
         active_policy = getattr(self, "_active_policy", None)
-        if active_policy is not None:
+        if active_policy is not None and not legacy_analysis_prompting_disabled:
             prompt_section = active_policy.to_prompt_section("execution")
             if prompt_section:
                 parts.append(prompt_section)
@@ -1818,12 +1857,37 @@ class ReActAgent:
         ledger = getattr(self, "_evidence_ledger", None)
         if ledger is None:
             return ""
+        lines: list[str] = []
         claims = ledger.latest_claims()
-        if not claims:
-            return ""
-        lines = ["Available grounded claims:"]
-        for claim in claims[:6]:
-            lines.append(claim.prompt_text())
+        if claims:
+            lines.append("Available grounded claims:")
+            for claim in claims[:6]:
+                lines.append(claim.prompt_text())
+
+        records = ledger.key_evidence_records()
+        if records:
+            lines.append("")
+            lines.append("Evidence IDs you MUST cite in your answer (use [ev_xxx] format):")
+            for record in records[:12]:
+                loc = record.path or "(no path)"
+                lines.append(f"  [{record.evidence_id}] {loc}: {record.summary[:80]}")
+            lines.append("")
+            lines.append("Example citation format:")
+            sample_id = records[0].evidence_id
+            lines.append(f'  "The module uses X pattern [{sample_id}]."')
+
+        if not lines:
+            all_records = ledger.all_records()
+            if all_records:
+                lines.append("Evidence IDs you MUST cite in your answer (use [ev_xxx] format):")
+                for record in all_records[:12]:
+                    loc = record.path or "(no path)"
+                    lines.append(f"  [{record.evidence_id}] {loc}: {record.summary[:80]}")
+                lines.append("")
+                lines.append("Example citation format:")
+                sample_id = all_records[0].evidence_id
+                lines.append(f'  "The module uses X pattern [{sample_id}]."')
+
         return "\n".join(lines)
 
     def _read_plan_gate_observation(
@@ -1845,6 +1909,19 @@ class ReActAgent:
         if state is None or not state.enabled or tool_call.name not in _READ_TOOL_NAMES:
             return None
 
+        # plan_reads phase: unconditionally gate all read tools regardless of path
+        read_plan = getattr(self, "_analysis_read_plan", None)
+        if state.phase == "plan_reads" or not state.read_plan_ready or read_plan is None:
+            return ToolDecision(
+                allowed=False,
+                reason="read_plan_required",
+                synthetic_observation=(
+                    "Deferred source read by phased analysis controller: broad analysis requires a read plan before "
+                    "source reads. Use discovery tools (find_files, search_text, find_symbol) first, then call "
+                    "submit_read_plan with your structured plan."
+                ),
+            )
+
         from agent.policy import normalize_repo_path
 
         normalized = normalize_repo_path(
@@ -1853,18 +1930,6 @@ class ReActAgent:
         )
         if not normalized:
             return None
-
-        read_plan = getattr(self, "_analysis_read_plan", None)
-        if state.phase == "plan_reads" or not state.read_plan_ready or read_plan is None:
-            return ToolDecision(
-                allowed=False,
-                reason="read_plan_required",
-                synthetic_observation=(
-                    "Deferred source read by phased analysis controller: broad analysis requires a read plan before "
-                    "source reads. Use discovery tools first, then submit a FINISH action whose message is valid JSON only: "
-                    '{"subsystem":"...","stop_condition":"...","items":[{"path":"...","reason":"...","closes_gap":"...","priority":1,"max_ranges":1}]}'
-                ),
-            )
 
         allowed_paths = read_plan.allowed_paths()
         if state.phase == "inspect" and normalized not in allowed_paths:

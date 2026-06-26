@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_c744a172",
+  "tool_name": "search_text",
+  "full_content": "agent\\core.py:35: from context.evidence import EvidenceLedger\nagent\\core.py:321:         self._evidence_ledger = EvidenceLedger()\nagent\\core.py:1511:     def _record_evidence(\n[Showing 3 matches]",
+  "summary": "agent\\core.py:35: from context.evidence import EvidenceLedger\nagent\\core.py:321:         self._evidence_ledger = EvidenceLedger()\nagent\\core.py:1511:     def _record_evidence(\n[Showing 3 matches]",
+  "token_count": 53,
+  "char_count": 195,
+  "line_count": 4,
+  "created_at": 1782440186.3322542
+}

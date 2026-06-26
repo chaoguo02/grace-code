@@ -44,8 +44,35 @@ class ReadPlan:
         return "; ".join(pieces)
 
 
+def _extract_json_object(text: str) -> dict:
+    """Extract the first JSON object from text that may contain prose around it."""
+    text = text.strip()
+    # Try direct parse first
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        pass
+    # Try json.loads starting from each '{' in the text
+    search_start = 0
+    while True:
+        idx = text.find("{", search_start)
+        if idx == -1:
+            break
+        try:
+            decoder = json.JSONDecoder()
+            payload, end = decoder.raw_decode(text, idx)
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            pass
+        search_start = idx + 1
+    raise ValueError("no valid JSON object found in message")
+
+
 def parse_read_plan_message(message: str, *, task_id: str) -> ReadPlan:
-    payload = json.loads(message)
+    payload = _extract_json_object(message)
     if not isinstance(payload, dict):
         raise ValueError("read plan payload must be a JSON object")
 

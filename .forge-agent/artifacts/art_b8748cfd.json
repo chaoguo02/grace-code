@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_b8748cfd",
+  "tool_name": "find_symbol",
+  "full_content": "context\\artifacts.py:68: class ArtifactStore (method)\ntools\\artifact_tool.py:13: class ArtifactStoreRef (top-level)",
+  "summary": "context\\artifacts.py:68: class ArtifactStore (method)\ntools\\artifact_tool.py:13: class ArtifactStoreRef (top-level)",
+  "token_count": 30,
+  "char_count": 115,
+  "line_count": 2,
+  "created_at": 1782440972.4092662
+}

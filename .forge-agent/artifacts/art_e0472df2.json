@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_e0472df2",
+  "tool_name": "find_symbol",
+  "full_content": "D:\\gc\\forge-agent\\agent\\core.py:1280: def _verification_read_gate_observation (method)",
+  "summary": "D:\\gc\\forge-agent\\agent\\core.py:1280: def _verification_read_gate_observation (method)",
+  "token_count": 24,
+  "char_count": 86,
+  "line_count": 1,
+  "created_at": 1782389061.0558105
+}

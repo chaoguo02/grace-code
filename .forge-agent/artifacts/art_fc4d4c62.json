@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_fc4d4c62",
+  "tool_name": "file_read",
+  "full_content": "Skipped duplicate file_read: context/evidence.py the full file was already read in this run. Use the earlier observation instead of reading it again.",
+  "summary": "Skipped duplicate file_read: context/evidence.py the full file was already read in this run. Use the earlier observation instead of reading it again.",
+  "token_count": 30,
+  "char_count": 149,
+  "line_count": 1,
+  "created_at": 1782388225.557138
+}

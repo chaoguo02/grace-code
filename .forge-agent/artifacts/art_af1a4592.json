@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_af1a4592",
+  "tool_name": "search_text",
+  "full_content": "context\\read_plan.py:4: from dataclasses import dataclass, field\ncontext\\read_plan.py:8: @dataclass(frozen=True)\ncontext\\read_plan.py:9: class ReadPlanItem:\ncontext\\read_plan.py:16:     def summary(self) -> str:\ncontext\\read_plan.py:21: @dataclass\ncontext\\read_plan.py:22: class ReadPlan:\ncontext\\read_plan.py:29:     def allowed_paths(self) -> frozenset[str]:\ncontext\\read_plan.py:32:     def item_for_path(self, path: str) -> ReadPlanItem | None:\ncontext\\read_plan.py:38:     def summary(self, max_items: int = 4) -> str:\ncontext\\read_plan.py:47: def parse_read_plan_message(message: str, *, task_id: str) -> ReadPlan:\ncontext\\read_plan.py:96: def read_plan_to_dict(plan: ReadPlan) -> dict[str, Any]:\n[Showing 11 matches]",
+  "summary": "context\\read_plan.py:4: from dataclasses import dataclass, field\ncontext\\read_plan.py:8: @dataclass(frozen=True)\ncontext\\read_plan.py:9: class ReadPlanItem:\ncontext\\read_plan.py:16:     def summary(self) -> str:\ncontext\\read_plan.py:21: @dataclass\ncontext\\read_plan.py:22: class ReadPlan:\ncontext\\read_plan.py:29:     def allowed_paths(self) -> frozenset[str]:\ncontext\\read_plan.py:32:     def item_for_path(self, path: str) -> ReadPlanItem | None:\ncontext\\read_plan.py:38:     def summary(self, max_items: int = 4) -> str:\ncontext\\read_plan.py:47: def parse_read_plan_message(message: str, *, task_id: str) -> ReadPlan:\ncontext\\read_plan.py:96: def read_plan_to_dict(plan: ReadPlan) -> dict[str, Any]:\n[Showing 11 matches]",
+  "token_count": 212,
+  "char_count": 723,
+  "line_count": 12,
+  "created_at": 1782440165.0733774
+}

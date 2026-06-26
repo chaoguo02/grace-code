@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_f779c598",
+  "tool_name": "find_symbol",
+  "full_content": "context\\artifacts.py:68: class ArtifactStore (method)",
+  "summary": "context\\artifacts.py:68: class ArtifactStore (method)",
+  "token_count": 14,
+  "char_count": 53,
+  "line_count": 1,
+  "created_at": 1782443073.3759742
+}

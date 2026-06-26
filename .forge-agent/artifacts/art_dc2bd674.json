@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_dc2bd674",
+  "tool_name": "find_symbol",
+  "full_content": "context\\read_plan.py:9: class ReadPlanItem (top-level)\ncontext\\read_plan.py:22: class ReadPlan (top-level)",
+  "summary": "context\\read_plan.py:9: class ReadPlanItem (top-level)\ncontext\\read_plan.py:22: class ReadPlan (top-level)",
+  "token_count": 31,
+  "char_count": 106,
+  "line_count": 2,
+  "created_at": 1782455522.4246025
+}

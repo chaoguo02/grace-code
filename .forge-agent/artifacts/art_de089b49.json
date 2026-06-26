@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_de089b49",
+  "tool_name": "search_text",
+  "full_content": "agent\\core.py:90: class AnalysisPhaseState:\nagent\\core.py:329:         self._analysis_phase_state = self._init_analysis_phase_state(task, policy)\nagent\\core.py:746:                             state = self._analysis_phase_state\nagent\\core.py:1331:     def _init_analysis_phase_state(self, task: Task, policy: TaskPolicy) -> AnalysisPhaseState:\nagent\\core.py:1335:             return AnalysisPhaseState(enabled=False, phase=\"answer\")\nagent\\core.py:1337:             return AnalysisPhaseState(enabled=False, phase=\"answer\")\nagent\\core.py:1339:             return AnalysisPhaseState(enabled=False, phase=\"answer\", task_shape=shape.kind)\nagent\\core.py:1340:         return AnalysisPhaseState(\nagent\\core.py:1636:             f\"files={self._analysis_phase_files_summary()}\"\nagent\\core.py:1794:             f\"Files read: {len(state.files_read)} ({self._analysis_phase_files_summary()})\",\n[Showing 10 matches]",
+  "summary": "agent\\core.py:90: class AnalysisPhaseState:\nagent\\core.py:329:         self._analysis_phase_state = self._init_analysis_phase_state(task, policy)\nagent\\core.py:746:                             state = self._analysis_phase_state\nagent\\core.py:1331:     def _init_analysis_phase_state(self, task: Task, policy: TaskPolicy) -> AnalysisPhaseState:\nagent\\core.py:1335:             return AnalysisPhaseState(enabled=False, phase=\"answer\")\nagent\\core.py:1337:             return AnalysisPhaseState(enabled=False, phase=\"answer\")\nagent\\core.py:1339:             return AnalysisPhaseState(enabled=False, phase=\"answer\", task_shape=shape.kind)\nagent\\core.py:1340:         return AnalysisPhaseState(\nagent\\core.py:1636:             f\"files={self._analysis_phase_files_summary()}\"\nagent\\core.py:1794:             f\"Files read: {len(state.files_read)} ({self._analysis_phase_files_summary()})\",\n[Showing 10 matches]",
+  "token_count": 210,
+  "char_count": 902,
+  "line_count": 11,
+  "created_at": 1782440197.9908426
+}

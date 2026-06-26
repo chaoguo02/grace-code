@@ -296,6 +296,14 @@ class EvidenceLedger:
     def known_evidence_ids(self) -> set[str]:
         return {record.evidence_id for record in self._records if record.evidence_id}
 
+    def key_evidence_records(self) -> list["EvidenceRecord"]:
+        """Return records marked as key evidence, most recent first."""
+        return [r for r in reversed(self._records) if r.key_evidence and r.evidence_id]
+
+    def all_records(self) -> list["EvidenceRecord"]:
+        """Return all records with evidence ids, most recent first."""
+        return [r for r in reversed(self._records) if r.evidence_id]
+
     def latest_claims(self) -> list[Claim]:
         if not self._phase_summaries:
             return []

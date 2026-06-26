@@ -45,10 +45,29 @@ class RecordingTool(BaseTool):
 
 
 def make_registry() -> tuple[ToolRegistry, RecordingTool, RecordingTool]:
+    from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
     read_tool = RecordingTool("file_read", "# Forge Agent\nA local autonomous coding agent.")
     write_tool = RecordingTool("file_write", "written")
-    registry = ToolRegistry().register(read_tool).register(write_tool)
+    submit_ref = SubmitReadPlanRef()
+    registry = (
+        ToolRegistry()
+        .register(read_tool)
+        .register(write_tool)
+        .register(SubmitReadPlanTool(submit_ref))
+    )
+    registry._submit_plan_ref = submit_ref
     return registry, read_tool, write_tool
+
+
+def make_submit_plan_action(items: list[dict], subsystem: str = "broad-analysis",
+                            stop_condition: str = "stop after planned reads") -> Action:
+    """Create a TOOL_CALL action for submit_read_plan."""
+    params = {
+        "subsystem": subsystem,
+        "stop_condition": stop_condition,
+        "items": items,
+    }
+    return Action(ActionType.TOOL_CALL, "submit read plan", [ToolCall("submit_read_plan", params)])
 
 
 def make_log(tmp_path: Path, task: Task) -> EventLog:
@@ -370,6 +389,103 @@ def test_plan_reads_hides_source_read_schemas(tmp_path: Path) -> None:
     assert "search_text" in schema_names
     assert "file_read" not in schema_names
     assert "file_view" not in schema_names
+
+
+def test_plan_reads_always_shows_discovery_tools(tmp_path: Path) -> None:
+    """plan_reads phase always shows discovery tools and submit_read_plan, never returns []."""
+    from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
+    submit_ref = SubmitReadPlanRef()
+    registry = (
+        ToolRegistry()
+        .register(RecordingTool("find_files", "found"))
+        .register(RecordingTool("search_text", "found"))
+        .register(RecordingTool("file_read", "read"))
+        .register(RecordingTool("file_view", "view"))
+        .register(SubmitReadPlanTool(submit_ref))
+    )
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False, budget_tokens=80_000))
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
+    policy = build_task_policy(task)
+    agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+
+    schema_names = {schema.name for schema in agent._schemas_for_current_phase()}
+
+    assert "find_files" in schema_names
+    assert "search_text" in schema_names
+    assert "submit_read_plan" in schema_names
+    assert "file_read" not in schema_names
+    assert "file_view" not in schema_names
+
+
+def test_plan_reads_keeps_tools_even_after_budget_exceeded(tmp_path: Path) -> None:
+    """After token budget exhaustion, discovery tools + submit_read_plan remain available."""
+    from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
+    submit_ref = SubmitReadPlanRef()
+    registry = (
+        ToolRegistry()
+        .register(RecordingTool("find_files", "found"))
+        .register(RecordingTool("search_text", "found"))
+        .register(RecordingTool("file_read", "read"))
+        .register(SubmitReadPlanTool(submit_ref))
+    )
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False, budget_tokens=80_000))
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
+    policy = build_task_policy(task)
+    agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+    # Simulate having used 12000+ tokens (>= 15% of 80000)
+    agent._analysis_phase_state.phase_token_usage["plan_reads"] = 12_001
+
+    schema_names = {schema.name for schema in agent._schemas_for_current_phase()}
+
+    assert "find_files" in schema_names
+    assert "submit_read_plan" in schema_names
+    assert "file_read" not in schema_names
+
+
+def test_plan_reads_allows_discovery_tools_within_token_budget(tmp_path: Path) -> None:
+    """Within token budget, discovery tools are available but read tools are hidden."""
+    from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
+    submit_ref = SubmitReadPlanRef()
+    registry = (
+        ToolRegistry()
+        .register(RecordingTool("find_files", "found"))
+        .register(RecordingTool("search_text", "found"))
+        .register(RecordingTool("file_read", "read"))
+        .register(RecordingTool("file_view", "view"))
+        .register(SubmitReadPlanTool(submit_ref))
+    )
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False, budget_tokens=80_000))
+    task = Task("梳理当前架构", str(tmp_path), intent="analysis")
+    policy = build_task_policy(task)
+    agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+    # Simulate having used only 5000 tokens (well within 15% of 80000 = 12000)
+    agent._analysis_phase_state.phase_token_usage["plan_reads"] = 5_000
+
+    schema_names = {schema.name for schema in agent._schemas_for_current_phase()}
+
+    assert "find_files" in schema_names
+    assert "search_text" in schema_names
+    assert "submit_read_plan" in schema_names
+    assert "file_read" not in schema_names
+    assert "file_view" not in schema_names
+
+
+def test_parse_read_plan_extracts_json_from_prose(tmp_path: Path) -> None:
+    """parse_read_plan_message handles messages with prose around JSON."""
+    from context.read_plan import parse_read_plan_message
+    msg = (
+        "Based on my discovery, here is the read plan:\n"
+        + json.dumps({
+            "subsystem": "evidence",
+            "stop_condition": "all files read",
+            "items": [{"path": "a.py", "reason": "check", "closes_gap": "verify", "priority": 1}],
+        })
+        + "\n\nLet me know."
+    )
+    plan = parse_read_plan_message(msg, task_id="t1")
+    assert plan.subsystem == "evidence"
+    assert len(plan.items) == 1
+    assert plan.items[0].path == "a.py"
 
 
 def test_phase_controller_moves_to_synthesize_after_distinct_reads(tmp_path: Path) -> None:
@@ -1327,22 +1443,18 @@ def test_extractor_no_block_on_llm_failure(tmp_path: Path) -> None:
 def test_same_round_reads_after_inspect_limit_are_gated(tmp_path: Path) -> None:
     registry, read_tool, _write_tool = make_registry()
     backend = MockBackend([
-        Action(
-            ActionType.FINISH,
-            "submit read plan",
-            message=json.dumps({
-                "subsystem": "module-audit",
-                "stop_condition": "stop after inspect limit and synthesize",
-                "items": [
-                    {
-                        "path": f"src/file{index}.py",
-                        "reason": f"inspect file {index}",
-                        "closes_gap": f"confirm file {index}",
-                        "priority": index + 1,
-                    }
-                    for index in range(6)
-                ],
-            }),
+        make_submit_plan_action(
+            [
+                {
+                    "path": f"src/file{index}.py",
+                    "reason": f"inspect file {index}",
+                    "closes_gap": f"confirm file {index}",
+                    "priority": index + 1,
+                }
+                for index in range(6)
+            ],
+            subsystem="module-audit",
+            stop_condition="stop after inspect limit and synthesize",
         ),
         Action(ActionType.TOOL_CALL, "parallel reads", [
             ToolCall("file_read", {"path": f"src/file{index}.py"})
@@ -1419,23 +1531,20 @@ def test_named_gap_gate_defers_unrecommended_verify_read(tmp_path: Path) -> None
 def test_evidence_lifecycle_materializes_completed_phase_tool_outputs(tmp_path: Path) -> None:
     registry, read_tool, _write_tool = make_registry()
     read_tool.output = "line 1 important architecture fact\nline 2 more detail\nline 3 more detail"
+    expected_first_id = expected_evidence_id("file_0.py", output=read_tool.output)
     backend = MockBackend([
-        Action(
-            ActionType.FINISH,
-            "submit read plan",
-            message=json.dumps({
-                "subsystem": "module-audit",
-                "stop_condition": "stop after five planned reads and synthesize",
-                "items": [
-                    {
-                        "path": f"file_{i}.py",
-                        "reason": f"inspect file {i}",
-                        "closes_gap": f"confirm file {i}",
-                        "priority": i + 1,
-                    }
-                    for i in range(5)
-                ],
-            }),
+        make_submit_plan_action(
+            [
+                {
+                    "path": f"file_{i}.py",
+                    "reason": f"inspect file {i}",
+                    "closes_gap": f"confirm file {i}",
+                    "priority": i + 1,
+                }
+                for i in range(5)
+            ],
+            subsystem="module-audit",
+            stop_condition="stop after five planned reads and synthesize",
         ),
         *[
             Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
@@ -1445,7 +1554,7 @@ def test_evidence_lifecycle_materializes_completed_phase_tool_outputs(tmp_path: 
         Action(
             ActionType.FINISH,
             "synthesized",
-            message=f"## Confirmed\n- Evidence captured for module audit [{expected_evidence_id('file_0.py', output='line 1 important architecture fact\nline 2 more detail\nline 3 more detail')}]",
+            message=f"## Confirmed\n- Evidence captured for module audit [{expected_first_id}]",
         ),
     ])
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
@@ -1473,28 +1582,29 @@ def test_evidence_lifecycle_materializes_completed_phase_tool_outputs(tmp_path: 
     tool_messages = [message for message in final_messages if message.role == "tool"]
     assert tool_messages
     assert all(message.tool_call_id for message in tool_messages)
-    assert all(str(message.content).startswith("[Evidence ev_") for message in tool_messages)
+    evidence_tool_messages = [
+        m for m in tool_messages
+        if not str(m.content).startswith("Read plan accepted")
+    ]
+    assert evidence_tool_messages
+    assert all(str(message.content).startswith("[Evidence ev_") for message in evidence_tool_messages)
 
 
 def test_repeated_deferred_reads_stop_with_phase_summary(tmp_path: Path) -> None:
     registry, read_tool, _write_tool = make_registry()
     backend = MockBackend([
-        Action(
-            ActionType.FINISH,
-            "submit read plan",
-            message=json.dumps({
-                "subsystem": "module-audit",
-                "stop_condition": "stop after five planned reads and synthesize",
-                "items": [
-                    {
-                        "path": f"src/file{index}.py",
-                        "reason": f"inspect file {index}",
-                        "closes_gap": f"confirm file {index}",
-                        "priority": index + 1,
-                    }
-                    for index in range(5)
-                ],
-            }),
+        make_submit_plan_action(
+            [
+                {
+                    "path": f"src/file{index}.py",
+                    "reason": f"inspect file {index}",
+                    "closes_gap": f"confirm file {index}",
+                    "priority": index + 1,
+                }
+                for index in range(5)
+            ],
+            subsystem="module-audit",
+            stop_condition="stop after five planned reads and synthesize",
         ),
         *[
             Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": f"src/file{index}.py"})])
@@ -1534,21 +1644,17 @@ def test_broad_analysis_finish_retries_for_ungrounded_answer(tmp_path: Path) -> 
         path="agent/core.py",
     ).evidence_id
     backend = MockBackend([
-        Action(
-            ActionType.FINISH,
-            "submit read plan",
-            message=json.dumps({
-                "subsystem": "module-audit",
-                "stop_condition": "stop after one planned read and answer",
-                "items": [
-                    {
-                        "path": "agent/core.py",
-                        "reason": "inspect core runtime",
-                        "closes_gap": "confirm controller wiring",
-                        "priority": 1,
-                    }
-                ],
-            }),
+        make_submit_plan_action(
+            [
+                {
+                    "path": "agent/core.py",
+                    "reason": "inspect core runtime",
+                    "closes_gap": "confirm controller wiring",
+                    "priority": 1,
+                }
+            ],
+            subsystem="module-audit",
+            stop_condition="stop after one planned read and answer",
         ),
         Action(ActionType.TOOL_CALL, "read core", [ToolCall("file_read", {"path": "agent/core.py"})]),
         Action(ActionType.FINISH, "ungrounded", message="## Confirmed\n- Core wiring is present"),
@@ -1606,22 +1712,18 @@ def test_broad_analysis_gated_read_logs_tool_decision(tmp_path: Path) -> None:
 def test_analysis_phase_transitions_are_logged(tmp_path: Path) -> None:
     registry, read_tool, _write_tool = make_registry()
     backend = MockBackend([
-        Action(
-            ActionType.FINISH,
-            "submit read plan",
-            message=json.dumps({
-                "subsystem": "module-audit",
-                "stop_condition": "stop after five planned reads and synthesize",
-                "items": [
-                    {
-                        "path": f"file_{i}.py",
-                        "reason": f"inspect file {i}",
-                        "closes_gap": f"confirm file {i}",
-                        "priority": i + 1,
-                    }
-                    for i in range(5)
-                ],
-            }),
+        make_submit_plan_action(
+            [
+                {
+                    "path": f"file_{i}.py",
+                    "reason": f"inspect file {i}",
+                    "closes_gap": f"confirm file {i}",
+                    "priority": i + 1,
+                }
+                for i in range(5)
+            ],
+            subsystem="module-audit",
+            stop_condition="stop after five planned reads and synthesize",
         ),
         *[
             Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
@@ -1670,22 +1772,18 @@ def test_analysis_phase_transitions_are_logged(tmp_path: Path) -> None:
 def test_synthesize_logs_claim_created_events(tmp_path: Path) -> None:
     registry, _read_tool, _write_tool = make_registry()
     backend = MockBackend([
-        Action(
-            ActionType.FINISH,
-            "submit read plan",
-            message=json.dumps({
-                "subsystem": "module-audit",
-                "stop_condition": "stop after five planned reads and synthesize",
-                "items": [
-                    {
-                        "path": f"file_{i}.py",
-                        "reason": f"inspect file {i}",
-                        "closes_gap": f"confirm file {i}",
-                        "priority": i + 1,
-                    }
-                    for i in range(5)
-                ],
-            }),
+        make_submit_plan_action(
+            [
+                {
+                    "path": f"file_{i}.py",
+                    "reason": f"inspect file {i}",
+                    "closes_gap": f"confirm file {i}",
+                    "priority": i + 1,
+                }
+                for i in range(5)
+            ],
+            subsystem="module-audit",
+            stop_condition="stop after five planned reads and synthesize",
         ),
         *[
             Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
@@ -1743,22 +1841,18 @@ def test_analysis_read_guardrail_reflects_after_many_distinct_files(tmp_path: Pa
     """Broad analysis pauses for synthesis after reading many distinct files."""
     registry, read_tool, _write_tool = make_registry()
     backend = MockBackend([
-        Action(
-            ActionType.FINISH,
-            "submit read plan",
-            message=json.dumps({
-                "subsystem": "module-audit",
-                "stop_condition": "stop after five planned reads and synthesize",
-                "items": [
-                    {
-                        "path": f"file_{i}.py",
-                        "reason": f"inspect file {i}",
-                        "closes_gap": f"confirm file {i}",
-                        "priority": i + 1,
-                    }
-                    for i in range(5)
-                ],
-            }),
+        make_submit_plan_action(
+            [
+                {
+                    "path": f"file_{i}.py",
+                    "reason": f"inspect file {i}",
+                    "closes_gap": f"confirm file {i}",
+                    "priority": i + 1,
+                }
+                for i in range(5)
+            ],
+            subsystem="module-audit",
+            stop_condition="stop after five planned reads and synthesize",
         ),
         *[
             Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])

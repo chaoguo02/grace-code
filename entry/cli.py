@@ -138,6 +138,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     from tools.web_tool import WebSearchTool, WebFetchTool
     from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
     from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
+    from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
 
     # 构建 HitlManager（如果启用且有确认回调）
     hitl_manager = None
@@ -161,6 +162,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     web_cfg = cfg.tools.web
     artifact_store_ref = ArtifactStoreRef()
     evidence_ledger_ref = EvidenceLedgerRef()
+    submit_plan_ref = SubmitReadPlanRef()
     # ShellTool: 无 HitlManager 时保留 confirm_callback 降级路径
     shell_cb = confirm_callback if hitl_manager is None else None
     registry = (
@@ -188,9 +190,11 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
         .register(ArtifactSearchTool(artifact_store_ref))
         .register(EvidenceListTool(evidence_ledger_ref))
         .register(EvidenceGetTool(evidence_ledger_ref))
+        .register(SubmitReadPlanTool(submit_plan_ref))
     )
     registry._artifact_store_ref = artifact_store_ref
     registry._evidence_ledger_ref = evidence_ledger_ref
+    registry._submit_plan_ref = submit_plan_ref
 
     # 注册记忆工具（如果提供了 MemoryStore）
     if memory_store is not None:
@@ -344,6 +348,63 @@ def _build_multi_config(config, auto_approve: bool = False) -> "MultiAgentConfig
     )
 
 
+def _run_v2_mode(
+    *,
+    mode: str,
+    description: str,
+    repo_path: Path,
+    backend,
+    registry,
+    agent_config,
+    memory_context,
+    log_dir: str,
+    intent_override: str,
+) -> None:
+    from agent.factory import classify_task_intent
+    from agent.task import RunStatus
+    from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
+    from llm.base import LLMMessage
+
+    primary_agent = "build" if mode == "v2-build" else "plan"
+    db_path = default_session_db_path(str(repo_path))
+    store = SessionStore(db_path)
+    runtime = SessionRuntime(
+        store=store,
+        backend=backend,
+        base_registry=registry,
+        agent_registry=AgentRegistryV2(),
+        root_agent_config=agent_config,
+        log_dir=log_dir,
+        child_max_steps=12,
+        child_budget_tokens=30_000,
+        memory_context=memory_context,
+    )
+    session = runtime.create_root_session(
+        agent_name=primary_agent,
+        repo_path=str(repo_path),
+        title=description[:80] or f"v2-{primary_agent}",
+        metadata={"entrypoint": "cli_run_v2", "mode": mode},
+    )
+    intent = classify_task_intent(description, intent_override, backend)
+    result = runtime.run_session(
+        session.id,
+        agent_name=primary_agent,
+        task_description=description,
+        intent=intent,
+        messages=[LLMMessage(role="user", content=description)],
+    )
+
+    click.echo(dim(f"  Mode    : {mode}"))
+    click.echo(dim(f"  V2 DB   : {db_path}"))
+    click.echo(dim(f"  Session : {session.id}\n"))
+    if result.summary:
+        click.echo(result.summary)
+    if result.status == RunStatus.SUCCESS:
+        click.echo(green("\n  V2 run completed successfully."))
+    else:
+        click.echo(yellow(f"\n  V2 run finished with status: {result.status.value}"))
+
+
 # ---------------------------------------------------------------------------
 # run 子命令
 # ---------------------------------------------------------------------------
@@ -360,7 +421,7 @@ def _build_multi_config(config, auto_approve: bool = False) -> "MultiAgentConfig
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
-@click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto"]), help="Agent mode: react, plan, dag, multi-agent, or auto")
+@click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto", "v2-build", "v2-plan"]), help="Agent mode: react, plan, dag, multi-agent, auto, v2-build, or v2-plan")
 @click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
 @click.option("--replan", is_flag=True, default=False, help="Enable one or more DAG replans after subtask failure")
 @click.option("--max-replans", default=None, type=int, help="Maximum DAG replan attempts")
@@ -507,6 +568,21 @@ def run(
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
     )
+    if mode in ("v2-build", "v2-plan"):
+        _run_v2_mode(
+            mode=mode,
+            description=description,
+            repo_path=repo_path,
+            backend=backend,
+            registry=registry,
+            agent_config=agent_config,
+            memory_context=memory_context,
+            log_dir=config.agent.log_dir,
+            intent_override=intent_override,
+        )
+        flush_observability()
+        return
+
     # Plan 审批回调
     from agent.plan import PlanApproval
 

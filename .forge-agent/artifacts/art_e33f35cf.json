@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_e33f35cf",
+  "tool_name": "search_text",
+  "full_content": "context\\evidence.py:25: class EvidenceRecord:\ncontext\\evidence.py:89: class PhaseSummary:\ncontext\\evidence.py:158:     def add_observation(\ncontext\\evidence.py:186:     def summarize_phase(self, phase: str) -> PhaseSummary:\ncontext\\evidence.py:216:     def summarize_phase_semantically(\n[Showing 5 matches]",
+  "summary": "context\\evidence.py:25: class EvidenceRecord:\ncontext\\evidence.py:89: class PhaseSummary:\ncontext\\evidence.py:158:     def add_observation(\ncontext\\evidence.py:186:     def summarize_phase(self, phase: str) -> PhaseSummary:\ncontext\\evidence.py:216:     def summarize_phase_semantically(\n[Showing 5 matches]",
+  "token_count": 76,
+  "char_count": 306,
+  "line_count": 6,
+  "created_at": 1782440181.4994345
+}

@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_e65ca033",
+  "tool_name": "find_symbol",
+  "full_content": "agent\\core.py:1594: def _update_analysis_phase (method)",
+  "summary": "agent\\core.py:1594: def _update_analysis_phase (method)",
+  "token_count": 15,
+  "char_count": 55,
+  "line_count": 1,
+  "created_at": 1782443073.3549044
+}
