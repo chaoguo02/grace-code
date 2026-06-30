@@ -1,7 +1,4 @@
 """User business logic and data access."""
-import logging
-
-logger = logging.getLogger(__name__)
 
 FAKE_DB = [
     {"id": 1, "name": "alice", "email": "alice@example.com", "password": "pass123"},
@@ -31,19 +28,10 @@ class UserService:
                 return user
         return None
 
-    def delete_user(self, user_id: int):
-        """Delete a user by ID. Returns True if deleted, False if not found."""
-        logger.info("UserService.delete_user(%s)", user_id)
-        for i, user in enumerate(FAKE_DB):
-            if user["id"] == user_id:
-                del FAKE_DB[i]
-                return True
-        return False
-
     def create(self, name: str, email: str, password: str):
         """Create a new user."""
         global _next_id
-        logger.info("UserService.create(%s, %s)", name, email)
+        print(f"UserService.create({name}, {email})")
         user = {"id": _next_id, "name": name, "email": email, "password": password}
         FAKE_DB.append(user)
         _next_id += 1

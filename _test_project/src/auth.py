@@ -1,12 +1,9 @@
 """Authentication and token verification module."""
 import functools
 import hashlib
-import logging
 import time
 from flask import request, jsonify
 from config import SECRET_KEY, TOKEN_EXPIRY_HOURS
-
-logger = logging.getLogger(__name__)
 
 ACTIVE_SESSIONS = {}
 
