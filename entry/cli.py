@@ -360,7 +360,6 @@ def _run_v2_mode(
     log_dir: str,
     intent_override: str,
 ) -> None:
-    from agent.factory import classify_task_intent
     from agent.task import RunStatus
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
     from llm.base import LLMMessage
@@ -385,7 +384,7 @@ def _run_v2_mode(
         title=description[:80] or f"v2-{primary_agent}",
         metadata={"entrypoint": "cli_run_v2", "mode": mode},
     )
-    intent = classify_task_intent(description, intent_override, backend)
+    intent = intent_override if intent_override != "auto" else "analysis"
     result = runtime.run_session(
         session.id,
         agent_name=primary_agent,

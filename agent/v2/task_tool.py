@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING, Any
 
 from tools.base import BaseTool, ToolResult
@@ -23,6 +22,7 @@ class TaskToolV2(BaseTool):
         subagents = ", ".join(spec.name for spec in self._runtime.agent_registry.list_subagents())
         return (
             "Create a child session and delegate a subtask to a subagent. "
+            "Each child session is stateless — put ALL context in the prompt. "
             f"Available subagent types: {subagents}."
         )
 
@@ -31,22 +31,20 @@ class TaskToolV2(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "description": {"type": "string"},
                 "subagent_type": {"type": "string"},
                 "prompt": {"type": "string"},
             },
-            "required": ["description", "subagent_type", "prompt"],
+            "required": ["subagent_type", "prompt"],
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        description = str(params.get("description") or "").strip()
         subagent_type = str(params.get("subagent_type") or "").strip()
         prompt = str(params.get("prompt") or "").strip()
-        if not description or not subagent_type or not prompt:
+        if not subagent_type or not prompt:
             return ToolResult(
                 success=False,
                 output="",
-                error="task requires description, subagent_type, and prompt",
+                error="task requires subagent_type and prompt",
             )
         if not self._runtime.agent_registry.has(subagent_type):
             return ToolResult(
@@ -58,16 +56,15 @@ class TaskToolV2(BaseTool):
         child_result = self._runtime.run_child_session(
             parent_session_id=self._parent_session_id,
             subagent_type=subagent_type,
-            description=description,
+            description=prompt[:60],
             prompt=prompt,
         )
-        self._runtime.apply_child_result_policy(self._parent_session_id, child_result)
-        output = (
-            "Structured child session result. Treat this JSON object as the authoritative child output.\n"
-            f"{json.dumps(child_result.to_dict(), ensure_ascii=False, indent=2)}"
-        )
+        is_failure = child_result.status == "failed" and bool(child_result.error)
+        output = child_result.summary
+        if child_result.missing_info:
+            output += f"\n\n[Note: {child_result.missing_info}]"
         return ToolResult(
-            success=child_result.status != "failed",
+            success=not is_failure,
             output=output,
-            error=child_result.error or None,
+            error=child_result.error if is_failure else None,
         )

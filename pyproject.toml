@@ -65,6 +65,7 @@ markers = [
     "context: Token budget, history, compaction, repo map",
     "multi: Multi-agent coordination, DAG, plan",
     "entry: CLI, chat session, renderer, config",
+    "e2e: End-to-end behavioral tests with real LLM calls",
 ]
 
 [tool.coverage.run]

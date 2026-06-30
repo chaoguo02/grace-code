@@ -8,7 +8,7 @@ from agent.event_log import EventLog
 from agent.policy import PhasePolicy
 from agent.task import RunResult, RunStatus, Task
 from agent.v2.agent_registry import AgentRegistryV2
-from agent.v2.dynamic_registry import DynamicPolicyAwareToolRegistry
+from agent.policy_registry import PolicyAwareToolRegistry
 from agent.v2.models import ChildSessionResult
 from agent.v2.session_store import SessionStore
 from agent.v2.task_tool import TaskToolV2
@@ -17,30 +17,11 @@ from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
 
 
-_DELEGATION_HINT_TOKENS = (
-    "task",
-    "subagent",
-    "subagent_type",
-    "child session",
-    "explore",
-    "general",
-    "子会话",
-    "子 session",
-    "task 工具",
-)
-
 _CHILD_SUMMARY_RULE = (
     "Your final answer is returned to the parent as a summary-only tool result. "
     "The parent does not automatically inherit your full reasoning or full tool history. "
     "Make your final summary standalone and directly useful."
 )
-_DELEGATION_FALLBACK_DENY_TOOLS = frozenset({
-    "file_read",
-    "file_view",
-    "find_files",
-    "find_symbol",
-    "search_text",
-})
 
 
 class SessionRuntime:
@@ -66,8 +47,6 @@ class SessionRuntime:
         self._child_max_steps = child_max_steps
         self._child_budget_tokens = child_budget_tokens
         self._memory_context = memory_context
-        self._session_dynamic_denied_tools: dict[str, frozenset[str]] = {}
-        self._active_registries: dict[str, DynamicPolicyAwareToolRegistry] = {}
 
     @property
     def agent_registry(self) -> AgentRegistryV2:
@@ -147,12 +126,8 @@ class SessionRuntime:
 
         self._store.update_status(session_id, "running")
         initial_count = len(persisted_messages)
-        try:
-            with EventLog.create(task, log_dir=self._log_dir) as log:
-                result = agent.run(task, log)
-        finally:
-            if spec.mode == "primary":
-                self._active_registries.pop(session_id, None)
+        with EventLog.create(task, log_dir=self._log_dir) as log:
+            result = agent.run(task, log)
 
         for message in history.to_list()[initial_count:]:
             self._store.append_message(session_id, message)
@@ -202,16 +177,12 @@ class SessionRuntime:
         registry = self._base_registry.filtered(spec.allowed_tools)
         if spec.allow_task_tool:
             registry.register(TaskToolV2(self, session.id))
-        dynamic_denied_tools = self._session_dynamic_denied_tools.get(session.id, frozenset())
-        wrapped = DynamicPolicyAwareToolRegistry(
+        wrapped = PolicyAwareToolRegistry(
             base=registry,
             phase_policy=PhasePolicy(allowed_tools=frozenset(registry.tool_names)),
             repo_path=session.repo_path,
             phase_name="v2_execution",
-            dynamic_denied_tools=dynamic_denied_tools,
         )
-        if spec.mode == "primary":
-            self._active_registries[session.id] = wrapped
         return wrapped
 
     def _build_agent_config(self, spec) -> AgentConfig:
@@ -230,43 +201,20 @@ class SessionRuntime:
             return self._build_child_runtime_messages(spec)
         if spec.mode != "primary":
             return []
-        messages = [
-            LLMMessage(
-                role="user",
-                content=(
-                    "[V2 Primary Session Rule]\n"
-                    "When you use the task tool, treat the child session result as authoritative structured data.\n"
-                    "- If a child session returns status=partial or status=failed, do NOT perform the child's "
-                    "exploration or file-reading work yourself.\n"
-                    "- Instead, dispatch a new, more specific child session to fill the missing parts, or ask the "
-                    "user for clarification if the missing scope is ambiguous.\n"
-                    "- Only do direct file exploration yourself if the user explicitly changes strategy."
-                ),
-            )
-        ]
-        if not self._is_explicit_delegation_request(task_description):
-            return messages
-        messages.append(
-            LLMMessage(
-                role="user",
-                content=(
-                    "[V2 Delegation Rule]\n"
-                    "The user explicitly asked you to use the task tool / child session model. "
-                    "Your first meaningful action must be a task tool call that delegates the requested "
-                    "exploration or implementation to the appropriate subagent. "
-                    "Do not do your own substantive file exploration before that first task call. "
-                    "After the child session returns, treat its summary as your primary source. "
-                    "Do not repeat broad exploration unless the child summary is clearly insufficient. "
-                    "If the child result is insufficient, dispatch another more specific child session instead of "
-                    "doing the broad exploration yourself."
-                ),
-            ),
+        subagent_descriptions = "\n".join(
+            f"- {s.name}: {s.description}" for s in self._agent_registry.list_subagents()
         )
-        return messages
-
-    def _is_explicit_delegation_request(self, task_description: str) -> bool:
-        lowered = (task_description or "").lower()
-        return any(token in lowered for token in _DELEGATION_HINT_TOKENS)
+        content = (
+            "[V2 Available Subagents]\n"
+            "You have a `task` tool to delegate subtasks to isolated child sessions.\n"
+            f"Available subagent types:\n{subagent_descriptions}\n\n"
+            "Guidelines:\n"
+            "- Each child session is stateless. Put ALL necessary context in the prompt.\n"
+            "- The child's final summary is the only thing returned to you.\n"
+            "- Use delegation for independent, clearly-scoped work.\n"
+            "- Do simple tasks directly without delegating."
+        )
+        return [LLMMessage(role="user", content=content)]
 
     def _build_child_runtime_messages(self, spec) -> list[LLMMessage]:
         if spec.name == "explore":
@@ -313,15 +261,6 @@ class SessionRuntime:
             error=error,
         )
 
-    def apply_child_result_policy(self, parent_session_id: str, child_result: ChildSessionResult) -> None:
-        if child_result.status not in {"partial", "failed"}:
-            return
-        denied_tools = self._session_dynamic_denied_tools.get(parent_session_id, frozenset())
-        next_denied = frozenset(set(denied_tools) | set(_DELEGATION_FALLBACK_DENY_TOOLS))
-        self._session_dynamic_denied_tools[parent_session_id] = next_denied
-        active_registry = self._active_registries.get(parent_session_id)
-        if active_registry is not None:
-            active_registry.set_dynamic_denied_tools(next_denied)
 
     def _extract_child_artifacts(self, messages: list[LLMMessage]) -> list[str]:
         artifact_paths: list[str] = []
