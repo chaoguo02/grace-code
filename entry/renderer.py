@@ -646,24 +646,15 @@ def create_renderer(
 
 def hitl_terminal_confirm(request: "Any") -> tuple[bool, str]:
     """
-    终端 HITL 确认 UI。接收 HitlRequest，返回 (approved, note)。
-
-    显示格式：
-      ┌─ Confirmation Required ──────────────
-      │  Tool:   file_write
-      │  Risk:   medium
-      │  Params: path="src/main.py"
-      │  Agent:  "I need to update..."
-      └──────────────────────────────────────
-      [y]approve / [n]deny / [n: reason] >
+    Legacy 终端 HITL 确认 UI（向后兼容）。
+    接收 HitlRequest，返回 (approved, note)。
+    新代码应使用 permission_prompt()。
     """
     import sys
 
     if not sys.stdin.isatty():
         return (False, "Non-interactive terminal, auto-denied")
 
-    # 格式化参数展示
-    params_display = ""
     params = request.params
     if "cmd" in params:
         params_display = f'cmd="{params["cmd"]}"'
@@ -675,7 +666,6 @@ def hitl_terminal_confirm(request: "Any") -> tuple[bool, str]:
             params_str = params_str[:80] + "..."
         params_display = params_str
 
-    # 渲染确认框
     sys.stdout.write("\n")
     sys.stdout.write(_yellow("  ┌─ Confirmation Required ") + _yellow("─" * 34) + "\n")
     sys.stdout.write(_yellow("  │  ") + f"Tool:   {_bold(request.tool_name)}\n")
@@ -689,7 +679,6 @@ def hitl_terminal_confirm(request: "Any") -> tuple[bool, str]:
     sys.stdout.write(_yellow("  └") + _yellow("─" * 60) + "\n")
     sys.stdout.flush()
 
-    # 等待用户输入
     while True:
         try:
             ans = input(_cyan("  [y]approve / [n]deny / [n: reason] > ")).strip()
@@ -712,6 +701,84 @@ def hitl_terminal_confirm(request: "Any") -> tuple[bool, str]:
             return (False, note)
         else:
             sys.stdout.write(_dim("  (enter y, n, or n: <reason>)\n"))
+
+
+def permission_prompt(request: "Any") -> "Any":
+    """
+    3-way terminal permission prompt (aligned with Claude Code).
+
+    显示格式：
+      ┌─ Permission Required ──────────────
+      │  Tool:   shell
+      │  Params: cmd="git commit -m 'fix'"
+      │  Agent:  "I need to commit..."
+      └──────────────────────────────────────
+      [a]llow once / always [A]llow / [d]eny >
+
+    Returns PromptDecision(action, note, inferred_rule).
+    """
+    import sys
+    from hitl.pipeline import PromptDecision
+    from hitl.pattern_inference import infer_permission_pattern
+
+    if not sys.stdin.isatty():
+        return PromptDecision(action="deny", note="Non-interactive terminal")
+
+    params = request.params
+    if "cmd" in params:
+        params_display = f'cmd="{params["cmd"]}"'
+    elif "path" in params:
+        params_display = f'path="{params["path"]}"'
+    else:
+        params_str = str(params)
+        if len(params_str) > 80:
+            params_str = params_str[:80] + "..."
+        params_display = params_str
+
+    sys.stdout.write("\n")
+    sys.stdout.write(_yellow("  ┌─ Permission Required ") + _yellow("─" * 36) + "\n")
+    sys.stdout.write(_yellow("  │  ") + f"Tool:   {_bold(request.tool_name)}\n")
+    sys.stdout.write(_yellow("  │  ") + f"Params: {params_display}\n")
+    thought = getattr(request, "thought", "")
+    if thought and thought != "(no thought)":
+        thought_short = thought[:80]
+        if len(thought) > 80:
+            thought_short += "..."
+        sys.stdout.write(_yellow("  │  ") + _dim(f'Agent:  "{thought_short}"') + "\n")
+    sys.stdout.write(_yellow("  └") + _yellow("─" * 60) + "\n")
+    sys.stdout.flush()
+
+    while True:
+        try:
+            ans = input(_cyan("  [a]llow once / always [A]llow / [d]eny > ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.stdout.write("\n")
+            return PromptDecision(action="deny")
+
+        if ans.lower() in ("a", "y", "yes", "allow", ""):
+            sys.stdout.write(_green("  ✓ Allowed (once)\n\n"))
+            sys.stdout.flush()
+            return PromptDecision(action="allow_once")
+
+        elif ans in ("A",) or ans.lower() in ("always", "aa"):
+            rule = infer_permission_pattern(request.tool_name, request.params)
+            sys.stdout.write(_green(f"  ✓ Always allow: ") + _dim(rule.raw) + "\n\n")
+            sys.stdout.flush()
+            return PromptDecision(action="always_allow", inferred_rule=rule)
+
+        elif ans.lower() in ("d", "n", "no", "deny"):
+            sys.stdout.write(_red("  ✗ Denied\n\n"))
+            sys.stdout.flush()
+            return PromptDecision(action="deny")
+
+        elif ans.lower().startswith("d:") or ans.lower().startswith("n:"):
+            note = ans[2:].strip()
+            sys.stdout.write(_red(f"  ✗ Denied") + _dim(f" ({note})\n\n"))
+            sys.stdout.flush()
+            return PromptDecision(action="deny", note=note)
+
+        else:
+            sys.stdout.write(_dim("  (enter a, A, d, or d: <reason>)\n"))
 
 
 def _risk_color(risk: str) -> str:

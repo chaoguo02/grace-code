@@ -123,6 +123,8 @@ class HitlConfig:
     min_risk_for_confirm: str = "medium"
     policy_file: str = ".forge-agent/hitl/policies.yaml"
     learn_threshold: int = 3
+    settings_file: str = ".forge-agent/settings.json"
+    default_mode: str = "ask_edits"
 
 
 @dataclass

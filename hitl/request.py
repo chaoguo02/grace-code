@@ -20,6 +20,7 @@ class HitlDecision(str, Enum):
     POLICY_APPROVED = "policy_approved"  # Policy 自动批准
     POLICY_DENIED = "policy_denied"      # Policy 自动拒绝
     SKIPPED = "skipped"                  # 风险低于阈值，跳过确认
+    ALWAYS_ALLOWED = "always_allowed"    # 用户选择 "Always Allow"
 
 
 @dataclass
@@ -54,6 +55,7 @@ class HitlResult:
             HitlDecision.APPROVED,
             HitlDecision.POLICY_APPROVED,
             HitlDecision.SKIPPED,
+            HitlDecision.ALWAYS_ALLOWED,
         )
 
     @property

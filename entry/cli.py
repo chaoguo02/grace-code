@@ -126,7 +126,8 @@ def _init_memory(repo_path: str, config) -> tuple:
 # 构建 agent 各组件
 # ---------------------------------------------------------------------------
 
-def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None, external_store=None):
+def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
+                    external_store=None, repo_path=None, auto_approve=False):
     """根据配置组装工具注册表。"""
     from tools.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
@@ -140,34 +141,41 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
     from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
 
-    # 构建 HitlManager（如果启用且有确认回调）
-    hitl_manager = None
-    hitl_cfg = getattr(cfg, "hitl", None)
-    if confirm_callback is not None and hitl_cfg and hitl_cfg.enabled:
-        from hitl.manager import HitlManager
-        from hitl.policy import PolicyEngine
-        from entry.renderer import hitl_terminal_confirm
+    # ── 构建 PermissionPipeline（5 层权限管道）──
+    from hitl.pipeline import PermissionPipeline
+    from hitl.settings_loader import load_permission_settings
+    from hitl.hooks import HookConfig
 
-        policy_engine = PolicyEngine(policies_path=hitl_cfg.policy_file)
+    project_root = str(repo_path) if repo_path else None
+    rules, hook_configs = load_permission_settings(project_root or ".")
+    hooks = [HookConfig(**h) for h in hook_configs] if hook_configs else []
 
-        def _hitl_confirm_adapter(request):
-            return hitl_terminal_confirm(request)
+    perm_confirm = None
+    if confirm_callback is not None:
+        from entry.renderer import permission_prompt
+        perm_confirm = permission_prompt
 
-        hitl_manager = HitlManager(
-            confirm_callback=_hitl_confirm_adapter,
-            policy_engine=policy_engine,
-            min_risk_for_confirm=hitl_cfg.min_risk_for_confirm,
-        )
+    settings_path = None
+    if project_root:
+        from pathlib import Path
+        settings_path = str(Path(project_root) / ".forge-agent" / "settings.json")
+
+    pipeline = PermissionPipeline(
+        rules=rules,
+        hooks=hooks,
+        confirm_callback=perm_confirm,
+        auto_approve=auto_approve,
+        settings_path=settings_path,
+        project_root=project_root,
+    )
 
     web_cfg = cfg.tools.web
     artifact_store_ref = ArtifactStoreRef()
     evidence_ledger_ref = EvidenceLedgerRef()
     submit_plan_ref = SubmitReadPlanRef()
-    # ShellTool: 无 HitlManager 时保留 confirm_callback 降级路径
-    shell_cb = confirm_callback if hitl_manager is None else None
     registry = (
-        ToolRegistry(hitl_manager=hitl_manager)
-        .register(ShellTool(confirm_callback=shell_cb, runtime=runtime))
+        ToolRegistry(permission_pipeline=pipeline)
+        .register(ShellTool(runtime=runtime))
         .register(FileReadTool())
         .register(FileViewTool())
         .register(FileWriteTool())
@@ -359,12 +367,17 @@ def _run_v2_mode(
     memory_context,
     log_dir: str,
     intent_override: str,
+    plan_approval_callback=None,
+    auto_approve: bool = False,
+    plan_file: str | None = None,
 ) -> None:
+    import os
+    import subprocess
+    from datetime import datetime
     from agent.task import RunStatus
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
     from llm.base import LLMMessage
 
-    primary_agent = "build" if mode == "v2-build" else "plan"
     db_path = default_session_db_path(str(repo_path))
     store = SessionStore(db_path)
     runtime = SessionRuntime(
@@ -378,24 +391,225 @@ def _run_v2_mode(
         child_budget_tokens=30_000,
         memory_context=memory_context,
     )
-    session = runtime.create_root_session(
-        agent_name=primary_agent,
-        repo_path=str(repo_path),
-        title=description[:80] or f"v2-{primary_agent}",
-        metadata={"entrypoint": "cli_run_v2", "mode": mode},
-    )
-    intent = intent_override if intent_override != "auto" else "analysis"
-    result = runtime.run_session(
-        session.id,
-        agent_name=primary_agent,
-        task_description=description,
-        intent=intent,
-        messages=[LLMMessage(role="user", content=description)],
-    )
+    intent = intent_override if intent_override != "auto" else "edit"
 
+    if mode == "v2-build":
+        # ── 上下文连续：如果提供了 --plan-file，将计划文件内容注入 build session ──
+        build_messages: list[LLMMessage] = []
+        if plan_file and os.path.isfile(plan_file):
+            with open(plan_file, encoding="utf-8") as f:
+                plan_content = f.read()
+            click.echo(dim(f"  Plan file: {plan_file}"))
+            build_messages.append(LLMMessage(
+                role="user",
+                content=(
+                    f"[PLAN CONTEXT] The following implementation plan has been reviewed and approved. "
+                    f"Execute it now.\n\n{plan_content}"
+                ),
+            ))
+        build_messages.append(LLMMessage(role="user", content=description))
+
+        session = runtime.create_root_session(
+            agent_name="build",
+            repo_path=str(repo_path),
+            title=description[:80] or "v2-build",
+            metadata={"entrypoint": "cli_run_v2", "mode": mode},
+        )
+        result = runtime.run_session(
+            session.id,
+            agent_name="build",
+            task_description=description,
+            intent=intent,
+            messages=build_messages,
+        )
+        _print_v2_result(mode, db_path, session.id, result)
+        return
+
+    # --- plan / v2-plan: 权限过滤器 ---
+    # plan agent = 只读工具（模型看到写工具但调用被拦截），用户审查后手动切 build。
+    # 封闭循环：模型提交计划 → 用户审批 → 拒绝时反馈注入 → 模型重新规划 → 再审批
+    # 计划文件 = single source of truth，原地覆盖（对齐 Claude Code .claude/plans/[name].md）
+    if mode in ("plan", "v2-plan"):
+        session = runtime.create_root_session(
+            agent_name="plan",
+            repo_path=str(repo_path),
+            title=description[:80] or "plan",
+            metadata={"entrypoint": "cli_run_v2", "mode": mode},
+        )
+        plan_steps = max(5, agent_config.max_steps // 3)
+        plan_budget = max(5000, agent_config.budget_tokens // 3)
+
+        # 固定计划文件路径（single file, 原地覆盖）
+        plans_dir = os.path.join(str(repo_path), ".forge-agent", "plans")
+        os.makedirs(plans_dir, exist_ok=True)
+        task_slug = description[:40].replace(" ", "_").replace("/", "_").replace("\\", "_")
+        plan_path = os.path.join(plans_dir, f"{task_slug}.md")
+
+        # 首次 plan session
+        result = runtime.run_session(
+            session.id,
+            agent_name="plan",
+            task_description=description,
+            intent="analysis",
+            messages=[LLMMessage(role="user", content=description)],
+            max_steps_override=plan_steps,
+            budget_tokens_override=plan_budget,
+        )
+
+        # ── Plan 审批循环（封闭循环直到批准或用户退出）────
+        max_revisions = 5
+        revision_count = 0
+        while True:
+            plan_text = result.summary or ""
+
+            # 原地覆盖同一个计划文件
+            if plan_text.strip():
+                with open(plan_path, "w", encoding="utf-8") as f:
+                    f.write(plan_text)
+
+            _print_v2_result(mode, db_path, session.id, result)
+            if plan_text.strip():
+                click.echo(dim(f"  Plan    : {plan_path}"))
+
+            # auto_approve → 跳过审核
+            if auto_approve:
+                if plan_text.strip():
+                    click.echo(green("  Auto-approved."))
+                return
+
+            if not plan_text.strip():
+                click.echo(yellow("  Plan session produced no output. Nothing to review."))
+                return
+
+            # ── 交互式审批菜单（对齐 Claude Code 5 选项）────
+            click.echo("\n" + "─" * 60)
+            click.echo(bold("  Plan ready for review"))
+            click.echo(f"  File: {plan_path}")
+            click.echo("─" * 60)
+            click.echo(f"  [1] Yes, and auto-accept edits")
+            click.echo(f"  [2] Yes, and manually approve edits")
+            click.echo(f"  [3] Edit plan file (opens editor)")
+            click.echo(f"  [4] Tell Claude what to change (re-plan)")
+            click.echo(f"  [5] Abort")
+            click.echo("─" * 60)
+            try:
+                choice = click.prompt("  Choice", type=str, default="1").strip()
+            except (EOFError, KeyboardInterrupt):
+                click.echo("\n  Aborted.")
+                return
+
+            if choice == "1":
+                # 批准 + 自动执行（bypass edit permissions）
+                # 审批通过后重新读取文件（用户可能通过选项3编辑过）
+                with open(plan_path, encoding="utf-8") as f:
+                    _ = f.read()
+                click.echo(green("  Plan approved (auto-accept). Executing...\n"))
+                _run_v2_mode(
+                    mode="v2-build",
+                    description=description,
+                    repo_path=repo_path,
+                    backend=backend,
+                    registry=registry,
+                    agent_config=agent_config,
+                    memory_context=memory_context,
+                    log_dir=log_dir,
+                    intent_override=intent_override,
+                    plan_approval_callback=plan_approval_callback,
+                    auto_approve=True,
+                    plan_file=plan_path,
+                )
+                return
+
+            elif choice == "2":
+                # 批准 + 逐步确认写操作
+                with open(plan_path, encoding="utf-8") as f:
+                    _ = f.read()
+                click.echo(green("  Plan approved (manual review). Executing...\n"))
+                _run_v2_mode(
+                    mode="v2-build",
+                    description=description,
+                    repo_path=repo_path,
+                    backend=backend,
+                    registry=registry,
+                    agent_config=agent_config,
+                    memory_context=memory_context,
+                    log_dir=log_dir,
+                    intent_override=intent_override,
+                    plan_approval_callback=plan_approval_callback,
+                    auto_approve=False,
+                    plan_file=plan_path,
+                )
+                return
+
+            elif choice == "3":
+                # 在编辑器中打开计划文件，原地编辑
+                editor = os.environ.get("EDITOR", "notepad")
+                try:
+                    subprocess.call([editor, plan_path])
+                except Exception:
+                    click.echo(red(f"  Failed to open editor: {editor}"))
+                    click.echo(dim(f"  Edit manually: {plan_path}"))
+                # 读回并显示差异提示
+                with open(plan_path, encoding="utf-8") as f:
+                    updated = f.read()
+                if updated != plan_text:
+                    plan_text = updated
+                    click.echo(green("  Plan updated."))
+                else:
+                    click.echo(dim("  No changes detected."))
+                # 回到菜单，用户可以选择批准或继续改
+                continue
+
+            elif choice == "4":
+                # 反馈 → 留在 plan 模式，模型重新规划
+                revision_count += 1
+                if revision_count >= max_revisions:
+                    click.echo(yellow(f"  Max revisions ({max_revisions}) reached. Aborting."))
+                    return
+                try:
+                    feedback = click.prompt(
+                        "  What would you like to change?", type=str
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    click.echo("\n  Aborted.")
+                    return
+                if not feedback.strip():
+                    continue
+                click.echo(dim(f"  Re-planning (revision {revision_count}/{max_revisions})...\n"))
+                result = runtime.run_session(
+                    session.id,
+                    agent_name="plan",
+                    task_description=description,
+                    intent="analysis",
+                    messages=[LLMMessage(
+                        role="user",
+                        content=(
+                            f"[USER FEEDBACK ON PLAN]\n{feedback}\n\n"
+                            f"Please revise the plan accordingly and output "
+                            f"an updated structured plan."
+                        ),
+                    )],
+                    max_steps_override=plan_steps,
+                    budget_tokens_override=plan_budget,
+                )
+                # 回到循环顶部：新 plan 覆盖文件，再次展示审批菜单
+                continue
+
+            elif choice == "5":
+                click.echo(dim("  Aborted. Plan saved at: ") + click.style(plan_path, fg="yellow"))
+                return
+
+            else:
+                click.echo(red(f"  Invalid choice: {choice}"))
+                continue
+        return
+
+
+def _print_v2_result(mode: str, db_path: str, session_id: str, result) -> None:
+    from agent.task import RunStatus
     click.echo(dim(f"  Mode    : {mode}"))
     click.echo(dim(f"  V2 DB   : {db_path}"))
-    click.echo(dim(f"  Session : {session.id}\n"))
+    click.echo(dim(f"  Session : {session_id}\n"))
     if result.summary:
         click.echo(result.summary)
     if result.status == RunStatus.SUCCESS:
@@ -420,13 +634,14 @@ def _run_v2_mode(
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
-@click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto", "v2-build", "v2-plan"]), help="Agent mode: react, plan, dag, multi-agent, auto, v2-build, or v2-plan")
+@click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto", "v2-build", "v2-plan"]), help="Agent mode: react, plan, dag, multi-agent, auto, v2-build, or v2-plan (deprecated)")
 @click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
 @click.option("--replan", is_flag=True, default=False, help="Enable one or more DAG replans after subtask failure")
 @click.option("--max-replans", default=None, type=int, help="Maximum DAG replan attempts")
 @click.option("--read", "read_paths", multiple=True, default=None, help="Explicitly allowed read path (repeatable)")
 @click.option("--write", "write_paths", multiple=True, default=None, help="Explicitly allowed write path (repeatable)")
 @click.option("--intent", "intent_override", default="auto", show_default=True, type=click.Choice(["analysis", "edit", "auto"]), help="Task intent: analysis (read-only), edit, or auto (detect)")
+@click.option("--plan-file", default=None, help="Inject an approved plan file into v2-build session")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -449,6 +664,7 @@ def run(
     read_paths: tuple[str, ...] | None,
     write_paths: tuple[str, ...] | None,
     intent_override: str,
+    plan_file: str | None,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -525,6 +741,8 @@ def run(
         runtime=runtime,
         memory_store=memory_store,
         external_store=external_store,
+        repo_path=repo_path,
+        auto_approve=auto_approve,
     )
 
     # ProactiveMemory（run 模式）
@@ -567,22 +785,7 @@ def run(
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
     )
-    if mode in ("v2-build", "v2-plan"):
-        _run_v2_mode(
-            mode=mode,
-            description=description,
-            repo_path=repo_path,
-            backend=backend,
-            registry=registry,
-            agent_config=agent_config,
-            memory_context=memory_context,
-            log_dir=config.agent.log_dir,
-            intent_override=intent_override,
-        )
-        flush_observability()
-        return
-
-    # Plan 审批回调
+    # Plan 审批回调（V1 plan mode 和 V2 v2-plan 共用）
     from agent.plan import PlanApproval
 
     def _plan_approval_cb(plan_text: str):
@@ -611,6 +814,24 @@ def run(
                 rend.on_plan_rejected()
                 return PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
             click.echo("  Please enter y to approve, n to reject, or e to request revision.")
+
+    if mode in ("v2-build", "plan", "v2-plan"):
+        _run_v2_mode(
+            mode=mode,
+            description=description,
+            repo_path=repo_path,
+            backend=backend,
+            registry=registry,
+            agent_config=agent_config,
+            memory_context=memory_context,
+            log_dir=config.agent.log_dir,
+            intent_override=intent_override,
+            plan_approval_callback=_plan_approval_cb,
+            auto_approve=auto_approve,
+            plan_file=plan_file,
+        )
+        flush_observability()
+        return
 
     from agent.plan import PlanExecuteConfig
     plan_cfg = PlanExecuteConfig(
@@ -805,6 +1026,7 @@ def chat(
         runtime=runtime,
         memory_store=memory_store,
         external_store=external_store,
+        repo_path=repo_path,
     )
 
     # 注册 SkillTool（如果有已发现的 skills）

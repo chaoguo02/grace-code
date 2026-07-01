@@ -47,9 +47,11 @@ multi_agent:
 
 hitl:
   enabled: true
-  min_risk_for_confirm: medium   # none / low / medium / high
+  min_risk_for_confirm: medium   # none / low / medium / high (legacy, kept for compat)
   policy_file: .forge-agent/hitl/policies.yaml
-  learn_threshold: 3             # 连续 N 次相同决策后自动学习为 policy
+  learn_threshold: 3
+  settings_file: .forge-agent/settings.json
+  default_mode: ask_edits        # ask_edits / ask_all / auto
 
 observability:
   enabled: false
