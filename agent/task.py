@@ -52,6 +52,7 @@ class RunStatus(str, Enum):
     FAILED = "failed"
     MAX_STEPS = "max_steps"
     GAVE_UP = "gave_up"
+    BLOCKED = "blocked"
 
 
 @dataclass(frozen=True)

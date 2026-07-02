@@ -15,15 +15,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-MemoryType = Literal["episodic", "semantic", "procedural"]
+MemoryType = Literal["user", "feedback", "project", "reference"]
 
-_LEGACY_TYPE_MAP: dict[str, MemoryType] = {
-    "user": "episodic",
-    "feedback": "procedural",
-    "project": "semantic",
-    "reference": "semantic",
+# Old 3-type system → new 4-type system (for reading legacy files)
+_OLD_TYPE_MAP: dict[str, str] = {
+    "episodic": "user",
+    "procedural": "feedback",
+    "semantic": "project",
 }
-_VALID_MEMORY_TYPES = frozenset({"episodic", "semantic", "procedural"})
+_VALID_MEMORY_TYPES = frozenset({"user", "feedback", "project", "reference"})
+
+# Injection strategy constants (aligned with Claude Code)
+ALWAYS_INJECT_TYPES = frozenset({"user", "feedback"})
+ON_DEMAND_TYPES = frozenset({"project", "reference"})
+GLOBAL_TYPES = frozenset({"user", "feedback"})
 
 
 @dataclass
@@ -45,7 +50,7 @@ class Anchor:
 @dataclass
 class MemoryMetadata:
     """记忆元数据。"""
-    type: str = "semantic"  # "episodic" | "semantic" | "procedural"
+    type: str = "project"  # "user" | "feedback" | "project" | "reference"
     stale: bool = False
     access_count: int = 0
     validated_at: str = ""
@@ -92,13 +97,47 @@ class MemorySummary:
 
 
 def normalize_memory_type(raw_type: str | None) -> str:
-    """将旧类型名映射为新三分法类型。"""
+    """
+    Normalize memory type to the 4-type system (user/feedback/project/reference).
+
+    Handles:
+    - None/empty → "project" (default)
+    - Old 3-type names (episodic/semantic/procedural) → mapped to new equivalents
+    - Valid new type names → pass through
+    - Unknown → "project" (default)
+    """
     if not raw_type:
-        return "semantic"
-    mapped = _LEGACY_TYPE_MAP.get(raw_type, raw_type)
-    if mapped in _VALID_MEMORY_TYPES:
+        return "project"
+    if raw_type in _VALID_MEMORY_TYPES:
+        return raw_type
+    mapped = _OLD_TYPE_MAP.get(raw_type)
+    if mapped:
         return mapped
-    return "semantic"
+    return "project"
+
+
+def parse_memory_type(frontmatter: dict[str, Any]) -> str:
+    """
+    Parse memory type from frontmatter, preferring Claude Code's top-level type.
+
+    Compatibility order:
+    1. top-level `type`
+    2. legacy `metadata.type`
+    3. default `project`
+    """
+    top_level_type = frontmatter.get("type")
+    if top_level_type:
+        return normalize_memory_type(str(top_level_type))
+
+    metadata = frontmatter.get("metadata")
+    if isinstance(metadata, dict):
+        metadata_type = metadata.get("type")
+        if metadata_type:
+            return normalize_memory_type(str(metadata_type))
+    elif isinstance(metadata, str):
+        return normalize_memory_type(metadata)
+
+    return "project"
 
 
 def _now() -> str:

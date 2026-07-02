@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from memory.store import MemoryStore
 
 if TYPE_CHECKING:
+    from llm.base import LLMBackend
     from memory.retriever import ProactiveRetriever
 
 logger = logging.getLogger(__name__)
@@ -61,14 +62,18 @@ class MemoryContext:
         max_lines: int = 50,
         enabled: bool = True,
         retriever: ProactiveRetriever | None = None,
+        selector_backend: "LLMBackend | None" = None,
     ) -> None:
         self._store = store
         self._max_lines = max_lines
         self._enabled = enabled
         self._task_context: str = ""
         self._retriever = retriever
+        self._selector_backend = selector_backend
         self._user_message: str = ""
         self._cached_section: str | None = None
+        self._already_surfaced: set[str] = set()
+        self._recent_tools: list[str] = []
 
     @property
     def enabled(self) -> bool:
@@ -93,40 +98,55 @@ class MemoryContext:
             self._user_message = message
             self._cached_section = None  # invalidate step-level cache
 
+    def add_recent_tool(self, tool_name: str) -> None:
+        """Track recently used tools (for selector context hint)."""
+        if tool_name not in self._recent_tools:
+            self._recent_tools.append(tool_name)
+            if len(self._recent_tools) > 10:
+                self._recent_tools = self._recent_tools[-10:]
+
     def build_memory_section(self) -> str:
         """
         构建 Memory Section 文本。
 
-        每次调用都从磁盘重新读取 MEMORY.md，确保：
-        - compaction 后重新注入最新索引
-        - agent 运行期间新写入的记忆能被感知
-
-        当设置了 task_context 时，按相关性排序记忆条目，
-        将最相关的记忆放在前面。
-
-        当配置了 retriever 且有 user_message 时，附加 RAG 检索结果。
+        Injection strategy (aligned with Claude Code):
+        - user/feedback types: always inject full content (they're short rules)
+        - project/reference types: selected via Sonnet selector (max 5), or keyword fallback
 
         返回格式：
-            ## Available Memories
-            <按相关性排序的 MEMORY.md 条目>
+            ## Always-Loaded Memories (user/feedback)
+            <full content of user and feedback memories>
 
-            ## Relevant Memory Content
-            <RAG 检索到的 chunk 内容>
+            ## Selected Memories (project/reference)
+            <full content of selected on-demand memories>
+
+            ## Available Memories
+            <index listing for remaining memories>
 
         没有记忆时返回空字符串。
         """
         if not self._enabled:
             return ""
 
-        # 步骤级缓存：同一步内重复调用直接返回缓存结果
         if self._cached_section is not None:
             return self._cached_section
 
-        # 如果有任务上下文，使用相关性过滤
+        parts: list[str] = []
+
+        # 1. Always-inject: full content of user/feedback memories
+        always_section = self._build_always_inject_section()
+        if always_section:
+            parts.append(always_section)
+
+        # 2. On-demand: Sonnet selector or keyword fallback for project/reference
+        selected_section = self._build_selected_section()
+        if selected_section:
+            parts.append(selected_section)
+
+        # 3. Index listing (for remaining memories the LLM can read on demand)
         if self._task_context:
             index_section = self._build_filtered_section()
         else:
-            # 无任务上下文时，注入完整索引
             index_content = self._store.get_index_content(max_lines=self._max_lines)
             if not index_content.strip():
                 index_section = ""
@@ -138,21 +158,91 @@ class MemoryContext:
                     "Use memory_read to read a specific memory, memory_write to",
                     "save new information you want to remember across sessions.",
                 ])
+        if index_section:
+            parts.append(index_section)
 
-        # RAG 主动检索
+        # 4. RAG 主动检索
         rag_section = self._build_rag_section()
+        if rag_section:
+            parts.append(rag_section)
 
-        parts = [p for p in (index_section, rag_section) if p]
         self._cached_section = "\n\n".join(parts)
         return self._cached_section
+
+    def _build_always_inject_section(self) -> str:
+        """Load full content of all user/feedback memories (always injected)."""
+        from memory.models import ALWAYS_INJECT_TYPES
+        summaries = self._store.list_memories()
+        always_mems = [s for s in summaries if s.type in ALWAYS_INJECT_TYPES]
+        if not always_mems:
+            return ""
+
+        lines: list[str] = ["## Active Rules & Preferences"]
+        for s in always_mems:
+            try:
+                mem = self._store.read_memory(s.name)
+                if mem and mem.content.strip():
+                    lines.append(f"### {s.name} ({s.type})")
+                    lines.append(mem.content.strip())
+                    lines.append("")
+            except Exception:
+                continue
+
+        if len(lines) <= 1:
+            return ""
+        return "\n".join(lines)
+
+    def _build_selected_section(self) -> str:
+        """Select and load on-demand (project/reference) memories via Sonnet selector."""
+        query = self._user_message or self._task_context
+        if not query:
+            return ""
+
+        # Try Sonnet selector first
+        if self._selector_backend:
+            from memory.selector import select_memories
+            selected_names = select_memories(
+                query=query,
+                memory_dir=self._store.store_dir,
+                selector_backend=self._selector_backend,
+                already_surfaced=self._already_surfaced,
+                recent_tools=self._recent_tools,
+            )
+            if selected_names:
+                return self._load_selected_memories(selected_names)
+
+        # Fallback: no selector configured or selector returned nothing
+        return ""
+
+    def _load_selected_memories(self, names: list[str]) -> str:
+        """Load full content of selected memories, tracking what was surfaced."""
+        from agent.v2.runtime import SessionRuntime
+        lines: list[str] = ["## Selected Project Knowledge"]
+        loaded = 0
+        for name in names:
+            if name in self._already_surfaced:
+                continue
+            mem = self._store.read_memory(name)
+            if mem and mem.content.strip():
+                freshness = SessionRuntime._memory_freshness_text(name, self._store)
+                lines.append(f"### {name}")
+                lines.append(mem.content.strip())
+                if freshness:
+                    lines.append(f"\n> ⚠️ {freshness}")
+                lines.append("")
+                self._already_surfaced.add(name)
+                loaded += 1
+        if loaded == 0:
+            return ""
+        return "\n".join(lines)
 
     def _build_rag_section(self) -> str:
         """用 ProactiveRetriever 检索相关 chunks 并格式化。
 
-        按文档要求按类型分配检索配额：
-        - semantic: top-5（稳定项目知识）
-        - episodic: top-3（近期事件，recency 加权）
-        - procedural 不在此注入（通过 task anchor 按文件触发）
+        按类型分配检索配额：
+        - project: top-5（稳定项目知识）
+        - reference: top-3（外部资源指引）
+        - feedback 不在此注入（通过 task anchor 按文件触发）
         """
         if not self._retriever:
             return ""
@@ -164,19 +254,18 @@ class MemoryContext:
                 user_message=query,
                 task_description=self._task_context,
             )
-            # 按类型分组限制配额
-            semantic_chunks: list[dict] = []
-            episodic_chunks: list[dict] = []
+            project_chunks: list[dict] = []
+            reference_chunks: list[dict] = []
             other_chunks: list[dict] = []
             for chunk in chunks:
                 mem_type = (chunk.get("metadata") or {}).get("type", "")
-                if mem_type == "semantic" and len(semantic_chunks) < 5:
-                    semantic_chunks.append(chunk)
-                elif mem_type == "episodic" and len(episodic_chunks) < 3:
-                    episodic_chunks.append(chunk)
-                elif mem_type not in ("semantic", "episodic", "procedural"):
+                if mem_type == "project" and len(project_chunks) < 5:
+                    project_chunks.append(chunk)
+                elif mem_type == "reference" and len(reference_chunks) < 3:
+                    reference_chunks.append(chunk)
+                elif mem_type not in ("project", "reference", "feedback"):
                     other_chunks.append(chunk)
-            filtered = semantic_chunks + episodic_chunks + other_chunks
+            filtered = project_chunks + reference_chunks + other_chunks
             return self._retriever.format_for_injection(filtered)
         except Exception as exc:
             logger.debug("RAG retrieval failed: %s", exc)
@@ -208,8 +297,8 @@ class MemoryContext:
             mem_keywords = _extract_keywords(f"{mem.name} {mem.description}")
             overlap = task_keywords & mem_keywords
             score = len(overlap)
-            # procedural 规则优先展示，避免任务约束被语义记忆淹没。
-            if mem.type == "procedural":
+            # feedback 规则优先展示，避免任务约束被项目记忆淹没。
+            if mem.type == "feedback":
                 score += 0.5
             scored.append((score, mem))
 
@@ -245,46 +334,43 @@ class MemoryContext:
 
         return result
 
-    def get_procedural_for_files(
+    def get_feedback_for_files(
         self, accessed_files: set[str], *, record_access: bool = False,
     ) -> str:
         """
-        根据已访问文件的锚点匹配，返回相关 procedural 记忆内容。
+        根据已访问文件的锚点匹配，返回相关 feedback 记忆内容。
 
-        按架构文档：procedural 规则嵌入 task anchor 每步注入，不会被 compaction 丢失。
+        feedback 规则嵌入 task anchor 每步注入，不会被 compaction 丢失。
 
         Args:
             accessed_files: 已访问的文件路径集合（相对路径）
             record_access: 是否递增匹配到的记忆的 access_count
 
         Returns:
-            格式化的 procedural 记忆文本；无匹配时返回空字符串。
+            格式化的 feedback 记忆文本；无匹配时返回空字符串。
         """
         if not self._enabled or not accessed_files:
             return ""
 
         summaries = self._store.list_memories()
-        procedural = [s for s in summaries if s.type == "procedural"]
-        if not procedural:
+        feedback_mems = [s for s in summaries if s.type == "feedback"]
+        if not feedback_mems:
             return ""
 
-        # 规范化路径：去除前导 ./ 和 \ → /
         normalized_files = {
             p.replace("\\", "/").lstrip("./") for p in accessed_files
         }
 
         matched_memories: list[str] = []
         matched_names: list[str] = []
-        for mem_summary in procedural:
+        for mem_summary in feedback_mems:
             mem = self._store.read_memory(mem_summary.name)
             if mem is None:
                 continue
-            # 检查此 procedural 记忆的文件锚点是否与访问文件匹配
             for anchor in mem.anchors:
                 if anchor.kind != "file" or not anchor.path:
                     continue
                 anchor_path = anchor.path.replace("\\", "/").lstrip("./")
-                # 支持前缀匹配（目录级）和精确匹配
                 for f in normalized_files:
                     if f == anchor_path or f.startswith(anchor_path + "/"):
                         stale_warn = ""
@@ -307,19 +393,27 @@ class MemoryContext:
                 self._store.record_access(name)
 
         return "\n\n".join([
-            "## Procedural Rules (triggered by file access)",
+            "## Feedback Rules (triggered by file access)",
             *matched_memories,
         ])
 
+    def get_procedural_for_files(
+        self, accessed_files: set[str], *, record_access: bool = False,
+    ) -> str:
+        """Backward-compatible alias for get_feedback_for_files()."""
+        return self.get_feedback_for_files(accessed_files, record_access=record_access)
+
     @staticmethod
     def _append_grouped_memories(lines: list[str], memories: list[object], limit: int | None = None) -> int:
-        """按类型优先级输出记忆摘要，procedural 始终在最前。"""
+        """按类型优先级输出记忆摘要，feedback 始终在最前。"""
         groups = [
-            ("Rules to follow", "procedural"),
-            ("Project knowledge", "semantic"),
-            ("Recent activities", "episodic"),
+            ("Rules to follow", "feedback"),
+            ("Project knowledge", "project"),
+            ("About the user", "user"),
+            ("References", "reference"),
         ]
         shown = 0
+        known_types = {t for _, t in groups}
         for title, mem_type in groups:
             typed = [mem for mem in memories if getattr(mem, "type", "") == mem_type]
             if limit is not None:
@@ -332,7 +426,7 @@ class MemoryContext:
                 shown += 1
                 if limit is not None and shown >= limit:
                     return shown
-        remaining = [mem for mem in memories if getattr(mem, "type", "") not in {"procedural", "semantic", "episodic"}]
+        remaining = [mem for mem in memories if getattr(mem, "type", "") not in known_types]
         for mem in remaining:
             if limit is not None and shown >= limit:
                 break

@@ -1,22 +1,28 @@
 """Data models and schemas."""
 
-USER_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "id": {"type": "integer"},
-        "name": {"type": "string", "minLength": 3, "maxLength": 20},
-        "email": {"type": "string", "format": "email"},
-        "password": {"type": "string", "minLength": 6},
-    },
-    "required": ["name", "email", "password"],
+# ── DDL table schemas for database migration ──────────────────────────────
+
+USER_TABLE = {
+    "table": "users",
+    "columns": [
+        {"name": "id",         "type": "INTEGER",  "constraints": "PRIMARY KEY AUTOINCREMENT"},
+        {"name": "name",       "type": "VARCHAR(20)", "constraints": "NOT NULL UNIQUE"},
+        {"name": "email",      "type": "VARCHAR(120)", "constraints": "NOT NULL UNIQUE"},
+        {"name": "password",   "type": "VARCHAR(255)", "constraints": "NOT NULL"},
+        {"name": "created_at", "type": "TIMESTAMP", "constraints": "DEFAULT CURRENT_TIMESTAMP"},
+    ],
 }
 
-SESSION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "user_id": {"type": "integer"},
-        "token": {"type": "string"},
-        "created_at": {"type": "integer"},
-    },
-    "required": ["user_id", "token"],
+SESSION_TABLE = {
+    "table": "sessions",
+    "columns": [
+        {"name": "token",      "type": "VARCHAR(64)", "constraints": "PRIMARY KEY"},
+        {"name": "user_id",    "type": "INTEGER",     "constraints": "NOT NULL REFERENCES users(id)"},
+        {"name": "created_at", "type": "INTEGER",     "constraints": "NOT NULL"},
+    ],
 }
+
+SCHEMAS = [
+    USER_TABLE,
+    SESSION_TABLE,
+]

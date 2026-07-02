@@ -189,6 +189,13 @@ class FileWriteTool(BaseTool):
         content (str): 要写入的内容
     """
 
+    def __init__(self, allowed_paths: list[str | Path] | None = None) -> None:
+        self._allowed_paths = (
+            {Path(path).expanduser().resolve() for path in allowed_paths}
+            if allowed_paths is not None
+            else None
+        )
+
     @property
     def name(self) -> str:
         return "file_write"
@@ -226,12 +233,20 @@ class FileWriteTool(BaseTool):
     def execute(self, params: dict[str, Any]) -> ToolResult:
         path = Path(params.get("path", ""))
         content = params.get("content", "")
+        target_path = path.expanduser().resolve()
+
+        if self._allowed_paths is not None and target_path not in self._allowed_paths:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Permission denied: Writing to {target_path} is not allowed.",
+            )
 
         # 覆盖大文件时发出警告
         warning = ""
-        if path.exists() and path.is_file():
+        if target_path.exists() and target_path.is_file():
             try:
-                existing_lines = path.read_text(encoding="utf-8", errors="replace").count("\n")
+                existing_lines = target_path.read_text(encoding="utf-8", errors="replace").count("\n")
                 if existing_lines > 50:
                     warning = (
                         f"\n⚠️  WARNING: Overwrote existing file with {existing_lines}+ lines. "
@@ -241,8 +256,8 @@ class FileWriteTool(BaseTool):
                 pass
 
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(content, encoding="utf-8")
         except OSError as e:
             return ToolResult(success=False, output="", error=str(e))
 

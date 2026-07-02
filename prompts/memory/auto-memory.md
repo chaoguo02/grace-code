@@ -1,24 +1,55 @@
-## Auto Memory Guidelines
+## Auto Memory
 
-### When to save
-- **At the start** of a task, use memory_list to check if there's relevant prior knowledge
-- **Save** useful information you discover: build commands, debugging tricks, project conventions, user preferences
-- When the **user corrects you**, save the correction as a memory (type: feedback)
-- Save **concrete, actionable** facts — not vague observations
-- Use memory_write with descriptive names like "build-commands", "debugging-tips", "api-conventions"
+You have a persistent, file-based memory system. Memories are stored as Markdown files with YAML frontmatter.
 
-### What NOT to save
-- Code patterns, architecture, or file paths derivable from the current codebase
-- Git history or recent changes — use git log / git blame instead
-- Debugging solutions or fix recipes — the fix is in the code, the commit message has context
-- Ephemeral task details: in-progress work, temporary state, current conversation context
-- Anything already documented in project README or config files
+### Memory Types
 
-### Before using a memory
-- Memories can become stale. Before acting on a memory that names a specific file, function, or flag, **verify it still exists** (use find_files or search_text)
-- If a memory conflicts with what you observe in the code, trust the code and update/delete the memory
-- Treat memories as hints, not facts — they describe what WAS true, not necessarily what IS true
+| Type | Scope | Purpose |
+|---|---|---|
+| `user` | Global | User role, preferences, expertise level |
+| `feedback` | Global | User corrections and confirmed approaches |
+| `project` | Project | Ongoing work, decisions, deadlines |
+| `reference` | Project | Pointers to external systems (Linear, Grafana, etc.) |
+
+`user` and `feedback` memories are private and always loaded. `project` and `reference` memories are project-scoped and recalled on demand.
+
+### Automatic Saves (handled by the system)
+
+The following patterns are detected and saved automatically — you do NOT need to handle these manually:
+- **User corrections**: phrases like "don't do X", "stop doing Y", "instead use Z", "remember that..." are captured as `feedback` memories.
+- **Successful build/test commands**: when a shell command matching build/test patterns succeeds, it's saved as a `project` memory.
+- **Plan revision feedback**: when the user rejects or requests changes to a plan, the feedback is captured as `feedback` memory.
+
+### When to Explicitly Save
+
+Use `memory_write` when you discover information that won't be captured automatically:
+- **User role/expertise**: "I'm a frontend engineer", "I've never used Rust before"
+- **Project decisions**: "We're using SQLite for the prototype, will migrate to Postgres later"
+- **External references**: "CI logs are in GitHub Actions, deploy goes through Vercel"
+- **Non-obvious conventions**: naming patterns, preferred libraries, architectural rules not documented in code
+
+### What NOT to Save
+
+The following information can be obtained in real-time from the codebase. Storing it as memory creates stale data that pollutes reasoning:
+
+- Specific code patterns, file structure, or project architecture (use grep/find to get live state)
+- Git history and recent changes (git log is the authoritative source)
+- Bug fix details or debugging solutions (the fix is in the code; the commit message has context)
+- Rules already in CLAUDE.md / settings.json (avoid duplication)
+- Temporary debug steps, unless they form a reusable pattern
+- Current conversation's temporary state (session-level info doesn't need cross-session persistence)
+
+**Judgment criterion**: only save if this information will still be valuable in a week AND cannot be derived from the codebase.
+
+### Before Acting on a Memory
+
+- Memories are point-in-time observations, not live state. If a memory names a file, function, or flag, **verify it still exists** before recommending it.
+- If a memory conflicts with current code, trust the code — then update or delete the stale memory.
+- Memories older than 1 day may carry outdated file:line citations. Always verify against current code before asserting as fact.
 
 ### Maintenance
-- If a memory is **no longer relevant**, use memory_delete to keep the index clean
-- If you discover a memory is outdated, update it with memory_write (same name overwrites)
+
+- Delete irrelevant memories with `memory_delete` to keep the index clean.
+- Update outdated memories with `memory_write` (same name overwrites).
+- At the start of complex tasks, use `memory_list` to check for relevant prior knowledge.
+- If you write a memory explicitly, the system will NOT attempt automatic extraction for that turn (your intent takes priority).

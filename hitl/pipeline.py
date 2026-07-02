@@ -17,7 +17,6 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
-from hitl.hooks import HookConfig, run_hook
 from hitl.permission_rule import PermissionRule
 from hitl.settings_loader import save_rule_to_settings
 
@@ -87,7 +86,7 @@ class PermissionPipeline:
         self,
         *,
         rules: list[PermissionRule] | None = None,
-        hooks: list[HookConfig] | None = None,
+        hook_dispatcher: Any = None,
         confirm_callback: ConfirmCallback | None = None,
         auto_approve: bool = False,
         settings_path: str | None = None,
@@ -96,7 +95,7 @@ class PermissionPipeline:
         self._deny_rules: list[PermissionRule] = []
         self._ask_rules: list[PermissionRule] = []
         self._allow_rules: list[PermissionRule] = []
-        self._hooks = hooks or []
+        self._hook_dispatcher = hook_dispatcher
         self._confirm_callback = confirm_callback
         self._auto_approve = auto_approve
         self._settings_path = settings_path
@@ -195,15 +194,24 @@ class PermissionPipeline:
     # ─── Layer 2: PreToolUse Hooks ─────────────────────────────────────
 
     def _layer2_hooks(self, tool_name: str, params: dict[str, Any]) -> PermissionResult | None:
-        """Run user-defined shell hooks. Hook exit codes: 0=approve, 1=abstain, 2=deny."""
-        for hook in self._hooks:
-            if hook.matches(tool_name, params):
-                hook_result = run_hook(hook, tool_name, params, cwd=self._project_root)
-                if hook_result.approves:
-                    return PermissionResult(approved=True, layer=2, reason="Hook approved")
-                elif hook_result.denies:
-                    return PermissionResult(approved=False, layer=2, reason="Hook denied")
-                # abstains → continue
+        """Run PreToolUse hooks via HookDispatcher. Exit 0=approve, 2=deny."""
+        if self._hook_dispatcher is None:
+            return None
+
+        from hooks.events import HookContext, HookEvent
+
+        ctx = HookContext(
+            event=HookEvent.PRE_TOOL_USE,
+            tool_name=tool_name,
+            tool_input=params,
+        )
+        dispatch_result = self._hook_dispatcher.dispatch(HookEvent.PRE_TOOL_USE, ctx)
+        if dispatch_result.blocked:
+            return PermissionResult(
+                approved=False, layer=2, reason=dispatch_result.reason or "Blocked by hook"
+            )
+        if dispatch_result.approved_explicitly:
+            return PermissionResult(approved=True, layer=2, reason="Hook approved")
         return None
 
     # ─── Layer 3: Permission Rules ─────────────────────────────────────

@@ -37,6 +37,7 @@ class SessionRuntime:
         child_max_steps: int = 12,
         child_budget_tokens: int = 30_000,
         memory_context=None,
+        hook_dispatcher=None,
     ) -> None:
         self._store = store
         self._backend = backend
@@ -47,6 +48,7 @@ class SessionRuntime:
         self._child_max_steps = child_max_steps
         self._child_budget_tokens = child_budget_tokens
         self._memory_context = memory_context
+        self._hook_dispatcher = hook_dispatcher
 
     @property
     def agent_registry(self) -> AgentRegistryV2:
@@ -77,6 +79,8 @@ class SessionRuntime:
         task_description: str,
         intent: str,
         messages: list[LLMMessage] | None = None,
+        max_steps_override: int | None = None,
+        budget_tokens_override: int | None = None,
     ) -> RunResult:
         session = self._store.get_session(session_id)
         if session is None:
@@ -110,8 +114,8 @@ class SessionRuntime:
             description=task_description,
             repo_path=session.repo_path,
             intent=intent,
-            max_steps=agent_cfg.max_steps,
-            budget_tokens=agent_cfg.budget_tokens,
+            max_steps=max_steps_override or agent_cfg.max_steps,
+            budget_tokens=budget_tokens_override or agent_cfg.budget_tokens,
             metadata={
                 "entrypoint": "v2",
                 "mode": f"v2-{agent_name}",
@@ -125,6 +129,8 @@ class SessionRuntime:
         )
 
         self._store.update_status(session_id, "running")
+        self._fire_hook("SessionStart", session_id=session_id)
+
         initial_count = len(persisted_messages)
         with EventLog.create(task, log_dir=self._log_dir) as log:
             result = agent.run(task, log)
@@ -137,6 +143,8 @@ class SessionRuntime:
         else:
             self._store.update_status(session_id, "failed", error=result.error or result.summary)
             self._store.set_summary(session_id, result.summary, status="failed")
+
+        self._fire_hook("Stop", session_id=session_id)
         return result
 
     def run_child_session(
@@ -171,10 +179,32 @@ class SessionRuntime:
             intent="analysis" if subagent_type == "explore" else "edit",
             messages=[LLMMessage(role="user", content=prompt)],
         )
+        self._fire_hook("SubagentStop", session_id=child.id)
         return self._build_child_session_result(child.id, result)
 
+    def _fire_hook(self, event_name: str, session_id: str = "") -> None:
+        """Fire a lifecycle hook event if dispatcher is configured."""
+        if self._hook_dispatcher is None:
+            return
+        from hooks.events import HookContext, HookEvent
+
+        try:
+            evt = HookEvent(event_name)
+            ctx = HookContext(event=evt, session_id=session_id)
+            self._hook_dispatcher.dispatch(evt, ctx)
+        except Exception:
+            pass
+
     def _build_registry_for_session(self, spec, session) -> ToolRegistry:
-        registry = self._base_registry.filtered(spec.allowed_tools)
+        # Plan agent：注册全部工具（模型能看到定义），通过 plan_mode_allowed 拦截写操作
+        is_plan = spec.name == "plan"
+        if is_plan:
+            from agent.v2.agent_registry import _BUILD_ALLOWED, _PLAN_ALLOWED
+            registry = self._base_registry.filtered(_BUILD_ALLOWED)
+            plan_mode_allowed = _PLAN_ALLOWED
+        else:
+            registry = self._base_registry.filtered(spec.allowed_tools)
+            plan_mode_allowed = None
         if spec.allow_task_tool:
             registry.register(TaskToolV2(self, session.id))
         wrapped = PolicyAwareToolRegistry(
@@ -182,6 +212,7 @@ class SessionRuntime:
             phase_policy=PhasePolicy(allowed_tools=frozenset(registry.tool_names)),
             repo_path=session.repo_path,
             phase_name="v2_execution",
+            plan_mode_allowed=plan_mode_allowed,
         )
         return wrapped
 
@@ -201,6 +232,13 @@ class SessionRuntime:
             return self._build_child_runtime_messages(spec)
         if spec.mode != "primary":
             return []
+        messages: list[LLMMessage] = []
+
+        # Plan 模式下注入只读约束（ref: Claude Code EnterPlanMode 返回指令）
+        if spec.name == "plan":
+            from agent.prompt import get_plan_mode_injection
+            messages.append(LLMMessage(role="user", content=get_plan_mode_injection()))
+
         subagent_descriptions = "\n".join(
             f"- {s.name}: {s.description}" for s in self._agent_registry.list_subagents()
         )
@@ -214,7 +252,8 @@ class SessionRuntime:
             "- Use delegation for independent, clearly-scoped work.\n"
             "- Do simple tasks directly without delegating."
         )
-        return [LLMMessage(role="user", content=content)]
+        messages.append(LLMMessage(role="user", content=content))
+        return messages
 
     def _build_child_runtime_messages(self, spec) -> list[LLMMessage]:
         if spec.name == "explore":
@@ -238,7 +277,103 @@ class SessionRuntime:
                 "- If you cannot finish, summarize the blocker precisely.\n"
                 f"- {_CHILD_SUMMARY_RULE}"
             )
-        return [LLMMessage(role="user", content=content)]
+        messages = [LLMMessage(role="user", content=content)]
+
+        # Inject memory context so child agents know project rules and conventions
+        memory_section = self._build_child_memory_context()
+        if memory_section:
+            messages.append(LLMMessage(role="user", content=memory_section))
+
+        return messages
+
+    def _build_child_memory_context(self) -> str:
+        """
+        Build a compact memory snippet for child agents.
+
+        Injects:
+        - ALL procedural/feedback memories (global rules, no freshness warning)
+        - Top 5 semantic/project memories by recency (with freshness warning if >1 day old)
+
+        Returns empty string if no memory_context is configured or no memories exist.
+        """
+        if self._memory_context is None:
+            return ""
+
+        try:
+            store = self._memory_context._store
+            summaries = store.list_memories()
+        except Exception:
+            return ""
+
+        if not summaries:
+            return ""
+
+        # Separate: user/feedback (always inject) vs project/reference (top-5 by recency)
+        _GLOBAL_TYPES = {"user", "feedback"}
+        global_mems = [s for s in summaries if s.type in _GLOBAL_TYPES]
+        project_mems = [s for s in summaries if s.type not in _GLOBAL_TYPES]
+
+        # Sort project memories by updated_at descending, take top 5
+        project_mems.sort(key=lambda s: s.updated_at or "", reverse=True)
+        project_mems = project_mems[:5]
+
+        lines: list[str] = []
+        lines.append("[Memory Context]")
+        lines.append("The following project knowledge applies to your work:\n")
+
+        # Read full content for global memories (they're short rules — no freshness limit)
+        for s in global_mems:
+            try:
+                mem = store.read_memory(s.name)
+                if mem and mem.content.strip():
+                    lines.append(f"**{s.name}** ({s.type}): {mem.content.strip()}")
+                    lines.append("")
+            except Exception:
+                continue
+
+        # For project memories, include description + freshness warning
+        if project_mems:
+            lines.append("Project knowledge:")
+            for s in project_mems:
+                freshness = self._memory_freshness_text(s.name, store)
+                desc = f"- {s.name}: {s.description}"
+                if freshness:
+                    desc += f" [{freshness}]"
+                lines.append(desc)
+
+        # Don't inject if nothing meaningful was collected
+        content = "\n".join(lines)
+        if content.strip() == "[Memory Context]\nThe following project knowledge applies to your work:":
+            return ""
+
+        return content
+
+    @staticmethod
+    def _memory_freshness_text(name: str, store) -> str:
+        """
+        Generate freshness warning for a memory file based on mtime.
+
+        Aligned with Claude Code's memoryFreshnessText():
+        - <=1 day old: no warning (fresh)
+        - >1 day old: relative age warning ("X days ago")
+
+        Uses relative time ("47 days ago") instead of ISO timestamps because
+        models reason better about staleness with relative time expressions.
+        """
+        import os
+        from datetime import datetime
+
+        try:
+            path = store._file_path(name)
+            if not path.exists():
+                return ""
+            mtime = datetime.fromtimestamp(os.path.getmtime(path))
+            age_days = (datetime.now() - mtime).days
+            if age_days <= 1:
+                return ""
+            return f"{age_days} days ago — verify against current code"
+        except Exception:
+            return ""
 
     def _build_child_session_result(self, session_id: str, result: RunResult) -> ChildSessionResult:
         session = self._store.get_session(session_id)

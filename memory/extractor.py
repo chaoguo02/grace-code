@@ -83,9 +83,10 @@ class MemoryExtractor:
         summary: str,
         store: "MemoryStore | None",
         external_store: Any = None,
+        skip_auto_extract: bool = False,
     ) -> int:
         """提取并写入成功任务记忆；任何失败都不影响主流程。"""
-        if store is None:
+        if store is None or skip_auto_extract:
             return 0
         written = 0
         for candidate in self.extract(task, log, summary):
@@ -117,16 +118,19 @@ class MemoryExtractor:
                     "Follow Mem0-style extract semantics and Generative Agents-style reflection: "
                     "derive concise memories from observations, not a generic conversation summary. "
                     "Return ONLY valid JSON with this shape: "
-                    "{\"memories\":[{\"type\":\"episodic|semantic|procedural\","
+                    "{\"memories\":[{\"type\":\"user|feedback|project|reference\","
                     "\"name\":\"kebab-case-slug\",\"description\":\"one line\","
                     "\"content\":\"markdown\",\"confidence\":\"high|medium|low\","
                     "\"anchors\":[{\"kind\":\"file|symbol|task\",\"path\":\"...\","
                     "\"name\":\"...\",\"value\":\"...\"}]}]}. "
-                    "Use episodic for specific outcomes, semantic for stable project facts, "
-                    "procedural for rules or corrections. Drop low-value details. "
-                    "Procedural memories MUST include at least one file or symbol anchor "
+                    "Use user for role/preferences, feedback for corrections/rules, "
+                    "project for architecture/decisions/build commands, reference for external pointers. "
+                    "Only save if it will still be valuable after 1 week AND cannot be derived from the codebase. "
+                    "Do NOT save code patterns, file structure, git history/recent changes, fixed bug solutions, "
+                    "content already in CLAUDE.md, temporary debug steps, or current conversation state. "
+                    "Feedback memories SHOULD include file or symbol anchors when possible "
                     "(kind='file' with path, or kind='symbol' with name) for precise triggering. "
-                    "If no specific file/symbol can be identified, use semantic type instead."
+                    "If no specific file/symbol can be identified, use project type instead."
                 ),
             ),
             LLMMessage(role="user", content=self._build_extraction_context(task, log, summary)),
@@ -232,7 +236,7 @@ class MemoryExtractor:
         if not summary.strip():
             return []
         return [MemoryCandidate(
-            type="episodic",
+            type="project",
             name=self._slug("episode", f"{task.description} {summary}"),
             description=f"Completed task: {task.description[:80]}",
             content=f"Task completed successfully.\n\n**Task:** {task.description}\n\n**Outcome:** {summary}",

@@ -387,7 +387,7 @@ class ExternalMemoryStore:
         query_emb = _encode(query, self._model_name)
         now_ts = datetime.now(timezone.utc)
 
-        type_boosts = {"procedural": 0.05, "episodic": 0.03}
+        type_boosts = {"feedback": 0.05, "user": 0.03}
 
         scored: list[tuple[float, dict[str, Any]]] = []
         for row in rows:

@@ -132,6 +132,14 @@ def _resolve_mode(mode: str, task_description: str | None) -> str:
 # 任务意图分类
 # ---------------------------------------------------------------------------
 
+_EDIT_INDICATORS = re.compile(
+    r"\b(fix|write|create|modify|change|update|add|remove|delete|"
+    r"refactor|implement|rename|move|replace|install|upgrade|patch|"
+    r"rewrite|migrate|编辑|修改|创建|删除|重构|添加|修复|写入)\b",
+    re.IGNORECASE,
+)
+
+
 def classify_task_intent(
     description: str,
     intent_override: str = "auto",
@@ -139,11 +147,14 @@ def classify_task_intent(
 ) -> str:
     """Determine task intent: "edit" or "analysis".
 
+    Uses a fast keyword heuristic instead of an LLM call.
+    If description contains edit-implying verbs, returns "edit";
+    otherwise defaults to "analysis".
+
     Args:
         description: Natural language task description.
-        intent_override: "analysis", "edit", or "auto" (detect via LLM).
-        backend: LLM backend for auto detection. If None and override is "auto",
-                 falls back to "edit" as the conservative default.
+        intent_override: "analysis", "edit", or "auto" (detect heuristically).
+        backend: Unused (kept for API compatibility).
 
     Returns:
         "edit" | "analysis"
@@ -151,29 +162,6 @@ def classify_task_intent(
     if intent_override != "auto":
         return intent_override
 
-    if backend is None:
+    if _EDIT_INDICATORS.search(description):
         return "edit"
-
-    try:
-        from llm.base import LLMMessage
-        messages: list[LLMMessage] = [
-            LLMMessage(
-                role="system",
-                content=(
-                    "Classify coding tasks. Reply with ONLY ONE WORD: "
-                    "\"analysis\" if the task is read-only (asking, reading, "
-                    "explaining, comparing, finding, reviewing, searching), "
-                    "or \"edit\" if it requires writing, modifying, creating, "
-                    "fixing, refactoring, deleting, or changing code/files/docs. "
-                    "Do not include any other text."
-                ),
-            ),
-            LLMMessage(role="user", content=description),
-        ]
-        response = backend.complete(messages, tools=[])
-        word = (response.action.message or response.action.thought or "").strip().lower()
-        if word in ("analysis", "edit"):
-            return word
-    except Exception:
-        pass
-    return "edit"
+    return "analysis"
