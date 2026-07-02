@@ -87,6 +87,7 @@ def _init_memory(repo_path: str, config) -> tuple:
     """
     from memory.store import TwoTierMemoryStore
     from memory.context import MemoryContext
+    from llm.router import create_selector_backend
 
     retriever = None
     external_store = None
@@ -113,13 +114,82 @@ def _init_memory(repo_path: str, config) -> tuple:
         max_index_lines=config.memory.max_index_lines,
         indexer=indexer,
     )
+    selector_backend = create_selector_backend({
+        "memory": {
+            "selector_enabled": config.memory.selector_enabled,
+            "selector_model": config.memory.selector_model,
+        },
+        "llm": {
+            "provider": config.llm.provider,
+            "model": config.llm.model,
+            "api_key": config.llm.api_key,
+            "base_url": config.llm.base_url,
+        },
+    })
     memory_context = MemoryContext(
         store=memory_store,
         max_lines=config.memory.max_index_lines,
         enabled=config.memory.enabled,
         retriever=retriever,
+        selector_backend=selector_backend,
     )
     return memory_store, memory_context, external_store
+
+
+# ---------------------------------------------------------------------------
+# Hook Dispatcher 初始化
+# ---------------------------------------------------------------------------
+
+def _init_hook_dispatcher(repo_path: Path, proactive_memory=None, memory_store=None,
+                          log_dir: str | None = None, backend=None):
+    """Create HookDispatcher with optional ProactiveMemory as internal hooks."""
+    from hooks import HookDispatcher, HookEvent, HookMatcher, HookRegistry, InternalHook
+
+    registry = HookRegistry()
+
+    # Load external hooks from settings.json
+    settings_path = repo_path / ".forge-agent" / "settings.json"
+    registry.load_from_settings(settings_path)
+
+    # Register ProactiveMemory as internal PostToolUse/UserPromptSubmit subscriber
+    if proactive_memory is not None:
+        registry.register_internal(HookEvent.POST_TOOL_USE, InternalHook(
+            callback=lambda ctx: proactive_memory.check_tool_result(
+                ctx.tool_name,
+                ctx.tool_input,
+                (ctx.tool_output or {}).get("output", ""),
+                (ctx.tool_output or {}).get("success", False),
+            ),
+            matcher=HookMatcher(pattern="shell"),
+        ))
+        # Detect explicit memory_write → suppress auto-extraction this turn
+        registry.register_internal(HookEvent.POST_TOOL_USE, InternalHook(
+            callback=lambda ctx: proactive_memory.notify_explicit_memory_write(),
+            matcher=HookMatcher(pattern="memory_write"),
+        ))
+        def _on_user_prompt(ctx):
+            proactive_memory.reset_turn()
+            proactive_memory.check_user_message(ctx.user_input)
+
+        registry.register_internal(HookEvent.USER_PROMPT_SUBMIT, InternalHook(
+            callback=_on_user_prompt,
+        ))
+
+    # Register memory consolidation on SessionStop
+    if memory_store is not None:
+        def _on_session_stop(ctx):
+            from memory.consolidation import record_session_end, run_consolidation
+            try:
+                record_session_end(memory_store.store_dir)
+                run_consolidation(memory_store, log_dir=log_dir, backend=backend, async_run=True)
+            except Exception:
+                pass
+
+        registry.register_internal(HookEvent.STOP, InternalHook(
+            callback=_on_session_stop,
+        ))
+
+    return HookDispatcher(registry, cwd=str(repo_path))
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +214,9 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     # ── 构建 PermissionPipeline（5 层权限管道）──
     from hitl.pipeline import PermissionPipeline
     from hitl.settings_loader import load_permission_settings
-    from hitl.hooks import HookConfig
 
     project_root = str(repo_path) if repo_path else None
-    rules, hook_configs = load_permission_settings(project_root or ".")
-    hooks = [HookConfig(**h) for h in hook_configs] if hook_configs else []
+    rules, _hook_configs = load_permission_settings(project_root or ".")
 
     perm_confirm = None
     if confirm_callback is not None:
@@ -162,7 +230,6 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
 
     pipeline = PermissionPipeline(
         rules=rules,
-        hooks=hooks,
         confirm_callback=perm_confirm,
         auto_approve=auto_approve,
         settings_path=settings_path,
@@ -370,11 +437,14 @@ def _run_v2_mode(
     plan_approval_callback=None,
     auto_approve: bool = False,
     plan_file: str | None = None,
+    hook_dispatcher=None,
+    proactive_memory=None,
 ) -> None:
     import os
     import subprocess
     from datetime import datetime
     from agent.task import RunStatus
+    from agent.factory import classify_task_intent
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
     from llm.base import LLMMessage
 
@@ -390,8 +460,9 @@ def _run_v2_mode(
         child_max_steps=12,
         child_budget_tokens=30_000,
         memory_context=memory_context,
+        hook_dispatcher=hook_dispatcher,
     )
-    intent = intent_override if intent_override != "auto" else "edit"
+    intent = classify_task_intent(description, intent_override, backend)
 
     if mode == "v2-build":
         # ── 上下文连续：如果提供了 --plan-file，将计划文件内容注入 build session ──
@@ -517,6 +588,8 @@ def _run_v2_mode(
                     plan_approval_callback=plan_approval_callback,
                     auto_approve=True,
                     plan_file=plan_path,
+                    hook_dispatcher=hook_dispatcher,
+                    proactive_memory=proactive_memory,
                 )
                 return
 
@@ -538,6 +611,8 @@ def _run_v2_mode(
                     plan_approval_callback=plan_approval_callback,
                     auto_approve=False,
                     plan_file=plan_path,
+                    hook_dispatcher=hook_dispatcher,
+                    proactive_memory=proactive_memory,
                 )
                 return
 
@@ -575,6 +650,8 @@ def _run_v2_mode(
                     return
                 if not feedback.strip():
                     continue
+                if proactive_memory:
+                    proactive_memory.check_plan_feedback(feedback)
                 click.echo(dim(f"  Re-planning (revision {revision_count}/{max_revisions})...\n"))
                 result = runtime.run_session(
                     session.id,
@@ -752,6 +829,19 @@ def run(
         proactive_memory = ProactiveMemory(memory_store)
         proactive_memory.check_user_message(description)
 
+    # Initialize HookDispatcher with ProactiveMemory as internal subscriber
+    hook_dispatcher = _init_hook_dispatcher(
+        repo_path, proactive_memory,
+        memory_store=memory_store,
+        log_dir=config.agent.log_dir,
+        backend=backend,
+    )
+
+    # Wire hook_dispatcher into ToolRegistry (PostToolUse) and PermissionPipeline (PreToolUse)
+    registry._hook_dispatcher = hook_dispatcher
+    if hasattr(registry, '_permission_pipeline') and registry._permission_pipeline is not None:
+        registry._permission_pipeline._hook_dispatcher = hook_dispatcher
+
     # memory 模块日志可见性
     if config.memory.enabled:
         logging.getLogger("memory").setLevel(logging.INFO)
@@ -812,6 +902,8 @@ def run(
                 except (EOFError, KeyboardInterrupt):
                     feedback = "Plan revision requested by user"
                 rend.on_plan_rejected()
+                if proactive_memory and feedback:
+                    proactive_memory.check_plan_feedback(feedback)
                 return PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
             click.echo("  Please enter y to approve, n to reject, or e to request revision.")
 
@@ -829,6 +921,8 @@ def run(
             plan_approval_callback=_plan_approval_cb,
             auto_approve=auto_approve,
             plan_file=plan_file,
+            hook_dispatcher=hook_dispatcher,
+            proactive_memory=proactive_memory,
         )
         flush_observability()
         return

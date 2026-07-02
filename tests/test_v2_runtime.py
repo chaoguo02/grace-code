@@ -832,3 +832,33 @@ def test_v2_unknown_parent_session_raises(tmp_path):
             description="test",
             prompt="Do something.",
         )
+
+
+def test_v2_build_readonly_tool_then_final_text_is_success(tmp_path):
+    """Final text after a read-only tool call completes V2 without post-hoc write validation."""
+    backend = MockBackend([
+        Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="read memory",
+            tool_calls=[ToolCall(name="memory_read", params={"name": "memory-system-test-contract"})],
+        ),
+        Action(
+            action_type=ActionType.FINISH,
+            thought="summarize",
+            message="The memory records how to test the memory system.",
+        ),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    root = runtime.create_root_session(agent_name="build", repo_path=str(tmp_path), title="root")
+
+    result = runtime.run_session(
+        root.id,
+        agent_name="build",
+        task_description="Read the memory and summarize it. Do not modify files.",
+        intent="analysis",
+        messages=[],
+    )
+
+    assert result.status == RunStatus.SUCCESS
+    assert result.summary == "The memory records how to test the memory system."
+    assert store.get_session(root.id).status == "completed"

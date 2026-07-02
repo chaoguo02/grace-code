@@ -3,7 +3,6 @@
 import json
 from pathlib import Path
 
-from agent.completion import CompletionValidator
 from config.schema import load_config
 from agent.core import AgentConfig, PlanExecuteAgent, ReActAgent
 from agent.event_log import EventLog, summarize_run
@@ -781,107 +780,7 @@ def test_policy_registry_hides_and_blocks_denied_tools(tmp_path: Path) -> None:
     assert web_tool.calls == []
 
 
-def test_completion_validator_requires_logged_read(tmp_path: Path) -> None:
-    """require_any_read fails when no read happened under strict file scope."""
-    task = Task("只允许读取 README，不要查看其他文件", str(tmp_path), intent="analysis")
-    policy = build_task_policy(task)
-    assert policy.completion.require_any_read is True
-
-    log = make_log(tmp_path, task)
-    try:
-        log.log_task_start(task)
-        verdict = CompletionValidator().validate(log, policy, str(tmp_path))
-    finally:
-        log.close()
-
-    assert not verdict.success
-    assert "without reading any file" in verdict.reason
-
-
-def test_completion_validator_accepts_logged_write(tmp_path: Path) -> None:
-    task = Task("只允许修改 README", str(tmp_path), intent="edit")
-    policy = build_task_policy(task)
-    log = make_log(tmp_path, task)
-    try:
-        log.log_task_start(task)
-        log.log_action(1, Action(ActionType.TOOL_CALL, "write", [ToolCall("file_write", {"path": "README.md"})]))
-        log.log_observation(1, ToolResult(success=True, output="ok").to_observation("file_write"))
-        verdict = CompletionValidator().validate(log, policy, str(tmp_path))
-    finally:
-        log.close()
-
-    assert verdict.success
-
-
-def test_completion_validator_rejects_ungrounded_broad_analysis_answer(tmp_path: Path) -> None:
-    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
-    task.shape = classify_task_shape(task)
-    policy = build_task_policy(task)
-    log = make_log(tmp_path, task)
-    ledger = EvidenceLedger()
-    try:
-        log.log_task_start(task)
-        log.log_action(1, Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": "agent/core.py"})]))
-        log.log_observation(1, ToolResult(success=True, output="core wiring").to_observation("file_read"))
-        ledger.add_observation(
-            phase="inspect",
-            tool_name="file_read",
-            output="core wiring",
-            path="agent/core.py",
-            artifact_id="art_core",
-            key_evidence=True,
-        )
-        ledger.summarize_phase("inspect")
-        verdict = CompletionValidator().validate(
-            log,
-            policy,
-            str(tmp_path),
-            task=task,
-            evidence_ledger=ledger,
-            final_summary="## Confirmed\n- Core wiring is present",
-        )
-    finally:
-        log.close()
-
-    assert not verdict.success
-    assert verdict.reason_code == "analysis_answer_grounding_failed"
-    assert verdict.retryable is True
-
-
-def test_completion_validator_accepts_grounded_broad_analysis_answer(tmp_path: Path) -> None:
-    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
-    task.shape = classify_task_shape(task)
-    policy = build_task_policy(task)
-    log = make_log(tmp_path, task)
-    ledger = EvidenceLedger()
-    try:
-        log.log_task_start(task)
-        log.log_action(1, Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": "agent/core.py"})]))
-        log.log_observation(1, ToolResult(success=True, output="core wiring").to_observation("file_read"))
-        record = ledger.add_observation(
-            phase="inspect",
-            tool_name="file_read",
-            output="core wiring",
-            path="agent/core.py",
-            artifact_id="art_core",
-            key_evidence=True,
-        )
-        ledger.summarize_phase("inspect")
-        verdict = CompletionValidator().validate(
-            log,
-            policy,
-            str(tmp_path),
-            task=task,
-            evidence_ledger=ledger,
-            final_summary=f"## Confirmed\n- Core wiring is present [{record.evidence_id}]",
-        )
-    finally:
-        log.close()
-
-    assert verdict.success
-
-
-def test_analysis_plan_cannot_finish_without_reading_allowed_file(tmp_path: Path) -> None:
+def test_analysis_plan_final_text_completes_without_posthoc_read_validation(tmp_path: Path) -> None:
     registry, read_tool, write_tool = make_registry()
     backend = MockBackend([
         Action(ActionType.FINISH, "plan", message="### Goal\nRead pyproject after approval."),
@@ -906,8 +805,8 @@ def test_analysis_plan_cannot_finish_without_reading_allowed_file(tmp_path: Path
     finally:
         log.close()
 
-    assert result.status == RunStatus.GAVE_UP
-    assert "without reading required source file: pyproject.toml" in result.summary
+    assert result.status == RunStatus.SUCCESS
+    assert result.summary == "I planned again instead of reading."
     assert read_tool.calls == []
     assert write_tool.calls == []
 
@@ -949,12 +848,15 @@ def test_analysis_plan_executes_with_readonly_tools(tmp_path: Path) -> None:
     assert "must read the approved source file now" in execution_texts
 
 
-def test_analysis_planning_phase_has_no_tools(tmp_path: Path) -> None:
+def test_analysis_planning_phase_has_read_tools(tmp_path: Path) -> None:
+    """After B7: analysis planning phase has read-only tools (file_read works, file_write blocked)."""
     registry, read_tool, write_tool = make_registry()
     backend = MockBackend([
-        Action(ActionType.TOOL_CALL, "premature read", [ToolCall("file_read", {"path": "README.md"})]),
+        # Planning phase: file_read should succeed (read-only tools available)
+        Action(ActionType.TOOL_CALL, "planning read", [ToolCall("file_read", {"path": "README.md"})]),
         Action(ActionType.FINISH, "plan", message="### Goal\nRead README after approval."),
-        Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": "README.md"})]),
+        # Execution phase: file_read succeeds again
+        Action(ActionType.TOOL_CALL, "exec read", [ToolCall("file_read", {"path": "README.md"})]),
         Action(ActionType.FINISH, "done", message="Answered from README."),
     ])
     task = Task(
@@ -977,12 +879,9 @@ def test_analysis_planning_phase_has_no_tools(tmp_path: Path) -> None:
         log.close()
 
     assert result.status == RunStatus.SUCCESS
-    assert read_tool.calls == [{"path": "README.md"}]
+    # Both planning and execution reads succeed
+    assert read_tool.calls == [{"path": "README.md"}, {"path": "README.md"}]
     assert write_tool.calls == []
-    subtask_logs = sorted((tmp_path / "subtasks").glob("*.jsonl"))
-    assert subtask_logs
-    blocked_log = subtask_logs[-1].read_text(encoding="utf-8")
-    assert "Unknown tool 'file_read'. Available tools: none" in blocked_log
 
 
 
@@ -1100,13 +999,21 @@ def test_explicit_intent_passes_through() -> None:
     assert classify_task_intent("any text", "analysis", None) == "analysis"
 
 
-def test_auto_intent_falls_back_to_edit_without_backend() -> None:
-    """When --intent is auto and no backend, conservative fallback is edit."""
-    assert classify_task_intent("read README and explain", "auto", None) == "edit"
-    assert classify_task_intent("read README and explain") == "edit"
+def test_auto_intent_uses_keyword_heuristic() -> None:
+    """B5: classify_task_intent uses keyword heuristic, no LLM call needed."""
+    # No edit keywords → analysis
+    assert classify_task_intent("read README and explain", "auto", None) == "analysis"
+    assert classify_task_intent("analyze the architecture") == "analysis"
+    # Edit keywords → edit
+    assert classify_task_intent("fix the login bug") == "edit"
+    assert classify_task_intent("create a new config file") == "edit"
+    assert classify_task_intent("修改 README 文件") == "edit"
+    # Explicit override always wins
+    assert classify_task_intent("read README", "edit", None) == "edit"
+    assert classify_task_intent("fix the bug", "analysis", None) == "analysis"
 
 
-def test_edit_plan_cannot_finish_without_write(tmp_path: Path) -> None:
+def test_edit_plan_final_text_completes_without_posthoc_write_validation(tmp_path: Path) -> None:
     registry, _read_tool, write_tool = make_registry()
     backend = MockBackend([
         Action(ActionType.FINISH, "plan", message="### Goal\nEdit README."),
@@ -1125,8 +1032,8 @@ def test_edit_plan_cannot_finish_without_write(tmp_path: Path) -> None:
     finally:
         log.close()
 
-    assert result.status == RunStatus.GAVE_UP
-    assert "without performing any file write" in result.summary
+    assert result.status == RunStatus.SUCCESS
+    assert result.summary == "I planned again instead of writing."
     assert write_tool.calls == []
 
 
@@ -1191,7 +1098,7 @@ def test_revise_approval_replans_before_execute(tmp_path: Path) -> None:
     assert "Need a narrower plan" in revision_texts
 
 
-def test_memory_types_episodic_semantic_procedural() -> None:
+def test_memory_types_user_project_feedback() -> None:
     """三种新记忆类型均可建模，并支持文件锚点。"""
     from memory.models import Anchor, Memory, MemoryMetadata
 
@@ -1199,11 +1106,11 @@ def test_memory_types_episodic_semantic_procedural() -> None:
         name="anchored-rule",
         description="Rule for core edits",
         content="Read policy registry before editing core policy.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[Anchor(kind="file", path="agent/core.py")],
     )
 
-    assert memory.metadata.type == "procedural"
+    assert memory.metadata.type == "feedback"
     assert memory.anchors[0].path == "agent/core.py"
     assert memory.to_dict()["anchors"] == [{"kind": "file", "path": "agent/core.py"}]
 
@@ -1218,7 +1125,7 @@ def test_memory_anchors_roundtrip(tmp_path: Path) -> None:
         name="anchored-rule",
         description="Rule with anchors",
         content="Follow the anchored rule.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[
             Anchor(kind="file", path="agent/core.py"),
             Anchor(kind="task", value="refactoring"),
@@ -1229,7 +1136,7 @@ def test_memory_anchors_roundtrip(tmp_path: Path) -> None:
     loaded = store.read_memory("anchored-rule")
 
     assert loaded is not None
-    assert loaded.metadata.type == "procedural"
+    assert loaded.metadata.type == "feedback"
     assert [anchor.to_dict() for anchor in loaded.anchors] == [
         {"kind": "file", "path": "agent/core.py"},
         {"kind": "task", "value": "refactoring"},
@@ -1259,8 +1166,8 @@ def test_memory_backward_compat_old_types(tmp_path: Path) -> None:
     summaries = store.list_memories()
 
     assert memory is not None
-    assert memory.metadata.type == "procedural"
-    assert summaries[0].type == "procedural"
+    assert memory.metadata.type == "feedback"
+    assert summaries[0].type == "feedback"
 
 
 def test_memory_write_tool_accepts_new_types_and_anchors(tmp_path: Path) -> None:
@@ -1273,7 +1180,7 @@ def test_memory_write_tool_accepts_new_types_and_anchors(tmp_path: Path) -> None
     result = tool.execute({
         "name": "yaml-rule",
         "description": "Use safe YAML parsing",
-        "type": "procedural",
+        "type": "feedback",
         "content": "Use yaml.safe_load() for YAML config files.",
         "anchors": [{"kind": "file", "path": "config/default.yaml"}],
     })
@@ -1281,17 +1188,17 @@ def test_memory_write_tool_accepts_new_types_and_anchors(tmp_path: Path) -> None
     loaded = store.read_memory("yaml-rule")
     assert result.success
     assert loaded is not None
-    assert loaded.metadata.type == "procedural"
+    assert loaded.metadata.type == "feedback"
     assert loaded.anchors[0].to_dict() == {"kind": "file", "path": "config/default.yaml"}
 
 
-def test_extractor_extracts_episodic_from_success(tmp_path: Path) -> None:
-    """LLM 返回结构化 episodic 记忆时，extractor 正确解析。"""
+def test_extractor_extracts_user_from_success(tmp_path: Path) -> None:
+    """LLM 返回结构化 user 记忆时，extractor 正确解析。"""
     from memory.extractor import MemoryExtractor
 
     llm_json = json.dumps({"memories": [
         {
-            "type": "episodic",
+            "type": "user",
             "name": "readme-summary",
             "description": "Learned README describes Forge Agent",
             "content": "Task: read README.md. Outcome: README.md describes Forge Agent.",
@@ -1311,19 +1218,19 @@ def test_extractor_extracts_episodic_from_success(tmp_path: Path) -> None:
     finally:
         log.close()
 
-    episodic = [c for c in candidates if c.type == "episodic"]
-    assert episodic
-    assert "README.md describes Forge Agent" in episodic[0].content
-    assert episodic[0].anchors[0].path == "README.md"
+    user = [c for c in candidates if c.type == "user"]
+    assert user
+    assert "README.md describes Forge Agent" in user[0].content
+    assert user[0].anchors[0].path == "README.md"
 
 
-def test_extractor_extracts_procedural_from_correction(tmp_path: Path) -> None:
-    """LLM 识别用户纠正并返回 procedural 候选。"""
+def test_extractor_extracts_feedback_from_correction(tmp_path: Path) -> None:
+    """LLM 识别用户纠正并返回 feedback 候选。"""
     from memory.extractor import MemoryExtractor
 
     llm_json = json.dumps({"memories": [
         {
-            "type": "procedural",
+            "type": "feedback",
             "name": "yaml-safe-load",
             "description": "Always use yaml.safe_load for config",
             "content": "When processing config/default.yaml, use yaml.safe_load() instead of regex.",
@@ -1342,9 +1249,9 @@ def test_extractor_extracts_procedural_from_correction(tmp_path: Path) -> None:
     finally:
         log.close()
 
-    procedural = [c for c in candidates if c.type == "procedural"]
-    assert procedural
-    assert procedural[0].anchors[0].to_dict() == {"kind": "file", "path": "config/default.yaml"}
+    feedback = [c for c in candidates if c.type == "feedback"]
+    assert feedback
+    assert feedback[0].anchors[0].to_dict() == {"kind": "file", "path": "config/default.yaml"}
 
 
 def test_extractor_drops_low_confidence(tmp_path: Path) -> None:
@@ -1354,7 +1261,7 @@ def test_extractor_drops_low_confidence(tmp_path: Path) -> None:
 
     llm_json = json.dumps({"memories": [
         {
-            "type": "semantic",
+            "type": "project",
             "name": "low-conf",
             "description": "not sure",
             "content": "Maybe true",
@@ -1633,16 +1540,9 @@ def test_repeated_deferred_reads_stop_with_phase_summary(tmp_path: Path) -> None
     assert any(r["reason"] == "analysis_deferred_read_answer_boundary" for r in reflections)
 
 
-def test_broad_analysis_finish_retries_for_ungrounded_answer(tmp_path: Path) -> None:
+def test_broad_analysis_finish_does_not_posthoc_validate_grounding(tmp_path: Path) -> None:
     registry, read_tool, _write_tool = make_registry()
     read_tool.output = "core wiring"
-    preview = EvidenceLedger()
-    expected_id = preview.add_observation(
-        phase="inspect",
-        tool_name="file_read",
-        output="core wiring",
-        path="agent/core.py",
-    ).evidence_id
     backend = MockBackend([
         make_submit_plan_action(
             [
@@ -1658,7 +1558,6 @@ def test_broad_analysis_finish_retries_for_ungrounded_answer(tmp_path: Path) -> 
         ),
         Action(ActionType.TOOL_CALL, "read core", [ToolCall("file_read", {"path": "agent/core.py"})]),
         Action(ActionType.FINISH, "ungrounded", message="## Confirmed\n- Core wiring is present"),
-        Action(ActionType.FINISH, "grounded", message=f"## Confirmed\n- Core wiring is present [{expected_id}]"),
     ])
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
     task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis", max_steps=8)
@@ -1667,7 +1566,6 @@ def test_broad_analysis_finish_retries_for_ungrounded_answer(tmp_path: Path) -> 
     try:
         result = agent.run(task, log)
         events = log.replay()
-        stats = summarize_run(log)
     finally:
         log.close()
 
@@ -1675,10 +1573,10 @@ def test_broad_analysis_finish_retries_for_ungrounded_answer(tmp_path: Path) -> 
     reflection_events = [event.payload for event in events if event.event_type == EventType.REFLECTION]
 
     assert result.status == RunStatus.SUCCESS
+    assert result.summary == "## Confirmed\n- Core wiring is present"
     assert len(read_tool.calls) == 1
-    assert any(event["reason"] == "analysis_answer_grounding_failed" for event in recovery_events)
-    assert any(event["reason"] == "analysis_answer_grounding_failed" for event in reflection_events)
-    assert f"[{expected_id}]" in result.summary
+    assert not any(event.get("reason") == "analysis_answer_grounding_failed" for event in recovery_events)
+    assert not any(event.get("reason") == "analysis_answer_grounding_failed" for event in reflection_events)
 
 
 def test_broad_analysis_gated_read_logs_tool_decision(tmp_path: Path) -> None:
@@ -1934,8 +1832,8 @@ def test_phase_synthesize_reflection_mentions_named_gaps(tmp_path: Path) -> None
     assert "named gaps" in prompt
 
 
-def test_file_view_paging_is_not_semantic_loop(tmp_path: Path) -> None:
-    """Sequential file_view windows are progress, not a semantic tool loop."""
+def test_file_view_paging_is_not_project_loop(tmp_path: Path) -> None:
+    """Sequential file_view windows are progress, not a project tool loop."""
     registry, _read_tool, _write_tool = make_registry()
     agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
     task = Task("查看长文件", str(tmp_path), intent="analysis")
@@ -2000,7 +1898,7 @@ def test_duplicate_file_read_is_not_executed_twice(tmp_path: Path) -> None:
 # ===========================================================================
 
 
-def _make_candidate(name="test-mem", content="some content", mem_type="semantic", anchors=None):
+def _make_candidate(name="test-mem", content="some content", mem_type="project", anchors=None):
     """辅助：构造一个 MemoryCandidate。"""
     from memory.extractor import MemoryCandidate
     from memory.models import Anchor
@@ -2037,7 +1935,7 @@ def test_consolidate_noop_identical(tmp_path):
         name="build-cmd",
         description="Build commands",
         content="npm run build",
-        metadata=MemoryMetadata(type="semantic"),
+        metadata=MemoryMetadata(type="project"),
     )
     store.write_memory(existing)
 
@@ -2056,7 +1954,7 @@ def test_consolidate_update_same_name(tmp_path):
         name="build-cmd",
         description="Build commands",
         content="npm run build",
-        metadata=MemoryMetadata(type="semantic"),
+        metadata=MemoryMetadata(type="project"),
     )
     store.write_memory(existing)
 
@@ -2077,7 +1975,7 @@ def test_consolidate_merge_high_similarity(tmp_path):
         name="api-conventions",
         description="API conventions",
         content="All endpoints use JSON.",
-        metadata=MemoryMetadata(type="semantic"),
+        metadata=MemoryMetadata(type="project"),
     )
     store.write_memory(existing)
 
@@ -2103,7 +2001,7 @@ def test_consolidate_llm_judge_noop(tmp_path):
         name="test-rule",
         description="Testing rule",
         content="Always write unit tests.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
     )
     store.write_memory(existing)
 
@@ -2135,7 +2033,7 @@ def test_consolidate_llm_judge_update(tmp_path):
         name="deploy-steps",
         description="Deploy steps",
         content="Run make deploy.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
     )
     store.write_memory(existing)
 
@@ -2164,8 +2062,8 @@ def test_consolidate_llm_judge_update(tmp_path):
 # ===========================================================================
 
 
-def test_procedural_triggered_by_file_access(tmp_path):
-    """读取文件后，匹配锚点的 procedural 记忆被返回。"""
+def test_feedback_triggered_by_file_access(tmp_path):
+    """读取文件后，匹配锚点的 feedback 记忆被返回。"""
     from memory.store import MemoryStore
     from memory.context import MemoryContext
     from memory.models import Anchor, Memory, MemoryMetadata
@@ -2175,25 +2073,25 @@ def test_procedural_triggered_by_file_access(tmp_path):
         name="use-safe-load",
         description="Use yaml.safe_load for config files",
         content="Always use yaml.safe_load() when reading config/.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[Anchor(kind="file", path="config/default.yaml")],
     ))
     store.write_memory(Memory(
         name="api-convention",
         description="API returns JSON",
         content="All API endpoints return JSON.",
-        metadata=MemoryMetadata(type="semantic"),
+        metadata=MemoryMetadata(type="project"),
     ))
 
     ctx = MemoryContext(store=store)
-    result = ctx.get_procedural_for_files({"config/default.yaml"})
+    result = ctx.get_feedback_for_files({"config/default.yaml"})
 
     assert "use-safe-load" in result
     assert "yaml.safe_load" in result
 
 
-def test_procedural_not_triggered_by_unrelated_file(tmp_path):
-    """不相关的文件访问不触发 procedural 注入。"""
+def test_feedback_not_triggered_by_unrelated_file(tmp_path):
+    """不相关的文件访问不触发 feedback 注入。"""
     from memory.store import MemoryStore
     from memory.context import MemoryContext
     from memory.models import Anchor, Memory, MemoryMetadata
@@ -2203,17 +2101,17 @@ def test_procedural_not_triggered_by_unrelated_file(tmp_path):
         name="use-safe-load",
         description="Use yaml.safe_load for config files",
         content="Always use yaml.safe_load() when reading config/.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[Anchor(kind="file", path="config/default.yaml")],
     ))
 
     ctx = MemoryContext(store=store)
-    result = ctx.get_procedural_for_files({"src/main.py"})
+    result = ctx.get_feedback_for_files({"src/main.py"})
 
     assert result == ""
 
 
-def test_procedural_directory_prefix_match(tmp_path):
+def test_feedback_directory_prefix_match(tmp_path):
     """文件锚点为目录前缀时，匹配该目录下的文件。"""
     from memory.store import MemoryStore
     from memory.context import MemoryContext
@@ -2224,19 +2122,19 @@ def test_procedural_directory_prefix_match(tmp_path):
         name="tests-rule",
         description="Test convention",
         content="All tests must use pytest fixtures.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[Anchor(kind="file", path="tests")],
     ))
 
     ctx = MemoryContext(store=store)
-    result = ctx.get_procedural_for_files({"tests/test_api.py"})
+    result = ctx.get_feedback_for_files({"tests/test_api.py"})
 
     assert "tests-rule" in result
     assert "pytest fixtures" in result
 
 
-def test_semantic_episodic_at_task_start(tmp_path):
-    """任务开始时 build_memory_section 包含 semantic/episodic 摘要。"""
+def test_project_user_at_task_start(tmp_path):
+    """任务开始时 build_memory_section 包含 project/user 摘要。"""
     from memory.store import MemoryStore
     from memory.context import MemoryContext
     from memory.models import Memory, MemoryMetadata
@@ -2246,20 +2144,20 @@ def test_semantic_episodic_at_task_start(tmp_path):
         name="project-tech-stack",
         description="Tech stack is Python + FastAPI",
         content="The project uses Python 3.11 and FastAPI.",
-        metadata=MemoryMetadata(type="semantic"),
+        metadata=MemoryMetadata(type="project"),
     ))
     store.write_memory(Memory(
         name="last-deploy",
         description="Last deploy was on 2024-01-15",
         content="Deployed v2.1.0 successfully.",
-        metadata=MemoryMetadata(type="episodic"),
+        metadata=MemoryMetadata(type="user"),
     ))
 
     ctx = MemoryContext(store=store)
     ctx.set_task_context("fix API bug")
     section = ctx.build_memory_section()
 
-    # semantic and episodic should appear in the memory section
+    # project and user should appear in the memory section
     assert "project-tech-stack" in section or "last-deploy" in section
 
 
@@ -2278,14 +2176,14 @@ def test_mark_stale_on_file_write(tmp_path):
         name="config-rule",
         description="Config loading rule",
         content="Use yaml.safe_load for config.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[Anchor(kind="file", path="config/app.yaml")],
     ))
     store.write_memory(Memory(
         name="api-rule",
         description="API convention",
         content="All endpoints return JSON.",
-        metadata=MemoryMetadata(type="semantic"),
+        metadata=MemoryMetadata(type="project"),
         anchors=[Anchor(kind="file", path="src/api.py")],
     ))
 
@@ -2309,7 +2207,7 @@ def test_stale_not_triggered_by_file_read(tmp_path):
         name="config-rule",
         description="Config loading rule",
         content="Use yaml.safe_load for config.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[Anchor(kind="file", path="config/app.yaml")],
     ))
 
@@ -2318,8 +2216,8 @@ def test_stale_not_triggered_by_file_read(tmp_path):
     assert mem.metadata.stale is False
 
 
-def test_stale_warning_in_procedural_injection(tmp_path):
-    """stale 的 procedural 记忆注入时显示警告。"""
+def test_stale_warning_in_feedback_injection(tmp_path):
+    """stale 的 feedback 记忆注入时显示警告。"""
     from memory.store import MemoryStore
     from memory.context import MemoryContext
     from memory.models import Anchor, Memory, MemoryMetadata
@@ -2329,40 +2227,40 @@ def test_stale_warning_in_procedural_injection(tmp_path):
         name="stale-rule",
         description="A stale rule",
         content="Do X when editing config.",
-        metadata=MemoryMetadata(type="procedural", stale=True),
+        metadata=MemoryMetadata(type="feedback", stale=True),
         anchors=[Anchor(kind="file", path="config/app.yaml")],
     ))
 
     ctx = MemoryContext(store=store)
-    result = ctx.get_procedural_for_files({"config/app.yaml"})
+    result = ctx.get_feedback_for_files({"config/app.yaml"})
 
     assert "stale-rule" in result
     assert "STALE" in result
 
 
-def test_prune_expired_episodic(tmp_path):
-    """超龄且低访问量的 episodic 记忆被清理。"""
+def test_prune_expired_user(tmp_path):
+    """超龄且低访问量的 user 记忆被清理。"""
     from memory.store import MemoryStore
     from memory.models import Memory, MemoryMetadata
 
     store = MemoryStore(repo_path="test", memory_dir=str(tmp_path))
-    # 创建一条很旧的 episodic 记忆
+    # 创建一条很旧的 user 记忆
     store.write_memory(Memory(
         name="old-episode",
         description="Old episode",
         content="Something that happened long ago.",
-        metadata=MemoryMetadata(type="episodic", access_count=0),
+        metadata=MemoryMetadata(type="user", access_count=0),
         updated_at="2020-01-01T00:00:00Z",
     ))
-    # 创建一条最近的 episodic 记忆
+    # 创建一条最近的 user 记忆
     store.write_memory(Memory(
         name="recent-episode",
         description="Recent episode",
         content="Something that happened recently.",
-        metadata=MemoryMetadata(type="episodic", access_count=0),
+        metadata=MemoryMetadata(type="user", access_count=0),
     ))
 
-    pruned = store.prune_expired(max_episodic_age_days=30)
+    pruned = store.prune_expired(max_user_age_days=30)
 
     assert pruned == 1
     assert store.read_memory("old-episode") is None
@@ -2370,7 +2268,7 @@ def test_prune_expired_episodic(tmp_path):
 
 
 def test_prune_preserves_high_access_count(tmp_path):
-    """高访问量的 episodic 记忆即使旧也保留更久。"""
+    """高访问量的 user 记忆即使旧也保留更久。"""
     from memory.store import MemoryStore
     from memory.models import Memory, MemoryMetadata
 
@@ -2380,11 +2278,11 @@ def test_prune_preserves_high_access_count(tmp_path):
         name="important-episode",
         description="Important episode",
         content="Important thing that happened.",
-        metadata=MemoryMetadata(type="episodic", access_count=10),
+        metadata=MemoryMetadata(type="user", access_count=10),
         updated_at="2025-12-01T00:00:00Z",
     ))
 
-    # max_episodic_age_days=30, but retention = 30*(1+10*0.5) = 180 days
+    # max_user_age_days=30, but retention = 30*(1+10*0.5) = 180 days
     # 从 2025-12-01 到 2026-06-24 大约 205 天，超过 180 天应被清理
     # 但如果 access_count=10, retention=180，而 age ~= 205, 会被删...
     # 用更大 access_count 测试保留
@@ -2392,11 +2290,11 @@ def test_prune_preserves_high_access_count(tmp_path):
         name="very-important-episode",
         description="Very important",
         content="Very important thing.",
-        metadata=MemoryMetadata(type="episodic", access_count=20),
+        metadata=MemoryMetadata(type="user", access_count=20),
         updated_at="2025-12-01T00:00:00Z",
     ))
 
-    pruned = store.prune_expired(max_episodic_age_days=30)
+    pruned = store.prune_expired(max_user_age_days=30)
 
     # access_count=10: retention=180, age~205 → pruned
     assert store.read_memory("important-episode") is None
@@ -2419,7 +2317,7 @@ def test_record_access_increments_count(tmp_path):
         name="some-fact",
         description="A fact",
         content="Python is great.",
-        metadata=MemoryMetadata(type="semantic"),
+        metadata=MemoryMetadata(type="project"),
     ))
 
     assert store.read_memory("some-fact").metadata.access_count == 0
@@ -2431,8 +2329,8 @@ def test_record_access_increments_count(tmp_path):
     assert store.read_memory("some-fact").metadata.access_count == 2
 
 
-def test_procedural_injection_increments_access_count(tmp_path):
-    """procedural 记忆被注入时 access_count 递增。"""
+def test_feedback_injection_increments_access_count(tmp_path):
+    """feedback 记忆被注入时 access_count 递增。"""
     from memory.store import MemoryStore
     from memory.context import MemoryContext
     from memory.models import Anchor, Memory, MemoryMetadata
@@ -2442,29 +2340,29 @@ def test_procedural_injection_increments_access_count(tmp_path):
         name="rule-a",
         description="Rule A",
         content="Always do X.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[Anchor(kind="file", path="src/app.py")],
     ))
 
     ctx = MemoryContext(store=store)
-    ctx.get_procedural_for_files({"src/app.py"}, record_access=True)
+    ctx.get_feedback_for_files({"src/app.py"}, record_access=True)
 
     mem = store.read_memory("rule-a")
     assert mem.metadata.access_count == 1
 
     # 第二次触发（record_access=True 再递增）
-    ctx.get_procedural_for_files({"src/app.py"}, record_access=True)
+    ctx.get_feedback_for_files({"src/app.py"}, record_access=True)
     mem = store.read_memory("rule-a")
     assert mem.metadata.access_count == 2
 
     # record_access=False 不递增
-    ctx.get_procedural_for_files({"src/app.py"}, record_access=False)
+    ctx.get_feedback_for_files({"src/app.py"}, record_access=False)
     mem = store.read_memory("rule-a")
     assert mem.metadata.access_count == 2
 
 
-def test_consolidate_procedural_without_anchor_downgrades(tmp_path):
-    """procedural 无有效文件/符号锚点时降级为 semantic。"""
+def test_consolidate_feedback_without_anchor_downgrades(tmp_path):
+    """feedback 无有效文件/符号锚点时降级为 project。"""
     from memory.store import MemoryStore
     from memory.models import Anchor
 
@@ -2474,18 +2372,18 @@ def test_consolidate_procedural_without_anchor_downgrades(tmp_path):
     candidate = _make_candidate(
         name="rule-no-file",
         content="Always use async.",
-        mem_type="procedural",
+        mem_type="feedback",
         anchors=[Anchor(kind="task", value="coding")],
     )
     action = store.consolidate(candidate)
 
     assert action == "ADD"
     mem = store.read_memory("rule-no-file")
-    assert mem.metadata.type == "semantic"  # 被降级
+    assert mem.metadata.type == "project"  # 被降级
 
 
-def test_consolidate_procedural_with_file_anchor_stays(tmp_path):
-    """procedural 有文件锚点时保持 procedural 类型。"""
+def test_consolidate_feedback_with_file_anchor_stays(tmp_path):
+    """feedback 有文件锚点时保持 feedback 类型。"""
     from memory.store import MemoryStore
     from memory.models import Anchor
 
@@ -2493,14 +2391,14 @@ def test_consolidate_procedural_with_file_anchor_stays(tmp_path):
     candidate = _make_candidate(
         name="rule-with-file",
         content="Use safe_load for config.",
-        mem_type="procedural",
+        mem_type="feedback",
         anchors=[Anchor(kind="file", path="config/app.yaml")],
     )
     action = store.consolidate(candidate)
 
     assert action == "ADD"
     mem = store.read_memory("rule-with-file")
-    assert mem.metadata.type == "procedural"
+    assert mem.metadata.type == "feedback"
 
 
 def test_validate_memory_resets_stale(tmp_path):
@@ -2513,7 +2411,7 @@ def test_validate_memory_resets_stale(tmp_path):
         name="stale-rule",
         description="A rule",
         content="Do X.",
-        metadata=MemoryMetadata(type="procedural", stale=True),
+        metadata=MemoryMetadata(type="feedback", stale=True),
         anchors=[Anchor(kind="file", path="src/main.py")],
     ))
 
@@ -2541,8 +2439,8 @@ def test_validate_memory_nonexistent(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_proactive_feedback_with_file_ref_is_procedural(tmp_path):
-    """用户修正中包含文件路径时，ProactiveMemory 保存为 procedural 并带 anchor。"""
+def test_proactive_feedback_with_file_ref_is_feedback(tmp_path):
+    """用户修正中包含文件路径时，ProactiveMemory 保存为 feedback 并带 anchor。"""
     from memory.store import MemoryStore
     from memory.proactive import ProactiveMemory
 
@@ -2552,7 +2450,7 @@ def test_proactive_feedback_with_file_ref_is_procedural(tmp_path):
 
     summaries = store.list_memories()
     assert len(summaries) == 1
-    assert summaries[0].type == "procedural"
+    assert summaries[0].type == "feedback"
 
     mem = store.read_memory(summaries[0].name)
     assert mem is not None
@@ -2561,8 +2459,8 @@ def test_proactive_feedback_with_file_ref_is_procedural(tmp_path):
     assert any("config/parser.py" in (a.path or "") for a in file_anchors)
 
 
-def test_proactive_feedback_without_file_ref_is_semantic(tmp_path):
-    """用户修正中不含文件路径时，ProactiveMemory 降级为 semantic。"""
+def test_proactive_feedback_without_file_ref_is_feedback(tmp_path):
+    """用户修正保存为 feedback，即使没有文件路径。"""
     from memory.store import MemoryStore
     from memory.proactive import ProactiveMemory
 
@@ -2572,23 +2470,23 @@ def test_proactive_feedback_without_file_ref_is_semantic(tmp_path):
 
     summaries = store.list_memories()
     assert len(summaries) == 1
-    assert summaries[0].type == "semantic"
+    assert summaries[0].type == "feedback"
 
 
 # ---------------------------------------------------------------------------
-# Fix B: Extractor 无锚点 procedural 通过 consolidate 降级
+# Fix B: Extractor 无锚点 feedback 通过 consolidate 降级
 # ---------------------------------------------------------------------------
 
 
-def test_extractor_procedural_without_anchor_downgrades_via_consolidate(tmp_path):
-    """LLM 提取的 procedural 无 file/symbol anchor 时，consolidate 降级为 semantic。"""
+def test_extractor_feedback_without_anchor_downgrades_via_consolidate(tmp_path):
+    """LLM 提取的 feedback 无 file/symbol anchor 时，consolidate 降级为 project。"""
     from memory.store import MemoryStore
     from memory.models import Anchor
     from memory.extractor import MemoryCandidate
 
     store = MemoryStore(repo_path="test", memory_dir=str(tmp_path))
     candidate = MemoryCandidate(
-        type="procedural",
+        type="feedback",
         name="rule-no-anchor",
         description="A vague rule",
         content="Always be polite.",
@@ -2599,18 +2497,18 @@ def test_extractor_procedural_without_anchor_downgrades_via_consolidate(tmp_path
 
     assert action == "ADD"
     mem = store.read_memory("rule-no-anchor")
-    assert mem.metadata.type == "semantic"
+    assert mem.metadata.type == "project"
 
 
-def test_extractor_procedural_with_file_anchor_stays(tmp_path):
-    """LLM 提取的 procedural 有 file anchor 时，保持 procedural。"""
+def test_extractor_feedback_with_file_anchor_stays(tmp_path):
+    """LLM 提取的 feedback 有 file anchor 时，保持 feedback。"""
     from memory.store import MemoryStore
     from memory.models import Anchor
     from memory.extractor import MemoryCandidate
 
     store = MemoryStore(repo_path="test", memory_dir=str(tmp_path))
     candidate = MemoryCandidate(
-        type="procedural",
+        type="feedback",
         name="rule-with-anchor",
         description="Use safe_load",
         content="Always use yaml.safe_load.",
@@ -2621,7 +2519,7 @@ def test_extractor_procedural_with_file_anchor_stays(tmp_path):
 
     assert action == "ADD"
     mem = store.read_memory("rule-with-anchor")
-    assert mem.metadata.type == "procedural"
+    assert mem.metadata.type == "feedback"
 
 
 # ===========================================================================
@@ -2629,14 +2527,14 @@ def test_extractor_procedural_with_file_anchor_stays(tmp_path):
 # ===========================================================================
 
 
-def test_e2e_full_lifecycle_procedural(tmp_path):
+def test_e2e_full_lifecycle_feedback(tmp_path):
     """
     端到端场景 1：用户修正 → 保存 → 文件读取触发 → 文件写入 stale → 重新验证
 
     模拟完整流程：
     1. 用户说 "don't use regex in config/parser.py"
-    2. ProactiveMemory 保存为 procedural + file anchor
-    3. Agent 读取 config/parser.py → procedural 规则被触发注入
+    2. ProactiveMemory 保存为 feedback + file anchor
+    3. Agent 读取 config/parser.py → feedback 规则被触发注入
     4. Agent 修改 config/parser.py → 规则变 stale
     5. validate_memory 重置 stale
     """
@@ -2654,11 +2552,11 @@ def test_e2e_full_lifecycle_procedural(tmp_path):
     assert len(summaries) == 1
     mem_name = summaries[0].name
     mem = store.read_memory(mem_name)
-    assert mem.metadata.type == "procedural"
+    assert mem.metadata.type == "feedback"
     assert any(a.kind == "file" and "config/parser.py" in (a.path or "") for a in mem.anchors)
 
-    # Step 2: Agent 读取 config/parser.py → procedural 触发
-    result = ctx.get_procedural_for_files({"config/parser.py"}, record_access=True)
+    # Step 2: Agent 读取 config/parser.py → feedback 触发
+    result = ctx.get_feedback_for_files({"config/parser.py"}, record_access=True)
     assert "regex" in result or "safe_load" in result
     assert mem_name in result
 
@@ -2672,7 +2570,7 @@ def test_e2e_full_lifecycle_procedural(tmp_path):
     assert mem.metadata.stale is True
 
     # Step 5: 再次读取时显示 stale 警告
-    result = ctx.get_procedural_for_files({"config/parser.py"})
+    result = ctx.get_feedback_for_files({"config/parser.py"})
     assert "STALE" in result
 
     # Step 6: Agent 确认规则仍有效 → validate
@@ -2700,7 +2598,7 @@ def test_e2e_consolidation_dedup(tmp_path):
 
     # Round 1: 新记忆 → ADD
     c1 = MemoryCandidate(
-        type="semantic",
+        type="project",
         name="api-conventions",
         description="API uses JSON responses",
         content="All API endpoints return JSON with snake_case keys.",
@@ -2711,7 +2609,7 @@ def test_e2e_consolidation_dedup(tmp_path):
 
     # Round 2: 完全相同 → NOOP
     c2 = MemoryCandidate(
-        type="semantic",
+        type="project",
         name="api-conventions",
         description="API uses JSON responses",
         content="All API endpoints return JSON with snake_case keys.",
@@ -2722,7 +2620,7 @@ def test_e2e_consolidation_dedup(tmp_path):
 
     # Round 3: 同名但内容更新 → UPDATE
     c3 = MemoryCandidate(
-        type="semantic",
+        type="project",
         name="api-conventions",
         description="API uses JSON responses with pagination",
         content="All API endpoints return JSON. Lists use cursor-based pagination.",
@@ -2734,14 +2632,14 @@ def test_e2e_consolidation_dedup(tmp_path):
     assert "pagination" in mem.content
 
 
-def test_e2e_episodic_decay_and_prune(tmp_path):
+def test_e2e_user_decay_and_prune(tmp_path):
     """
-    端到端场景 3：episodic 记忆 Ebbinghaus 衰减
+    端到端场景 3：user 记忆 Ebbinghaus 衰减
 
     模拟：
-    1. 创建一条 60 天前的 episodic 记忆（access_count=0）
-    2. 创建一条 60 天前但 access_count=3 的 episodic 记忆
-    3. prune_expired(max_episodic_age_days=30) 只删除前者
+    1. 创建一条 60 天前的 user 记忆（access_count=0）
+    2. 创建一条 60 天前但 access_count=3 的 user 记忆
+    3. prune_expired(max_user_age_days=30) 只删除前者
     4. 高频访问的记忆因 retention_days 延长而存活
     """
     from memory.store import MemoryStore
@@ -2752,35 +2650,35 @@ def test_e2e_episodic_decay_and_prune(tmp_path):
 
     old_date = (datetime.now(timezone.utc) - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # 低访问量 episodic（retention=30 days，60天前 → 过期）
+    # 低访问量 user（retention=30 days，60天前 → 过期）
     store.write_memory(Memory(
         name="old-episode-unused",
         description="An old event nobody accessed",
         content="Fixed a typo in README.",
-        metadata=MemoryMetadata(type="episodic", access_count=0),
+        metadata=MemoryMetadata(type="user", access_count=0),
         updated_at=old_date,
     ))
 
-    # 高访问量 episodic（retention=30*(1+3*0.5)=75 days，60天前 → 未过期）
+    # 高访问量 user（retention=30*(1+3*0.5)=75 days，60天前 → 未过期）
     store.write_memory(Memory(
         name="old-episode-used",
         description="A frequently accessed event",
         content="Discovered API rate limit bug.",
-        metadata=MemoryMetadata(type="episodic", access_count=3),
+        metadata=MemoryMetadata(type="user", access_count=3),
         updated_at=old_date,
     ))
 
-    # 新的 semantic（不受 episodic 过期影响）
+    # 新的 project（不受 user 过期影响）
     store.write_memory(Memory(
         name="project-fact",
         description="Stable project knowledge",
         content="Project uses Python 3.11.",
-        metadata=MemoryMetadata(type="semantic"),
+        metadata=MemoryMetadata(type="project"),
     ))
 
     assert len(store.list_memories()) == 3
 
-    pruned = store.prune_expired(max_episodic_age_days=30)
+    pruned = store.prune_expired(max_user_age_days=30)
 
     assert pruned == 1
     assert store.read_memory("old-episode-unused") is None
@@ -2807,7 +2705,7 @@ def test_e2e_path_normalization_absolute_to_relative(tmp_path):
         name="core-rule",
         description="Always check policy before running tools",
         content="Before executing any tool, check active policy constraints.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[Anchor(kind="file", path="agent/core.py")],
     ))
 
@@ -2818,9 +2716,9 @@ def test_e2e_path_normalization_absolute_to_relative(tmp_path):
     normalized = normalize_repo_path(abs_path, repo_path)
     assert normalized == "agent/core.py"
 
-    # 用规范化路径查询 procedural
+    # 用规范化路径查询 feedback
     ctx = MemoryContext(store=store)
-    result = ctx.get_procedural_for_files({normalized})
+    result = ctx.get_feedback_for_files({normalized})
     assert "core-rule" in result
     assert "policy" in result
 
@@ -2830,9 +2728,9 @@ def test_e2e_type_differentiated_retrieval(tmp_path):
     端到端场景 5：差异化检索策略
 
     验证：
-    - semantic/episodic 出现在 build_memory_section（任务开始注入）
-    - procedural 不出现在 build_memory_section
-    - procedural 仅通过 get_procedural_for_files 按文件触发
+    - user/feedback 出现在 build_memory_section（always 注入）
+    - project 出现在可用索引/按需召回路径
+    - get_feedback_for_files 仍支持按文件触发并记录访问
     """
     from memory.store import MemoryStore
     from memory.context import MemoryContext
@@ -2845,34 +2743,33 @@ def test_e2e_type_differentiated_retrieval(tmp_path):
         name="tech-stack",
         description="Python + FastAPI",
         content="Project uses Python 3.11 with FastAPI.",
-        metadata=MemoryMetadata(type="semantic"),
+        metadata=MemoryMetadata(type="project"),
     ))
     store.write_memory(Memory(
         name="last-bug",
         description="Fixed auth bug yesterday",
         content="The auth bug was a missing null check.",
-        metadata=MemoryMetadata(type="episodic"),
+        metadata=MemoryMetadata(type="user"),
     ))
     store.write_memory(Memory(
         name="no-regex-config",
         description="Don't use regex for config parsing",
         content="Use yaml.safe_load, not regex.",
-        metadata=MemoryMetadata(type="procedural"),
+        metadata=MemoryMetadata(type="feedback"),
         anchors=[Anchor(kind="file", path="config/parser.py")],
     ))
 
     ctx = MemoryContext(store=store)
     ctx.set_task_context("fix a bug in auth system")
 
-    # build_memory_section 应包含 semantic/episodic，不含 procedural 规则内容
+    # build_memory_section always injects user/feedback and lists available project memories.
     section = ctx.build_memory_section()
     assert "tech-stack" in section
     assert "last-bug" in section
-    # procedural 名可能在索引列表中，但其规则内容不应通过这条路径注入
-    assert "Use yaml.safe_load" not in section
+    assert "Use yaml.safe_load" in section
 
-    # get_procedural_for_files 才能获取 procedural 规则内容
-    proc = ctx.get_procedural_for_files({"config/parser.py"})
+    # get_feedback_for_files still supports targeted feedback retrieval.
+    proc = ctx.get_feedback_for_files({"config/parser.py"})
     assert "yaml.safe_load" in proc
 
 
@@ -2881,8 +2778,8 @@ def test_e2e_extractor_with_consolidate_pipeline(tmp_path):
     端到端场景 6：Extractor → Consolidate 完整管线
 
     模拟 LLM 提取后通过 consolidate 写入：
-    1. 有 anchor 的 procedural → 保持类型，ADD
-    2. 无 anchor 的 procedural → 降级 semantic，ADD
+    1. 有 anchor 的 feedback → 保持类型，ADD
+    2. 无 anchor 的 feedback → 降级 project，ADD
     3. 重复提取同名 → NOOP
     """
     from memory.store import MemoryStore
@@ -2894,7 +2791,7 @@ def test_e2e_extractor_with_consolidate_pipeline(tmp_path):
     # 用 write_success_memories 的 consolidate 路径
     candidates = [
         MemoryCandidate(
-            type="procedural",
+            type="feedback",
             name="safe-load-rule",
             description="Use safe_load",
             content="Always use yaml.safe_load in config/.",
@@ -2902,7 +2799,7 @@ def test_e2e_extractor_with_consolidate_pipeline(tmp_path):
             confidence="high",
         ),
         MemoryCandidate(
-            type="procedural",
+            type="feedback",
             name="be-polite",
             description="Be polite to users",
             content="Always be polite.",
@@ -2910,7 +2807,7 @@ def test_e2e_extractor_with_consolidate_pipeline(tmp_path):
             confidence="high",
         ),
         MemoryCandidate(
-            type="episodic",
+            type="user",
             name="debug-session",
             description="Debugged the parser",
             content="Found a bug in parser.py line 42.",
@@ -2923,9 +2820,9 @@ def test_e2e_extractor_with_consolidate_pipeline(tmp_path):
         store.consolidate(c)
 
     mems = {s.name: s for s in store.list_memories()}
-    assert mems["safe-load-rule"].type == "procedural"
-    assert mems["be-polite"].type == "semantic"  # 降级
-    assert mems["debug-session"].type == "episodic"
+    assert mems["safe-load-rule"].type == "feedback"
+    assert mems["be-polite"].type == "project"  # 降级
+    assert mems["debug-session"].type == "user"
 
     # 再次提交同名 → NOOP
     assert store.consolidate(candidates[0]) == "NOOP"
