@@ -140,9 +140,12 @@ class ToolRegistry:
     3. 记录每个工具的执行耗时统计（get_timing_stats）
     """
 
-    def __init__(self, hitl_manager: Any = None) -> None:
+    def __init__(self, hitl_manager: Any = None, permission_pipeline: Any = None, hook_dispatcher: Any = None) -> None:
         self._tools: dict[str, BaseTool] = {}
+        self._permission_pipeline = permission_pipeline
+        # Backward compat: hitl_manager still accepted, pipeline takes precedence
         self._hitl_manager = hitl_manager
+        self._hook_dispatcher = hook_dispatcher
         self._timing_stats: dict[str, dict[str, float | int]] = {}
 
     def register(self, tool: BaseTool) -> "ToolRegistry":
@@ -176,8 +179,19 @@ class ToolRegistry:
 
         tool = self._tools[name]
 
-        # HITL 审批门控
-        if self._hitl_manager is not None:
+        # Permission Pipeline gate (5-layer evaluation)
+        if self._permission_pipeline is not None:
+            perm_result = self._permission_pipeline.check(tool, params, thought=thought)
+            if not perm_result.approved:
+                feedback = getattr(perm_result, "feedback", "")
+                error_msg = f"Tool '{name}' denied: {perm_result.reason}"
+                if feedback:
+                    error_msg += f" Feedback: {feedback}"
+                result = ToolResult(success=False, output="", error=error_msg)
+                self._record_timing(name, start, result)
+                return result
+        # Legacy HITL gate (backward compat when no pipeline)
+        elif self._hitl_manager is not None:
             hitl_result = self._hitl_manager.check(tool, params, thought=thought)
             if hitl_result.is_denied:
                 note = hitl_result.feedback_note
@@ -197,6 +211,10 @@ class ToolRegistry:
                 output="",
                 error=f"Tool '{name}' raised an unexpected error: {exc}",
             )
+
+        # Fire PostToolUse / PostToolUseFailure hook
+        if self._hook_dispatcher:
+            self._fire_post_tool_hook(name, params, result)
 
         self._record_timing(name, start, result)
         return result
@@ -227,6 +245,26 @@ class ToolRegistry:
 
     def __repr__(self) -> str:
         return f"ToolRegistry(tools={self.tool_names})"
+
+    def _fire_post_tool_hook(self, name: str, params: dict[str, Any], result: ToolResult) -> None:
+        """Fire PostToolUse or PostToolUseFailure event via the hook dispatcher."""
+        from hooks.events import HookContext, HookEvent
+
+        evt = HookEvent.POST_TOOL_USE if result.success else HookEvent.POST_TOOL_USE_FAILURE
+        ctx = HookContext(
+            event=evt,
+            tool_name=name,
+            tool_input=params,
+            tool_output={
+                "success": result.success,
+                "output": result.output[:2000],
+                "error": result.error or "",
+            },
+        )
+        try:
+            self._hook_dispatcher.dispatch(evt, ctx)
+        except Exception:
+            pass
 
     def _record_timing(self, name: str, start: float, result: ToolResult) -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000

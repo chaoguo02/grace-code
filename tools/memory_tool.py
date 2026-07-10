@@ -28,10 +28,32 @@ logger = logging.getLogger(__name__)
 
 # 可选类型字面量，帮助 LLM 决定用什么类型
 _TYPE_DESCRIPTIONS = {
-    "episodic": "What happened — tool calls, test outcomes, decisions made",
-    "semantic": "What is true — project conventions, file responsibilities, config values",
-    "procedural": "How to do things — user corrections, coding rules, patterns to follow or avoid",
+    "user": "User role, goals, preferences, expertise level — private, always loaded",
+    "feedback": "User corrections, confirmed approaches, rules to follow — private, always loaded",
+    "project": "Ongoing work, decisions, architecture, build commands — project-scoped, on-demand",
+    "reference": "Pointers to external resources (docs, dashboards, issue trackers) — project-scoped, on-demand",
 }
+
+
+MEMORY_LIST_DEFAULT_LIMIT = 20
+MEMORY_LIST_MAX_LIMIT = 100
+MEMORY_DESC_MAX_LENGTH = 120
+
+MEMORY_LIST_DESCRIPTION = """\
+List memories in the index with optional filtering and pagination.
+
+Returns a paginated list of memory entries (name, type, description).
+By default, returns up to 20 entries starting from the beginning.
+You can optionally specify offset and limit to page through results,
+and query to filter by name keyword.
+
+When you already know the approximate name of the memory you need,
+use the query parameter to filter results instead of paging through
+all entries. This can be important for larger memory stores.
+
+When results are truncated, a message will indicate how many more
+entries exist and how to retrieve them.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +158,8 @@ class MemoryWriteTool(BaseTool):
                     "type": "string",
                     "enum": list(_TYPE_DESCRIPTIONS.keys()),
                     "description": (
-                        "Type of memory: episodic=what happened, "
-                        "semantic=what is true, procedural=how to do things"
+                        "Type of memory: user=about the user, feedback=corrections/rules, "
+                        "project=project knowledge, reference=external pointers"
                     ),
                 },
                 "anchors": {
@@ -240,11 +262,7 @@ class MemoryListTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "List all saved memories with their name, description, and type. "
-            "Use this at the start of a task to check if there is relevant prior knowledge. "
-            "Then use memory_read to access a specific memory's full content."
-        )
+        return MEMORY_LIST_DESCRIPTION
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
@@ -255,6 +273,18 @@ class MemoryListTool(BaseTool):
                     "type": "string",
                     "enum": list(_TYPE_DESCRIPTIONS.keys()),
                     "description": "Optional filter by memory type",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional case-insensitive substring filter matched against memory name and description",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": f"Maximum number of entries to return (default {MEMORY_LIST_DEFAULT_LIMIT}, max {MEMORY_LIST_MAX_LIMIT})",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Number of matching entries to skip before returning results (default 0)",
                 },
             },
             "required": [],
@@ -269,22 +299,90 @@ class MemoryListTool(BaseTool):
                 error=f"Invalid type '{filter_type}'. Valid types: {valid}",
             )
 
+        try:
+            limit = int(params.get("limit", MEMORY_LIST_DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            return ToolResult(success=False, output="", error="limit must be an integer")
+        try:
+            offset = int(params.get("offset", 0))
+        except (TypeError, ValueError):
+            return ToolResult(success=False, output="", error="offset must be an integer")
+        limit = max(1, min(limit, MEMORY_LIST_MAX_LIMIT))
+        offset = max(0, offset)
+
+        query: str | None = (params.get("query") or "").strip() or None
         summaries = self._store.list_memories()
         if filter_type:
             summaries = [s for s in summaries if s.type == filter_type]
+        if query:
+            query_lower = query.lower()
+            summaries = [
+                s for s in summaries
+                if query_lower in (s.name or "").lower()
+                or query_lower in (s.description or "").lower()
+            ]
 
-        if not summaries:
+        total = len(summaries)
+        page = summaries[offset:offset + limit]
+        has_more = (offset + limit) < total
+        if not page:
             msg = "No memories saved yet."
-            if filter_type:
-                msg = f"No memories of type '{filter_type}' found."
+            if filter_type or query:
+                filters = []
+                if filter_type:
+                    filters.append(f"type='{filter_type}'")
+                if query:
+                    filters.append(f"query='{query}'")
+                msg = f"No memories found for {', '.join(filters)}."
             return ToolResult(success=True, output=msg)
 
-        lines = [f"Memories ({len(summaries)} total):\n"]
-        for s in summaries:
-            lines.append(f"  - {s.name}: {s.description} ({s.type})")
-        lines.append("\nUse memory_read <name> to read full content.")
+        output = _format_paginated_list(
+            memories=page,
+            total=total,
+            offset=offset,
+            limit=limit,
+            has_more=has_more,
+            query=query,
+        )
+        return ToolResult(success=True, output=output)
 
-        return ToolResult(success=True, output="\n".join(lines))
+
+def _format_paginated_list(
+    *,
+    memories: list,
+    total: int,
+    offset: int,
+    limit: int,
+    has_more: bool,
+    query: str | None = None,
+) -> str:
+    shown_end = min(offset + len(memories), total)
+    header_parts = [f"Total: {total} memories"]
+    if query:
+        header_parts.append(f"filtered by query='{query}'")
+    header_parts.append(f"showing {offset + 1}-{shown_end}")
+
+    lines = [" | ".join(header_parts), ""]
+    for index, memory in enumerate(memories, start=offset):
+        lines.append(f"  [{index}] {memory.name}")
+        lines.append(f"      type: {memory.type} | updated: {memory.updated_at}")
+        description = memory.description or ""
+        if description:
+            truncated = description[:MEMORY_DESC_MAX_LENGTH]
+            if len(description) > MEMORY_DESC_MAX_LENGTH:
+                truncated += "..."
+            lines.append(f"      desc: {truncated}")
+        lines.append("")
+
+    if has_more:
+        remaining = total - offset - len(memories)
+        next_offset = offset + len(memories)
+        lines.append(
+            f"> WARNING: {remaining} more memories not shown. "
+            f"Use offset={next_offset} to see the next page, "
+            "or use query='keyword' to filter by name."
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

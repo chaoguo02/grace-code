@@ -107,10 +107,7 @@ def append_failure_dataset_item(
 def _resolve_dataset_path(repo_path: str, dataset_path: str | Path | None) -> Path:
     if dataset_path is None:
         return Path(repo_path) / DEFAULT_FAILURE_DATASET_PATH
-    path = Path(dataset_path)
-    if path.is_absolute():
-        return path
-    return Path(repo_path) / path
+    return Path(dataset_path)
 
 
 def _load_log_stats(log_path: str | Path | None) -> dict[str, Any]:

@@ -87,6 +87,7 @@ def _init_memory(repo_path: str, config) -> tuple:
     """
     from memory.store import TwoTierMemoryStore
     from memory.context import MemoryContext
+    from llm.router import create_selector_backend
 
     retriever = None
     external_store = None
@@ -113,20 +114,90 @@ def _init_memory(repo_path: str, config) -> tuple:
         max_index_lines=config.memory.max_index_lines,
         indexer=indexer,
     )
+    selector_backend = create_selector_backend({
+        "memory": {
+            "selector_enabled": config.memory.selector_enabled,
+            "selector_model": config.memory.selector_model,
+        },
+        "llm": {
+            "provider": config.llm.provider,
+            "model": config.llm.model,
+            "api_key": config.llm.api_key,
+            "base_url": config.llm.base_url,
+        },
+    })
     memory_context = MemoryContext(
         store=memory_store,
         max_lines=config.memory.max_index_lines,
         enabled=config.memory.enabled,
         retriever=retriever,
+        selector_backend=selector_backend,
     )
     return memory_store, memory_context, external_store
+
+
+# ---------------------------------------------------------------------------
+# Hook Dispatcher 初始化
+# ---------------------------------------------------------------------------
+
+def _init_hook_dispatcher(repo_path: Path, proactive_memory=None, memory_store=None,
+                          log_dir: str | None = None, backend=None):
+    """Create HookDispatcher with optional ProactiveMemory as internal hooks."""
+    from hooks import HookDispatcher, HookEvent, HookMatcher, HookRegistry, InternalHook
+
+    registry = HookRegistry()
+
+    # Load external hooks from settings.json
+    settings_path = repo_path / ".forge-agent" / "settings.json"
+    registry.load_from_settings(settings_path)
+
+    # Register ProactiveMemory as internal PostToolUse/UserPromptSubmit subscriber
+    if proactive_memory is not None:
+        registry.register_internal(HookEvent.POST_TOOL_USE, InternalHook(
+            callback=lambda ctx: proactive_memory.check_tool_result(
+                ctx.tool_name,
+                ctx.tool_input,
+                (ctx.tool_output or {}).get("output", ""),
+                (ctx.tool_output or {}).get("success", False),
+            ),
+            matcher=HookMatcher(pattern="shell"),
+        ))
+        # Detect explicit memory_write → suppress auto-extraction this turn
+        registry.register_internal(HookEvent.POST_TOOL_USE, InternalHook(
+            callback=lambda ctx: proactive_memory.notify_explicit_memory_write(),
+            matcher=HookMatcher(pattern="memory_write"),
+        ))
+        def _on_user_prompt(ctx):
+            proactive_memory.reset_turn()
+            proactive_memory.check_user_message(ctx.user_input)
+
+        registry.register_internal(HookEvent.USER_PROMPT_SUBMIT, InternalHook(
+            callback=_on_user_prompt,
+        ))
+
+    # Register memory consolidation on SessionStop
+    if memory_store is not None:
+        def _on_session_stop(ctx):
+            from memory.consolidation import record_session_end, run_consolidation
+            try:
+                record_session_end(memory_store.store_dir)
+                run_consolidation(memory_store, log_dir=log_dir, backend=backend, async_run=True)
+            except Exception:
+                pass
+
+        registry.register_internal(HookEvent.STOP, InternalHook(
+            callback=_on_session_stop,
+        ))
+
+    return HookDispatcher(registry, cwd=str(repo_path))
 
 
 # ---------------------------------------------------------------------------
 # 构建 agent 各组件
 # ---------------------------------------------------------------------------
 
-def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None, external_store=None):
+def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
+                    external_store=None, repo_path=None, auto_approve=False):
     """根据配置组装工具注册表。"""
     from tools.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
@@ -138,34 +209,40 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     from tools.web_tool import WebSearchTool, WebFetchTool
     from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
     from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
+    from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
 
-    # 构建 HitlManager（如果启用且有确认回调）
-    hitl_manager = None
-    hitl_cfg = getattr(cfg, "hitl", None)
-    if confirm_callback is not None and hitl_cfg and hitl_cfg.enabled:
-        from hitl.manager import HitlManager
-        from hitl.policy import PolicyEngine
-        from entry.renderer import hitl_terminal_confirm
+    # ── 构建 PermissionPipeline（5 层权限管道）──
+    from hitl.pipeline import PermissionPipeline
+    from hitl.settings_loader import load_permission_settings
 
-        policy_engine = PolicyEngine(policies_path=hitl_cfg.policy_file)
+    project_root = str(repo_path) if repo_path else None
+    rules, _hook_configs = load_permission_settings(project_root or ".")
 
-        def _hitl_confirm_adapter(request):
-            return hitl_terminal_confirm(request)
+    perm_confirm = None
+    if confirm_callback is not None:
+        from entry.renderer import permission_prompt
+        perm_confirm = permission_prompt
 
-        hitl_manager = HitlManager(
-            confirm_callback=_hitl_confirm_adapter,
-            policy_engine=policy_engine,
-            min_risk_for_confirm=hitl_cfg.min_risk_for_confirm,
-        )
+    settings_path = None
+    if project_root:
+        from pathlib import Path
+        settings_path = str(Path(project_root) / ".forge-agent" / "settings.json")
+
+    pipeline = PermissionPipeline(
+        rules=rules,
+        confirm_callback=perm_confirm,
+        auto_approve=auto_approve,
+        settings_path=settings_path,
+        project_root=project_root,
+    )
 
     web_cfg = cfg.tools.web
     artifact_store_ref = ArtifactStoreRef()
     evidence_ledger_ref = EvidenceLedgerRef()
-    # ShellTool: 无 HitlManager 时保留 confirm_callback 降级路径
-    shell_cb = confirm_callback if hitl_manager is None else None
+    submit_plan_ref = SubmitReadPlanRef()
     registry = (
-        ToolRegistry(hitl_manager=hitl_manager)
-        .register(ShellTool(confirm_callback=shell_cb, runtime=runtime))
+        ToolRegistry(permission_pipeline=pipeline)
+        .register(ShellTool(runtime=runtime))
         .register(FileReadTool())
         .register(FileViewTool())
         .register(FileWriteTool())
@@ -188,9 +265,11 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
         .register(ArtifactSearchTool(artifact_store_ref))
         .register(EvidenceListTool(evidence_ledger_ref))
         .register(EvidenceGetTool(evidence_ledger_ref))
+        .register(SubmitReadPlanTool(submit_plan_ref))
     )
     registry._artifact_store_ref = artifact_store_ref
     registry._evidence_ledger_ref = evidence_ledger_ref
+    registry._submit_plan_ref = submit_plan_ref
 
     # 注册记忆工具（如果提供了 MemoryStore）
     if memory_store is not None:
@@ -209,24 +288,6 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
         from tools.memory_tool import MemorySearchTool
         registry.register(MemorySearchTool(external_store))
 
-    # 注册 MCP 工具（从配置中读取 mcp_servers 并连接）
-    mcp_manager = None
-    mcp_servers_cfg = getattr(cfg, "mcp_servers", {}) or {}
-    if mcp_servers_cfg:
-        logger = logging.getLogger("cli")
-        logger.info("Connecting to MCP servers: %s", list(mcp_servers_cfg.keys()))
-        try:
-            from tools.mcp_client import create_manager_from_config
-            mcp_manager = create_manager_from_config(mcp_servers_cfg)
-            proxies = mcp_manager.connect_and_discover_sync()
-            for proxy in proxies:
-                registry.register(proxy)
-            logger.info("MCP tools registered: %s", [p.name for p in proxies])
-        except Exception as exc:
-            logger.warning("Failed to connect MCP servers: %s", exc)
-            mcp_manager = None
-
-    registry._mcp_manager = mcp_manager
     return registry
 
 
@@ -328,20 +389,325 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
     return resp in ("y", "yes", "")
 
 
-def _build_multi_config(config, auto_approve: bool = False) -> "MultiAgentConfig":
-    """从 AppConfig 构建 MultiAgentConfig。"""
-    from agent.multi_agent import MultiAgentConfig
-    ma = config.multi_agent
-    return MultiAgentConfig(
-        budget_ratio=(ma.coordinator_budget_ratio, ma.sub_agent_budget_ratio),
-        max_agents=ma.max_retries + 6,
-        coordinator_max_steps=ma.coordinator_max_steps,
-        max_parallel=ma.max_parallel_executors,
-        worker_model=ma.worker_model or None,
-        worker_provider=ma.worker_provider or None,
-        merge_approval_callback=None if auto_approve else _merge_approval_cb,
-        log_dir=config.agent.log_dir,
+def _render_v2_event(event, rend, proactive_memory=None, last_tool=None, last_tool_params=None):
+    from agent.task import EventType
+
+    payload = event.payload
+    if event.event_type == EventType.ACTION:
+        step = payload.get("step", 0)
+        action = payload.get("action", {})
+        tool_calls = action.get("tool_calls") or []
+        if tool_calls:
+            for tool_call in tool_calls:
+                if last_tool is not None:
+                    last_tool[0] = tool_call.get("name", "")
+                if last_tool_params is not None:
+                    last_tool_params[0] = tool_call.get("params", {})
+                rend.on_tool_call(step, tool_call.get("name", ""), tool_call.get("params", {}))
+        elif action.get("action_type") == "finish":
+            rend.on_finish(step, action.get("message", ""))
+        elif action.get("action_type") == "give_up":
+            rend.on_give_up(step, action.get("message", ""))
+    elif event.event_type == EventType.OBSERVATION:
+        step = payload.get("step", 0)
+        obs = payload.get("observation", {})
+        tool_name = obs.get("tool_name") or (last_tool[0] if last_tool else "")
+        output = obs.get("output", "")
+        status = obs.get("status", "")
+        rend.on_observation(step, tool_name, status, output, obs.get("error"))
+        if proactive_memory is not None:
+            proactive_memory.check_tool_result(
+                tool_name=tool_name,
+                params=(last_tool_params[0] if last_tool_params else {}),
+                output=output,
+                success=(status == "success"),
+            )
+    elif event.event_type == EventType.REFLECTION:
+        rend.on_reflection(payload.get("reason", ""))
+
+
+def _run_v2_mode(
+    *,
+    mode: str,
+    description: str,
+    repo_path: Path,
+    backend,
+    registry,
+    agent_config,
+    memory_context,
+    log_dir: str,
+    intent_override: str,
+    plan_approval_callback=None,
+    auto_approve: bool = False,
+    plan_file: str | None = None,
+    hook_dispatcher=None,
+    proactive_memory=None,
+    mcp_integration=None,
+    renderer=None,
+) -> None:
+    import os
+    import subprocess
+    from datetime import datetime
+    from agent.task import RunStatus
+    from agent.factory import classify_task_intent
+    from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
+    from llm.base import LLMMessage
+
+    db_path = default_session_db_path(str(repo_path))
+    store = SessionStore(db_path)
+    rend = renderer
+    last_tool = [""]
+    last_tool_params = [{}]
+    runtime = SessionRuntime(
+        store=store,
+        backend=backend,
+        base_registry=registry,
+        agent_registry=AgentRegistryV2(),
+        root_agent_config=agent_config,
+        log_dir=log_dir,
+        memory_context=memory_context,
+        hook_dispatcher=hook_dispatcher,
+        mcp_integration=mcp_integration,
+        event_callback=(
+            (lambda event: _render_v2_event(
+                event, rend, proactive_memory=proactive_memory,
+                last_tool=last_tool, last_tool_params=last_tool_params,
+            )) if rend is not None else None
+        ),
     )
+    intent = classify_task_intent(description, intent_override, backend)
+
+    if mode == "v2-build":
+        # ── 上下文连续：如果提供了 --plan-file，将计划文件内容注入 build session ──
+        build_messages: list[LLMMessage] = []
+        if plan_file and os.path.isfile(plan_file):
+            with open(plan_file, encoding="utf-8") as f:
+                plan_content = f.read()
+            click.echo(dim(f"  Plan file: {plan_file}"))
+            build_messages.append(LLMMessage(
+                role="user",
+                content=(
+                    f"[PLAN CONTEXT] The following implementation plan has been reviewed and approved. "
+                    f"Execute it now.\n\n{plan_content}"
+                ),
+            ))
+        build_messages.append(LLMMessage(role="user", content=description))
+
+        session = runtime.create_root_session(
+            agent_name="build",
+            repo_path=str(repo_path),
+            title=description[:80] or "v2-build",
+            metadata={"entrypoint": "cli_run_v2", "mode": mode},
+        )
+        result = runtime.run_session(
+            session.id,
+            agent_name="build",
+            task_description=description,
+            intent=intent,
+            messages=build_messages,
+        )
+        _print_v2_result(mode, db_path, session.id, result, show_summary=False)
+        return
+
+    # --- plan / v2-plan: 权限过滤器 ---
+    # plan agent = 只读工具（模型看到写工具但调用被拦截），用户审查后手动切 build。
+    # 封闭循环：模型提交计划 → 用户审批 → 拒绝时反馈注入 → 模型重新规划 → 再审批
+    # 计划文件 = single source of truth，原地覆盖（对齐 Claude Code .claude/plans/[name].md）
+    if mode in ("plan", "v2-plan"):
+        session = runtime.create_root_session(
+            agent_name="plan",
+            repo_path=str(repo_path),
+            title=description[:80] or "plan",
+            metadata={"entrypoint": "cli_run_v2", "mode": mode},
+        )
+        plan_steps = max(5, agent_config.max_steps // 3)
+        plan_budget = max(5000, agent_config.budget_tokens // 3)
+
+        # 固定计划文件路径（single file, 原地覆盖）
+        plans_dir = os.path.join(str(repo_path), ".forge-agent", "plans")
+        os.makedirs(plans_dir, exist_ok=True)
+        task_slug = description[:40].replace(" ", "_").replace("/", "_").replace("\\", "_")
+        plan_path = os.path.join(plans_dir, f"{task_slug}.md")
+
+        # 首次 plan session
+        result = runtime.run_session(
+            session.id,
+            agent_name="plan",
+            task_description=description,
+            intent="analysis",
+            messages=[LLMMessage(role="user", content=description)],
+            max_steps_override=plan_steps,
+            budget_tokens_override=plan_budget,
+        )
+
+        # ── Plan 审批循环（封闭循环直到批准或用户退出）────
+        max_revisions = 5
+        revision_count = 0
+        while True:
+            plan_text = result.summary or ""
+
+            # 原地覆盖同一个计划文件
+            if plan_text.strip():
+                with open(plan_path, "w", encoding="utf-8") as f:
+                    f.write(plan_text)
+
+            _print_v2_result(mode, db_path, session.id, result, show_summary=False)
+            if plan_text.strip():
+                click.echo(dim(f"  Plan    : {plan_path}"))
+
+            # auto_approve → 跳过审核
+            if auto_approve:
+                if plan_text.strip():
+                    click.echo(green("  Auto-approved."))
+                return
+
+            if not plan_text.strip():
+                click.echo(yellow("  Plan session produced no output. Nothing to review."))
+                return
+
+            # ── 交互式审批菜单（对齐 Claude Code 5 选项）────
+            click.echo("\n" + "─" * 60)
+            click.echo(bold("  Plan ready for review"))
+            click.echo(f"  File: {plan_path}")
+            click.echo("─" * 60)
+            click.echo(f"  [1] Yes, and auto-accept edits")
+            click.echo(f"  [2] Yes, and manually approve edits")
+            click.echo(f"  [3] Edit plan file (opens editor)")
+            click.echo(f"  [4] Tell Claude what to change (re-plan)")
+            click.echo(f"  [5] Abort")
+            click.echo("─" * 60)
+            try:
+                choice = click.prompt("  Choice", type=str, default="1").strip()
+            except (EOFError, KeyboardInterrupt):
+                click.echo("\n  Aborted.")
+                return
+
+            if choice == "1":
+                # 批准 + 自动执行（bypass edit permissions）
+                # 审批通过后重新读取文件（用户可能通过选项3编辑过）
+                with open(plan_path, encoding="utf-8") as f:
+                    _ = f.read()
+                click.echo(green("  Plan approved (auto-accept). Executing...\n"))
+                _run_v2_mode(
+                    mode="v2-build",
+                    description=description,
+                    repo_path=repo_path,
+                    backend=backend,
+                    registry=registry,
+                    agent_config=agent_config,
+                    memory_context=memory_context,
+                    log_dir=log_dir,
+                    intent_override=intent_override,
+                    plan_approval_callback=plan_approval_callback,
+                    auto_approve=True,
+                    plan_file=plan_path,
+                    hook_dispatcher=hook_dispatcher,
+                    proactive_memory=proactive_memory,
+                    renderer=renderer,
+                )
+                return
+
+            elif choice == "2":
+                # 批准 + 逐步确认写操作
+                with open(plan_path, encoding="utf-8") as f:
+                    _ = f.read()
+                click.echo(green("  Plan approved (manual review). Executing...\n"))
+                _run_v2_mode(
+                    mode="v2-build",
+                    description=description,
+                    repo_path=repo_path,
+                    backend=backend,
+                    registry=registry,
+                    agent_config=agent_config,
+                    memory_context=memory_context,
+                    log_dir=log_dir,
+                    intent_override=intent_override,
+                    plan_approval_callback=plan_approval_callback,
+                    auto_approve=False,
+                    plan_file=plan_path,
+                    hook_dispatcher=hook_dispatcher,
+                    proactive_memory=proactive_memory,
+                    renderer=renderer,
+                )
+                return
+
+            elif choice == "3":
+                # 在编辑器中打开计划文件，原地编辑
+                editor = os.environ.get("EDITOR", "notepad")
+                try:
+                    subprocess.call([editor, plan_path])
+                except Exception:
+                    click.echo(red(f"  Failed to open editor: {editor}"))
+                    click.echo(dim(f"  Edit manually: {plan_path}"))
+                # 读回并显示差异提示
+                with open(plan_path, encoding="utf-8") as f:
+                    updated = f.read()
+                if updated != plan_text:
+                    plan_text = updated
+                    click.echo(green("  Plan updated."))
+                else:
+                    click.echo(dim("  No changes detected."))
+                # 回到菜单，用户可以选择批准或继续改
+                continue
+
+            elif choice == "4":
+                # 反馈 → 留在 plan 模式，模型重新规划
+                revision_count += 1
+                if revision_count >= max_revisions:
+                    click.echo(yellow(f"  Max revisions ({max_revisions}) reached. Aborting."))
+                    return
+                try:
+                    feedback = click.prompt(
+                        "  What would you like to change?", type=str
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    click.echo("\n  Aborted.")
+                    return
+                if not feedback.strip():
+                    continue
+                if proactive_memory:
+                    proactive_memory.check_plan_feedback(feedback)
+                click.echo(dim(f"  Re-planning (revision {revision_count}/{max_revisions})...\n"))
+                result = runtime.run_session(
+                    session.id,
+                    agent_name="plan",
+                    task_description=description,
+                    intent="analysis",
+                    messages=[LLMMessage(
+                        role="user",
+                        content=(
+                            f"[USER FEEDBACK ON PLAN]\n{feedback}\n\n"
+                            f"Please revise the plan accordingly and output "
+                            f"an updated structured plan."
+                        ),
+                    )],
+                    max_steps_override=plan_steps,
+                    budget_tokens_override=plan_budget,
+                )
+                # 回到循环顶部：新 plan 覆盖文件，再次展示审批菜单
+                continue
+
+            elif choice == "5":
+                click.echo(dim("  Aborted. Plan saved at: ") + click.style(plan_path, fg="yellow"))
+                return
+
+            else:
+                click.echo(red(f"  Invalid choice: {choice}"))
+                continue
+        return
+
+
+def _print_v2_result(mode: str, db_path: str, session_id: str, result, *, show_summary: bool = True) -> None:
+    from agent.task import RunStatus
+    click.echo(dim(f"  Mode    : {mode}"))
+    click.echo(dim(f"  V2 DB   : {db_path}"))
+    click.echo(dim(f"  Session : {session_id}\n"))
+    if show_summary and result.summary:
+        click.echo(result.summary)
+    if result.status == RunStatus.SUCCESS:
+        click.echo(green("\n  V2 run completed successfully."))
+    else:
+        click.echo(yellow(f"\n  V2 run finished with status: {result.status.value}"))
 
 
 # ---------------------------------------------------------------------------
@@ -360,13 +726,14 @@ def _build_multi_config(config, auto_approve: bool = False) -> "MultiAgentConfig
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
-@click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto"]), help="Agent mode: react, plan, dag, multi-agent, or auto")
+@click.option("--mode", default="v2-build", show_default=True, type=click.Choice(["v2-build", "v2-plan"]), help="Agent mode: v2-build or v2-plan")
 @click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
 @click.option("--replan", is_flag=True, default=False, help="Enable one or more DAG replans after subtask failure")
 @click.option("--max-replans", default=None, type=int, help="Maximum DAG replan attempts")
 @click.option("--read", "read_paths", multiple=True, default=None, help="Explicitly allowed read path (repeatable)")
 @click.option("--write", "write_paths", multiple=True, default=None, help="Explicitly allowed write path (repeatable)")
 @click.option("--intent", "intent_override", default="auto", show_default=True, type=click.Choice(["analysis", "edit", "auto"]), help="Task intent: analysis (read-only), edit, or auto (detect)")
+@click.option("--plan-file", default=None, help="Inject an approved plan file into v2-build session")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -389,6 +756,7 @@ def run(
     read_paths: tuple[str, ...] | None,
     write_paths: tuple[str, ...] | None,
     intent_override: str,
+    plan_file: str | None,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -465,6 +833,8 @@ def run(
         runtime=runtime,
         memory_store=memory_store,
         external_store=external_store,
+        repo_path=repo_path,
+        auto_approve=auto_approve,
     )
 
     # ProactiveMemory（run 模式）
@@ -474,6 +844,19 @@ def run(
         proactive_memory = ProactiveMemory(memory_store)
         proactive_memory.check_user_message(description)
 
+    # Initialize HookDispatcher with ProactiveMemory as internal subscriber
+    hook_dispatcher = _init_hook_dispatcher(
+        repo_path, proactive_memory,
+        memory_store=memory_store,
+        log_dir=config.agent.log_dir,
+        backend=backend,
+    )
+
+    # Wire hook_dispatcher into ToolRegistry (PostToolUse) and PermissionPipeline (PreToolUse)
+    registry._hook_dispatcher = hook_dispatcher
+    if hasattr(registry, '_permission_pipeline') and registry._permission_pipeline is not None:
+        registry._permission_pipeline._hook_dispatcher = hook_dispatcher
+
     # memory 模块日志可见性
     if config.memory.enabled:
         logging.getLogger("memory").setLevel(logging.INFO)
@@ -482,7 +865,8 @@ def run(
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
     from agent.policy import normalize_repo_path
-    from agent.factory import create_agent, classify_task_intent
+    from agent.factory import classify_task_intent
+    from dataclasses import dataclass
     from entry.renderer import create_renderer
     try:
         from context.token_budget import is_tiktoken_available
@@ -507,147 +891,78 @@ def run(
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
     )
-    # Plan 审批回调
-    from agent.plan import PlanApproval
+    # Plan 审批回调（V1 plan mode 和 V2 v2-plan 共用）
+
+    @dataclass
+    class _PlanApproval:
+        approved: bool
+        action: str = "execute"
+        feedback: str = ""
 
     def _plan_approval_cb(plan_text: str):
         if auto_approve:
             rend.on_plan_generated(plan_text)
             rend.on_plan_approved()
-            return PlanApproval(approved=True)
+            return _PlanApproval(approved=True)
         rend.on_plan_generated(plan_text)
         while True:
             try:
                 resp = input("  [approve(y)/reject(n)/revise(e)] > ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 rend.on_plan_rejected()
-                return PlanApproval(approved=False, feedback="Plan approval interrupted")
+                return _PlanApproval(approved=False, feedback="Plan approval interrupted")
             if resp in ("y", "yes", "approve", "a", ""):
                 rend.on_plan_approved()
-                return PlanApproval(approved=True)
+                return _PlanApproval(approved=True)
             if resp in ("n", "no", "reject", "r"):
                 rend.on_plan_rejected()
-                return PlanApproval(approved=False, feedback="Plan rejected by user")
+                return _PlanApproval(approved=False, feedback="Plan rejected by user")
             if resp in ("e", "edit", "revise", "feedback", "f"):
                 try:
                     feedback = input("  Revision feedback > ").strip()
                 except (EOFError, KeyboardInterrupt):
                     feedback = "Plan revision requested by user"
                 rend.on_plan_rejected()
-                return PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
+                if proactive_memory and feedback:
+                    proactive_memory.check_plan_feedback(feedback)
+                return _PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
             click.echo("  Please enter y to approve, n to reject, or e to request revision.")
 
-    from agent.plan import PlanExecuteConfig
-    plan_cfg = PlanExecuteConfig(
-        plan_subtask_log_dir=f"{config.agent.log_dir}/subtasks",
-        plan_approval_callback=_plan_approval_cb,
-        enable_replan=bool(replan or config.plan.enable_replan),
-        max_replans=max_replans if max_replans is not None else config.plan.max_replans,
-        allow_parallel_verification=config.plan.allow_parallel_verification,
-        allow_parallel_commands=config.plan.allow_parallel_commands,
-    )
+    mcp_integration = None
+    if mode in ("v2-build", "plan", "v2-plan") and getattr(config, "mcp_servers", None):
+        from agent.v2 import MCPToolIntegration
+        mcp_integration = MCPToolIntegration({"mcp_servers": config.mcp_servers})
+        mcp_integration.initialize()
+        mcp_integration.register_into(registry)
 
-    multi_cfg = _build_multi_config(config, auto_approve=auto_approve) if mode == "multi-agent" else None
-    agent = create_agent(
-        mode, backend, registry, agent_config,
-        plan_config=plan_cfg,
-        task_description=description,
-        plan_approval_callback=_plan_approval_cb,
-        memory_context=memory_context,
-        multi_config=multi_cfg,
-    )
-    click.echo(dim(f"  Mode    : {mode}"))
+    if mode in ("v2-build", "plan", "v2-plan"):
+        try:
+            _run_v2_mode(
+                mode=mode,
+                description=description,
+                repo_path=repo_path,
+                backend=backend,
+                registry=registry,
+                agent_config=agent_config,
+                memory_context=memory_context,
+                log_dir=config.agent.log_dir,
+                intent_override=intent_override,
+                plan_approval_callback=_plan_approval_cb,
+                auto_approve=auto_approve,
+                plan_file=plan_file,
+                hook_dispatcher=hook_dispatcher,
+                proactive_memory=proactive_memory,
+                mcp_integration=mcp_integration,
+                renderer=rend,
+            )
+        finally:
+            if mcp_integration is not None:
+                mcp_integration.shutdown()
+        flush_observability()
+        return
 
-    repo_str = str(repo_path)
-    task_obj = Task(
-        description=description,
-        repo_path=repo_str,
-        intent=classify_task_intent(description, intent_override, backend),
-        max_steps=config.agent.max_steps,
-        budget_tokens=config.agent.budget_tokens,
-        metadata={
-            "entrypoint": "cli_run",
-            "mode": mode,
-            "provider": config.llm.provider,
-            "model": config.llm.model,
-        },
-        explicit_read_paths=frozenset(normalize_repo_path(p, repo_str) for p in read_paths) if read_paths else None,
-        explicit_write_paths=frozenset(normalize_repo_path(p, repo_str) for p in write_paths) if write_paths else None,
-    )
-
-    if verbose:
-        click.echo(dim(
-            f"  tiktoken: {'yes' if is_tiktoken_available() else 'no (char estimate)'}\n"
-        ))
-
-    # 运行
-    t0 = time.time()
-    with EventLog.create(task_obj, log_dir=config.agent.log_dir) as log:
-        click.echo(dim(f"  Log: {log.path}\n"))
-
-        # 实时事件输出（monkey-patch EventLog）
-        from agent.task import EventType
-        _original_append = log._append
-        _last_tool = [""]
-        _last_tool_params = [{}]
-
-        def _live_append(event):
-            _original_append(event)
-            etype = event.event_type
-            p = event.payload
-            if etype == EventType.ACTION:
-                action = p["action"]
-                tcs = action.get("tool_calls") or []
-                if tcs:
-                    for tc in tcs:
-                        _last_tool[0] = tc["name"]
-                        _last_tool_params[0] = tc.get("params", {})
-                        rend.on_tool_call(p["step"], tc["name"], tc.get("params", {}))
-                elif action.get("action_type") == "finish":
-                    rend.on_finish(p["step"], action.get("message", ""))
-                elif action.get("action_type") == "give_up":
-                    rend.on_give_up(p["step"], action.get("message", ""))
-            elif etype == EventType.OBSERVATION:
-                obs = p["observation"]
-                tool_name = obs.get("tool_name", _last_tool[0])
-                status = obs.get("status", "")
-                output = obs.get("output", "")
-                rend.on_observation(
-                    p["step"],
-                    tool_name,
-                    status,
-                    output,
-                    obs.get("error"),
-                )
-                # ProactiveMemory：检查工具结果
-                if proactive_memory is not None:
-                    proactive_memory.check_tool_result(
-                        tool_name=tool_name,
-                        params=_last_tool_params[0],
-                        output=output,
-                        success=(status == "success"),
-                    )
-            elif etype == EventType.REFLECTION:
-                rend.on_reflection(p.get("reason", ""))
-
-        log._append = _live_append
-        result = agent.run(task_obj, log)
-    flush_observability()
-
-    elapsed = time.time() - t0
-
-    # 打印结果
-    click.echo(bold("─" * 60))
-    status_str = green("SUCCESS") if result.is_success() else red(result.status.value.upper())
-    click.echo(f"Status  : {status_str}")
-    click.echo(f"Steps   : {result.steps_taken}")
-    click.echo(f"Tokens  : {result.total_tokens:,}")
-    click.echo(f"Time    : {elapsed:.1f}s")
-    if result.error:
-        click.echo(red(f"Error   : {result.error}"))
-    click.echo(bold("─" * 60) + "\n")
-
-    sys.exit(0 if result.is_success() else 1)
+    click.echo(red(f"Error: mode '{mode}' has been removed. Use --mode v2-build or --mode v2-plan."), err=True)
+    sys.exit(1)
 
 
 
@@ -659,7 +974,7 @@ def run(
 @click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
-@click.option("--mode", default="react", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto"]), help="Agent mode")
+@click.option("--mode", default="v2-build", show_default=True, type=click.Choice(["v2-build", "v2-plan"]), help="Agent mode")
 @click.option("--max-steps", default=None, type=int, help="Max steps per round")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
@@ -730,6 +1045,7 @@ def chat(
         runtime=runtime,
         memory_store=memory_store,
         external_store=external_store,
+        repo_path=repo_path,
     )
 
     # 注册 SkillTool（如果有已发现的 skills）
@@ -825,15 +1141,7 @@ def chat(
                 click.echo(dim(f"  {msg}"))
             elif cmd.startswith("/mode"):
                 parts = user_input.strip().split()
-                if len(parts) == 2 and parts[1] in ("react", "plan", "dag", "multi-agent", "auto"):
-                    session.switch_mode(parts[1])
-                    click.echo(dim(f"  Mode switched to: {parts[1]}"))
-                else:
-                    current = getattr(session, "_mode", "react")
-                    click.echo(dim(
-                        f"  Current mode: {current}\n"
-                        f"  Usage: /mode react|plan|dag|multi-agent|auto"
-                    ))
+                click.echo(dim("  Agent modes are set at startup via --mode. Runtime switching has been removed."))
             elif cmd.startswith("/model"):
                 parts = user_input.strip().split(maxsplit=2)
                 if len(parts) >= 2:
@@ -871,6 +1179,34 @@ def chat(
                     click.echo(dim(f"  Reloaded. {len(skill_registry.list_skills())} skills discovered."))
                 else:
                     click.echo(dim("  Usage: /skill list | /skill show <name> | /skill reload"))
+            elif cmd.startswith("/goal"):
+                from runtime.goal import GoalState, MAX_GOAL_CONDITION_CHARS
+                args = user_input[len("/goal"):].strip()
+                clear_words = {"clear", "stop", "off", "reset", "none", "cancel"}
+                if not args:
+                    goal = session.goal_store.get()
+                    if not goal or not goal.active:
+                        click.echo(dim("  当前没有活跃的 /goal 目标。"))
+                    else:
+                        click.echo(dim(
+                            f"  🎯 当前目标：{goal.condition}\n"
+                            f"     轮数：{goal.turn_count}/{goal.max_turns}\n"
+                            f"     状态：{'活跃' if goal.active else '已完成'}\n"
+                            f"     上次评估：{goal.last_judge_reason or '尚未评估'}"
+                        ))
+                elif args.lower() in clear_words:
+                    session.goal_store.clear()
+                    click.echo(dim("  🎯 目标已清除。"))
+                elif len(args) > MAX_GOAL_CONDITION_CHARS:
+                    click.echo(red(
+                        f"  条件过长（{len(args)} 字符），上限 {MAX_GOAL_CONDITION_CHARS} 字符。"
+                    ))
+                else:
+                    session.goal_store.set(GoalState(
+                        condition=args,
+                        session_id=getattr(session, "_session_id", ""),
+                    ))
+                    click.echo(dim(f"  🎯 目标已设定：{args}\n  每轮结束后会自动评估。"))
             elif cmd.startswith("/mcp"):
                 parts = user_input.strip().split(maxsplit=2)
                 subcmd = parts[1] if len(parts) > 1 else ""
@@ -928,6 +1264,7 @@ def chat(
                     "    /stats   — show session statistics",
                     "    /clear   — clear conversation history",
                     "    /compact [focus] — compress conversation (optional: prioritize retaining focus topic)",
+                    "    /goal [condition|clear] — set/show/clear a session completion goal",
                     "    /mode    — show or switch agent mode (react|plan|dag|multi-agent|auto)",
                     "    /model   — show or switch LLM model",
                     "    /skill   — list/show/reload skills",

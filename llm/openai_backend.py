@@ -106,15 +106,16 @@ class OpenAIBackend(LLMBackend):
         api_messages: list[dict],
         tools: list[LLMToolSchema],
     ) -> LLMResponse:
-        api_tools = [_to_openai_tool(t) for t in tools]
-
-        response = self._client.chat.completions.create(
+        kwargs: dict = dict(
             model=self._model,
             max_tokens=self._max_tokens,
             messages=api_messages,
-            tools=api_tools,
-            tool_choice="auto",
         )
+        if tools:
+            kwargs["tools"] = [_to_openai_tool(t) for t in tools]
+            kwargs["tool_choice"] = "auto"
+
+        response = self._client.chat.completions.create(**kwargs)
 
         choice = response.choices[0]
         message = choice.message
@@ -129,11 +130,23 @@ class OpenAIBackend(LLMBackend):
 
         action = _parse_openai_response(choice, thought)
 
+        # DSML fallback: if model returned DSML in content instead of native tool_calls
+        raw_content = thought
+        if action.action_type == ActionType.FINISH and message.content:
+            dsml_tool_calls = _parse_dsml_tool_calls(message.content)
+            if dsml_tool_calls:
+                raw_content = _extract_thought_before_dsml(message.content)
+                action = Action(
+                    action_type=ActionType.TOOL_CALL,
+                    thought=raw_content,
+                    tool_calls=dsml_tool_calls,
+                )
+
         cache_stats = _extract_openai_cache_stats(response.usage)
 
         return LLMResponse(
             action=action,
-            raw_content=thought,
+            raw_content=raw_content,
             input_tokens=response.usage.prompt_tokens,
             output_tokens=response.usage.completion_tokens,
             cache_stats=cache_stats,
@@ -379,6 +392,55 @@ _INLINE_JSON_RE = re.compile(r"\{[^{}]+\}", re.DOTALL)
 _FINISH_KEYWORDS = ("task complete", "task is complete", "i have finished", "all done")
 _GIVE_UP_KEYWORDS = ("cannot solve", "give up", "unable to", "i cannot")
 
+# ---------------------------------------------------------------------------
+# DSML 解析 — DeepSeek 在无 tools 时以文本形式输出工具调用
+# ---------------------------------------------------------------------------
+
+_DSML_MARKER = "｜｜DSML｜｜"
+_DSML_INVOKE_RE = re.compile(
+    r"<｜｜DSML｜｜invoke\s+name=\"([^\"]+)\">(.*?)</｜｜DSML｜｜invoke>",
+    re.DOTALL,
+)
+_DSML_PARAM_RE = re.compile(
+    r"<｜｜DSML｜｜parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)</｜｜DSML｜｜parameter>",
+    re.DOTALL,
+)
+
+
+def _parse_dsml_tool_calls(text: str) -> list[ToolCall] | None:
+    """Parse DSML-format tool calls embedded in text content.
+
+    Returns a list of ToolCall objects if DSML is found, None otherwise.
+    """
+    if _DSML_MARKER not in text:
+        return None
+    invokes = _DSML_INVOKE_RE.findall(text)
+    if not invokes:
+        return None
+    tool_calls: list[ToolCall] = []
+    for name, body in invokes:
+        params: dict[str, Any] = {}
+        for param_name, param_value in _DSML_PARAM_RE.findall(body):
+            value: Any = param_value.strip()
+            try:
+                value = int(value)
+            except ValueError:
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
+            params[param_name] = value
+        tool_calls.append(ToolCall(name=name, params=params))
+    return tool_calls or None
+
+
+def _extract_thought_before_dsml(text: str) -> str:
+    """Extract the text content before the first DSML marker as thought."""
+    idx = text.find("<" + _DSML_MARKER)
+    if idx <= 0:
+        return ""
+    return text[:idx].strip()
+
 
 def _build_tool_description_for_text(tools: list[LLMToolSchema]) -> str:
     """
@@ -532,6 +594,7 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
     finish_reason = None
     tool_calls_raw = []      # 收集 tool call deltas
     stream_usage = None      # 最后一个 chunk 的 usage
+    dsml_detected = False    # DSML 标记检测：一旦检测到则停止流式输出
 
     stream = self._client.chat.completions.create(**kwargs)
     for chunk in stream:
@@ -554,9 +617,10 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
         # text delta（最终回答）
         if delta.content:
             full_text += delta.content
-            # 如果已经开始接收 tool_calls，不再流式输出文本
-            # （模型可能在 tool_call 间隙输出垃圾文本如 "(no thought)"）
-            if on_text and not tool_calls_raw:
+            if not dsml_detected and _DSML_MARKER in full_text:
+                dsml_detected = True
+            # 如果已经开始接收 tool_calls 或检测到 DSML，不再流式输出文本
+            if on_text and not tool_calls_raw and not dsml_detected:
                 on_text(delta.content)
 
         # tool call delta 拼接
@@ -571,6 +635,33 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
                     tool_calls_raw[idx]["name"] += tc_delta.function.name
                 if tc_delta.function.arguments:
                     tool_calls_raw[idx]["arguments"] += tc_delta.function.arguments
+
+    # ── DSML fallback: parse DSML from text when no native tool_calls ──
+    if not tool_calls_raw and full_text:
+        dsml_tool_calls = _parse_dsml_tool_calls(full_text)
+        if dsml_tool_calls:
+            thought_text = _extract_thought_before_dsml(full_text)
+            action = Action(
+                action_type=ActionType.TOOL_CALL,
+                thought=full_reasoning or thought_text,
+                tool_calls=dsml_tool_calls,
+            )
+            from context.token_budget import estimate_tokens
+            if stream_usage:
+                input_tokens = getattr(stream_usage, "prompt_tokens", 0) or 0
+                output_tokens = getattr(stream_usage, "completion_tokens", 0) or 0
+                cache_stats = _extract_openai_cache_stats(stream_usage)
+            else:
+                input_tokens = sum(estimate_tokens(m.get("content", "")) for m in api_messages)
+                output_tokens = estimate_tokens(full_text)
+                cache_stats = CacheStats()
+            return LLMResponse(
+                action=action,
+                raw_content=thought_text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_stats=cache_stats,
+            )
 
     # 构造 mock choice 供 _parse_openai_response 复用
     import json as _json

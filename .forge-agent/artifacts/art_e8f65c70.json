@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_e8f65c70",
+  "tool_name": "find_files",
+  "full_content": "agent\\__init__.py\nagent\\completion.py\nagent\\core.py\nagent\\dag.py\nagent\\event_log.py\nagent\\factory.py\nagent\\multi_agent.py\nagent\\plan.py\nagent\\policy.py\nagent\\policy_registry.py\nagent\\prompt.py\nagent\\runtime_control.py\nagent\\task.py\nagent\\task_classifier.py",
+  "summary": "agent\\__init__.py\nagent\\completion.py\nagent\\core.py\nagent\\dag.py\nagent\\event_log.py\nagent\\factory.py\nagent\\multi_agent.py\nagent\\plan.py\nagent\\policy.py\nagent\\policy_registry.py\nagent\\prompt.py\nagent\\runtime_control.py\nagent\\task.py\nagent\\task_classifier.py",
+  "token_count": 75,
+  "char_count": 256,
+  "line_count": 14,
+  "created_at": 1782453261.220913
+}

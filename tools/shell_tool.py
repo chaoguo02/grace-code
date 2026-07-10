@@ -16,6 +16,7 @@ Shell 命令执行工具。四层防护：
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from typing import Any, Callable
@@ -107,8 +108,9 @@ class ShellTool(BaseTool):
         cwd (str):     工作目录（默认使用当前目录）
 
     安全模型：
-        - L0 黑名单硬拦截：execute() 内 _check_blocked()，永远不执行
-        - L1+ 确认：通过 classify_risk() 上报风险等级，由 HitlManager 统一处理
+        - L0 黑名单硬拦截：execute() 内 _check_blocked()，defense-in-depth
+        - 权限管道 Layer 1 也调用 _check_blocked()，双重保障
+        - 其他权限决策由 PermissionPipeline 统一处理
     """
 
     def __init__(
@@ -116,7 +118,6 @@ class ShellTool(BaseTool):
         confirm_callback: ConfirmCallback | None = None,
         runtime: Runtime | None = None,
     ) -> None:
-        # confirm_callback 保留用于向后兼容（无 HitlManager 时的降级路径）
         self._confirm_callback = confirm_callback
         self._runtime = runtime or LocalRuntime()
 
@@ -214,6 +215,19 @@ class ShellTool(BaseTool):
                 error = result.stderr.strip()
             else:
                 error = f"Exit code: {result.returncode}"
+                # cwd 诊断：ModuleNotFoundError / FileNotFoundError 通常是 cwd 问题
+                combined = f"{result.stdout}{result.stderr}".lower()
+                if any(sig in combined for sig in (
+                    "modulenotfounderror", "no module named",
+                    "filenotfounderror", "no such file or directory",
+                    "cannot find", "not recognized",
+                )):
+                    effective_cwd = cwd or os.getcwd()
+                    error += (
+                        f"\n[HINT] Working directory was: {effective_cwd}\n"
+                        f"If the target file/module is in a subdirectory, use "
+                        f"the cwd parameter or prefix with 'cd <project_root> && '."
+                    )
         else:
             error = None
         return ToolResult(success=result.success, output=output, error=error)

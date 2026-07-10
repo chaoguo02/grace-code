@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_fbb2cfe9",
+  "tool_name": "find_symbol",
+  "full_content": "agent\\core.py:1347: def _schemas_for_current_phase (method)",
+  "summary": "agent\\core.py:1347: def _schemas_for_current_phase (method)",
+  "token_count": 16,
+  "char_count": 59,
+  "line_count": 1,
+  "created_at": 1782453274.512474
+}

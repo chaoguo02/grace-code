@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python -m pytest test_plan_mode.py --tb=short -q 2>&1)"
+    ]
+  }
+}

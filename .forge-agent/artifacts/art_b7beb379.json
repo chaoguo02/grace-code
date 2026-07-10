@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_b7beb379",
+  "tool_name": "find_symbol",
+  "full_content": "context\\evidence.py:132: class EvidenceLedger (method)\ntools\\evidence_tool.py:14: class EvidenceLedgerRef (top-level)",
+  "summary": "context\\evidence.py:132: class EvidenceLedger (method)\ntools\\evidence_tool.py:14: class EvidenceLedgerRef (top-level)",
+  "token_count": 31,
+  "char_count": 117,
+  "line_count": 2,
+  "created_at": 1782440961.9461308
+}

@@ -156,6 +156,11 @@ class ChatSession:
         from context.session import SessionState
         self._session_state = SessionState()
 
+        # ── Goal Stop Hook（Claude Code /goal-style session goal）────
+        from runtime.goal import GoalStore
+        self.goal_store = GoalStore(Path(self.repo_path) / ".forge-agent" / "goal.json")
+        self.goal_store.restore()
+
         # ── 跨 session 上下文恢复（从持久化的 compaction 摘要）─────
         self._inject_session_summary()
 
@@ -171,9 +176,9 @@ class ChatSession:
         self.round_count = 0
 
     def switch_mode(self, mode: str) -> None:
-        """运行时切换 agent 模式（react / plan / dag / multi-agent / auto）。"""
-        if mode not in ("react", "plan", "dag", "multi-agent", "auto"):
-            raise ValueError(f"Unknown mode: {mode!r}")
+        """运行时切换 agent 模式（仅保留 v2 兼容）。"""
+        if mode not in ("v2-build", "v2-plan"):
+            raise ValueError(f"Unknown mode: {mode!r}. Use v2-build or v2-plan.")
         self._mode = mode
         self._renderer.mode = mode
         self._rebuild_agent()
@@ -204,56 +209,25 @@ class ChatSession:
         self._rebuild_agent()
 
     def _rebuild_agent(self) -> None:
-        """用当前的 backend + mode 重建 agent 实例。"""
-        multi_cfg = self._build_multi_config() if self._mode == "multi-agent" else None
+        """用当前的 backend 重建 agent 实例。"""
         self.agent = create_agent(
             self._mode, self._backend, self._registry, self._agent_cfg,
             plan_approval_callback=self._plan_approval,
             memory_context=self._memory_context,
-            multi_config=multi_cfg,
         )
-
-    def _build_multi_config(self):
-        """从 AppConfig 构建 MultiAgentConfig。"""
-        from agent.multi_agent import MultiAgentConfig
-        ma = self.config.multi_agent
-        return MultiAgentConfig(
-            budget_ratio=(ma.coordinator_budget_ratio, ma.sub_agent_budget_ratio),
-            max_agents=ma.max_retries + 6,
-            coordinator_max_steps=ma.coordinator_max_steps,
-            max_parallel=ma.max_parallel_executors,
-            worker_model=ma.worker_model or None,
-            worker_provider=ma.worker_provider or None,
-            merge_approval_callback=self._merge_approval,
-            log_dir=self.log_dir,
-        )
-
-    def _merge_approval(self, worktree_name: str, diff: str) -> bool:
-        """HITL: 展示 worktree diff，请求用户确认合并。"""
-        import sys
-        print(f"\n  ─── Worktree '{worktree_name}' diff ───")
-        if diff.strip():
-            lines = diff.splitlines()
-            if len(lines) > 60:
-                print("\n".join(lines[:60]))
-                print(f"  ... ({len(lines) - 60} more lines)")
-            else:
-                print(diff)
-        else:
-            print("  (no diff)")
-        print("  ─────────────────────────────────────")
-        try:
-            resp = input(f"  Merge '{worktree_name}'? [y/n] > ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return False
-        return resp in ("y", "yes", "")
 
     def _plan_approval(self, plan_text: str):
         """
         交互式 Plan 审批。展示 plan，等待用户 approve/reject/revise。
         返回 PlanApproval，避免把未知输入或 edit(e) 误当成批准。
         """
-        from agent.plan import PlanApproval
+        from dataclasses import dataclass
+
+        @dataclass
+        class _PlanApproval:
+            approved: bool
+            action: str = "execute"
+            feedback: str = ""
 
         self._renderer.on_plan_generated(plan_text)
         while True:
@@ -263,21 +237,21 @@ class ChatSession:
                 ).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 self._renderer.on_plan_rejected()
-                return PlanApproval(approved=False, feedback="Plan approval interrupted")
+                return _PlanApproval(approved=False, feedback="Plan approval interrupted")
 
             if response in ("y", "yes", "approve", "a", ""):
                 self._renderer.on_plan_approved()
-                return PlanApproval(approved=True)
+                return _PlanApproval(approved=True)
             if response in ("n", "no", "reject", "r"):
                 self._renderer.on_plan_rejected()
-                return PlanApproval(approved=False, feedback="Plan rejected by user")
+                return _PlanApproval(approved=False, feedback="Plan rejected by user")
             if response in ("e", "edit", "revise", "feedback", "f"):
                 try:
                     feedback = input(_cyan_prompt("  Revision feedback > ")).strip()
                 except (EOFError, KeyboardInterrupt):
                     feedback = "Plan revision requested by user"
                 self._renderer.on_plan_rejected()
-                return PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
+                return _PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
 
             print("  Please enter y to approve, n to reject, or e to request revision.")
 
@@ -480,10 +454,36 @@ class ChatSession:
         # 注入 skills metadata（如果有）
         if self._skill_registry and self._skill_registry.list_skills():
             agent._skills_prompt = self._skill_registry.format_for_prompt()
+        agent._goal_stop_hook = self._goal_stop_hook
         result = agent.run(task, log)
         if hasattr(agent, "_pending_history"):
             del agent._pending_history
+        if hasattr(agent, "_goal_stop_hook"):
+            del agent._goal_stop_hook
         return result
+
+    def _goal_stop_hook(self, messages: list[dict]):
+        from runtime.goal import goal_stop_hook
+        return goal_stop_hook(
+            self.goal_store,
+            messages,
+            backend_factory=self._create_goal_judge_backend,
+        )
+
+    def _create_goal_judge_backend(self, judge_model: str):
+        from llm.router import create_backend
+        provider = self.config.llm.provider
+        model = judge_model
+        if model == "haiku" and provider != "anthropic":
+            model = self.config.llm.model
+        return create_backend(
+            provider=provider,
+            model=model,
+            api_key=self.config.llm.api_key or None,
+            base_url=self.config.llm.base_url or None,
+            max_tokens=500,
+            timeout_seconds=30.0,
+        )
 
     # ------------------------------------------------------------------
     # 统计 & 工具方法

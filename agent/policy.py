@@ -27,6 +27,7 @@ READONLY_TOOLS = (
     | frozenset({"git_status", "git_diff"})
     | WEB_TOOLS
     | frozenset({"memory_read", "memory_list", "artifact_list", "artifact_read", "artifact_search", "evidence_list", "evidence_get"})
+    | frozenset({"submit_read_plan"})
 )
 
 NO_OTHER_FILES_RE = re.compile(
@@ -214,10 +215,16 @@ def _blocked_tools_from_text(description: str) -> tuple[set[str], list[str]]:
 def build_task_policy(task: Task) -> TaskPolicy:
     description = task.description
     intent = task.intent
+    disable_implicit_path_scope = bool(task.metadata.get("v2_bypass_path_scope_policy"))
 
-    explicit_read_paths = task.explicit_read_paths or extract_explicit_read_paths(description, task.repo_path) or None
+    explicit_read_paths = task.explicit_read_paths
+    if explicit_read_paths is None and not disable_implicit_path_scope:
+        explicit_read_paths = extract_explicit_read_paths(description, task.repo_path) or None
     explicit_write_paths = task.explicit_write_paths
-    strict_file_scope = bool(NO_OTHER_FILES_RE.search(description) or explicit_read_paths)
+    if disable_implicit_path_scope:
+        strict_file_scope = bool(explicit_read_paths)
+    else:
+        strict_file_scope = bool(NO_OTHER_FILES_RE.search(description) or explicit_read_paths)
 
     blocked_tools, notes = _blocked_tools_from_text(description)
     if strict_file_scope:

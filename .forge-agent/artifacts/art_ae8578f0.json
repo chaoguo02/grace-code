@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_ae8578f0",
+  "tool_name": "search_text",
+  "full_content": "tools\\evidence_tool.py:20: class EvidenceListTool(BaseTool):\ntools\\evidence_tool.py:75: class EvidenceGetTool(BaseTool):\ntools\\evidence_tool.py:117: class ArtifactSearchTool(BaseTool):\n[Showing 3 matches]",
+  "summary": "tools\\evidence_tool.py:20: class EvidenceListTool(BaseTool):\ntools\\evidence_tool.py:75: class EvidenceGetTool(BaseTool):\ntools\\evidence_tool.py:117: class ArtifactSearchTool(BaseTool):\n[Showing 3 matches]",
+  "token_count": 51,
+  "char_count": 204,
+  "line_count": 4,
+  "created_at": 1782440181.520544
+}

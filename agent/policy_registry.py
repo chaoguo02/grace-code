@@ -19,15 +19,23 @@ class PolicyAwareToolRegistry(ToolRegistry):
         repo_path: str,
         phase_name: str,
         base_allowed_tools: set[str] | frozenset[str] | None = None,
+        plan_mode_allowed: frozenset[str] | None = None,
     ) -> None:
-        super().__init__(hitl_manager=getattr(base, "_hitl_manager", None))
+        super().__init__(
+            hitl_manager=getattr(base, "_hitl_manager", None),
+            permission_pipeline=getattr(base, "_permission_pipeline", None),
+        )
         self._base = base
         self._phase_policy = phase_policy
         self._repo_path = repo_path
         self._phase_name = phase_name
         self._base_allowed_tools = frozenset(base_allowed_tools) if base_allowed_tools is not None else None
+        # plan_mode_allowed：非只读工具仍注册（模型能看到定义），但调用时返回权限错误
+        # ref: Claude Code hasPermissionsToUseToolInner() — plan 模式所有写操作直接拒绝
+        self._plan_mode_allowed = plan_mode_allowed
         self._artifact_store_ref = getattr(base, "_artifact_store_ref", None)
         self._evidence_ledger_ref = getattr(base, "_evidence_ledger_ref", None)
+        self._submit_plan_ref = getattr(base, "_submit_plan_ref", None)
         for name, tool in base._tools.items():
             if self._is_tool_visible(name):
                 self._tools[name] = tool
@@ -65,6 +73,26 @@ class PolicyAwareToolRegistry(ToolRegistry):
                 return False
         return True
 
+    def _is_tool_enabled(self, name: str) -> bool:
+        if name in {"artifact_list", "artifact_read", "artifact_search"}:
+            return self._artifact_store_ref is not None and self._artifact_store_ref.store is not None
+        if name in {"evidence_list", "evidence_get"}:
+            return self._evidence_ledger_ref is not None and self._evidence_ledger_ref.ledger is not None
+        return True
+
+    def get_schemas(self):
+        schemas = [
+            tool.to_llm_schema()
+            for name, tool in self._tools.items()
+            if self._is_tool_enabled(name)
+        ]
+        schemas.sort(key=lambda s: s.name)
+        return schemas
+
+    @property
+    def tool_names(self) -> list[str]:
+        return [name for name in self._tools.keys() if self._is_tool_enabled(name)]
+
     def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
         start = time.perf_counter()
         violation = self._check_tool_call(name, params)
@@ -77,8 +105,21 @@ class PolicyAwareToolRegistry(ToolRegistry):
         return result
 
     def _check_tool_call(self, name: str, params: dict[str, Any]) -> str | None:
+        # ── Plan Mode 权限拦截 ──
+        # 模型能看到写工具的定义，但调用时返回明确的权限错误。
+        # ref: Claude Code plan 模式 — 写操作直接拒绝，模型感知到限制后自行调整行为。
+        if self._plan_mode_allowed is not None and name not in self._plan_mode_allowed:
+            return (
+                f"Permission denied: '{name}' is not available in plan mode. "
+                f"Plan mode only allows read-only operations. "
+                f"Available tools: {', '.join(sorted(self._plan_mode_allowed))}. "
+                f"You are in plan mode — explore the codebase and produce a "
+                f"structured implementation plan instead of attempting writes."
+            )
         if name not in self._tools:
             return f"Tool '{name}' is blocked by task policy in {self._phase_name} phase. Available tools: {', '.join(self.tool_names) or 'none'}"
+        if not self._is_tool_enabled(name):
+            return f"Tool '{name}' is not available in the current environment. Available tools: {', '.join(self.tool_names) or 'none'}"
         if name in self._phase_policy.denied_tools:
             return f"Tool '{name}' is blocked by task policy."
 

@@ -74,6 +74,8 @@ class MemoryConfig:
     directory: str = ""
     max_index_lines: int = 50
     auto_memory: bool = True
+    selector_enabled: bool = True
+    selector_model: str = ""
 
 
 @dataclass
@@ -123,6 +125,8 @@ class HitlConfig:
     min_risk_for_confirm: str = "medium"
     policy_file: str = ".forge-agent/hitl/policies.yaml"
     learn_threshold: int = 3
+    settings_file: str = ".forge-agent/settings.json"
+    default_mode: str = "ask_edits"
 
 
 @dataclass
@@ -272,6 +276,8 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         directory=memory_raw.get("directory", ""),
         max_index_lines=int(memory_raw.get("max_index_lines", 50)),
         auto_memory=bool(memory_raw.get("auto_memory", True)),
+        selector_enabled=bool(memory_raw.get("selector_enabled", True)),
+        selector_model=memory_raw.get("selector_model", ""),
     )
 
     plan = PlanCfg(

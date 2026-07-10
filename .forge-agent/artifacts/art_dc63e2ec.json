@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_dc63e2ec",
+  "tool_name": "search_text",
+  "full_content": "agent\\core.py:321:         self._evidence_ledger = EvidenceLedger()\nagent\\core.py:324:             evidence_ledger_ref.ledger = self._evidence_ledger\n[Showing 2 matches]",
+  "summary": "agent\\core.py:321:         self._evidence_ledger = EvidenceLedger()\nagent\\core.py:324:             evidence_ledger_ref.ledger = self._evidence_ledger\n[Showing 2 matches]",
+  "token_count": 45,
+  "char_count": 169,
+  "line_count": 3,
+  "created_at": 1782440198.0014377
+}

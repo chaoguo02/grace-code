@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_f6196652",
+  "tool_name": "find_symbol",
+  "full_content": "agent\\core.py:1628: def _record_evidence (method)",
+  "summary": "agent\\core.py:1628: def _record_evidence (method)",
+  "token_count": 15,
+  "char_count": 49,
+  "line_count": 1,
+  "created_at": 1782454953.5081432
+}

@@ -73,12 +73,33 @@ class ProactiveMemory:
         self._store = store
         self._saved_corrections: set[str] = set()
         self._saved_commands: set[str] = set()
+        from memory.write_discipline import WriteDiscipline
+        self._write_discipline = WriteDiscipline()
+
+    def notify_explicit_memory_write(self) -> None:
+        """
+        Called when the user explicitly uses memory_write tool.
+
+        Suppresses automatic extraction for this turn to avoid overwriting
+        the user's deliberate intent (aligned with Claude Code's
+        hasMemoryWritesSince() check).
+        """
+        self._write_discipline.notify_explicit_memory_write()
+
+    def reset_turn(self) -> None:
+        """Reset per-turn state. Call at the start of each new user message."""
+        self._write_discipline.reset_turn()
 
     def check_user_message(self, user_input: str) -> None:
         """
         检查用户消息是否包含修正/偏好模式。
         匹配时自动保存为 feedback 类型记忆。
+
+        Skipped if user has explicitly written memory this turn.
         """
+        if self._write_discipline.should_skip_auto_extract():
+            return
+
         if len(user_input) < 5 or len(user_input) > 500:
             return
 
@@ -94,6 +115,29 @@ class ProactiveMemory:
 
                 self._save_feedback(user_input, matched_text)
                 return
+
+    def check_plan_feedback(self, feedback: str) -> None:
+        """
+        Capture plan rejection/revision feedback as procedural memory.
+
+        Plan feedback always represents a deliberate design preference
+        (unlike general chat which needs pattern matching to detect corrections).
+        Only saves feedback with actionable content (>10 chars, not generic).
+        """
+        if not feedback or len(feedback.strip()) < 10:
+            return
+
+        # Skip generic/non-actionable feedback
+        generic = {"plan rejected by user", "plan revision requested by user", "plan approval interrupted"}
+        if feedback.strip().lower() in generic:
+            return
+
+        dedup_key = feedback[:50].lower().strip()
+        if dedup_key in self._saved_corrections:
+            return
+        self._saved_corrections.add(dedup_key)
+
+        self._save_feedback(feedback, f"Plan feedback: {feedback[:60]}")
 
     def check_tool_result(
         self,
@@ -131,11 +175,11 @@ class ProactiveMemory:
     # ------------------------------------------------------------------
 
     def _save_feedback(self, full_message: str, matched_text: str) -> None:
-        """保存用户修正为 procedural 记忆（需有 file anchor，否则降级 semantic）。"""
+        """保存用户修正为 feedback 记忆。"""
         from memory.models import Anchor, Memory, MemoryMetadata
 
         anchors = self._anchors_from_text(full_message)
-        mem_type = "procedural" if anchors else "semantic"
+        mem_type = "feedback"
         name = self._generate_name(matched_text, prefix=mem_type)
 
         content = (
@@ -165,13 +209,11 @@ class ProactiveMemory:
             return
         self._saved_commands.add(cmd_key)
 
-        # 检查是否已存在 build-commands 记忆
         existing = self._store.read_memory("build-commands")
         if existing and cmd in existing.content:
-            return  # 已记录
+            return
 
         if existing:
-            # 追加到已有记忆
             updated_content = existing.content.rstrip() + f"\n- `{cmd}`"
             memory = Memory(
                 name="build-commands",
@@ -184,11 +226,11 @@ class ProactiveMemory:
                 name="build-commands",
                 description="Build, test, and lint commands for this project",
                 content=f"## Build Commands\n\n- `{cmd}`",
-                metadata=MemoryMetadata(type="semantic"),
+                metadata=MemoryMetadata(type="project"),
             )
 
         if self._store.write_memory(memory):
-            logger.info("Proactive memory saved: build-commands (semantic)")
+            logger.info("Proactive memory saved: build-commands (project)")
 
     @staticmethod
     def _anchors_from_text(text: str) -> "list[Anchor]":

@@ -159,3 +159,36 @@ def create_backend_from_config(config: dict) -> LLMBackend:
         max_tokens=int(config.get("max_tokens", 8192)),
         timeout_seconds=float(config.get("timeout_seconds", 60.0)),
     )
+
+
+def create_selector_backend(config: dict) -> LLMBackend | None:
+    """
+    Create a lightweight backend for the memory selector (Sonnet-class side query).
+
+    Uses config.memory.selector_model if set, otherwise reuses main backend config
+    with max_tokens=256. Returns None if selector is disabled or config is insufficient.
+    """
+    memory_config = config.get("memory", {})
+    if not memory_config.get("selector_enabled", False):
+        return None
+
+    llm_config = config.get("llm", {})
+    provider = llm_config.get("provider", "")
+    if not provider:
+        return None
+
+    selector_model = memory_config.get("selector_model") or llm_config.get("model", "")
+    if not selector_model:
+        return None
+
+    try:
+        return create_backend(
+            provider=provider,
+            model=selector_model,
+            api_key=llm_config.get("api_key") or None,
+            base_url=llm_config.get("base_url") or None,
+            max_tokens=256,
+            timeout_seconds=10.0,
+        )
+    except (ValueError, Exception):
+        return None

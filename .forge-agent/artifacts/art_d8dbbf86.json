@@ -1,0 +1,10 @@
+{
+  "artifact_id": "art_d8dbbf86",
+  "tool_name": "find_symbol",
+  "full_content": "context\\evidence.py:185: def summarize_phase (method)\ncontext\\evidence.py:215: def summarize_phase_semantically (method)",
+  "summary": "context\\evidence.py:185: def summarize_phase (method)\ncontext\\evidence.py:215: def summarize_phase_semantically (method)",
+  "token_count": 28,
+  "char_count": 120,
+  "line_count": 2,
+  "created_at": 1782443073.362617
+}

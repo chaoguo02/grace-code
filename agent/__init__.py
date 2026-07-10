@@ -8,25 +8,16 @@
 
 __all__ = [
     "Agent", "AgentConfig", "ReActAgent",
-    "PlanExecuteAgent", "PlanExecuteConfig",
-    "Plan", "SubTask", "PlanGenerationError",
     "create_agent",
 ]
 
 
 def __getattr__(name: str):
     """延迟导入 __all__ 中的符号。"""
-    if name in ("Agent", "AgentConfig", "ReActAgent", "PlanExecuteAgent"):
-        from agent.core import Agent, AgentConfig, ReActAgent, PlanExecuteAgent
+    if name in ("Agent", "AgentConfig", "ReActAgent"):
+        from agent.core import Agent, AgentConfig, ReActAgent
         _mod = {"Agent": Agent, "AgentConfig": AgentConfig,
-                "ReActAgent": ReActAgent, "PlanExecuteAgent": PlanExecuteAgent}
-        if name in _mod:
-            globals()[name] = _mod[name]
-            return _mod[name]
-    if name in ("PlanExecuteConfig", "Plan", "SubTask", "PlanGenerationError"):
-        from agent.plan import PlanExecuteConfig, Plan, SubTask, PlanGenerationError
-        _mod = {"PlanExecuteConfig": PlanExecuteConfig, "Plan": Plan,
-                "SubTask": SubTask, "PlanGenerationError": PlanGenerationError}
+                "ReActAgent": ReActAgent}
         if name in _mod:
             globals()[name] = _mod[name]
             return _mod[name]

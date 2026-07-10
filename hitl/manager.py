@@ -1,9 +1,14 @@
 """
 hitl/manager.py
 
-HITL 中央管理器。嵌入 ToolRegistry.execute_tool() 的审批门控。
+HITL 中央管理器（Legacy — 保留向后兼容）。
 
-决策流：
+新代码应使用 hitl.pipeline.PermissionPipeline。
+此类保留用于：
+- 旧代码路径中仍 import HitlManager 的地方
+- 无 PermissionPipeline 时的降级路径
+
+决策流（legacy）：
 1. tool.classify_risk(params) → 获取风险等级
 2. risk < min_risk_for_confirm → SKIPPED（自动放行）
 3. PolicyEngine.match() → POLICY_APPROVED / POLICY_DENIED

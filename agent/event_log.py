@@ -1,4 +1,4 @@
-"""
+﻿"""
 agent/event_log.py
 
 Append-only JSONL 事件日志。
@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Iterator
 
 from agent.task import Event, EventType, Task, Action, Observation, RunResult
-from agent.plan import Plan, SubTask
 
 
 # ---------------------------------------------------------------------------
@@ -256,89 +255,6 @@ class EventLog:
             payload={
                 "step": step,
                 "record": record.to_dict(),
-            },
-        ))
-
-    def log_plan_generated(self, plan: Plan) -> None:
-        """PlanExecuteAgent 成功生成执行计划。"""
-        self._append(Event(
-            event_type=EventType.PLAN_GENERATED,
-            task_id=self._current_task_id,
-            payload={"plan": plan.to_dict()},
-        ))
-
-    def log_replan_generated(self, plan: Plan, attempt: int, reason: str) -> None:
-        """DAG 执行失败后生成重新规划。"""
-        self._append(Event(
-            event_type=EventType.REPLAN_GENERATED,
-            task_id=self._current_task_id,
-            payload={
-                "attempt": attempt,
-                "reason": reason,
-                "plan": plan.to_dict(),
-            },
-        ))
-
-    def log_dag_graph(self, mermaid: str, critical_path: list[str], critical_duration_ms: float) -> None:
-        """记录 DAG Mermaid 图和关键路径信息，避免塞进最终 summary。"""
-        self._append(Event(
-            event_type=EventType.DAG_GRAPH,
-            task_id=self._current_task_id,
-            payload={
-                "mermaid": mermaid,
-                "critical_path": critical_path,
-                "critical_duration_ms": critical_duration_ms,
-            },
-        ))
-
-    def log_subtask_start(
-        self, subtask: SubTask, index: int, total: int
-    ) -> None:
-        """开始执行一个子任务。"""
-        self._append(Event(
-            event_type=EventType.SUBTASK_START,
-            task_id=self._current_task_id,
-            payload={
-                "subtask": subtask.to_dict(),
-                "index": index,
-                "total": total,
-            },
-        ))
-
-    def log_subtask_complete(
-        self, subtask: SubTask, result: RunResult
-    ) -> None:
-        """子任务成功完成。"""
-        self._append(Event(
-            event_type=EventType.SUBTASK_COMPLETE,
-            task_id=self._current_task_id,
-            payload={
-                "subtask_id": subtask.id,
-                "result": result.to_dict(),
-            },
-        ))
-
-    def log_subtask_failed(
-        self, subtask: SubTask, result: RunResult
-    ) -> None:
-        """子任务执行失败。"""
-        self._append(Event(
-            event_type=EventType.SUBTASK_FAILED,
-            task_id=self._current_task_id,
-            payload={
-                "subtask_id": subtask.id,
-                "result": result.to_dict(),
-            },
-        ))
-
-    def log_subtask_skipped(self, subtask: SubTask, reason: str) -> None:
-        """子任务因上游失败等原因被跳过。"""
-        self._append(Event(
-            event_type=EventType.SUBTASK_SKIPPED,
-            task_id=self._current_task_id,
-            payload={
-                "subtask": subtask.to_dict(),
-                "reason": reason,
             },
         ))
 

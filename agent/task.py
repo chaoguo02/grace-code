@@ -52,6 +52,7 @@ class RunStatus(str, Enum):
     FAILED = "failed"
     MAX_STEPS = "max_steps"
     GAVE_UP = "gave_up"
+    BLOCKED = "blocked"
 
 
 @dataclass(frozen=True)
@@ -141,12 +142,16 @@ class Observation:
     tool_name: str
     tokens_used: int = 0
     error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def is_success(self) -> bool:
         return self.status == ObservationStatus.SUCCESS
+
+    def is_expected_block(self) -> bool:
+        return bool(self.metadata.get("expected_block"))
 
     def __repr__(self) -> str:
         return (

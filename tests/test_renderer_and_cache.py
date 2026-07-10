@@ -44,19 +44,70 @@ def test_file_view_summary_shows_window_range():
     assert "lines 101-200 of 1200" in summary
 
 
-def test_streamed_finish_outputs_only_rendered_markdown(capsys):
-    """streamed answer text is buffered and only rendered markdown is displayed at finish."""
+def test_renderer_labels_thought_stream(capsys):
+    from entry.renderer import InlineRenderer
+
+    renderer = InlineRenderer()
+    renderer.stream_thought("I should inspect files.")
+    out = capsys.readouterr().out
+
+    assert "Think" in out
+    assert "I should inspect files" in out
+
+
+def test_renderer_formats_task_tool_call(capsys):
+    from entry.renderer import InlineRenderer
+
+    renderer = InlineRenderer()
+    renderer.on_tool_call(1, "task", {
+        "subagent_type": "general",
+        "description": "review task tool",
+        "prompt": "Review agent/v2/task_tool.py for bugs",
+    })
+    out = capsys.readouterr().out
+
+    assert "ToolCall [1] task" in out
+    assert "general" in out
+    assert "review task tool" in out
+
+
+def test_renderer_formats_task_notification(capsys):
+    from entry.renderer import InlineRenderer
+
+    renderer = InlineRenderer()
+    output = """<task-notification>
+  <agent-type>general</agent-type>
+  <session-id>abc123</session-id>
+  <status>completed</status>
+  <turns-used>2</turns-used>
+  <summary>
+Found one issue.
+  </summary>
+</task-notification>"""
+    renderer.on_observation(1, "task", "success", output, None)
+    out = capsys.readouterr().out
+
+    assert "Subagent" in out
+    assert "general" in out
+    assert "completed" in out
+    assert "Found one issue" in out
+
+
+def test_streamed_answer_outputs_immediately_and_finish_does_not_duplicate(capsys):
+    """streamed answer text is displayed immediately and finish only prints a footer."""
     from entry.renderer import InlineRenderer
 
     renderer = InlineRenderer()
     renderer.stream_text("# Title\n\n- item")
-    assert capsys.readouterr().out == ""
+    streamed = capsys.readouterr().out
+
+    assert "Answer" in streamed
+    assert "# Title" in streamed
+    assert "- item" in streamed
 
     renderer.on_finish(1, "# Title\n\n- item")
     out = capsys.readouterr().out
 
     assert "# Title" not in out
-    assert "Title" in out
     assert "- item" not in out
-    assert "item" in out
-    assert "Done" in out
+    assert "Finish [1]" in out

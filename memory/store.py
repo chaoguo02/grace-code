@@ -32,13 +32,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from memory.models import Anchor, Memory, MemoryMetadata, MemorySummary, normalize_memory_type
+from memory.models import Anchor, Memory, MemoryMetadata, MemorySummary, normalize_memory_type, parse_memory_type
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +52,10 @@ _GLOBAL_MEMORY_DIR = "~/.forge-agent/global/memory"
 _INDEX_FILENAME = "MEMORY.md"
 _FRONTMATTER_SEP = "---"
 _MAX_INDEX_LINES = 200  # MEMORY.md 默认最大行数
+_MAX_INDEX_BYTES = 25_600  # MEMORY.md 最大字节数 (25KB)
 
-# episodic（原 user）和 procedural（原 feedback）类型默认存储到全局（跨项目共享）
-_GLOBAL_MEMORY_TYPES = frozenset({"user", "feedback", "episodic", "procedural"})
+# user 和 feedback 类型默认存储到全局（跨项目共享）
+_GLOBAL_MEMORY_TYPES = frozenset({"user", "feedback"})
 
 # ---------------------------------------------------------------------------
 # YAML frontmatter 解析
@@ -86,20 +88,21 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 
 def _build_frontmatter(memory: Memory) -> str:
     """从 Memory 对象生成 YAML frontmatter 字符串。"""
-    meta: dict[str, Any] = {"type": memory.metadata.type}
+    fm: dict[str, Any] = {
+        "name": memory.name,
+        "description": memory.description,
+        "type": memory.metadata.type,
+        "updated_at": memory.updated_at,
+    }
+    meta: dict[str, Any] = {}
     if memory.metadata.stale:
         meta["stale"] = True
     if memory.metadata.access_count > 0:
         meta["access_count"] = memory.metadata.access_count
     if memory.metadata.validated_at:
         meta["validated_at"] = memory.metadata.validated_at
-
-    fm: dict[str, Any] = {
-        "name": memory.name,
-        "description": memory.description,
-        "metadata": meta,
-        "updated_at": memory.updated_at,
-    }
+    if meta:
+        fm["metadata"] = meta
     if memory.anchors:
         fm["anchors"] = [a.to_dict() for a in memory.anchors]
     return yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
@@ -109,6 +112,60 @@ def _build_memory_file(memory: Memory) -> str:
     """组装完整的记忆文件内容（frontmatter + body）。"""
     fm = _build_frontmatter(memory)
     return f"---\n{fm}\n---\n\n{memory.content.strip()}\n"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write text via temp file + os.replace() to avoid torn reads."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _needs_type_migration(frontmatter: dict[str, Any]) -> bool:
+    from memory.models import _OLD_TYPE_MAP, _VALID_MEMORY_TYPES
+
+    top_level_type = frontmatter.get("type")
+    metadata = frontmatter.get("metadata")
+    metadata_has_type = isinstance(metadata, dict) and "type" in metadata
+    if metadata_has_type:
+        return True
+    if top_level_type and top_level_type not in _VALID_MEMORY_TYPES:
+        return top_level_type in _OLD_TYPE_MAP
+    return not top_level_type
+
+
+def _truncate_index(content: str, max_lines: int = _MAX_INDEX_LINES, max_bytes: int = _MAX_INDEX_BYTES) -> str:
+    """
+    Truncate MEMORY.md content to 200-line / 25KB limits.
+
+    Aligned with Claude Code's truncateMemoryIndex():
+    - First truncate by lines
+    - Then truncate by bytes (at last newline boundary)
+    - Append WARNING if truncated
+    """
+    original = content
+    lines = content.splitlines()
+
+    # Line limit
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        content = "\n".join(lines)
+
+    # Byte limit (truncate at last newline before the limit)
+    encoded = content.encode("utf-8")
+    if len(encoded) > max_bytes:
+        truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        last_newline = truncated.rfind("\n")
+        if last_newline > 0:
+            content = truncated[:last_newline]
+        else:
+            content = truncated
+
+    if content != original:
+        content += "\n\n> WARNING: MEMORY.md is truncated. Only part of it was loaded."
+
+    return content
 
 
 def _project_hash(repo_path: str) -> str:
@@ -205,12 +262,12 @@ class MemoryStore:
                     value=a.get("value"),
                 ))
 
-        return Memory(
+        memory = Memory(
             name=fm.get("name", name),
             description=fm.get("description", ""),
             content=body,
             metadata=MemoryMetadata(
-                type=normalize_memory_type(meta.get("type", "reference")),
+                type=parse_memory_type(fm),
                 stale=bool(meta.get("stale", False)),
                 access_count=int(meta.get("access_count", 0)),
                 validated_at=str(meta.get("validated_at", "")),
@@ -218,6 +275,13 @@ class MemoryStore:
             updated_at=fm.get("updated_at", ""),
             anchors=anchors,
         )
+        if _needs_type_migration(fm):
+            try:
+                _atomic_write_text(path, _build_memory_file(memory))
+                self._dirty = True
+            except OSError:
+                pass
+        return memory
 
     def write_memory(self, memory: Memory) -> bool:
         """
@@ -234,7 +298,7 @@ class MemoryStore:
         content = _build_memory_file(memory)
         path = self._file_path(memory.name)
         try:
-            path.write_text(content, encoding="utf-8")
+            _atomic_write_text(path, content)
         except OSError as exc:
             logger.error("Failed to write memory %s: %s", memory.name, exc)
             return False
@@ -271,7 +335,7 @@ class MemoryStore:
         统计每种类型的记忆数量。
 
         Returns:
-            {type_name: count, ...} 例如 {"episodic": 3, "semantic": 5, "procedural": 2}
+            {type_name: count, ...} 例如 {"user": 1, "feedback": 3, "project": 5, "reference": 2}
         """
         counts: dict[str, int] = {}
         for summary in self.list_memories():
@@ -412,21 +476,22 @@ class MemoryStore:
         memory.metadata.validated_at = _now()
         return self.write_memory(memory)
 
-    def prune_expired(self, max_episodic_age_days: int = 30) -> int:
+    def prune_expired(
+        self,
+        max_episodic_age_days: int = 30,
+        *,
+        max_user_age_days: int | None = None,
+    ) -> int:
         """
-        清理过期的 episodic 记忆。
+        清理过期的 user 记忆。
 
-        保留策略：retention_days = max_episodic_age_days * (1 + access_count * 0.5)
-        只清理 episodic 类型，semantic 和 procedural 不受影响。
-
-        Args:
-            max_episodic_age_days: 基础最大保留天数
-
-        Returns:
-            被删除的记忆数量
+        保留策略：retention_days = max_age_days * (1 + access_count * 0.5)
+        只清理 user 类型；feedback/project/reference 不受影响。
+        max_user_age_days is accepted as the new-name alias for compatibility.
         """
         from datetime import datetime, timezone
 
+        max_age_days = max_user_age_days if max_user_age_days is not None else max_episodic_age_days
         now = datetime.now(timezone.utc)
         pruned = 0
         for fpath in sorted(self._store_dir.glob("*.md")):
@@ -436,7 +501,7 @@ class MemoryStore:
             memory = self.read_memory(name)
             if memory is None:
                 continue
-            if memory.metadata.type != "episodic":
+            if memory.metadata.type != "user":
                 continue
             if not memory.updated_at:
                 continue
@@ -445,7 +510,7 @@ class MemoryStore:
             except (ValueError, TypeError):
                 continue
             age_days = (now - updated).days
-            retention_days = max_episodic_age_days * (1 + memory.metadata.access_count * 0.5)
+            retention_days = max_age_days * (1 + memory.metadata.access_count * 0.5)
             if age_days > retention_days:
                 self.delete_memory(name)
                 pruned += 1
@@ -466,7 +531,7 @@ class MemoryStore:
         3. 外部向量搜索相似度 ≥ 0.85 → MERGE
         4. 相似度 0.5-0.85 → 调用 LLM judge → NOOP/UPDATE
         5. 无匹配 → ADD
-        6. procedural 无 file/symbol anchor → 降级为 semantic
+        6. feedback 无 file/symbol anchor → 降级为 project
 
         Args:
             candidate: MemoryCandidate 对象
@@ -478,14 +543,14 @@ class MemoryStore:
         """
         memory = candidate.to_memory()
 
-        # 类型降级：procedural 无 file/symbol anchor → semantic
-        if memory.metadata.type == "procedural":
+        # 类型降级：feedback 无 file/symbol anchor → project
+        if memory.metadata.type == "feedback":
             has_valid_anchor = any(
                 a.kind in ("file", "symbol") and (a.path or a.name)
                 for a in memory.anchors
             )
             if not has_valid_anchor:
-                memory.metadata.type = "semantic"
+                memory.metadata.type = "project"
 
         # 检查同名记忆
         existing = self.read_memory(candidate.name)
@@ -566,6 +631,9 @@ class MemoryStore:
         """
         获取 MEMORY.md 的内容（前 max_lines 行），用于注入 LLM 上下文。
 
+        Enforces 200-line / 25KB hard limits (aligned with Claude Code).
+        Truncation always happens at the last newline boundary before the limit.
+
         Args:
             max_lines: 最大行数，默认使用 self._max_index_lines
 
@@ -573,24 +641,18 @@ class MemoryStore:
             MEMORY.md 的纯文本内容，空 store 返回空字符串
         """
         if self._dirty or not self.index_path.exists():
-            # 索引脏了或不存在：重建
             self._rebuild_index()
             self._dirty = False
         if not self.index_path.exists():
             return ""
 
         text = self.index_path.read_text(encoding="utf-8").strip()
-        # 索引只有标题行（没有记忆条目）时返回空
         if text.count("\n") == 0 and ("# Memory Index" in text or not text):
             return ""
 
         limit = max_lines if max_lines is not None else self._max_index_lines
-        lines = text.splitlines()
-        if len(lines) > limit:
-            omitted = len(lines) - limit
-            lines = lines[:limit]
-            lines.append(f"... [{omitted} lines omitted]")
-        return "\n".join(lines)
+        result = _truncate_index(text, max_lines=limit, max_bytes=_MAX_INDEX_BYTES)
+        return result
 
     # ------------------------------------------------------------------
     # 内部
@@ -608,6 +670,8 @@ class MemoryStore:
         """
         从目录中的 .md 文件重建 MEMORY.md 索引。
         排除 MEMORY.md 自身。
+
+        Enforces 200-line / 25KB hard limits at write time (aligned with Claude Code).
         """
         summaries = self._scan_dir()
         lines = ["# Memory Index\n"]
@@ -615,7 +679,9 @@ class MemoryStore:
             lines.append(
                 f"- [{s.name}]({s.name}.md) — {s.description} ({s.type})"
             )
-        self.index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        content = "\n".join(lines) + "\n"
+        content = _truncate_index(content, max_lines=_MAX_INDEX_LINES, max_bytes=_MAX_INDEX_BYTES)
+        _atomic_write_text(self.index_path, content + "\n")
 
     def _scan_dir(self) -> list[MemorySummary]:
         """扫描目录，从 .md 文件中提取摘要（不含 MEMORY.md）。"""
@@ -636,7 +702,7 @@ class MemoryStore:
             summaries.append(MemorySummary(
                 name=fm.get("name", fpath.stem),
                 description=fm.get("description", ""),
-                type=normalize_memory_type(meta.get("type", "reference")),
+                type=parse_memory_type(fm),
                 updated_at=fm.get("updated_at", ""),
             ))
         return summaries
@@ -656,7 +722,7 @@ class MemoryStore:
                 summaries.append(MemorySummary(
                     name=m.group(1),
                     description=m.group(3).strip(),
-                    type=normalize_memory_type(m.group(4) or "reference"),
+                    type=normalize_memory_type(m.group(4)),
                 ))
         return summaries
 
@@ -787,10 +853,21 @@ class TwoTierMemoryStore(MemoryStore):
             return self._global_store.validate_memory(name)
         return False
 
-    def prune_expired(self, max_episodic_age_days: int = 30) -> int:
+    def prune_expired(
+        self,
+        max_episodic_age_days: int = 30,
+        *,
+        max_user_age_days: int | None = None,
+    ) -> int:
         """两层都清理。"""
-        count = super().prune_expired(max_episodic_age_days)
-        count += self._global_store.prune_expired(max_episodic_age_days)
+        count = super().prune_expired(
+            max_episodic_age_days,
+            max_user_age_days=max_user_age_days,
+        )
+        count += self._global_store.prune_expired(
+            max_episodic_age_days,
+            max_user_age_days=max_user_age_days,
+        )
         return count
 
     def consolidate(self, candidate: Any, external_store: Any = None, backend: Any = None) -> str:
