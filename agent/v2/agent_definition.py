@@ -82,12 +82,14 @@ def _parse_definition(path: Path) -> AgentDefinition | None:
 
     tools_raw = frontmatter.get("tools", "")
     disallowed_raw = frontmatter.get("disallowedTools", frontmatter.get("disallowed_tools", ""))
+    allowed_subagents_raw = frontmatter.get("allowedSubagents", frontmatter.get("allowed_subagents", None))
 
     return AgentDefinition(
         name=str(name),
         description=str(frontmatter.get("description", "")),
         tools=_parse_tool_list(tools_raw),
         disallowed_tools=_parse_tool_list(disallowed_raw),
+        allowed_subagents=_parse_optional_list(allowed_subagents_raw),
         model=str(frontmatter.get("model", "inherit")),
         isolation=str(frontmatter.get("isolation", "fork")),
         background=bool(frontmatter.get("background", False)),
@@ -107,3 +109,9 @@ def _parse_tool_list(value: Any) -> frozenset[str]:
     if isinstance(value, list):
         return frozenset(str(item).strip() for item in value if str(item).strip())
     return frozenset()
+
+
+def _parse_optional_list(value: Any) -> frozenset[str] | None:
+    if value is None:
+        return None
+    return _parse_tool_list(value)

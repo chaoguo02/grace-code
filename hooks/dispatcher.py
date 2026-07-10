@@ -43,6 +43,13 @@ class HookDispatcher:
         For blockable events (PreToolUse, UserPromptSubmit): exits 2 → block.
         For non-blockable events: exit codes are logged but don't block.
         """
+        return self._dispatch(event, context, force_blockable=False)
+
+    def dispatch_stop(self, context: HookContext) -> DispatchResult:
+        """Dispatch Stop hooks with Claude Code-style blocking semantics."""
+        return self._dispatch(HookEvent.STOP, context, force_blockable=True)
+
+    def _dispatch(self, event: HookEvent, context: HookContext, *, force_blockable: bool) -> DispatchResult:
         tool_name = context.tool_name
         tool_input = context.tool_input
 
@@ -60,7 +67,7 @@ class HookDispatcher:
             return DispatchResult()
 
         collected_context: list[str] = []
-        is_blockable = event in BLOCKABLE_EVENTS
+        is_blockable = force_blockable or event in BLOCKABLE_EVENTS
 
         for hook_config in external_hooks:
             result = execute_hook(
@@ -70,11 +77,14 @@ class HookDispatcher:
                 cwd=self._cwd,
             )
 
-            # Exit 2 = block (only for blockable events)
+            # Exit 2 = block (only for blockable events or dispatch_stop)
             if result.blocks and is_blockable:
+                reason = ""
+                if result.parsed and result.parsed.reason:
+                    reason = result.parsed.reason
                 return DispatchResult(
                     blocked=True,
-                    reason=result.stderr or "Blocked by hook",
+                    reason=reason or result.stderr or result.stdout or "Blocked by hook",
                 )
 
             # Exit 0 with explicit approve decision

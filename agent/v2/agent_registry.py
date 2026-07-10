@@ -83,7 +83,7 @@ class AgentRegistryV2:
     def list_subagents(self) -> list[AgentDefinition]:
         return [
             spec for spec in self._agents.values()
-            if not spec.hidden
+            if not spec.hidden and spec.isolation != "none"
         ]
 
     def list_primary_agents(self) -> list[AgentDefinition]:

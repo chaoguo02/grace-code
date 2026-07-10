@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import abc
 import os
+import re
 import shutil
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from typing import Any
 
 
@@ -175,6 +177,11 @@ class InlineRenderer(RendererBase):
         self._round_tokens = 0
         self._round_steps = 0
         self._round_start = time.time()
+        self._thought_active = False
+        self._thought_line_start = True
+        self._thought_buffer: list[str] = []
+        self._answer_active = False
+        self._answer_line_start = True
         self._init_md_theme()
 
     @classmethod
@@ -258,19 +265,39 @@ class InlineRenderer(RendererBase):
 
     def stream_text(self, token: str) -> None:
         with self._lock:
-            if not self._streaming:
+            if not self._answer_active:
+                self._answer_active = True
+                self._answer_line_start = True
                 self._streaming = True
+                self._finish_thought_block()
                 self._clear_status_bar()
                 self._stream_rendered_lines = 0
+                sys.stdout.write("\n" + _bold(_green("💬 Answer")) + "\n")
             self._stream_buffer.append(token)
             self._stream_line_count += token.count("\n")
+            for ch in token:
+                if self._answer_line_start:
+                    sys.stdout.write("  ")
+                    self._answer_line_start = False
+                sys.stdout.write(ch)
+                if ch == "\n":
+                    self._answer_line_start = True
+            sys.stdout.flush()
 
     def stream_thought(self, token: str) -> None:
         with self._lock:
-            if not self._streaming:
-                self._streaming = True
+            if not self._thought_active:
+                self._thought_active = True
+                self._thought_line_start = True
                 self._clear_status_bar()
-            sys.stdout.write(_dim(token))
+                sys.stdout.write("\n" + _bold(_magenta("💭 Think")) + "\n")
+            for ch in token:
+                if self._thought_line_start:
+                    sys.stdout.write(_dim("  "))
+                    self._thought_line_start = False
+                sys.stdout.write(_dim(ch))
+                if ch == "\n":
+                    self._thought_line_start = True
             sys.stdout.flush()
 
     def _render_markdown(self, text: str, *, indent: str = "") -> str:
@@ -323,13 +350,106 @@ class InlineRenderer(RendererBase):
 
     # ── 工具面板 ──────────────────────────────────────────────────
 
+    def _finish_thought_block(self) -> None:
+        if self._thought_active:
+            if not self._thought_line_start:
+                sys.stdout.write("\n")
+            sys.stdout.write("\n")
+            self._thought_active = False
+            self._thought_line_start = True
+
+    def _finish_answer_block(self) -> None:
+        if self._answer_active:
+            if not self._answer_line_start:
+                sys.stdout.write("\n")
+            sys.stdout.write("\n")
+            self._answer_active = False
+            self._answer_line_start = True
+
     def _format_tool_header(self, step: int, name: str, key_info: str) -> str:
-        icon = "─"
-        prefix = _yellow(f"  {icon} ")
-        label = _bold(_yellow(f"[{step}] {name}"))
+        label = _bold(_yellow(f"🛠 ToolCall [{step}] {name}"))
         if key_info:
-            label += _dim(f" {key_info}")
-        return f"{prefix}{label}"
+            label += _dim(f" → {key_info}")
+        return f"{label}"
+
+    def _format_task_tool_header(self, step: int, params: dict[str, Any]) -> str:
+        subagent = str(params.get("subagent_type", "?")).strip() or "?"
+        description = str(params.get("description", "")).strip()
+        prompt = str(params.get("prompt", "")).strip()
+        lines = [f"{_bold(_yellow(f'🛠 ToolCall [{step}] task'))} {_dim('→')} {_bold(subagent)}"]
+        if description:
+            lines.append(_dim(f"    task: {description[:100]}"))
+        if prompt:
+            preview = prompt.replace("\n", " ")[:140]
+            if len(prompt) > 140:
+                preview += "..."
+            lines.append(_dim(f"    prompt: {preview}"))
+        return "\n".join(lines)
+
+    def _parse_task_notification(self, output: str) -> dict[str, str] | None:
+        text = output.strip()
+        if not text.startswith("<task-notification>"):
+            return None
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return self._parse_task_notification_lenient(text)
+        if root.tag != "task-notification":
+            return None
+        def _text(tag: str) -> str:
+            node = root.find(tag)
+            return (node.text or "").strip() if node is not None else ""
+        return {
+            "agent_type": _text("agent-type"),
+            "session_id": _text("session-id"),
+            "status": _text("status"),
+            "turns_used": _text("turns-used"),
+            "error": _text("error"),
+            "summary": _text("summary"),
+        }
+
+    def _parse_task_notification_lenient(self, text: str) -> dict[str, str] | None:
+        """Best-effort parser for task notifications with unescaped summary text."""
+        if "<task-notification>" not in text:
+            return None
+
+        def _tag(name: str) -> str:
+            match = re.search(rf"<{re.escape(name)}>(.*?)</{re.escape(name)}>", text, re.DOTALL)
+            return match.group(1).strip() if match else ""
+
+        return {
+            "agent_type": _tag("agent-type"),
+            "session_id": _tag("session-id"),
+            "status": _tag("status"),
+            "turns_used": _tag("turns-used"),
+            "error": _tag("error"),
+            "summary": _tag("summary"),
+        }
+
+    def _format_task_observation(self, output: str, error: str | None) -> str:
+        notification = self._parse_task_notification(output)
+        if notification is None:
+            return self._format_tool_output("success" if not error else "error", output, error)
+        agent = notification.get("agent_type") or "subagent"
+        status = notification.get("status") or "unknown"
+        session = notification.get("session_id") or "?"
+        turns = notification.get("turns_used") or "?"
+        summary = notification.get("summary") or "(no summary)"
+        err = notification.get("error") or error or ""
+        icon = "✅" if status == "completed" else ("⚠️" if status == "partial" else "❌")
+        status_text = _green(status) if status == "completed" else (_yellow(status) if status == "partial" else _red(status))
+        lines = [
+            f"{_bold(_cyan('🤖 Subagent'))} {_bold(agent)} {icon} {status_text}",
+            _dim(f"    session: {session} · turns: {turns}"),
+        ]
+        if err:
+            lines.append(_red(f"    error: {err}"))
+        lines.append(_dim("    summary:"))
+        for line in summary.splitlines()[:20]:
+            lines.append(f"      {line}")
+        if len(summary.splitlines()) > 20:
+            lines.append(_dim(f"      ... ({len(summary.splitlines()) - 20} more lines)"))
+        return "\n".join(lines)
 
     def _format_file_read_summary(self, tool_name: str, output: str) -> str:
         """Summarize file read/view output without dumping file contents."""
@@ -381,6 +501,8 @@ class InlineRenderer(RendererBase):
                 self._streaming = False
 
             self._clear_status_bar()
+            self._finish_thought_block()
+            self._finish_answer_block()
 
             key = ""
             for k in ("cmd", "path", "pattern", "symbol", "message", "query"):
@@ -388,7 +510,10 @@ class InlineRenderer(RendererBase):
                     key = str(params[k])[:60]
                     break
 
-            header = self._format_tool_header(step, name, key)
+            if name == "task":
+                header = self._format_task_tool_header(step, params)
+            else:
+                header = self._format_tool_header(step, name, key)
             sys.stdout.write(f"{header}\n")
             sys.stdout.flush()
 
@@ -411,7 +536,9 @@ class InlineRenderer(RendererBase):
                 "find_files", "find_symbol",
             }
 
-            if status == "success":
+            if tool_name == "task":
+                sys.stdout.write(f"{self._format_task_observation(output, error)}\n")
+            elif status == "success":
                 if tool_name in {"file_read", "file_view"}:
                     sys.stdout.write(f"{self._format_file_read_summary(tool_name, output)}\n")
                 elif silent:
@@ -450,6 +577,7 @@ class InlineRenderer(RendererBase):
     def on_reflection(self, reason: str) -> None:
         with self._lock:
             self._clear_status_bar()
+            self._finish_thought_block()
             if self._streaming:
                 if self._stream_rendered_lines > 0:
                     self._erase_rendered_lines(self._stream_rendered_lines)
@@ -465,23 +593,28 @@ class InlineRenderer(RendererBase):
     def on_finish(self, step: int, message: str) -> None:
         with self._lock:
             self._clear_status_bar()
+            self._finish_thought_block()
+            was_answer_streamed = self._answer_active
+            self._finish_answer_block()
             streamed_text = "".join(self._stream_buffer)
             was_streaming = self._streaming
             if was_streaming:
                 self._streaming = False
                 self._stream_buffer.clear()
 
-            display_text = streamed_text or message
-            if display_text:
-                rendered = self._render_markdown(display_text, indent="  ")
-                if rendered:
-                    sys.stdout.write(f"\n{rendered}\n")
-            sys.stdout.write(_green(f"\n  ✓ Done (step {step})\n"))
+            if not was_answer_streamed:
+                display_text = streamed_text or message
+                if display_text:
+                    rendered = self._render_markdown(display_text, indent="  ")
+                    if rendered:
+                        sys.stdout.write(f"\n{rendered}\n")
+            sys.stdout.write(_green(f"\n✅ Finish [{step}]\n"))
             sys.stdout.flush()
 
     def on_give_up(self, step: int, message: str) -> None:
         with self._lock:
             self._clear_status_bar()
+            self._finish_thought_block()
             streamed_text = "".join(self._stream_buffer)
             was_streaming = self._streaming
             if was_streaming:

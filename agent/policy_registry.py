@@ -73,6 +73,26 @@ class PolicyAwareToolRegistry(ToolRegistry):
                 return False
         return True
 
+    def _is_tool_enabled(self, name: str) -> bool:
+        if name in {"artifact_list", "artifact_read", "artifact_search"}:
+            return self._artifact_store_ref is not None and self._artifact_store_ref.store is not None
+        if name in {"evidence_list", "evidence_get"}:
+            return self._evidence_ledger_ref is not None and self._evidence_ledger_ref.ledger is not None
+        return True
+
+    def get_schemas(self):
+        schemas = [
+            tool.to_llm_schema()
+            for name, tool in self._tools.items()
+            if self._is_tool_enabled(name)
+        ]
+        schemas.sort(key=lambda s: s.name)
+        return schemas
+
+    @property
+    def tool_names(self) -> list[str]:
+        return [name for name in self._tools.keys() if self._is_tool_enabled(name)]
+
     def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
         start = time.perf_counter()
         violation = self._check_tool_call(name, params)
@@ -98,6 +118,8 @@ class PolicyAwareToolRegistry(ToolRegistry):
             )
         if name not in self._tools:
             return f"Tool '{name}' is blocked by task policy in {self._phase_name} phase. Available tools: {', '.join(self.tool_names) or 'none'}"
+        if not self._is_tool_enabled(name):
+            return f"Tool '{name}' is not available in the current environment. Available tools: {', '.join(self.tool_names) or 'none'}"
         if name in self._phase_policy.denied_tools:
             return f"Tool '{name}' is blocked by task policy."
 

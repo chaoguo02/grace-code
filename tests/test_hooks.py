@@ -57,6 +57,11 @@ class TestHookContext:
         assert ctx.tool_output is None
         assert ctx.user_input == ""
 
+    def test_messages_are_serialized(self):
+        messages = [{"role": "user", "content": "hi"}]
+        ctx = HookContext(event=HookEvent.STOP, messages=messages)
+        assert ctx.to_dict()["messages"] == messages
+
 
 # ─── HookMatcher tests ───────────────────────────────────────────────────────
 
@@ -242,6 +247,39 @@ class TestHookDispatcher:
         result = dispatcher.dispatch(HookEvent.PRE_TOOL_USE, ctx)
 
         assert result.approved_explicitly is True
+        assert result.blocked is False
+
+    @patch("hooks.executor.subprocess.run")
+    def test_dispatch_stop_blocks_on_exit_2(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=2, stdout="", stderr="tests failed"
+        )
+        registry = HookRegistry()
+        registry._external[HookEvent.STOP].append(
+            ExternalHookConfig(command="python -m pytest", matcher=HookMatcher(pattern="*"))
+        )
+        dispatcher = HookDispatcher(registry)
+
+        ctx = HookContext(event=HookEvent.STOP, messages=[{"role": "assistant", "content": "done"}])
+        result = dispatcher.dispatch_stop(ctx)
+
+        assert result.blocked is True
+        assert "tests failed" in result.reason
+
+    @patch("hooks.executor.subprocess.run")
+    def test_regular_stop_dispatch_remains_non_blockable(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=2, stdout="", stderr="tests failed"
+        )
+        registry = HookRegistry()
+        registry._external[HookEvent.STOP].append(
+            ExternalHookConfig(command="python -m pytest", matcher=HookMatcher(pattern="*"))
+        )
+        dispatcher = HookDispatcher(registry)
+
+        ctx = HookContext(event=HookEvent.STOP)
+        result = dispatcher.dispatch(HookEvent.STOP, ctx)
+
         assert result.blocked is False
 
     @patch("hooks.executor.subprocess.run")

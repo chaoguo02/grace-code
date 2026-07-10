@@ -15,7 +15,7 @@ from agent.v2.models import AgentDefinition, ForkResult
 from agent.policy_registry import PolicyAwareToolRegistry
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
-from agent.v2.task_tool import AgentTool
+from agent.v2.task_tool import AgentTool, VIOLATION_MARKER
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
@@ -43,6 +43,7 @@ class SessionRuntime:
         memory_context=None,
         hook_dispatcher=None,
         mcp_integration=None,
+        event_callback=None,
     ) -> None:
         self._store = store
         self._backend = backend
@@ -53,6 +54,7 @@ class SessionRuntime:
         self._memory_context = memory_context
         self._hook_dispatcher = hook_dispatcher
         self._mcp_integration = mcp_integration
+        self._event_callback = event_callback
 
     @property
     def agent_registry(self) -> AgentRegistryV2:
@@ -140,6 +142,17 @@ class SessionRuntime:
 
         initial_count = len(persisted_messages)
         with EventLog.create(task, log_dir=self._log_dir) as log:
+            if self._event_callback is not None:
+                original_append = log._append
+
+                def _append_and_emit(event):
+                    original_append(event)
+                    try:
+                        self._event_callback(event)
+                    except Exception:
+                        logger.debug("V2 event callback failed", exc_info=True)
+
+                log._append = _append_and_emit
             result = agent.run(task, log)
 
         for message in history.to_list()[initial_count:]:
@@ -202,13 +215,13 @@ class SessionRuntime:
             registry = self._base_registry.filtered(_BUILD_ALLOWED | mcp_tool_names)
             plan_mode_allowed = _PLAN_ALLOWED
         else:
-            from agent.v2.agent_registry import _BUILD_ALLOWED
-            registry = self._base_registry.filtered(_BUILD_ALLOWED | mcp_tool_names)
+            registry = self._base_registry.filtered(self._agent_registry.tool_names_for(spec.name) | mcp_tool_names)
             plan_mode_allowed = None
 
-        # Coordinator agents get the task tool
-        if spec.name in ("build", "plan"):
-            registry.register(AgentTool(self, session.id))
+        # Agents with an explicit subagent allowlist get the task tool.
+        if spec.allowed_subagents is not None:
+            registry._tools.pop("task", None)
+            registry.register(AgentTool(self, session.id, caller_agent_name=spec.name))
 
         wrapped = PolicyAwareToolRegistry(
             base=registry,
@@ -222,7 +235,7 @@ class SessionRuntime:
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()
-        if spec.name not in {"build", "general"}:
+        if spec.name not in {"build", "general", "coordinator"}:
             return frozenset()
         return getattr(self._mcp_integration, "tool_names", frozenset())
 
@@ -259,7 +272,61 @@ class SessionRuntime:
             "- Use subagents for independent, clearly-scoped work.\n"
             "- Do simple tasks directly without delegating.\n"
             "- Never hand off understanding — you can delegate execution, not comprehension.\n"
-            "- When the user explicitly asks to use the task tool or delegate, call it instead of answering directly."
+            "- When the user explicitly asks to use the task tool or delegate, call it instead of answering directly.\n\n"
+            "Atomic Task Boundaries (MANDATORY — prevent subagent failure at the source):\n"
+            "Every task prompt you write MUST specify:\n"
+            "1. SCOPE: which files to touch (limit to 1-3 files per subagent).\n"
+            "2. CONSTRAINTS: what NOT to do. Always include at least one explicit\n"
+            "   negative constraint (\"Do NOT modify files\", \"Do NOT run tests\",\n"
+            "   \"Only read — do not write\", \"Stop after finding the root cause\").\n"
+            "3. DELIVERABLE: the exact output format expected.\n"
+            "A well-scoped subagent task finishes in 2-5 turns. If you think it\n"
+            "needs more, SPLIT it into 2-3 smaller tasks and delegate each separately.\n"
+            "Broad tasks like \"analyze this repo\" or \"fix the bugs\" will fail.\n\n"
+            "Subagent Output Review Protocol (MANDATORY — you are the final arbiter):\n"
+            "1. INSPECT before you relay. Every Confirmed Bug from a subagent MUST have:\n"
+            "   - A specific file path and line number.\n"
+            "   - A code snippet (``` fence) showing actual code read.\n"
+            "   - A verification description (how the finding was confirmed).\n"
+            "   If any of these is missing → DOWNGRADE to [UNVERIFIED]. Do NOT present as fact.\n"
+            "2. CHECK for format violations. If the subagent output contains "
+            f"\"{VIOLATION_MARKER}\", ALL findings must be "
+            "treated as [UNVERIFIED]. Report them under a separate section with "
+            "an explicit disclaimer.\n"
+            "3. SPOT DESIGN PATTERNS. Before accepting a bug report, ask yourself: "
+            "\"Is this reported behavior actually documented as intentional?\" "
+            "Examples of intentional patterns the subagent may misreport:\n"
+            "   - partial status with success=True (constrained run, WARNING is prepended)\n"
+            "   - Any behavior explained in comments, docstrings, or rules.\n"
+            "4. NEVER verbatim-forward a subagent report. Always re-express findings "
+            "in your own words after applying the checks above.\n"
+            "5. STRUCTURE your final output as:\n"
+            "   - Confirmed Issues (you or subagent verified with code evidence)\n"
+            "   - Unverified Claims (subagent reported but lacks evidence → marked [UNVERIFIED])\n"
+            "   - Design Observations (stylistic notes, not bugs)\n\n"
+            "Subagent Failure Recovery (decision tree — follow in order):\n"
+            "1. READ the <failure-diagnosis> block for failure_type, last_action,\n"
+            "   repeated_count, and diagnosis.\n"
+            "2. CLASSIFY and ACT:\n"
+            "   - TRANSIENT ERROR (network, timeout, rate-limit in error field)\n"
+            "     → Retry: same subagent, same task. Max 1 retry. State the reason.\n"
+            "   - LOOP (failure_type=gave_up + repeated_count ≥ 3)\n"
+            "     → Degrade and handle directly. The subagent was stuck repeating.\n"
+            "     Break the remaining work into atomic pieces and do it yourself.\n"
+            "     Do NOT retry with the same subagent type — it will loop again.\n"
+            "   - CAPABILITY LIMIT (failure_type=gave_up, no loop pattern)\n"
+            "     → Degrade. Take over the work yourself, starting from where the\n"
+            "     subagent left off. Report what the subagent completed so far.\n"
+            "   - RAN OUT OF TURNS (failure_type=max_steps / status=partial)\n"
+            "     → Split and retry. Break the original task into 2-3 smaller\n"
+            "     sub-tasks and delegate each to a fresh subagent.\n"
+            "   - NON-TRANSIENT ERROR (failure_type=error / failed)\n"
+            "     → Report to user. Subagent crashed. Do NOT retry. Tell the user\n"
+            "     what failed and present any partial results already obtained.\n"
+            "3. CIRCUIT BREAKER: after 2 consecutive failures → STOP ALL DELEGATION.\n"
+            "   Report: what was accomplished, what failed, and what the user should\n"
+            "   do next. Do not launch more subagents.\n"
+            "4. When degrading, state clearly: \"Subagent failed (type). Handling directly.\"\n"
         )
         messages.append(LLMMessage(role="user", content=content))
         return messages

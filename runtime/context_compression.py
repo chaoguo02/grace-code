@@ -9,8 +9,9 @@ applyToolResultBudget → snipCompact → microcompact → contextCollapse
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,26 @@ MANUAL_COMPACT_BUFFER_TOKENS = 3_000
 
 DEFAULT_MAX_RESULT_CHARS = 50_000
 TOOL_RESULT_PREVIEW_CHARS = 2_000
+MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000
 MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+
+TOOL_RESULT_BUDGETS: dict[str, float] = {
+    "shell": 30_000,
+    "bash": 30_000,
+    "search_text": 20_000,
+    "grep": 20_000,
+    "find_files": 100_000,
+    "glob": 100_000,
+    "web_fetch": 100_000,
+    "file_edit": 100_000,
+    "file_write": 100_000,
+    "edit": 100_000,
+    "write": 100_000,
+    "file_read": math.inf,
+    "file_view": math.inf,
+    "read": math.inf,
+    "task": math.inf,
+}
 
 
 @dataclass
@@ -44,31 +64,132 @@ class AutoCompactTrackingState:
     turn_id: str = ""
 
 
+@dataclass
+class ContentReplacementDecision:
+    """Stable per-tool-result budget decision."""
+
+    replaced: bool
+    content: str
+
+
+@dataclass
+class ContentReplacementState:
+    """Stable replacement decisions keyed by tool_use_id."""
+
+    decisions: dict[str, ContentReplacementDecision] = field(default_factory=dict)
+
+
+@dataclass
+class _ToolResultCandidate:
+    index: int
+    key: str
+    tool_name: str
+    content: str
+    char_count: int
+    budget: float
+    fresh: bool
+
+
 def apply_tool_result_budget(
     messages: list[Any],
-    max_chars: int = DEFAULT_MAX_RESULT_CHARS,
+    max_chars: int | None = None,
     preview_chars: int = TOOL_RESULT_PREVIEW_CHARS,
+    *,
+    replacement_state: ContentReplacementState | None = None,
+    tool_budgets: Mapping[str, float] | None = None,
+    max_total_chars: int = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS,
 ) -> tuple[list[Any], int]:
-    """Truncate oversized individual tool_result messages."""
+    """Apply per-tool and aggregate tool_result budgets with stable decisions."""
+    budgets = tool_budgets or TOOL_RESULT_BUDGETS
+    default_budget = float(max_chars if max_chars is not None else DEFAULT_MAX_RESULT_CHARS)
+    result = list(messages)
     tokens_freed = 0
-    result = []
+    candidates: list[_ToolResultCandidate] = []
 
-    for msg in messages:
-        if _is_tool_result_message(msg):
-            content = _get_tool_result_content(msg)
-            if isinstance(content, str) and len(content) > max_chars:
-                preview = content[:preview_chars]
-                truncated_msg = _set_tool_result_content(
-                    msg,
-                    f"{preview}\n\n"
-                    f"[... truncated {len(content) - preview_chars} chars. "
-                    f"Use the tool again with more specific parameters "
-                    f"to get the remaining content.]",
+    for index, msg in enumerate(result):
+        if not _is_tool_result_message(msg):
+            continue
+        content = _get_tool_result_content(msg)
+        if not isinstance(content, str):
+            continue
+        tool_name = _get_tool_result_tool_name(msg)
+        key = _get_tool_result_key(msg, index=index, tool_name=tool_name)
+        budget = float(budgets.get(tool_name, default_budget))
+        decision = replacement_state.decisions.get(key) if replacement_state is not None else None
+        if decision is not None:
+            result[index] = _set_tool_result_content(msg, decision.content)
+            tokens_freed += max(0, len(content) - len(decision.content)) // 4
+            candidates.append(_ToolResultCandidate(
+                index=index,
+                key=key,
+                tool_name=tool_name,
+                content=decision.content,
+                char_count=len(decision.content),
+                budget=budget,
+                fresh=False,
+            ))
+            continue
+
+        if len(content) > budget:
+            replacement = _make_tool_result_preview(content, preview_chars=preview_chars)
+            result[index] = _set_tool_result_content(msg, replacement)
+            tokens_freed += max(0, len(content) - preview_chars) // 4
+            if replacement_state is not None:
+                replacement_state.decisions[key] = ContentReplacementDecision(
+                    replaced=True,
+                    content=replacement,
                 )
-                tokens_freed += max(0, len(content) - preview_chars) // 4
-                result.append(truncated_msg)
-                continue
-        result.append(msg)
+            candidates.append(_ToolResultCandidate(
+                index=index,
+                key=key,
+                tool_name=tool_name,
+                content=replacement,
+                char_count=len(replacement),
+                budget=budget,
+                fresh=False,
+            ))
+            continue
+
+        if replacement_state is not None:
+            replacement_state.decisions[key] = ContentReplacementDecision(
+                replaced=False,
+                content=content,
+            )
+        candidates.append(_ToolResultCandidate(
+            index=index,
+            key=key,
+            tool_name=tool_name,
+            content=content,
+            char_count=len(content),
+            budget=budget,
+            fresh=True,
+        ))
+
+    total_chars = sum(candidate.char_count for candidate in candidates)
+    if total_chars <= max_total_chars:
+        return result, tokens_freed
+
+    replaceable = [candidate for candidate in candidates if candidate.fresh]
+    replaceable.sort(key=lambda c: (math.isinf(c.budget), -c.char_count))
+
+    for candidate in replaceable:
+        if total_chars <= max_total_chars:
+            break
+        if candidate.char_count <= preview_chars:
+            continue
+        current_content = _get_tool_result_content(result[candidate.index])
+        if not isinstance(current_content, str):
+            continue
+        replacement = _make_tool_result_preview(current_content, preview_chars=preview_chars)
+        result[candidate.index] = _set_tool_result_content(result[candidate.index], replacement)
+        freed_chars = max(0, len(current_content) - len(replacement))
+        tokens_freed += freed_chars // 4
+        total_chars -= freed_chars
+        if replacement_state is not None:
+            replacement_state.decisions[candidate.key] = ContentReplacementDecision(
+                replaced=True,
+                content=replacement,
+            )
 
     return result, tokens_freed
 
@@ -228,6 +349,7 @@ async def compress_messages(
     context_window: int = DEFAULT_CONTEXT_WINDOW,
     call_model_for_summary: Callable | None = None,
     autocompact_tracking: AutoCompactTrackingState | None = None,
+    content_replacement_state: ContentReplacementState | None = None,
     enable_budget: bool = True,
     enable_snip: bool = True,
     enable_microcompact: bool = True,
@@ -240,7 +362,10 @@ async def compress_messages(
     layers_applied: list[str] = []
 
     if enable_budget:
-        result_messages, freed = apply_tool_result_budget(result_messages)
+        result_messages, freed = apply_tool_result_budget(
+            result_messages,
+            replacement_state=content_replacement_state,
+        )
         total_freed += freed
         if freed > 0:
             layers_applied.append("budget")
@@ -336,6 +461,38 @@ def _get_tool_result_content(msg: Any) -> Any:
                     return block.get("content", "")
         return content
     return ""
+
+
+def _get_tool_result_tool_name(msg: Any) -> str:
+    if isinstance(msg, dict):
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    return str(block.get("tool_name") or block.get("name") or "")
+    return ""
+
+
+def _get_tool_result_key(msg: Any, *, index: int, tool_name: str) -> str:
+    if isinstance(msg, dict):
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_use_id = block.get("tool_use_id")
+                    if tool_use_id:
+                        return str(tool_use_id)
+    return f"{index}:{tool_name}"
+
+
+def _make_tool_result_preview(content: str, *, preview_chars: int) -> str:
+    preview = content[:preview_chars]
+    return (
+        f"{preview}\n\n"
+        f"[... truncated {len(content) - preview_chars} chars. "
+        f"Use the tool again with more specific parameters "
+        f"to get the remaining content.]"
+    )
 
 
 def _set_tool_result_content(msg: Any, new_content: str) -> dict:

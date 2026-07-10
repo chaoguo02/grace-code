@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _V2_DELEGATION_BLOCK_PREFIX = "BLOCKED_BY_DELEGATION_POLICY:"
+_MAX_STOP_HOOK_RETRIES = 3
 
 AnalysisPhase = Literal["plan_reads", "discover", "inspect", "synthesize", "verify", "answer"]
 
@@ -243,6 +244,7 @@ class ReActAgent:
         ))
         self._session_context: str | None = None  # set by ChatSession per round
         self._analysis_read_plan: ReadPlan | None = None
+        self._stop_hook_count = 0
 
     @property
     def step_count(self) -> int:
@@ -316,12 +318,9 @@ class ReActAgent:
             del self._long_term_context
         self._build_long_term_context()
 
-        self._loop_break_injected = False
-        self._loop_detected_count = 0
         self._accessed_files: set[str] = set()
         self._feedback_injected_files: set[str] = set()
         self._explicit_memory_write_this_run = False
-        self._read_file_ranges: set[tuple[str, int, int | None]] = set()
         self._analysis_read_guardrail_injected = False
         self._deferred_read_reflection_injected = False
         self._analysis_answer_phase_forced = False
@@ -597,74 +596,48 @@ class ReActAgent:
                     cache_stats=cumulative_cache,
                 )
 
-            # ── 3. 检测死循环（连续相同 action）────────────────────────
-            # 3 级分级响应（阈值 3 参考 Claude Code autoCompact 断路器）
-            # Level A: 首次检测 → 注入 break reflection（给模型一次纠正机会）
-            # Level B: 二次检测 → 注入 cwd 诊断提示，再给一次机会
-            # Level C: 三次检测 → 硬终止 GAVE_UP
+            # ── 3. 死循环检测（立即终止，不注入提示）──────────────
+            # Claude Code 风格：检测到循环立即终止，不浪费 turns 注入
+            # "break reflection" 或诊断提示。
+            # 两层检测：
+            #   Level 1 (window=3): 严格匹配 — 相同 tool + 相同参数
+            #   Level 2 (window=4): 语义匹配 — 相同 tool 名多重集（排除文件读写）
+            # 阈值设计依据：
+            #   - 2-3 次重试是正常的（网络错误、API 限流）
+            #   - 4+ 次语义匹配说明 Agent 在原地打转
             if self._is_looping(log):
-                _loop_count = getattr(self, "_loop_detected_count", 0) + 1
-                self._loop_detected_count = _loop_count
-
-                if _loop_count == 1:
-                    self._loop_break_injected = True
-                    logger.warning("Loop detected (level A) — injecting break reflection")
-                    recent_actions = log.get_actions()[-self._cfg.loop_detection_window:]
-                    tool_params = [
-                        str((tc.name, tc.params))
-                        for a in recent_actions for tc in (a.tool_calls or [])
-                    ]
-                    params_vary = len(set(tool_params)) > 1
-                    if params_vary:
-                        reflect_content = (
-                            "[SYSTEM] Your recent actions follow a repetitive pattern, but parameters differ.\n"
-                            "Consider: (1) Can you batch remaining work more efficiently?\n"
-                            "(2) Is there a faster approach (e.g., shell/sed for bulk changes)?\n"
-                            "(3) If all necessary changes are already done, call finish now.\n\n"
-                            f"[TASK ANCHOR] {task.description}"
-                        )
-                    else:
-                        reflect_content = (
-                            "[SYSTEM] You are repeating the exact same action with identical parameters.\n"
-                            "This is not making progress. STOP and try a completely different approach.\n"
-                            "If the task is already complete, call finish.\n\n"
-                            f"[TASK ANCHOR] {task.description}"
-                        )
-                    history.add(LLMMessage(role="user", content=reflect_content))
-                    continue
-
-                elif _loop_count == 2:
-                    # Level B: 提供 cwd 诊断提示，再给一次纠正机会
-                    logger.warning("Loop detected (level B) — injecting diagnostic hint")
-                    diag_content = (
-                        "[SYSTEM] Circuit breaker: you are still repeating the same action "
-                        "after being warned.\n"
-                        f"Common cause: shell commands using relative paths. "
-                        f"The working directory is NOT the target repository.\n"
-                        f"Fix: use cwd parameter set to '{task.repo_path}', "
-                        f"or prefix with 'cd {task.repo_path} && <command>'.\n\n"
-                        "If verification is failing but the core task IS done, "
-                        "call finish now with your summary of what was accomplished.\n\n"
-                        f"[TASK ANCHOR] {task.description}"
-                    )
-                    history.add(LLMMessage(role="user", content=diag_content))
-                    continue
-
-                else:
-                    # Level C: 硬终止
-                    reason = f"Loop detected: same action repeated after {_loop_count} warnings"
-                    logger.warning(reason)
-                    log.log_task_failed(steps=step, reason=reason)
-                    return _finish_run(
-                        status=RunStatus.GAVE_UP,
-                        summary=reason,
-                        steps_taken=step,
-                        total_tokens_used=total_tokens,
-                        cache_stats=cumulative_cache,
-                    )
+                diagnosis = self._build_loop_diagnosis(log)
+                logger.warning("Loop detected — terminating: %s", diagnosis)
+                log.log_task_failed(steps=step, reason=diagnosis)
+                return _finish_run(
+                    status=RunStatus.GAVE_UP,
+                    summary=diagnosis,
+                    steps_taken=step,
+                    total_tokens_used=total_tokens,
+                    cache_stats=cumulative_cache,
+                )
 
             # ── 4. 终止 action ──────────────────────────────────────────
             if action.action_type == ActionType.FINISH:
+                stop_message = self._run_stop_hook(history)
+                if stop_message is not None:
+                    next_count = self._stop_hook_count + 1
+                    if next_count > _MAX_STOP_HOOK_RETRIES:
+                        reason = f"Stop hook retry limit reached: {_MAX_STOP_HOOK_RETRIES}"
+                        logger.warning(reason)
+                        log.log_task_failed(steps=step, reason=reason)
+                        return _finish_run(
+                            status=RunStatus.GAVE_UP,
+                            summary=reason,
+                            steps_taken=step,
+                            total_tokens_used=total_tokens,
+                            cache_stats=cumulative_cache,
+                        )
+                    self._stop_hook_count = next_count
+                    history.add(LLMMessage(role="user", content=stop_message))
+                    continue
+
+                self._stop_hook_count = 0
                 summary = action.message or "Task complete."
                 patch = self._get_git_diff(task.repo_path)
                 log.log_task_complete(steps=step, summary=summary)
@@ -729,11 +702,7 @@ class ReActAgent:
                             level="WARNING",
                         )
                     else:
-                        duplicate_observation = self._duplicate_file_read_observation(tc, task.repo_path)
-                        if duplicate_observation is not None:
-                            observation = duplicate_observation
-                        else:
-                            with observer.start_tool(
+                        with observer.start_tool(
                                 name=f"tool:{tc.name}",
                                 input_data=build_tool_input(
                                     tc.name,
@@ -754,15 +723,15 @@ class ReActAgent:
                                     ),
                                     metadata={"tool_name": tc.name, "duration_ms": result.duration_ms},
                                 )
-                            observation = result.to_observation(tc.name)
-                            if tc.name == "memory_write" and observation.is_success():
-                                self._explicit_memory_write_this_run = True
-                            if (
-                                observation.error
-                                and observation.error.startswith(_V2_DELEGATION_BLOCK_PREFIX)
-                            ):
-                                observation.metadata["expected_block"] = True
-                                observation.metadata["block_kind"] = "v2_delegation_policy"
+                        observation = result.to_observation(tc.name)
+                        if tc.name == "memory_write" and observation.is_success():
+                            self._explicit_memory_write_this_run = True
+                        if (
+                            observation.error
+                            and observation.error.startswith(_V2_DELEGATION_BLOCK_PREFIX)
+                        ):
+                            observation.metadata["expected_block"] = True
+                            observation.metadata["block_kind"] = "v2_delegation_policy"
                     observations.append(observation)
 
                     if observation.is_success() and gated_decision is None:
@@ -1147,6 +1116,39 @@ class ReActAgent:
             if content.strip():
                 parts.append(f"[{role}] {content}")
         return "\n\n".join(parts)
+
+    def _run_stop_hook(self, history: ConversationHistory) -> str | None:
+        messages = history.to_dicts()
+        dispatcher = getattr(self._full_registry, "_hook_dispatcher", None)
+        if dispatcher is not None:
+            try:
+                from hooks.events import HookContext, HookEvent
+                ctx = HookContext(
+                    event=HookEvent.STOP,
+                    messages=messages,
+                )
+                result = dispatcher.dispatch_stop(ctx)
+            except Exception as exc:
+                logger.debug("Stop hook dispatch failed: %s", exc)
+                result = None
+            if result is not None and result.blocked:
+                return (
+                    "[Stop hook blocked completion]\n"
+                    f"{result.reason}\n"
+                    "Continue working until the check passes."
+                )
+
+        goal_hook = getattr(self, "_goal_stop_hook", None)
+        if goal_hook is None:
+            return None
+        try:
+            goal_messages = goal_hook(messages)
+        except Exception as exc:
+            logger.debug("Goal stop hook failed: %s", exc)
+            return None
+        if not goal_messages:
+            return None
+        return str(goal_messages[0].get("content", ""))
 
     def _is_missing_test_target_observation(self, observation: Observation) -> bool:
         """识别 pytest exit code 4 中的缺失目标，避免进入修复代码流程。"""
@@ -2140,53 +2142,6 @@ class ReActAgent:
             ),
         )
 
-    def _find_overlapping_file_read_range(
-        self,
-        key: tuple[str, int, int | None],
-    ) -> tuple[str, int, int | None] | None:
-        """Return an existing read range that fully covers key, if any."""
-        path, start_line, end_line = key
-        if not hasattr(self, "_read_file_ranges"):
-            self._read_file_ranges = set()
-        for existing in self._read_file_ranges:
-            existing_path, existing_start, existing_end = existing
-            if existing_path != path:
-                continue
-            if existing_end is None:
-                return existing
-            if end_line is None:
-                continue
-            if existing_start <= start_line and existing_end >= end_line:
-                return existing
-        return None
-
-    def _duplicate_file_read_observation(
-        self,
-        tool_call: ToolCall,
-        repo_path: str,
-    ) -> Observation | None:
-        """Return a synthetic observation when an identical file read was already done."""
-        key = self._file_read_range_key(tool_call, repo_path)
-        if key is None:
-            return None
-        overlapping_key = self._find_overlapping_file_read_range(key)
-        if overlapping_key is None:
-            self._read_file_ranges.add(key)
-            return None
-        path, start_line, end_line = overlapping_key
-        if end_line is None:
-            range_text = "the full file"
-        else:
-            range_text = f"lines {start_line}-{end_line}"
-        return Observation(
-            status=ObservationStatus.SUCCESS,
-            tool_name=tool_call.name,
-            output=(
-                f"Skipped duplicate {tool_call.name}: {path} {range_text} was already read in this run. "
-                "Use the earlier observation instead of reading it again."
-            ),
-        )
-
     def _format_action_for_history(self, action: Action) -> str:
         """把 Action 格式化为 assistant 消息，写入对话历史。支持并行 tool_calls。"""
         parts = [f"Thought: {action.thought}"]
@@ -2218,6 +2173,12 @@ class ReActAgent:
 
     def _build_tool_result_content(self, observation: Observation) -> str:
         """构建 native tool_use 模式下的工具结果内容（不含 [Tool:] 包装）。"""
+        if observation.tool_name == "task":
+            output = observation.output or ""
+            if observation.error:
+                output += f"\n<error>{observation.error}</error>"
+            return output or "(no output)"
+
         parts: list[str] = []
         if observation.output:
             output = observation.output
@@ -2275,11 +2236,16 @@ class ReActAgent:
 
     def _is_looping(self, log: EventLog) -> bool:
         """
-        检测是否陷入死循环。两级检测：
+        Detect dead loops. Two-level check:
 
-        1. 严格匹配：最近 N 条 action 的 (tool_name, params) 完全相同
-        2. 语义匹配：最近 N+1 条 action 使用的 tool_name 多重集相同
-           （反复调用相同类型的工具，只是参数略有不同——需要更多证据）
+        1. Exact match: last N actions have identical (tool_name, params).
+        2. Semantic match: last N+1 actions use the same tool_name multiset.
+
+        File operations (file_read, file_view, file_edit, file_write) are
+        handled by FileReadCache at the tool layer — repeated reads return
+        cached content with [CACHED] markers. The semantic layer treats
+        them like any other tool: if the agent is calling file_read in a
+        pattern, that IS a real loop and should be terminated.
         """
         n = self._cfg.loop_detection_window
         actions = log.get_actions()
@@ -2299,21 +2265,16 @@ class ReActAgent:
             )
 
         def _serialize_names(action: Action) -> tuple:
-            names = []
-            for tool_call in action.tool_calls:
-                # File ops on distinct targets are progress; exact duplicate params caught by Level 1.
-                if tool_call.name in ("file_read", "file_view", "file_edit", "file_write"):
-                    continue
-                names.append(tool_call.name)
-            return tuple(sorted(names))
+            return tuple(sorted(
+                tc.name for tc in action.tool_calls
+            ))
 
         # Level 1: exact match (window = N)
         first_exact = _serialize_exact(recent[0])
         if all(_serialize_exact(a) == first_exact for a in recent[1:]):
             return True
 
-        # Level 2: semantic loop — same tool name multiset repeated N+1 times
-        # Requires one more repetition than exact match to reduce false positives
+        # Level 2: semantic match (window = N+1, more evidence needed)
         semantic_window = n + 1
         if len(actions) >= semantic_window:
             semantic_recent = actions[-semantic_window:]
@@ -2323,6 +2284,40 @@ class ReActAgent:
                     return True
 
         return False
+
+    def _build_loop_diagnosis(self, log: EventLog) -> str:
+        """Build a structured diagnosis string for a detected loop.
+
+        Returns a line-oriented ASCII report so the parent agent can parse
+        key facts without scanning prose.
+        """
+        n = self._cfg.loop_detection_window
+        actions = log.get_actions()
+        recent = actions[-n:]
+
+        # Collect tool-call facts from the recent window
+        tool_names: list[str] = []
+        repeated_params: list[str] = []
+        seen_params: set[str] = set()
+        for action in recent:
+            for tc in (action.tool_calls or []):
+                tool_names.append(tc.name)
+                params_key = str(sorted(tc.params.items()))
+                if params_key in seen_params:
+                    if tc.name not in repeated_params:
+                        repeated_params.append(tc.name)
+                seen_params.add(params_key)
+
+        all_same_name = len(set(tool_names)) <= 1
+        diagnosis_parts = [
+            "Loop detected:",
+            f"  detection: {'exact match' if all_same_name and repeated_params else 'semantic match'}",
+            f"  window: {n} consecutive tool-call steps",
+            f"  repeated_tools: {list(dict.fromkeys(tool_names))}",
+            f"  repeated_params: {repeated_params or 'varied'}",
+            f"  total_steps_consumed: {len(actions)}",
+        ]
+        return "\n".join(diagnosis_parts)
 
     def _call_with_retry(
         self,

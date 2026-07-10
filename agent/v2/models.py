@@ -44,6 +44,7 @@ class AgentDefinition:
     description: str
     tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
+    allowed_subagents: frozenset[str] | None = None
     model: str = "inherit"
     isolation: str = "fork"
     background: bool = False
@@ -67,6 +68,7 @@ class ForkResult:
     error: str = ""
     artifacts: tuple[str, ...] = ()
     turns_used: int = 0
+    failure_diagnosis: str = ""  # structured diagnosis when status is "failed"
 
 
 # ── Built-in agent definitions (fallback when no .md files exist) ──
@@ -79,11 +81,14 @@ _DEFAULT_GENERAL_TOOLS = frozenset({
     "Read", "Glob", "Grep", "Write", "Edit", "Bash", "WebFetch", "WebSearch",
 })
 
+_COORDINATOR_TOOLS = frozenset({"Task", "Read", "Glob", "Grep"})
+
 _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
     "build": AgentDefinition(
         name="build",
         description="Primary coding agent with full tool access. Can delegate to subagents.",
         tools=_DEFAULT_GENERAL_TOOLS,
+        allowed_subagents=frozenset({"explore", "general", "code-reviewer"}),
         isolation="none",
         max_turns=100,
         system_prompt="",
@@ -92,9 +97,23 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         name="plan",
         description="Read-only planning agent. Explores codebase and produces structured plans.",
         tools=_DEFAULT_READONLY_TOOLS,
+        allowed_subagents=frozenset({"explore", "general", "code-reviewer"}),
         isolation="none",
         max_turns=60,
         system_prompt="",
+    ),
+    "coordinator": AgentDefinition(
+        name="coordinator",
+        description="Coordinates work across specialized subagents with a restricted tool set.",
+        tools=_COORDINATOR_TOOLS,
+        allowed_subagents=frozenset({"explore", "general", "code-reviewer"}),
+        isolation="none",
+        max_turns=80,
+        system_prompt="""You are a coordinator agent. Plan, delegate, synthesize, and verify.
+- Use task to delegate execution to specialized subagents.
+- Do not perform implementation work directly.
+- Do not rubber-stamp weak subagent findings.
+- Separate confirmed findings from unverified claims and observations.""",
     ),
     "explore": AgentDefinition(
         name="explore",

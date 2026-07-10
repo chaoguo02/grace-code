@@ -51,6 +51,7 @@ class HookContext:
     tool_input: dict[str, Any] = field(default_factory=dict)
     tool_output: dict[str, Any] | None = None
     user_input: str = ""
+    messages: list[Any] | None = None
     timestamp: str = field(default_factory=_now)
 
     def to_dict(self) -> dict[str, Any]:
@@ -67,4 +68,6 @@ class HookContext:
             d["tool_output"] = self.tool_output
         if self.user_input:
             d["user_input"] = self.user_input
+        if self.messages is not None:
+            d["messages"] = self.messages
         return d

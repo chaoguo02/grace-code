@@ -389,6 +389,43 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
     return resp in ("y", "yes", "")
 
 
+def _render_v2_event(event, rend, proactive_memory=None, last_tool=None, last_tool_params=None):
+    from agent.task import EventType
+
+    payload = event.payload
+    if event.event_type == EventType.ACTION:
+        step = payload.get("step", 0)
+        action = payload.get("action", {})
+        tool_calls = action.get("tool_calls") or []
+        if tool_calls:
+            for tool_call in tool_calls:
+                if last_tool is not None:
+                    last_tool[0] = tool_call.get("name", "")
+                if last_tool_params is not None:
+                    last_tool_params[0] = tool_call.get("params", {})
+                rend.on_tool_call(step, tool_call.get("name", ""), tool_call.get("params", {}))
+        elif action.get("action_type") == "finish":
+            rend.on_finish(step, action.get("message", ""))
+        elif action.get("action_type") == "give_up":
+            rend.on_give_up(step, action.get("message", ""))
+    elif event.event_type == EventType.OBSERVATION:
+        step = payload.get("step", 0)
+        obs = payload.get("observation", {})
+        tool_name = obs.get("tool_name") or (last_tool[0] if last_tool else "")
+        output = obs.get("output", "")
+        status = obs.get("status", "")
+        rend.on_observation(step, tool_name, status, output, obs.get("error"))
+        if proactive_memory is not None:
+            proactive_memory.check_tool_result(
+                tool_name=tool_name,
+                params=(last_tool_params[0] if last_tool_params else {}),
+                output=output,
+                success=(status == "success"),
+            )
+    elif event.event_type == EventType.REFLECTION:
+        rend.on_reflection(payload.get("reason", ""))
+
+
 def _run_v2_mode(
     *,
     mode: str,
@@ -406,6 +443,7 @@ def _run_v2_mode(
     hook_dispatcher=None,
     proactive_memory=None,
     mcp_integration=None,
+    renderer=None,
 ) -> None:
     import os
     import subprocess
@@ -417,6 +455,9 @@ def _run_v2_mode(
 
     db_path = default_session_db_path(str(repo_path))
     store = SessionStore(db_path)
+    rend = renderer
+    last_tool = [""]
+    last_tool_params = [{}]
     runtime = SessionRuntime(
         store=store,
         backend=backend,
@@ -427,6 +468,12 @@ def _run_v2_mode(
         memory_context=memory_context,
         hook_dispatcher=hook_dispatcher,
         mcp_integration=mcp_integration,
+        event_callback=(
+            (lambda event: _render_v2_event(
+                event, rend, proactive_memory=proactive_memory,
+                last_tool=last_tool, last_tool_params=last_tool_params,
+            )) if rend is not None else None
+        ),
     )
     intent = classify_task_intent(description, intent_override, backend)
 
@@ -459,7 +506,7 @@ def _run_v2_mode(
             intent=intent,
             messages=build_messages,
         )
-        _print_v2_result(mode, db_path, session.id, result)
+        _print_v2_result(mode, db_path, session.id, result, show_summary=False)
         return
 
     # --- plan / v2-plan: 权限过滤器 ---
@@ -504,7 +551,7 @@ def _run_v2_mode(
                 with open(plan_path, "w", encoding="utf-8") as f:
                     f.write(plan_text)
 
-            _print_v2_result(mode, db_path, session.id, result)
+            _print_v2_result(mode, db_path, session.id, result, show_summary=False)
             if plan_text.strip():
                 click.echo(dim(f"  Plan    : {plan_path}"))
 
@@ -556,6 +603,7 @@ def _run_v2_mode(
                     plan_file=plan_path,
                     hook_dispatcher=hook_dispatcher,
                     proactive_memory=proactive_memory,
+                    renderer=renderer,
                 )
                 return
 
@@ -579,6 +627,7 @@ def _run_v2_mode(
                     plan_file=plan_path,
                     hook_dispatcher=hook_dispatcher,
                     proactive_memory=proactive_memory,
+                    renderer=renderer,
                 )
                 return
 
@@ -648,12 +697,12 @@ def _run_v2_mode(
         return
 
 
-def _print_v2_result(mode: str, db_path: str, session_id: str, result) -> None:
+def _print_v2_result(mode: str, db_path: str, session_id: str, result, *, show_summary: bool = True) -> None:
     from agent.task import RunStatus
     click.echo(dim(f"  Mode    : {mode}"))
     click.echo(dim(f"  V2 DB   : {db_path}"))
     click.echo(dim(f"  Session : {session_id}\n"))
-    if result.summary:
+    if show_summary and result.summary:
         click.echo(result.summary)
     if result.status == RunStatus.SUCCESS:
         click.echo(green("\n  V2 run completed successfully."))
@@ -817,6 +866,7 @@ def run(
     from agent.task import Task
     from agent.policy import normalize_repo_path
     from agent.factory import classify_task_intent
+    from dataclasses import dataclass
     from entry.renderer import create_renderer
     try:
         from context.token_budget import is_tiktoken_available
@@ -903,6 +953,7 @@ def run(
                 hook_dispatcher=hook_dispatcher,
                 proactive_memory=proactive_memory,
                 mcp_integration=mcp_integration,
+                renderer=rend,
             )
         finally:
             if mcp_integration is not None:
@@ -1128,6 +1179,34 @@ def chat(
                     click.echo(dim(f"  Reloaded. {len(skill_registry.list_skills())} skills discovered."))
                 else:
                     click.echo(dim("  Usage: /skill list | /skill show <name> | /skill reload"))
+            elif cmd.startswith("/goal"):
+                from runtime.goal import GoalState, MAX_GOAL_CONDITION_CHARS
+                args = user_input[len("/goal"):].strip()
+                clear_words = {"clear", "stop", "off", "reset", "none", "cancel"}
+                if not args:
+                    goal = session.goal_store.get()
+                    if not goal or not goal.active:
+                        click.echo(dim("  当前没有活跃的 /goal 目标。"))
+                    else:
+                        click.echo(dim(
+                            f"  🎯 当前目标：{goal.condition}\n"
+                            f"     轮数：{goal.turn_count}/{goal.max_turns}\n"
+                            f"     状态：{'活跃' if goal.active else '已完成'}\n"
+                            f"     上次评估：{goal.last_judge_reason or '尚未评估'}"
+                        ))
+                elif args.lower() in clear_words:
+                    session.goal_store.clear()
+                    click.echo(dim("  🎯 目标已清除。"))
+                elif len(args) > MAX_GOAL_CONDITION_CHARS:
+                    click.echo(red(
+                        f"  条件过长（{len(args)} 字符），上限 {MAX_GOAL_CONDITION_CHARS} 字符。"
+                    ))
+                else:
+                    session.goal_store.set(GoalState(
+                        condition=args,
+                        session_id=getattr(session, "_session_id", ""),
+                    ))
+                    click.echo(dim(f"  🎯 目标已设定：{args}\n  每轮结束后会自动评估。"))
             elif cmd.startswith("/mcp"):
                 parts = user_input.strip().split(maxsplit=2)
                 subcmd = parts[1] if len(parts) > 1 else ""
@@ -1185,6 +1264,7 @@ def chat(
                     "    /stats   — show session statistics",
                     "    /clear   — clear conversation history",
                     "    /compact [focus] — compress conversation (optional: prioritize retaining focus topic)",
+                    "    /goal [condition|clear] — set/show/clear a session completion goal",
                     "    /mode    — show or switch agent mode (react|plan|dag|multi-agent|auto)",
                     "    /model   — show or switch LLM model",
                     "    /skill   — list/show/reload skills",

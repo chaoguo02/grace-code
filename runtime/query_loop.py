@@ -17,6 +17,7 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, Protocol, Sequence
 from runtime.context_compression import (
     DEFAULT_CONTEXT_WINDOW,
     AutoCompactTrackingState,
+    ContentReplacementState,
     compress_messages,
 )
 from runtime.streaming_executor import StreamingToolExecutor
@@ -27,6 +28,7 @@ from runtime.tool_registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
+MAX_STOP_HOOK_RETRIES = 3
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,8 @@ class LoopState:
     consecutive_tool_errors: int = 0
     max_consecutive_tool_errors: int = 3
     autocompact_tracking: AutoCompactTrackingState | None = None
+    content_replacement_state: ContentReplacementState | None = None
+    stop_hook_count: int = 0
 
 
 @dataclass
@@ -283,6 +287,7 @@ async def _streaming_query_loop(
         messages=list(messages),
         max_consecutive_tool_errors=max_consecutive_tool_errors,
         autocompact_tracking=AutoCompactTrackingState(),
+        content_replacement_state=ContentReplacementState(),
     )
 
     while True:
@@ -300,6 +305,7 @@ async def _streaming_query_loop(
             context_window=context_window,
             call_model_for_summary=call_model_for_summary,
             autocompact_tracking=state.autocompact_tracking,
+            content_replacement_state=state.content_replacement_state,
         )
         messages_for_query = compression.messages
 
@@ -409,11 +415,17 @@ async def _streaming_query_loop(
         if on_stop_hook is not None:
             hook_messages = await on_stop_hook(updated_messages)
             if hook_messages:
+                next_count = state.stop_hook_count + 1
+                if next_count > MAX_STOP_HOOK_RETRIES:
+                    logger.warning("Stop hook retry limit reached: %d", MAX_STOP_HOOK_RETRIES)
+                    yield LoopTerminalEvent(reason=LoopExitReason.ERROR)
+                    return
                 state = replace(
                     state,
                     messages=[*updated_messages, *hook_messages],
                     turn_count=state.turn_count + 1,
                     transition=Transition.STOP_HOOK,
+                    stop_hook_count=next_count,
                 )
                 continue
 
@@ -464,6 +476,7 @@ def _build_tool_result_messages(results: list[Any]) -> list[dict]:
                 {
                     "type": "tool_result",
                     "tool_use_id": _tool_call_id(result),
+                    "tool_name": _tool_name(result),
                     "content": _tool_output(result),
                     "is_error": _tool_is_error(result),
                 }
@@ -526,6 +539,14 @@ def _tool_output(result: Any) -> Any:
     if isinstance(result, dict):
         return result.get("output", result.get("content", result.get("error", "")))
     return getattr(result, "output", getattr(result, "content", getattr(result, "error", "")))
+
+
+def _tool_name(result: Any) -> str:
+    if isinstance(result, ToolExecutionResult):
+        return result.tool_name
+    if isinstance(result, dict):
+        return str(result.get("tool_name", result.get("name", "")))
+    return str(getattr(result, "tool_name", getattr(result, "name", "")))
 
 
 def _tool_is_error(result: Any) -> bool:

@@ -156,6 +156,11 @@ class ChatSession:
         from context.session import SessionState
         self._session_state = SessionState()
 
+        # ── Goal Stop Hook（Claude Code /goal-style session goal）────
+        from runtime.goal import GoalStore
+        self.goal_store = GoalStore(Path(self.repo_path) / ".forge-agent" / "goal.json")
+        self.goal_store.restore()
+
         # ── 跨 session 上下文恢复（从持久化的 compaction 摘要）─────
         self._inject_session_summary()
 
@@ -449,10 +454,36 @@ class ChatSession:
         # 注入 skills metadata（如果有）
         if self._skill_registry and self._skill_registry.list_skills():
             agent._skills_prompt = self._skill_registry.format_for_prompt()
+        agent._goal_stop_hook = self._goal_stop_hook
         result = agent.run(task, log)
         if hasattr(agent, "_pending_history"):
             del agent._pending_history
+        if hasattr(agent, "_goal_stop_hook"):
+            del agent._goal_stop_hook
         return result
+
+    def _goal_stop_hook(self, messages: list[dict]):
+        from runtime.goal import goal_stop_hook
+        return goal_stop_hook(
+            self.goal_store,
+            messages,
+            backend_factory=self._create_goal_judge_backend,
+        )
+
+    def _create_goal_judge_backend(self, judge_model: str):
+        from llm.router import create_backend
+        provider = self.config.llm.provider
+        model = judge_model
+        if model == "haiku" and provider != "anthropic":
+            model = self.config.llm.model
+        return create_backend(
+            provider=provider,
+            model=model,
+            api_key=self.config.llm.api_key or None,
+            base_url=self.config.llm.base_url or None,
+            max_tokens=500,
+            timeout_seconds=30.0,
+        )
 
     # ------------------------------------------------------------------
     # 统计 & 工具方法
