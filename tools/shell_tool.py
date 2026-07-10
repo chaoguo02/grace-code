@@ -129,8 +129,11 @@ class ShellTool(BaseTool):
     def description(self) -> str:
         return (
             "Execute a shell command and return its output (stdout + stderr combined). "
-            "Timeout is 30s by default. Avoid long-running commands; "
-            "prefer targeted commands like 'grep', 'pytest tests/foo.py', 'git diff'."
+            "Timeout is 30s by default. "
+            "RESTRICTION: Do NOT use this tool to read files (use file_read instead) "
+            "or modify files (use file_edit / file_write instead). "
+            "Use shell ONLY for operations that have no dedicated tool: "
+            "running tests, git commands, builds, package managers, etc."
         )
 
     @property

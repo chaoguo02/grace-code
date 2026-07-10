@@ -23,6 +23,19 @@ _SUBAGENT_SUMMARY_RULE = """Your final answer is returned to the parent as a too
 The parent only sees your final message — not your full reasoning or tool history.
 Make your final summary standalone and directly useful.
 
+TOOL SELECTION RULES (violating these → wasted turns → loop detection):
+1. USE THE DEDICATED TOOL FIRST. If a tool exists specifically for an operation,
+   do NOT use shell/zsh/bash for that operation. Examples:
+   - Read files → file_read (NOT cat/type/head/tail in shell)
+   - Edit files → file_edit (NOT sed/awk in shell)
+   - Write files → file_write (NOT echo/cat > in shell)
+   - Search code → search_text (NOT grep -r in shell)
+   - Find files → find_files (NOT find/ls in shell)
+2. Shell is ONLY for: running tests, building, git operations, package
+   managers, and other operations that have NO dedicated tool.
+3. If you catch yourself about to type a shell command to read or search a
+   file, STOP — use the dedicated tool instead.
+
 CRITICAL RULES:
 1. Only report findings that you can back up with specific file paths and line numbers.
 2. If you cannot verify something, explicitly say "UNVERIFIED" rather than stating it as fact.

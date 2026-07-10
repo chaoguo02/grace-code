@@ -425,6 +425,8 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "TRANSIENT ERROR" in text
     assert "LOOP" in text
     assert "CIRCUIT BREAKER" in text
+    assert "Task routing guide" in text
+    assert "read-only analysis" in text
 
 
 def test_v2_subagent_summary_rule_includes_consumption_signals(tmp_path):
@@ -440,6 +442,9 @@ def test_v2_subagent_summary_rule_includes_consumption_signals(tmp_path):
     assert "Never repeat information from the task prompt" in text
     assert "success=True with status \"partial\"" in text
     assert "Do NOT report \"partial with success=True\" as a bug" in text
+    assert "TOOL SELECTION RULES" in text
+    assert "USE THE DEDICATED TOOL FIRST" in text
+    assert "shell/zsh/bash" in text
 
 
 def test_v2_unknown_parent_session_raises(tmp_path):

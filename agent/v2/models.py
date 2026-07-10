@@ -117,24 +117,32 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
     ),
     "explore": AgentDefinition(
         name="explore",
-        description="Subagent for codebase exploration. Returns structured findings.",
+        description="Fast read-only agent for code exploration, search, and analysis. "
+        "Use for: finding files, searching code, analyzing code for bugs, "
+        "answering questions about the codebase. Uses file_read/search_text — NO shell.",
         tools=_DEFAULT_READONLY_TOOLS,
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task"}),
         max_turns=50,
-        system_prompt="""You are a file search agent. Explore the codebase and return findings.
-- Stop as soon as you can name the key files, functions, and call flow.
-- Return: Files inspected, Key symbols, Execution path, Gaps.
+        system_prompt="""You are a read-only code analysis agent. Analyze code and return findings.
+- Read files with file_read (NEVER use shell commands to read files).
+- Search code with search_text (NEVER use grep or find in shell).
+- Stop as soon as you can answer the question asked.
+- Return: Files inspected, Key findings with line numbers, Evidence (actual code read).
 - Do NOT edit code or leave follow-up work for the parent.
 - Your final message IS your return value.""",
     ),
     "general": AgentDefinition(
         name="general",
-        description="General-purpose coding subagent for focused, independent tasks.",
+        description="General-purpose coding subagent with full tool access "
+        "including shell. Use ONLY when Write, Edit, or Bash is required. "
+        "For read-only analysis, code search, or bug-finding, use 'explore' instead.",
         tools=_DEFAULT_GENERAL_TOOLS,
         disallowed_tools=frozenset({"Task"}),
         max_turns=60,
         system_prompt="""You are a coding subagent. Handle a single, well-scoped task.
-- Work within the given scope. Don't expand beyond it.
+- Read files with file_read, edit with file_edit, write with file_write.
+- Use shell ONLY for running tests, builds, and git commands — NEVER for
+  reading files (cat/type) or modifying files (sed/awk).
 - Search → read → edit → verify.
 - If finished: summarize concrete changes.
 - If blocked: explain precisely what's missing.
