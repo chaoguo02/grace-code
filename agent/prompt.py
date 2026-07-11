@@ -294,6 +294,20 @@ def build_coordinator_prompt(
     )
 
 
+def build_long_term_context(
+    memory_context=None,
+    skills_prompt: str = "",
+    repo_path: str = ".",
+) -> str | None:
+    """Build long-term memory context. Delegates to memory/injection_service."""
+    from memory.injection_service import build_injection_context
+    return build_injection_context(
+        memory_context=memory_context,
+        skills_prompt=skills_prompt,
+        repo_path=repo_path,
+    )
+
+
 def build_sub_agent_prompt(
     role: str,
     task_prompt: str,

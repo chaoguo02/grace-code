@@ -61,6 +61,7 @@ entries exist and how to retrieve them.
 # ---------------------------------------------------------------------------
 
 class MemoryReadTool(BaseTool):
+    is_read_only = True
     """
     读取一条记忆。按 name（短横线 slug）查找并返回完整内容。
     常用于 memory_list 之后读取具体内容。
@@ -248,6 +249,7 @@ class MemoryWriteTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class MemoryListTool(BaseTool):
+    is_read_only = True
     """
     列出所有记忆的摘要（名称 + 一行描述 + 类型）。
     agent 在开始任务前应调用此工具检查是否有相关记忆。
@@ -444,6 +446,7 @@ class MemoryDeleteTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class MemorySearchTool(BaseTool):
+    is_read_only = True
     """
     语义搜索外部记忆。返回按相关性排序的结果。
     和 memory_list（精准列出）互补，适合"记得有但想不起来叫什么"的场景。

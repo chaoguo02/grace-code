@@ -1,0 +1,2 @@
+Macro-action loop detected: Macro loop: 8 macro actions without progress (no writes, validates, or finishes). Distinct files read: 4. Distinct files written: 0.
+Pattern: read_file:file_read → read_file:file_read → read_file:file_read → read_file:file_read → search_code:find_files → search_code:find_files

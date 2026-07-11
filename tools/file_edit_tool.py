@@ -12,6 +12,7 @@ file_edit 工具：基于 old_str/new_str 的精确字符串替换。
 
 from __future__ import annotations
 
+import os as _os
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -31,8 +32,10 @@ class FileEditTool(BaseTool):
         new_str (str): 替换后的字符串
     """
 
-    def __init__(self, read_cache: "FileReadCache | None" = None) -> None:
+    def __init__(self, read_cache: "FileReadCache | None" = None,
+                 workspace_root: str | None = None) -> None:
         self._read_cache = read_cache
+        self._workspace_root = workspace_root
 
     @property
     def name(self) -> str:
@@ -87,6 +90,17 @@ class FileEditTool(BaseTool):
         if not str(path):
             return ToolResult(success=False, output="", error="path is required")
 
+        ws = self._workspace_root
+
+        # ── Layer 1: Sanitize path ──
+        if ws is not None:
+            from tools.base import sanitize_path
+            try:
+                clean = sanitize_path(str(path), ws)
+            except ValueError as e:
+                return ToolResult(success=False, output="", error=str(e))
+            path = Path(clean)
+
         # Case 1: old_str 为空 → 创建新文件模式
         if not old_str:
             if path.exists():
@@ -105,14 +119,26 @@ class FileEditTool(BaseTool):
                     output="",
                     error="Both old_str and new_str are empty. Nothing to do.",
                 )
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(new_str, encoding="utf-8")
-            except OSError as e:
-                return ToolResult(success=False, output="", error=str(e))
+            if ws is not None:
+                from tools.base import resolve_safe_parent, safe_create_file
+                safe_path, err = resolve_safe_parent(str(path), ws)
+                if err:
+                    return ToolResult(success=False, output="", error=err)
+                fd, err = safe_create_file(safe_path)
+                if err:
+                    return ToolResult(success=False, output="", error=err)
+                _os.write(fd, new_str.encode("utf-8"))
+                _os.close(fd)
+                path = Path(safe_path)
+            else:
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(new_str, encoding="utf-8")
+                except OSError as e:
+                    return ToolResult(success=False, output="", error=str(e))
             line_count = new_str.count("\n") + (1 if new_str and not new_str.endswith("\n") else 0)
             if self._read_cache is not None:
-                self._read_cache.invalidate(str(path.resolve()))
+                self._read_cache.invalidate(str(path.resolve()) if ws is None else str(path))
             return ToolResult(
                 success=True,
                 output=f"Created new file: {path} ({line_count} lines)",
@@ -180,14 +206,28 @@ class FileEditTool(BaseTool):
 
         new_content = content.replace(old_str, new_str, 1)
 
-        try:
-            path.write_text(new_content, encoding="utf-8")
-        except OSError as e:
-            return ToolResult(success=False, output="", error=str(e))
+        # ── Write with O_NOFOLLOW (TOCTOU protection) ──
+        if ws is not None:
+            from tools.base import resolve_safe_parent, safe_open_for_write
+            safe_path, err = resolve_safe_parent(str(path), ws)
+            if err:
+                return ToolResult(success=False, output="", error=err)
+            fd, err = safe_open_for_write(safe_path)
+            if err:
+                return ToolResult(success=False, output="", error=err)
+            _os.write(fd, new_content.encode("utf-8"))
+            _os.close(fd)
+            write_path = safe_path
+        else:
+            try:
+                path.write_text(new_content, encoding="utf-8")
+            except OSError as e:
+                return ToolResult(success=False, output="", error=str(e))
+            write_path = str(path.resolve())
 
         # ── Invalidate read cache for this path ──
         if self._read_cache is not None:
-            self._read_cache.invalidate(str(path.resolve()))
+            self._read_cache.invalidate(write_path)
 
         old_lines = old_str.count("\n") + 1
         new_lines = new_str.count("\n") + 1

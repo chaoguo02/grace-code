@@ -29,7 +29,7 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from agent.factory import create_agent  # noqa: E402
+from agent.factory import classify_task_intent  # noqa: E402
 from agent.prompt import reset_prompt_usage, set_project_dir  # noqa: E402
 from entry.renderer import InlineRenderer, create_renderer  # noqa: E402
 from observability import flush_observability  # noqa: E402
@@ -81,7 +81,7 @@ class ChatSession:
         self.config = config
         self._session_id = uuid.uuid4().hex[:12]
         self._confirm_callback = confirm_callback
-        self._mode = "react"
+        self._mode = "v2-build"
         self._model = getattr(backend, "model_name", "?")
         self._provider = getattr(config.llm, "provider", "?")
 
@@ -141,13 +141,15 @@ class ChatSession:
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
         )
-        multi_cfg = self._build_multi_config() if self._mode == "multi-agent" else None
-        self.agent = create_agent(
-            self._mode, self._backend, self._registry, self._agent_cfg,
-            plan_approval_callback=self._plan_approval,
+        from agent.v2.agent_factory import AgentFactory
+        self._agent_assembly = AgentFactory.create(
+            agent_name=self._mode,
+            backend=self._backend,
+            base_registry=self._registry,
+            root_agent_config=self._agent_cfg,
             memory_context=self._memory_context,
-            multi_config=multi_cfg,
         )
+        self.agent = self._agent_assembly.agent
         self._shared_history = ConversationHistory(
             max_messages=config.context.history_window * 2,
         )
@@ -189,32 +191,26 @@ class ChatSession:
         api_key: str | None = None,
         base_url: str | None = None,
     ) -> None:
-        """运行时切换 LLM 模型（保持对话历史）。"""
-        from llm.router import create_backend
-
-        provider = provider or self._provider or "openai"
-        resolved_key = api_key or os.environ.get(
-            {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY",
-             "deepseek": "DEEPSEEK_API_KEY", "groq": "GROQ_API_KEY",
-             "ollama": "OLLAMA_API_KEY", "openai-compat": "OPENAI_API_KEY"}.get(provider, ""), "",
+        """运行时切换 LLM 模型（保持对话历史）。委托给 agent_session_factory。"""
+        from entry.chat_services.agent_session_factory import rebuild_backend_for_model
+        self._backend, self._model, self._provider = rebuild_backend_for_model(
+            model, provider=provider, api_key=api_key, base_url=base_url,
+            current_provider=self._provider,
         )
-        self._backend = create_backend(
-            provider=provider, model=model,
-            api_key=resolved_key or None,
-            base_url=base_url,
-        )
-        self._model = model
-        self._provider = provider
         self._renderer.model = model
         self._rebuild_agent()
 
     def _rebuild_agent(self) -> None:
-        """用当前的 backend 重建 agent 实例。"""
-        self.agent = create_agent(
-            self._mode, self._backend, self._registry, self._agent_cfg,
-            plan_approval_callback=self._plan_approval,
+        """用当前的 backend 重建 agent 实例。委托给 AgentFactory。"""
+        from agent.v2.agent_factory import AgentFactory
+        self._agent_assembly = AgentFactory.create(
+            agent_name=self._mode,
+            backend=self._backend,
+            base_registry=self._registry,
+            root_agent_config=self._agent_cfg,
             memory_context=self._memory_context,
         )
+        self.agent = self._agent_assembly.agent
 
     def _plan_approval(self, plan_text: str):
         """
@@ -274,7 +270,6 @@ class ChatSession:
         self._shared_history.add(LLMMessage(role="user", content=user_input))
 
         # Phase 3: 开始一个结构化 task context
-        from agent.factory import classify_task_intent
         intent = classify_task_intent(user_input, "auto", self._backend)
 
         # Phase 7: 分类任务关系
@@ -368,13 +363,6 @@ class ChatSession:
             elapsed=elapsed,
             cache_stats=result.cache_stats,
         )
-
-        # Plan/DAG 模式执行完成后自动切回 react（一次性规划任务）
-        # Multi-Agent 不切回：用户显式选择的持久对话模式
-        if self._mode in ("plan", "dag"):
-            self._mode = "react"
-            self._renderer.mode = "react"
-            self._rebuild_agent()
 
         return result.is_success() or result.status.value == "gave_up"
 

@@ -211,6 +211,7 @@ class FindingsAccumulator:
 # ── Tool ──
 
 class SubmitFindingsTool(BaseTool):
+    is_read_only = True
     """Submit a structured analysis report.
 
     Subagents MUST call this tool (possibly multiple times) before finishing.

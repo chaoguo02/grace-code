@@ -1,4 +1,5 @@
 """Auth orchestration — wires token creation, session storage, and login."""
+import hashlib
 import logging
 from config import SECRET_KEY, TOKEN_EXPIRY_HOURS
 from src.user_service import UserService
@@ -44,7 +45,8 @@ class AuthService:
         if not user:
             logger.debug("Login failed: user '%s' not found", username)
             return None
-        if user.get("password") != password:
+        hashed = hashlib.sha256((password + self._secret_key).encode()).hexdigest()
+        if user.get("password") != hashed:
             logger.debug("Login failed: wrong password for '%s'", username)
             return None
         logger.debug("Login successful for '%s'", username)

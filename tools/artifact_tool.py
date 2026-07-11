@@ -17,6 +17,7 @@ class ArtifactStoreRef:
 
 
 class ArtifactListTool(BaseTool):
+    is_read_only = True
     def __init__(self, store_ref: ArtifactStoreRef) -> None:
         self._store_ref = store_ref
 
@@ -46,6 +47,7 @@ class ArtifactListTool(BaseTool):
 
 
 class ArtifactReadTool(BaseTool):
+    is_read_only = True
     def __init__(self, store_ref: ArtifactStoreRef) -> None:
         self._store_ref = store_ref
 

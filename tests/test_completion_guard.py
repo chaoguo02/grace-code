@@ -61,8 +61,8 @@ class TestCompletionGuardEditTasks:
             completion_policy=CompletionPolicy(require_any_write=True),
         )
         assert not result.can_complete
-        assert "require_any_write" in result.blocked_reason.lower()
-        assert "cannot finish" in result.inject_message.lower()
+        assert "no meaningful work" in result.blocked_reason.lower()
+        assert "meaningful work" in result.inject_message.lower()
 
     def test_allows_without_write_when_policy_does_not_require(self):
         guard = TaskCompletionGuard(min_tool_calls_for_completion=0)
@@ -113,7 +113,7 @@ class TestCompletionGuardAnalysisTasks:
             completion_policy=CompletionPolicy(require_any_read=True),
         )
         assert not result.can_complete
-        assert "require_any_read" in result.blocked_reason.lower()
+        assert "no meaningful work" in result.blocked_reason.lower()
 
     def test_allows_analysis_with_reads(self):
         guard = TaskCompletionGuard()
@@ -195,8 +195,8 @@ class TestCompletionGuardIntegration:
             ),
         )
         assert not result.can_complete
-        # First check (CompletionPolicy require_any_read) should fire
-        assert "read" in result.inject_message.lower()
+        # First check fires: no meaningful work done
+        assert "meaningful work" in result.inject_message.lower()
 
     def test_write_resets_after_check(self):
         """After the guard blocks once and the model does the work,

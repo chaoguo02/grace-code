@@ -213,17 +213,32 @@ class ShellTool(BaseTool):
         result = self._runtime.exec(cmd, cwd=cwd, timeout=timeout)
         output = truncate_output(result.output, MAX_OUTPUT_CHARS)
         if not result.success:
-            # 区分 timeout 和普通错误，error 字段包含可读原因
+            combined = f"{result.stdout}{result.stderr}".lower()
+            # ── Non-retryable: command not found / not recognized ──
+            _cmd_not_found = any(sig in combined for sig in (
+                "not recognized", "command not found",
+                "cannot find", "no such file",
+            ))
+            if _cmd_not_found:
+                from tools.base import ToolError as _ToolError
+                return ToolResult(
+                    success=False, output=output,
+                    error=f"Command not available on this system: {cmd.split()[0]!r}",
+                    tool_error=_ToolError(
+                        error_type="unavailable",
+                        retryable=False,
+                        detail=f"Command {cmd.split()[0]!r} is not installed or not available on this OS. "
+                               f"Use an alternative tool or approach — do NOT retry this command.",
+                    ),
+                )
+            # ── Timeout ──
             if "timed out" in result.stderr.lower():
                 error = result.stderr.strip()
             else:
                 error = f"Exit code: {result.returncode}"
-                # cwd 诊断：ModuleNotFoundError / FileNotFoundError 通常是 cwd 问题
-                combined = f"{result.stdout}{result.stderr}".lower()
                 if any(sig in combined for sig in (
                     "modulenotfounderror", "no module named",
-                    "filenotfounderror", "no such file or directory",
-                    "cannot find", "not recognized",
+                    "filenotfounderror",
                 )):
                     effective_cwd = cwd or os.getcwd()
                     error += (

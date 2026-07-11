@@ -30,14 +30,22 @@ def test_chat_session_does_not_expose_thought_stream(monkeypatch, tmp_path):
     """ChatSession keeps Action.thought internal instead of streaming it to UI."""
     from config.schema import AppConfig
     import entry.chat as chat_module
+    from agent.v2 import agent_factory as af_module
 
     captured = {}
 
-    def fake_create_agent(mode, backend, registry, agent_config, **kwargs):
-        captured["config"] = agent_config
-        return _DummyAgent(agent_config)
+    class _FakeAssembly:
+        def __init__(self, agent, spec=None, contract=None, agent_cfg=None):
+            self.agent = agent
+            self.spec = spec
+            self.contract = contract
+            self.agent_cfg = agent_cfg
 
-    monkeypatch.setattr(chat_module, "create_agent", fake_create_agent)
+    def fake_create(*, agent_name, backend, base_registry, root_agent_config, **kwargs):
+        captured["config"] = root_agent_config
+        return _FakeAssembly(agent=_DummyAgent(root_agent_config))
+
+    monkeypatch.setattr(af_module.AgentFactory, "create", staticmethod(fake_create))
 
     session = chat_module.ChatSession(
         backend=_DummyBackend(),

@@ -128,6 +128,7 @@ Call it with status='no_findings' and empty findings if you found nothing.
 
 
 class AgentTool(BaseTool):
+    allows_delegation = True
     """Dispatch a fork subagent. Claude Code `task` tool equivalent.
 
     The subagent runs in a fresh context (Fork model):
@@ -309,10 +310,19 @@ class AgentTool(BaseTool):
         )
 
         try:
+            # Look up parent session repo_path for proper scope inheritance
+            _parent_repo = None
+            try:
+                _parent = self._runtime._store.get_session(self._parent_session_id)
+                if _parent:
+                    _parent_repo = _parent.repo_path
+            except Exception:
+                pass
             fork_result = self._runtime.fork_session(
                 definition=definition,
                 description=description,
                 prompt=prompt,
+                repo_path=_parent_repo,
             )
             output = _format_fork_result(subagent_type, fork_result)
             if fork_result.status == "partial":
@@ -360,6 +370,7 @@ class AgentTool(BaseTool):
             error=fork_result.error if is_failure else "",
             subagent_tokens_used=fork_result.tokens_used,
             subagent_terminated_by_loop=fork_result.terminated_by_loop,
+            structured_findings=fork_result.structured_findings,
         )
 
     def _allowed_subagent_names(self) -> frozenset[str] | None:
@@ -390,6 +401,10 @@ def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
     ]
     if result.error:
         lines.append(f"  <error>{_xml_escape(result.error)}</error>")
+    if result.warning:
+        lines.append(f"  <warning>{_xml_escape(result.warning)}</warning>")
+    if result.merge_conflict:
+        lines.append(f"  <merge-conflict>true</merge-conflict>")
     if result.failure_diagnosis:
         lines.append(f"  <failure-diagnosis>{_xml_escape(result.failure_diagnosis)}</failure-diagnosis>")
 

@@ -88,6 +88,7 @@ def _parent_called_task(log_dir: str) -> bool:
     return any(tc.get("name") == "task" for tc in _get_tool_calls_from_log(log_dir))
 
 
+@pytest.mark.e2e
 class TestE2EBehavioral:
     """L5 behavioral E2E tests: real LLM, noop tools, tool-call assertions."""
 

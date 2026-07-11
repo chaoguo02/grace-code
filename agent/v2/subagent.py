@@ -9,8 +9,6 @@ from typing import Any
 
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
-from agent.policy import PhasePolicy
-from agent.policy_registry import PolicyAwareToolRegistry
 from agent.task import RunResult, RunStatus, Task
 from agent.v2.models import AgentDefinition, ForkResult
 from context.history import ConversationHistory
@@ -94,31 +92,17 @@ def fork_subagent(
     agent_id = uuid.uuid4().hex[:12]
     logger.info("Fork subagent '%s' (%s) starting: %s", definition.name, agent_id, prompt[:80])
 
-    # Build restricted tool registry for this subagent
-    from agent.v2.agent_registry import AgentRegistryV2
-    registry_v2 = AgentRegistryV2()
-    allowed_tools = registry_v2.tool_names_for(definition.name)
+    # ── Phase 6.2: Git Worktree isolation ──
+    from agent.v2.worktree_service import create_worktree
+    _worktree, _effective_repo_path = create_worktree(
+        repo_path, definition.name, agent_id,
+        isolation=definition.isolation,
+    )
 
-    restricted_registry = base_registry.filtered(allowed_tools)
-
-    # ── Session-global FileReadCache (P1-1) ──
-    # Subagents share the parent's mtime-verified cache. If the file hasn't
-    # been modified (mtime unchanged), re-reading provides zero new information.
-    # Write tools invalidate cache entries, guaranteeing freshness.
-    # No per-agent cache isolation needed — mtime is the source of truth.
-
-    # ── P1-5: Structured findings tool (fresh accumulator per subagent) ──
-    from tools.submit_findings_tool import FindingsAccumulator, SubmitFindingsTool
-    _findings_accumulator = FindingsAccumulator()
-    _submit_findings_tool = SubmitFindingsTool(accumulator=_findings_accumulator)
-    restricted_registry.register(_submit_findings_tool)
-
-    # Phase-policy wrap
-    wrapped_registry = PolicyAwareToolRegistry(
-        base=restricted_registry,
-        phase_policy=PhasePolicy(allowed_tools=frozenset(restricted_registry.tool_names)),
-        repo_path=repo_path,
-        phase_name=f"fork-{definition.name}",
+    # ── Restricted tool registry ──
+    from agent.v2.subagent_registry_factory import build_restricted_registry
+    wrapped_registry, _findings_accumulator = build_restricted_registry(
+        definition, base_registry, repo_path=repo_path,
     )
 
     # Build agent config
@@ -170,7 +154,7 @@ def fork_subagent(
     # Run
     task = Task(
         description=prompt,
-        repo_path=repo_path,
+        repo_path=_effective_repo_path,
         intent="analysis",
         max_steps=cfg.max_steps,
         budget_tokens=cfg.budget_tokens,
@@ -179,20 +163,86 @@ def fork_subagent(
             "agent_name": definition.name,
             "agent_id": agent_id,
             "isolation": definition.isolation,
+            "worktree_path": _worktree.path if _worktree else "",
+            "completion_requires": dict(definition.completion_requires),
+            "required_tools": sorted(definition.required_tools),
         },
     )
 
     _recent_actions: list[Any] = []
+    _worktree_merged = False
+    _worktree_error = ""
+
+    # ── Result object fallback: never let a bare exception escape ──
+    # The parent MUST receive a structured ForkResult regardless of what
+    # happens inside the subagent. Initialize to a failed state so even
+    # if the try block never executes, the contract is honored.
+    result = RunResult(
+        task_id=agent_id, status=RunStatus.FAILED,
+        summary="Subagent did not start", steps_taken=0, total_tokens=0,
+    )
+
     try:
         with EventLog.create(task, log_dir=log_dir) as event_log:
             result = agent.run(task, event_log)
             _recent_actions = _snapshot_recent_actions(event_log)
+
+        # ── Worktree merge: driven by physical diff, not logical status ──
+        # Claude Code pattern: a subagent that wrote real code but hit
+        # MAX_STEPS should still have its changes preserved. The parent
+        # gets a warning so it can review the partial output.
+        if _worktree is not None:
+            from agent.v2.worktree_service import has_changes as _wt_has_changes
+            _has_diff = _wt_has_changes(_worktree)
+            if result.is_success() or _has_diff:
+                from agent.v2.worktree_service import merge_worktree
+                _worktree_merged, _worktree_error = merge_worktree(
+                    _worktree, repo_path, definition.name, prompt,
+                )
+                if not _worktree_merged and _has_diff:
+                    _worktree_error = f"Merge conflict: {_worktree_error}"
+
+    except MemoryError:
+        logger.critical("Fork subagent '%s' OOM — aborting", definition.name)
+        result = RunResult(
+            task_id=agent_id, status=RunStatus.FAILED,
+            summary="Subagent ran out of memory",
+            steps_taken=0, total_tokens=0,
+            error="MemoryError: subagent exceeded available memory",
+        )
+
+    except Exception as exc:
+        logger.exception("Fork subagent '%s' crashed: %s", definition.name, exc)
+        result = RunResult(
+            task_id=agent_id, status=RunStatus.FAILED,
+            summary=f"Subagent crashed: {exc}",
+            steps_taken=0, total_tokens=0, error=str(exc),
+        )
+
     finally:
+        from agent.v2.worktree_service import discard_worktree
+        discard_worktree(_worktree, repo_path)
         _fire_hook(hook_dispatcher, "SubagentStop", session_id=agent_id)
+
+    # ── Contract: result is ALWAYS a valid RunResult at this point ──
+    _warning = ""
+    _merge_conflict = False
+    if _worktree_merged and result.status == RunStatus.MAX_STEPS:
+        _warning = (
+            "Subagent reached max steps, but partial file changes were "
+            "successfully merged. Review the changes before relying on them."
+        )
+    if _worktree_error and "conflict" in _worktree_error.lower():
+        _merge_conflict = True
+        _warning = (
+            f"Subagent changes caused merge conflicts: {_worktree_error}. "
+            "Manual resolution required."
+        )
 
     return _build_fork_result(
         definition.name, agent_id, result, _recent_actions,
         structured_findings=tuple(_findings_accumulator.all_findings()),
+        warning=_warning, merge_conflict=_merge_conflict,
     )
 
 
@@ -239,6 +289,8 @@ def _build_fork_result(
     agent_name: str, agent_id: str, result: RunResult,
     recent_actions: list[dict[str, Any]] | None = None,
     structured_findings: tuple[dict[str, object], ...] = (),
+    warning: str = "",
+    merge_conflict: bool = False,
 ) -> ForkResult:
     status = "completed"
     failure_diagnosis = ""
@@ -281,6 +333,8 @@ def _build_fork_result(
         terminated_by_loop=terminated_by_loop,
         structured_findings=structured_findings,
         failure_diagnosis=failure_diagnosis,
+        warning=warning,
+        merge_conflict=merge_conflict,
     )
 
 

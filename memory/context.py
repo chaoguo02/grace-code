@@ -111,19 +111,9 @@ class MemoryContext:
         """
         构建 Memory Section 文本。
 
-        Injection strategy (aligned with Claude Code):
-        - user/feedback types: always inject full content (they're short rules)
-        - project/reference types: selected via Sonnet selector (max 5), or keyword fallback
-
-        返回格式：
-            ## Always-Loaded Memories (user/feedback)
-            <full content of user and feedback memories>
-
-            ## Selected Memories (project/reference)
-            <full content of selected on-demand memories>
-
-            ## Available Memories
-            <index listing for remaining memories>
+        Phase 4 injection strategy (data-driven, not LLM-mediated):
+        - user/feedback types: always inject full content (short rules)
+        - project/reference types: scope+confidence precision injection (max 5)
 
         没有记忆时返回空字符串。
         """
@@ -135,38 +125,28 @@ class MemoryContext:
 
         parts: list[str] = []
 
-        # 1. Always-inject: full content of user/feedback memories
+        # 1. Always-inject: full content of user/feedback memories (unchanged)
         always_section = self._build_always_inject_section()
         if always_section:
             parts.append(always_section)
 
-        # 2. On-demand: Sonnet selector or keyword fallback for project/reference
-        selected_section = self._build_selected_section()
-        if selected_section:
-            parts.append(selected_section)
+        # 2. Precision Injection: scope + confidence (Phase 4 — replaces
+        #    Sonnet Selector + keyword scoring + RAG vector retrieval)
+        precision_section = self._build_precision_section()
+        if precision_section:
+            parts.append(precision_section)
 
-        # 3. Index listing (for remaining memories the LLM can read on demand)
-        if self._task_context:
-            index_section = self._build_filtered_section()
-        else:
-            index_content = self._store.get_index_content(max_lines=self._max_lines)
-            if not index_content.strip():
-                index_section = ""
-            else:
-                index_section = "\n".join([
-                    "## Available Memories",
-                    index_content,
-                    "",
-                    "Use memory_read to read a specific memory, memory_write to",
-                    "save new information you want to remember across sessions.",
-                ])
-        if index_section:
+        # 3. Index listing (on-demand lookup — LLM can memory_read as needed)
+        index_content = self._store.get_index_content(max_lines=self._max_lines)
+        if index_content.strip():
+            index_section = "\n".join([
+                "## Available Memories",
+                index_content,
+                "",
+                "Use memory_read to read a specific memory, memory_write to",
+                "save new information you want to remember across sessions.",
+            ])
             parts.append(index_section)
-
-        # 4. RAG 主动检索
-        rag_section = self._build_rag_section()
-        if rag_section:
-            parts.append(rag_section)
 
         self._cached_section = "\n\n".join(parts)
         return self._cached_section
@@ -195,8 +175,132 @@ class MemoryContext:
             return ""
         return "\n".join(lines)
 
+    def _build_precision_section(self) -> str:
+        """Phase 4 precision injection: scope + confidence filtering.
+
+        Replaces the old three-pipeline approach (Sonnet Selector + keyword
+        scoring + RAG retrieval) with a single deterministic pipeline:
+        1. list_by_scope("project", min_confidence=0.5)
+        2. Sort by confidence DESC, updated_at DESC
+        3. Take top-5, verify freshness (content_hash), format and inject
+
+        Zero extra LLM calls. Zero vector scans. Deterministic and fast.
+        """
+        try:
+            memories = self._store.list_by_scope("project", min_confidence=0.5)
+        except AttributeError:
+            # list_by_scope not available (old store) — fallback to empty
+            return ""
+
+        if not memories:
+            return ""
+
+        # Also include global-scoped memories (user preferences apply everywhere)
+        try:
+            global_mems = self._store.list_by_scope("global", min_confidence=0.5)
+        except AttributeError:
+            global_mems = []
+
+        # Sort: confidence DESC, then access_count DESC, then updated_at DESC
+        all_mems = memories + global_mems
+        all_mems.sort(
+            key=lambda m: (
+                -getattr(m.metadata, "confidence", 0.5),
+                -getattr(m.metadata, "access_count", 0),
+            )
+        )
+
+        # Take top-5 (already sorted, but deduplicate by name)
+        seen: set[str] = set()
+        top: list = []
+        for m in all_mems:
+            if m.name in seen:
+                continue
+            if getattr(m.metadata, "status", "active") != "active":
+                continue
+            if m.name in self._already_surfaced:
+                continue
+            seen.add(m.name)
+            top.append(m)
+            if len(top) >= 5:
+                break
+
+        if not top:
+            return ""
+
+        lines: list[str] = ["## Relevant Project Knowledge"]
+        for mem in top:
+            # Phase 6: cache returns Memory without content — load from file on demand
+            if not mem.content.strip():
+                full = self._store.read_memory(mem.name)
+                if full:
+                    mem = full
+            freshness = self._verify_memory_freshness(mem)
+            lines.append(f"### {mem.name}")
+            lines.append(mem.content.strip())
+            if freshness:
+                lines.append(f"\n> {freshness}")
+            lines.append("")
+            self._already_surfaced.add(mem.name)
+
+        return "\n".join(lines)
+
+    def _verify_memory_freshness(self, memory) -> str:
+        """Phase 4 Step 3: Content hash verification before injection.
+
+        Checks all file anchors with content_hash. Returns a freshness
+        warning string, or empty string if memory is still fresh.
+
+        - Hash matches → confidence boost (no warning)
+        - Hash mismatch → confidence *= 0.5, warning injected
+        - File deleted → memory deprecated, returns "DEPRECATED" signal
+        """
+        import hashlib
+        from pathlib import Path
+
+        anchors = getattr(memory, "anchors", []) or []
+        hash_anchors = [
+            a for a in anchors
+            if getattr(a, "kind", "") == "file" and getattr(a, "content_hash", "")
+        ]
+        if not hash_anchors:
+            return ""  # No hash binding — cannot verify
+
+        all_match = True
+        for anchor in hash_anchors:
+            try:
+                p = Path(anchor.path)
+                if not p.exists():
+                    # File deleted — memory is orphaned
+                    memory.metadata.status = "deprecated"
+                    try:
+                        self._store.write_memory(memory)
+                    except Exception:
+                        pass
+                    return "DEPRECATED"
+                current_hash = hashlib.sha256(p.read_bytes()).hexdigest()
+                if current_hash != anchor.content_hash:
+                    all_match = False
+            except (OSError, IOError):
+                continue
+
+        if not all_match:
+            # Partial mismatch — degrade confidence, don't discard
+            old_conf = getattr(memory.metadata, "confidence", 0.7)
+            memory.metadata.confidence = max(0.1, old_conf * 0.5)
+            try:
+                self._store.write_memory(memory)
+            except Exception:
+                pass
+            return "[FILE CHANGED] Associated files have changed since this memory was created. Confidence degraded. Verify before relying on this information."
+
+        return ""  # All hashes match — memory is fresh
+
     def _build_selected_section(self) -> str:
-        """Select and load on-demand (project/reference) memories via Sonnet selector."""
+        """Select and load on-demand (project/reference) memories via Sonnet selector.
+
+        Deprecated by Phase 4 _build_precision_section(). Kept for backward compat.
+        """
         query = self._user_message or self._task_context
         if not query:
             return ""
@@ -217,31 +321,8 @@ class MemoryContext:
         # Fallback: no selector configured or selector returned nothing
         return ""
 
-    def _load_selected_memories(self, names: list[str]) -> str:
-        """Load full content of selected memories, tracking what was surfaced."""
-        from agent.v2.runtime import SessionRuntime
-        lines: list[str] = ["## Selected Project Knowledge"]
-        loaded = 0
-        for name in names:
-            if name in self._already_surfaced:
-                continue
-            mem = self._store.read_memory(name)
-            if mem and mem.content.strip():
-                # P1: skip deprecated memories — Code is Truth
-                if mem.metadata.status != "active":
-                    logger.debug("Skipping %s memory '%s' in selected section", mem.metadata.status, name)
-                    continue
-                freshness = SessionRuntime._memory_freshness_text(name, self._store)
-                lines.append(f"### {name}")
-                lines.append(mem.content.strip())
-                if freshness:
-                    lines.append(f"\n> ⚠️ {freshness}")
-                lines.append("")
-                self._already_surfaced.add(name)
-                loaded += 1
-        if loaded == 0:
-            return ""
-        return "\n".join(lines)
+    # _load_selected_memories removed in Phase 4 — replaced by _build_precision_section.
+    # The old Sonnet selector path had a constitution violation (import agent.v2.runtime).
 
     def _build_rag_section(self) -> str:
         """用 ProactiveRetriever 检索相关 chunks 并格式化。

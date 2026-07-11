@@ -1,8 +1,12 @@
 """
 agent/factory.py
 
-Agent 工厂。根据 mode 创建对应的 Agent 实例。
-V1 模式已移除 —— 所有入口统一走 V2 SessionRuntime。
+Agent factory. Creates ReActAgent instances from mode presets.
+Mode is not an if-else trigger — it selects a TaskContract preset that
+determines the agent's execution boundary (tools, budget, steps).
+
+V1 modes (plan/dag/multi-agent/auto) have been removed.
+All callers route through V2 SessionRuntime or use this factory with presets.
 """
 
 from __future__ import annotations
@@ -25,18 +29,26 @@ def create_agent(
     memory_context=None,
     multi_config: object | None = None,
 ) -> ReActAgent:
-    """Create a ReActAgent instance.
+    """Create a ReActAgent. Delegates to AgentFactory (agent/v2/agent_factory.py).
 
-    All V1 modes (plan / dag / multi-agent / auto) have been removed.
-    Every caller now routes through V2 SessionRuntime.
+    Kept for backward compatibility. New code should use AgentFactory directly.
     """
     if agent_config is None:
         agent_config = AgentConfig()
-    return ReActAgent(backend, registry, agent_config, memory_context=memory_context)
+
+    from agent.v2.agent_factory import AgentFactory
+    assembly = AgentFactory.create(
+        agent_name=mode,
+        backend=backend,
+        base_registry=registry,
+        root_agent_config=agent_config,
+        memory_context=memory_context,
+    )
+    return assembly.agent
 
 
 # ---------------------------------------------------------------------------
-# 任务意图分类
+# Task intent classification
 # ---------------------------------------------------------------------------
 
 _EDIT_INDICATORS = re.compile(

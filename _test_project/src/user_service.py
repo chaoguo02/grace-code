@@ -1,12 +1,19 @@
 """User business logic and data access."""
+import hashlib
 import logging
+
+from config import SECRET_KEY
 
 logger = logging.getLogger(__name__)
 
+def _hash_password(password: str) -> str:
+    """Hash a password with SHA-256 using the app SECRET_KEY as pepper."""
+    return hashlib.sha256((password + SECRET_KEY).encode()).hexdigest()
+
 FAKE_DB = [
-    {"id": 1, "name": "alice", "email": "alice@example.com", "password": "pass123"},
-    {"id": 2, "name": "bob", "email": "bob@example.com", "password": "secret456"},
-    {"id": 3, "name": "charlie", "email": "charlie@example.com", "password": "qwerty"},
+    {"id": 1, "name": "alice", "email": "alice@example.com", "password": _hash_password("pass123")},
+    {"id": 2, "name": "bob", "email": "bob@example.com", "password": _hash_password("secret456")},
+    {"id": 3, "name": "charlie", "email": "charlie@example.com", "password": _hash_password("qwerty")},
 ]
 
 _next_id = 4
@@ -32,10 +39,10 @@ class UserService:
         return None
 
     def create(self, name: str, email: str, password: str):
-        """Create a new user."""
+        """Create a new user. Password is hashed before storage."""
         global _next_id
         logger.debug("UserService.create(%s, %s)", name, email)
-        user = {"id": _next_id, "name": name, "email": email, "password": password}
+        user = {"id": _next_id, "name": name, "email": email, "password": _hash_password(password)}
         FAKE_DB.append(user)
         _next_id += 1
         return {"id": user["id"], "name": user["name"], "email": user["email"]}

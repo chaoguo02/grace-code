@@ -46,6 +46,7 @@ def _run_git(
 
 
 class GitStatusTool(BaseTool):
+    is_read_only = True
     """
     (see class docstring below)
     """
@@ -91,6 +92,7 @@ class GitStatusTool(BaseTool):
 
 
 class GitDiffTool(BaseTool):
+    is_read_only = True
     """
     (see class docstring below)
     """

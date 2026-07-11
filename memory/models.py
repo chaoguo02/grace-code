@@ -64,9 +64,27 @@ class MemoryMetadata:
       "active"     — memory is current, inject into context
       "deprecated" — explicitly invalidated (superseded by code change, manual /deprecate command)
                      NOT injected into context. Code is Truth.
+
+    scope: where the memory applies:
+      "session"  — only this session (cleared on exit)
+      "project"  — this project (shared across sessions)
+      "global"   — all projects (user preferences, universal rules)
+
+    confidence: 0.0–1.0, how confident we are in this memory.
+      - 1.0: confirmed by user explicitly
+      - 0.7–0.9: extracted by LLM with high confidence
+      - 0.3–0.6: extracted by LLM with medium confidence, subject to verification
+      - < 0.3: low confidence — not injected, pending validation
+
+    ttl_seconds: time-to-live in seconds. None = permanent (default for user/feedback).
+      Project/reference memories may have shorter TTLs.
     """
     type: str = "project"  # "user" | "feedback" | "project" | "reference"
     status: str = "active"  # "active" | "deprecated"
+    scope: str = "project"  # "session" | "project" | "global"
+    confidence: float = 0.7  # 0.0–1.0
+    ttl_seconds: int | None = None  # None = permanent
+    expires_at: str = ""  # computed ISO timestamp when TTL expires
     # Backward compat — still readable for old files:
     stale: bool = False
     access_count: int = 0
@@ -95,6 +113,11 @@ class Memory:
             "name": self.name,
             "description": self.description,
             "type": self.metadata.type,
+            "status": self.metadata.status,
+            "scope": self.metadata.scope,
+            "confidence": self.metadata.confidence,
+            "ttl_seconds": self.metadata.ttl_seconds,
+            "expires_at": self.metadata.expires_at,
             "updated_at": self.updated_at,
             "content": self.content,
             "anchors": [anchor.to_dict() for anchor in self.anchors],

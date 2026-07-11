@@ -18,6 +18,7 @@ class EvidenceLedgerRef:
 
 
 class EvidenceListTool(BaseTool):
+    is_read_only = True
     def __init__(self, ledger_ref: EvidenceLedgerRef) -> None:
         self._ledger_ref = ledger_ref
 
@@ -73,6 +74,7 @@ class EvidenceListTool(BaseTool):
 
 
 class EvidenceGetTool(BaseTool):
+    is_read_only = True
     def __init__(self, ledger_ref: EvidenceLedgerRef) -> None:
         self._ledger_ref = ledger_ref
 
@@ -115,6 +117,7 @@ class EvidenceGetTool(BaseTool):
 
 
 class ArtifactSearchTool(BaseTool):
+    is_read_only = True
     def __init__(self, store_ref: ArtifactStoreRef) -> None:
         self._store_ref = store_ref
 

@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class WebSearchTool(BaseTool):
+    is_read_only = True
     """
     用 DuckDuckGo 搜索网页。
 
@@ -147,6 +148,7 @@ class WebSearchTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class WebFetchTool(BaseTool):
+    is_read_only = True
     """
     抓取指定 URL 并提取正文。
 

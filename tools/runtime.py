@@ -155,14 +155,38 @@ class LocalRuntime(Runtime):
     相比 subprocess.run 的优势：
     - 持有进程引用，可以在中断/超时时杀掉进程树
     - KeyboardInterrupt 时 kill_process_tree() 防止孤儿进程
+    - Windows: 自动检测并使用 Git Bash (bash.exe), 兼容 Unix 命令
     """
+
+    # Git Bash 标准安装路径, 按优先级查找
+    _BASH_CANDIDATES = [
+        r"D:\SoftwareDownload\Git\usr\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+    ]
 
     def __init__(self) -> None:
         self._current_proc: subprocess.Popen | None = None
+        self._bash_path: str | None = None
+        if os.name == "nt":
+            self._bash_path = self._find_bash()
+
+    @staticmethod
+    def _find_bash() -> str | None:
+        """Find Git Bash on Windows. Returns path or None."""
+        import shutil as _shutil
+        for candidate in LocalRuntime._BASH_CANDIDATES:
+            if os.path.isfile(candidate):
+                return candidate
+        # Fallback: try PATH
+        found = _shutil.which("bash")
+        if found and os.path.isfile(found):
+            return found
+        return None
 
     @property
     def name(self) -> str:
-        return "local"
+        return f"local({'bash' if self._bash_path else 'cmd'})"
 
     def exec(
         self,
@@ -182,6 +206,12 @@ class LocalRuntime(Runtime):
                 "encoding": "utf-8",
                 "errors": "replace",
             }
+            # Windows: use Git Bash instead of cmd.exe
+            # shell=True + executable on Windows passes /c which bash rejects.
+            # Instead, invoke bash -c directly without shell=True.
+            if os.name == "nt" and self._bash_path:
+                popen_kwargs["args"] = [self._bash_path, "-c", cmd]
+                popen_kwargs["shell"] = False
             # Unix: 创建新 session，后续 killpg 不会误杀父进程
             if os.name != "nt":
                 popen_kwargs["preexec_fn"] = os.setsid

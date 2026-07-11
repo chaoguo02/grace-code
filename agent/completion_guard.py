@@ -48,11 +48,16 @@ class CompletionContext:
     total_successful_tool_calls: int = 0
     """Tool-call actions where at least one observation succeeded."""
 
+    tool_call_counts: dict[str, int] = field(default_factory=dict)
+    """Per-tool call count: {'submit_findings': 2, 'file_read': 5, ...}.
+    Used by CompletionGuard to enforce completion_requires contracts."""
+
     def record_tool_result(
         self, tool_name: str, path: str | None, success: bool
     ) -> None:
         """Record a single tool execution result. Call after each tool call."""
         self.total_tool_calls += 1
+        self.tool_call_counts[tool_name] = self.tool_call_counts.get(tool_name, 0) + 1
         if success:
             self.total_successful_tool_calls += 1
             if tool_name in ("file_read", "file_view"):
@@ -117,8 +122,14 @@ class TaskCompletionGuard:
         task_max_steps: int = 40,
         current_step: int = 1,
         completion_policy: "CompletionPolicy | None" = None,
+        completion_requires: dict[str, int] | None = None,
     ) -> CompletionCheckResult:
         """Run all completion validation checks.
+
+        completion_requires: per-tool minimum call counts. e.g.
+        {"submit_findings": 1} means the agent MUST call submit_findings
+        at least once before FINISH is accepted. Enforced by Runtime,
+        not by prompt.
 
         Returns CompletionCheckResult — if can_complete=False, the inject_message
         MUST be added to the conversation and the loop must continue.
@@ -135,7 +146,13 @@ class TaskCompletionGuard:
             if not result.can_complete:
                 return result
 
-        # ── Check 3: Evidence-based completion (for analysis tasks) ──
+        # ── Check 3: Required tool calls (Runtime-enforced contract) ──
+        if completion_requires:
+            result = self._check_required_tools(ctx, completion_requires)
+            if not result.can_complete:
+                return result
+
+        # ── Check 4: Evidence-based completion (for analysis tasks) ──
         # Only enforce when CompletionPolicy requires reads, or the task
         # description explicitly targets files.
         require_evidence = (
@@ -154,34 +171,52 @@ class TaskCompletionGuard:
     def _check_completion_policy(
         self, ctx: CompletionContext, policy: "CompletionPolicy"
     ) -> CompletionCheckResult:
-        """Validate CompletionPolicy requirements against accumulated context."""
-        # Check require_any_read
-        if policy.require_any_read and not ctx.had_any_read:
+        """Validate that the agent did meaningful work toward the task goal.
+
+        Claude Code Stop Hook pattern: completion is verified by checking
+        "is the goal achieved?", not "did the agent perform action X?".
+
+        Meaningful work = wrote files OR (read files + analyzed).
+        The idempotent case (task already done in a prior run) is NOT a
+        failure — it means the agent verified the goal is already met.
+        """
+        # ── Has the agent done meaningful work? ──
+        _did_work = (
+            ctx.had_any_write
+            or ctx.had_any_read  # read + analyzed = meaningful, even if idempotent
+        )
+
+        if policy.require_any_read and not _did_work:
             return CompletionCheckResult(
                 can_complete=False,
-                blocked_reason="CompletionPolicy: require_any_read not satisfied",
+                blocked_reason="No meaningful work done (no reads, no writes)",
                 inject_message=(
-                    "[SYSTEM] You cannot finish yet. The task policy requires "
-                    "you to read at least one file before completing. "
-                    "Use file_read or file_view to inspect the relevant files, "
-                    "then call finish when you have evidence to support your conclusions."
+                    "[SYSTEM] You cannot finish yet — you have not done any "
+                    "meaningful work. Read the relevant files, make changes, "
+                    "or run commands, then call finish."
                 ),
             )
 
-        # Check require_any_write
-        if policy.require_any_write and not ctx.had_any_write:
+        if policy.require_any_write and not _did_work:
             return CompletionCheckResult(
                 can_complete=False,
-                blocked_reason="CompletionPolicy: require_any_write not satisfied",
+                blocked_reason="No meaningful work done (no reads, no writes)",
                 inject_message=(
-                    "[SYSTEM] You cannot finish yet. The task policy requires "
-                    "you to write at least one file before completing. "
-                    "Use file_write or file_edit to make the required changes, "
-                    "then call finish."
+                    "[SYSTEM] You cannot finish yet — you have not done any "
+                    "meaningful work. Read the relevant files, make changes, "
+                    "or run commands, then call finish."
                 ),
             )
 
-        # Check required_reads (specific paths)
+        # Log idempotent completion: agent read + verified, no writes needed
+        if policy.require_any_write and not ctx.had_any_write and _did_work:
+            logger.info(
+                "Idempotent completion: agent read %d files, confirmed task "
+                "already done. No redundant edits forced.",
+                len(ctx.files_read),
+            )
+
+        # ── Specific file requirements (hard gates) ──
         if policy.required_reads:
             missing = policy.required_reads - ctx.files_read
             if missing:
@@ -195,7 +230,6 @@ class TaskCompletionGuard:
                     ),
                 )
 
-        # Check required_writes (specific paths)
         if policy.required_writes:
             missing = policy.required_writes - ctx.files_written
             if missing:
@@ -257,3 +291,38 @@ class TaskCompletionGuard:
             )
 
         return CompletionCheckResult(can_complete=True)
+
+    def _check_required_tools(
+        self, ctx: CompletionContext, required: dict[str, int]
+    ) -> CompletionCheckResult:
+        """Enforce Runtime contract: certain tools MUST be called before FINISH.
+
+        This is NOT prompt-based advice — it's a hard gate. The model cannot
+        unilaterally declare completion if required tools were never called.
+        """
+        missing = []
+        for tool_name, min_count in required.items():
+            actual = ctx.tool_call_counts.get(tool_name, 0)
+            if actual < min_count:
+                missing.append((tool_name, min_count, actual))
+
+        if not missing:
+            return CompletionCheckResult(can_complete=True)
+
+        # Build a clear, structured error message
+        missing_desc = "; ".join(
+            f"{name} (need {need}, called {have})"
+            for name, need, have in missing
+        )
+        tool_list = ", ".join(name for name, _, _ in missing)
+        return CompletionCheckResult(
+            can_complete=False,
+            blocked_reason=f"Required tools not called: {missing_desc}",
+            inject_message=(
+                f"[SYSTEM] Cannot finish yet — required deliverables missing.\n"
+                f"Required tool(s): {tool_list}\n"
+                f"Details: {missing_desc}\n"
+                f"You MUST call the required tool(s) before calling finish. "
+                f"This is a Runtime-enforced contract, not optional."
+            ),
+        )

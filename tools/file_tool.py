@@ -21,6 +21,7 @@ tools/file_tool.py
 from __future__ import annotations
 
 import logging
+import os as _os
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -172,6 +173,7 @@ class FileReadCache:
 
 
 class FileReadTool(BaseTool):
+    is_read_only = True
     """
     读取文件内容。超过 MAX_READ_LINES 行时截断并提示。
 
@@ -181,6 +183,8 @@ class FileReadTool(BaseTool):
     params:
         path (str): 文件路径（相对或绝对）
     """
+
+    is_read_only = True
 
     def __init__(self, read_cache: FileReadCache | None = None) -> None:
         self._read_cache = read_cache or FileReadCache()
@@ -263,6 +267,7 @@ class FileReadTool(BaseTool):
 
 
 class FileViewTool(BaseTool):
+    is_read_only = True
     """
     分窗口查看文件，每次返回 VIEW_WINDOW_LINES 行。
 
@@ -273,6 +278,8 @@ class FileViewTool(BaseTool):
         path (str):       文件路径
         start_line (int): 从第几行开始（1-indexed，默认 1）
     """
+
+    is_read_only = True
 
     def __init__(self, read_cache: FileReadCache | None = None) -> None:
         self._read_cache = read_cache or FileReadCache()
@@ -376,13 +383,15 @@ class FileWriteTool(BaseTool):
     """
 
     def __init__(self, allowed_paths: list[str | Path] | None = None,
-                 read_cache: FileReadCache | None = None) -> None:
+                 read_cache: FileReadCache | None = None,
+                 workspace_root: str | None = None) -> None:
         self._allowed_paths = (
             {Path(path).expanduser().resolve() for path in allowed_paths}
             if allowed_paths is not None
             else None
         )
         self._read_cache = read_cache
+        self._workspace_root = workspace_root
 
     @property
     def name(self) -> str:
@@ -421,41 +430,53 @@ class FileWriteTool(BaseTool):
     def execute(self, params: dict[str, Any]) -> ToolResult:
         path = Path(params.get("path", ""))
         content = params.get("content", "")
-        target_path = path.expanduser().resolve()
+        ws = self._workspace_root
 
-        if self._allowed_paths is not None and target_path not in self._allowed_paths:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Permission denied: Writing to {target_path} is not allowed.",
-            )
-
-        # 覆盖大文件时发出警告
-        warning = ""
-        if target_path.exists() and target_path.is_file():
+        # ── Layer 1: Sanitize path (remove ../ traversal at string level) ──
+        if ws is not None:
+            from tools.base import sanitize_path
             try:
-                existing_lines = target_path.read_text(encoding="utf-8", errors="replace").count("\n")
-                if existing_lines > 50:
-                    warning = (
-                        f"\n⚠️  WARNING: Overwrote existing file with {existing_lines}+ lines. "
-                        "For targeted edits, use file_edit instead of file_write to avoid data loss."
-                    )
-            except OSError:
-                pass
+                clean = sanitize_path(str(path), ws)
+            except ValueError as e:
+                return ToolResult(success=False, output="", error=str(e))
+            path = Path(clean)
 
-        try:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(content, encoding="utf-8")
-        except OSError as e:
-            return ToolResult(success=False, output="", error=str(e))
+        # ── Layers 2+3: resolve parent + O_NOFOLLOW (TOCTOU protection) ──
+        if ws is not None:
+            from tools.base import resolve_safe_parent
+            safe_path, err = resolve_safe_parent(str(path), ws)
+            if err:
+                return ToolResult(success=False, output="", error=err)
+
+            from tools.base import safe_open_for_write
+            fd, err = safe_open_for_write(safe_path)
+            if err:
+                return ToolResult(success=False, output="", error=err)
+            _os.write(fd, content.encode("utf-8"))
+            _os.close(fd)
+            target_path = Path(safe_path)
+        else:
+            # No workspace — fall back to legacy behavior
+            target_path = path.expanduser().resolve()
+            if self._allowed_paths is not None and target_path not in self._allowed_paths:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"Permission denied: Writing to {target_path} is not allowed.",
+                )
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(content, encoding="utf-8")
+            except OSError as e:
+                return ToolResult(success=False, output="", error=str(e))
 
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
 
         # ── Invalidate read cache for this path ──
         if self._read_cache is not None:
+            from tools.base import sanitize_path
             self._read_cache.invalidate(str(target_path))
 
         return ToolResult(
             success=True,
-            output=f"Written {line_count} lines to {path}{warning}",
+            output=f"Written {line_count} lines to {path}",
         )

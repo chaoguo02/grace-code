@@ -51,6 +51,15 @@ class AgentDefinition:
     max_turns: int = 50
     hidden: bool = False
     system_prompt: str = ""
+    # ── Runtime-enforced contracts (not prompt-based) ──
+    required_tools: frozenset[str] = frozenset()
+    """Tools this subagent MUST call at least once before FINISH.
+    The CompletionGuard enforces this — the model cannot finish without
+    calling every tool in this set. Empty = no requirement."""
+    completion_requires: dict[str, int] = field(default_factory=dict)
+    """Per-tool minimum call counts required before FINISH is accepted.
+    e.g. {"submit_findings": 1} means the subagent MUST call submit_findings ≥ 1 time.
+    The CompletionGuard enforces this at the Runtime level."""
 
     @property
     def mode(self) -> str:
@@ -72,16 +81,28 @@ class ForkResult:
     terminated_by_loop: bool = False  # subagent was killed by loop detection
     structured_findings: tuple[dict[str, object], ...] = ()  # from SubmitFindingsTool
     failure_diagnosis: str = ""  # structured diagnosis when status is "failed"
-
+    warning: str = ""  # non-fatal warning (e.g. "partial changes were merged")
+    merge_conflict: bool = False  # True if worktree merge had conflicts
 
 # ── Built-in agent definitions (fallback when no .md files exist) ──
 
 _DEFAULT_READONLY_TOOLS = frozenset({
     "Read", "Glob", "Grep", "file_view", "WebFetch", "WebSearch",
+    "git_status", "git_diff",
+    "artifact_list", "artifact_read", "artifact_search",
+    "evidence_list", "evidence_get",
+    "memory_read", "memory_list", "memory_search",
 })
 
 _DEFAULT_GENERAL_TOOLS = frozenset({
-    "Read", "Glob", "Grep", "file_view", "Write", "Edit", "Bash", "WebFetch", "WebSearch",
+    "Read", "Glob", "Grep", "file_view", "Write", "Edit", "Bash",
+    "WebFetch", "WebSearch",
+    "git_status", "git_diff", "git_add", "git_commit",
+    "pytest",
+    "artifact_list", "artifact_read", "artifact_search",
+    "evidence_list", "evidence_get",
+    "memory_read", "memory_list", "memory_search", "memory_write", "memory_delete",
+    "Task",
 })
 
 _COORDINATOR_TOOLS = frozenset({"Task", "Read", "Glob", "Grep"})
@@ -158,6 +179,8 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task", "WebFetch", "WebSearch"}),
         max_turns=40,
         hidden=True,
+        required_tools=frozenset({"submit_findings"}),
+        completion_requires={"submit_findings": 1},
         system_prompt="""You are a code reviewer. Find bugs and quality issues.
 - Focus on correctness first, then simplification.
 - Do NOT rubber-stamp weak work.

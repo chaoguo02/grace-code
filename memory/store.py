@@ -101,6 +101,15 @@ def _build_frontmatter(memory: Memory) -> str:
         meta["access_count"] = memory.metadata.access_count
     if memory.metadata.validated_at:
         meta["validated_at"] = memory.metadata.validated_at
+    # Phase 4: persist scope, confidence, ttl
+    if memory.metadata.scope and memory.metadata.scope != "project":
+        meta["scope"] = memory.metadata.scope
+    if memory.metadata.confidence != 0.7:  # only persist non-default
+        meta["confidence"] = memory.metadata.confidence
+    if memory.metadata.ttl_seconds is not None:
+        meta["ttl_seconds"] = memory.metadata.ttl_seconds
+    if memory.metadata.expires_at:
+        meta["expires_at"] = memory.metadata.expires_at
     if meta:
         fm["metadata"] = meta
     if memory.anchors:
@@ -208,6 +217,10 @@ class MemoryStore:
         self._anchor_index: dict[str, list[str]] | None = None  # file_path → [memory_names]
         self._access_count_cache: dict[str, int] = {}  # deferred access_count increments
         self._ensure_dir()
+        # ── Phase 6: In-memory metadata cache ──
+        from memory.metadata_cache import MetadataCache
+        self._metadata_cache = MetadataCache()
+        self._metadata_cache.build(self._store_dir)
 
     # ------------------------------------------------------------------
     # 属性
@@ -268,6 +281,13 @@ class MemoryStore:
         if not raw_status and bool(meta.get("stale", False)):
             raw_status = "deprecated"  # migrate stale=True → status=deprecated
 
+        # Phase 4: read scope, confidence, ttl from frontmatter
+        _scope = str(meta.get("scope") or fm.get("scope") or "project")
+        _confidence = float(meta.get("confidence") or fm.get("confidence") or 0.7)
+        _ttl = meta.get("ttl_seconds") or fm.get("ttl_seconds")
+        _ttl = int(_ttl) if _ttl is not None else None
+        _expires = str(meta.get("expires_at") or fm.get("expires_at") or "")
+
         memory = Memory(
             name=fm.get("name", name),
             description=fm.get("description", ""),
@@ -275,6 +295,10 @@ class MemoryStore:
             metadata=MemoryMetadata(
                 type=parse_memory_type(fm),
                 status=str(raw_status) if raw_status else "active",
+                scope=_scope,
+                confidence=_confidence,
+                ttl_seconds=_ttl,
+                expires_at=_expires,
                 access_count=int(meta.get("access_count", 0)),
                 validated_at=str(meta.get("validated_at", "")),
             ),
@@ -310,6 +334,10 @@ class MemoryStore:
             return False
         self._dirty = True
         self._anchor_index = None  # invalidate reverse index
+        # Phase 6: update in-memory cache (no index rebuild needed)
+        cache = getattr(self, "_metadata_cache", None)
+        if cache is not None:
+            cache.upsert(memory)
         if self._indexer is not None:
             try:
                 self._indexer.index_memory(memory)
@@ -318,14 +346,15 @@ class MemoryStore:
         return True
 
     def list_memories(self) -> list[MemorySummary]:
-        """
-        列出所有记忆摘要。
+        """列出所有记忆摘要。
 
-        从 MEMORY.md 索引文件读取；索引不存在时扫描目录重建。
-
-        Returns:
-            MemorySummary 列表
+        Phase 6: Uses in-memory MetadataCache (O(1) allocation, no file I/O).
+        Falls back to MEMORY.md / directory scan if cache is empty.
         """
+        cache = getattr(self, "_metadata_cache", None)
+        if cache is not None and cache.is_built and cache.count > 0:
+            return cache.list_summaries()
+        # Fallback: old MEMORY.md / directory scan path
         if self._dirty or not self.index_path.exists():
             self._rebuild_index()
             self._dirty = False
@@ -333,7 +362,6 @@ class MemoryStore:
             summaries = self._parse_index(self.index_path.read_text(encoding="utf-8"))
             if summaries:
                 return summaries
-        # 降级：扫描目录
         return self._scan_dir()
 
     def count_by_type(self) -> dict[str, int]:
@@ -369,6 +397,10 @@ class MemoryStore:
             return False
         self._dirty = True
         self._anchor_index = None  # invalidate reverse index
+        # Phase 6: remove from in-memory cache
+        cache = getattr(self, "_metadata_cache", None)
+        if cache is not None:
+            cache.remove(name)
         if self._indexer is not None:
             try:
                 self._indexer.remove_memory(name)
@@ -564,6 +596,83 @@ class MemoryStore:
                 self.delete_memory(name)
                 pruned += 1
         return pruned
+
+    def evict_expired_by_ttl(self) -> int:
+        """Evict memories whose ttl_seconds has expired.
+
+        Checks each memory's metadata.ttl_seconds and expires_at.
+        Returns count of evicted memories.
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        pruned = 0
+        for fpath in sorted(self._store_dir.glob("*.md")):
+            if fpath.name == _INDEX_FILENAME:
+                continue
+            name = fpath.stem
+            memory = self.read_memory(name)
+            if memory is None:
+                continue
+            # Check TTL
+            ttl = getattr(memory.metadata, "ttl_seconds", None)
+            if ttl is None:
+                continue  # permanent — never expires
+            # Use expires_at if set, otherwise compute from updated_at
+            expires_at_str = getattr(memory.metadata, "expires_at", "")
+            if expires_at_str:
+                try:
+                    expires_at = datetime.fromisoformat(
+                        expires_at_str.replace("Z", "+00:00")
+                    )
+                    if now > expires_at:
+                        self.delete_memory(name)
+                        pruned += 1
+                except (ValueError, TypeError):
+                    pass
+            elif memory.updated_at:
+                try:
+                    updated = datetime.fromisoformat(
+                        memory.updated_at.replace("Z", "+00:00")
+                    )
+                    if (now - updated).total_seconds() > ttl:
+                        self.delete_memory(name)
+                        pruned += 1
+                except (ValueError, TypeError):
+                    pass
+        return pruned
+
+    def list_by_scope(
+        self, scope: str = "project", min_confidence: float = 0.0
+    ) -> list:
+        """List active memories filtered by scope and minimum confidence.
+
+        Phase 6: Uses in-memory MetadataCache — O(n) memory scan, ZERO file I/O.
+        Content is NOT loaded; call read_memory() for full content when needed.
+
+        Returns memories sorted by confidence (highest first).
+        """
+        cache = getattr(self, "_metadata_cache", None)
+        if cache is not None and cache.is_built:
+            return cache.list_by_scope(scope, min_confidence)
+        # Fallback: old file-I/O path
+        summaries = self.list_memories()
+        results = []
+        for summary in summaries:
+            memory = self.read_memory(summary.name)
+            if memory is None:
+                continue
+            if memory.metadata.status == "deprecated":
+                continue
+            mem_scope = getattr(memory.metadata, "scope", "project")
+            if mem_scope != scope:
+                continue
+            mem_confidence = getattr(memory.metadata, "confidence", 0.5)
+            if mem_confidence < min_confidence:
+                continue
+            results.append((mem_confidence, memory))
+        results.sort(key=lambda x: x[0], reverse=True)
+        return [m for _, m in results]
 
     def consolidate(
         self,

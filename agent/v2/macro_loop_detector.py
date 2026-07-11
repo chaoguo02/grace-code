@@ -72,12 +72,28 @@ _TOOL_TO_MACRO: dict[str, MacroActionType] = {
     "task_complete": MacroActionType.FINISH,
 }
 
-# Macro actions that indicate forward progress (reset repetition counters)
-_PROGRESS_ACTIONS = frozenset({
+# Macro actions that indicate forward progress.
+# For analysis tasks, READING NEW FILES and SEARCHING are also progress.
+# The detector checks task_intent to decide which metric to use.
+_PROGRESS_ACTIONS_EDIT = frozenset({
     MacroActionType.WRITE_FILE,
     MacroActionType.VALIDATE,
     MacroActionType.FINISH,
 })
+
+# Analysis tasks: reading/searching new territory IS forward progress.
+# Re-reading the same files or repeating the same searches is not.
+_PROGRESS_ACTIONS_ANALYSIS = frozenset({
+    MacroActionType.WRITE_FILE,
+    MacroActionType.VALIDATE,
+    MacroActionType.FINISH,
+    MacroActionType.READ_FILE,    # reading NEW files = progress
+    MacroActionType.SEARCH_CODE,  # searching = progress
+})
+
+# How many distinct "discoveries" count as one progress reset.
+# Prevents the detector from being too lenient (every new file = reset).
+_MIN_NEW_FILES_FOR_PROGRESS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +107,9 @@ class MacroActionRecord:
     detail: str = ""  # short description (file path, subagent name, etc.)
 
     def signature(self) -> str:
-        """A compact string key for pattern matching."""
+        """A compact string key for fingerprint matching. Includes payload."""
+        if self.detail:
+            return f"{self.action_type.value}:{self.tool_name}:{self.detail}"
         return f"{self.action_type.value}:{self.tool_name}"
 
 
@@ -116,7 +134,17 @@ class MacroLoopDetectorConfig:
     """How many times a pattern must repeat to trigger detection."""
 
     max_no_progress_cycles: int = 2
-    """Maximum macro-action cycles without any progress action (×3 actions)."""
+    """Maximum macro-action cycles without any progress action (×4 actions).
+
+    For analysis tasks (read-only), this is effectively disabled — analysis
+    tasks never produce writes, so no_progress is expected behavior.
+    Set analysis_no_progress_multiplier to increase tolerance.
+    """
+
+    analysis_no_progress_multiplier: int = 5
+    """For analysis tasks: multiply max_no_progress_cycles by this factor.
+    Analysis tasks don't write files, so the no_progress check is much
+    looser (default: 2*5=10 cycles, ~40 macro actions)."""
 
     noise_tolerant_min_occurrences: int = 3
     """For noise-tolerant detection: trip if any 2-action pair appears ≥ this many
@@ -168,6 +196,7 @@ class MacroLoopDetector:
     _distinct_files_read: set[str] = field(default_factory=set)
     _distinct_files_written: set[str] = field(default_factory=set)
     _trip_reason: str = ""
+    task_intent: Any = None  # TaskIntent — injected by _run_body()
 
     # ── Properties ──
 
@@ -208,16 +237,36 @@ class MacroLoopDetector:
         )
         self._history.append(record)
 
-        # Track progress indicators
+        # ── Intent-aware progress tracking ──
         if macro_type == MacroActionType.READ_FILE and detail:
+            _is_new = detail not in self._distinct_files_read
             self._distinct_files_read.add(detail)
+        else:
+            _is_new = False
+
         if macro_type == MacroActionType.WRITE_FILE and detail:
             self._distinct_files_written.add(detail)
+
+        # Determine which progress metric to use based on intent
+        _is_analysis = (
+            self.task_intent is not None and self.task_intent.is_analysis
+        )
+        if _is_analysis:
+            # Analysis: reading NEW files or searching = progress.
+            # Re-reading the same files = NOT progress (confirmation loop).
+            _made_progress = (
+                macro_type in _PROGRESS_ACTIONS_ANALYSIS
+                and (macro_type not in (MacroActionType.READ_FILE,) or _is_new
+                     or len(self._distinct_files_read) % _MIN_NEW_FILES_FOR_PROGRESS == 0)
+            )
+        else:
+            # Edit: only writes, validates, and finishes count as progress
+            _made_progress = macro_type in _PROGRESS_ACTIONS_EDIT
+
+        if _made_progress:
             self._no_progress_count = 0
-            # Clear history on write: pattern detection restarts after real progress
-            self._history.clear()
-        if macro_type in _PROGRESS_ACTIONS:
-            self._no_progress_count = 0
+            if macro_type == MacroActionType.WRITE_FILE:
+                self._history.clear()  # write = hard reset
         else:
             self._no_progress_count += 1
 
@@ -260,109 +309,61 @@ class MacroLoopDetector:
 
         recent = self._history[-self.config.window_size:]
 
-        # ── Check 1: No-progress cycle ──
-        if self._no_progress_count >= self.config.max_no_progress_cycles * 4:
-            # ~4 macro actions per turn, so max_no_progress_cycles turns of no progress
+        # ── Check 1: No-progress cycle (intent-aware) ──
+        # Progress is defined per intent — edit tasks need writes, analysis
+        # tasks count reading NEW files as progress. The multiplier hack is
+        # gone: if the agent is truly stuck (re-reading same files, no new
+        # discoveries), this fires for both edit AND analysis.
+        _no_progress_limit = self.config.max_no_progress_cycles * 4
+        if self._no_progress_count >= _no_progress_limit:
+            _is_analysis = (
+                self.task_intent is not None and self.task_intent.is_analysis
+            )
+            _kind = "analysis" if _is_analysis else "edit"
             self._trip_reason = (
-                f"Macro loop: {self._no_progress_count} macro actions without progress "
-                f"(no writes, validates, or finishes). Distinct files read: "
+                f"Macro loop ({_kind}): {self._no_progress_count} macro actions "
+                f"without progress. Distinct files read: "
                 f"{len(self._distinct_files_read)}. Distinct files written: "
                 f"{len(self._distinct_files_written)}."
             )
             logger.warning("MacroLoopDetector tripped: %s", self._trip_reason)
             return True
 
-        # ── Check 2: Repeating pattern detection ──
-        signatures = [r.signature() for r in recent]
+        # ── Check 2: Exact payload fingerprint loops ──
+        # Catches two patterns:
+        #   a) Same action (type+payload) repeated consecutively (鬼打墙)
+        #   b) Alternating pair A→B→A→B repeated (spawn→read→spawn→read)
+        # Does NOT catch READ(A)→SEARCH(B)→READ(C)→SEARCH(D) — normal exploration.
+        if len(recent) >= self.config.min_repetitions:
+            fingerprints = [r.signature() for r in recent]
 
-        for pattern_len in range(
-            self.config.min_pattern_length,
-            self.config.max_pattern_length + 1,
-        ):
-            repetitions = self._count_pattern_repetitions(signatures, pattern_len)
-            if repetitions >= self.config.min_repetitions:
-                pattern_slice = signatures[-pattern_len:]
-                # Skip single-action-type patterns — those are the local
-                # loop detector's job. Macro detection focuses on multi-action
-                # cycles (e.g., SPAWN → READ → SPAWN → READ).
-                unique_actions = set(pattern_slice)
-                if len(unique_actions) <= 1:
-                    continue
-                pattern_str = " → ".join(pattern_slice)
+            # a) Consecutive identical: last N fingerprints all the same
+            _last_n = fingerprints[-self.config.min_repetitions:]
+            if len(set(_last_n)) == 1:
                 self._trip_reason = (
-                    f"Macro loop: pattern [{pattern_str}] repeated "
-                    f"{repetitions}x in window of {len(recent)} actions."
+                    f"Macro loop (exact): [{_last_n[0]}] "
+                    f"repeated {self.config.min_repetitions}x consecutively."
                 )
                 logger.warning("MacroLoopDetector tripped: %s", self._trip_reason)
                 return True
 
-        # ── Check 3: Noise-tolerant pair frequency ──
-        # Count how many times each 2-action signature pair appears in the
-        # window, even non-consecutively. Catches patterns like:
-        #   SPAWN → READ → (noise) → SPAWN → READ → (noise) → SPAWN → READ
-        if self.config.noise_tolerant_min_occurrences > 0:
-            trip = self._check_noise_tolerant(signatures)
-            if trip:
-                return True
-
-        return False
-
-    def _check_noise_tolerant(self, signatures: list[str]) -> bool:
-        """Check if any 2-action pair appears frequently in the window,
-        even when the occurrences are not consecutive.
-
-        For window size 6, if SPAWN→READ appears 3 times, it means the
-        agent has done this cycle 3 times in 6 actions — clearly looping.
-        """
-        if len(signatures) < self.config.noise_tolerant_min_occurrences * 2:
-            return False
-
-        # Count occurrences of each adjacent pair
-        pair_counts: dict[str, int] = {}
-        for i in range(len(signatures) - 1):
-            pair = f"{signatures[i]}→{signatures[i + 1]}"
-            pair_counts[pair] = pair_counts.get(pair, 0) + 1
-
-        for pair, count in pair_counts.items():
-            if count >= self.config.noise_tolerant_min_occurrences:
-                # Ensure at least 2 distinct action types (skip same-action noise)
-                actions = pair.split("→")
-                if len(set(actions)) >= 2:
+            # b) Alternating pair: A→B→A→B repeated (e.g. spawn→read→spawn→read)
+            _alt_len = self.config.min_repetitions * 2
+            if len(fingerprints) >= _alt_len:
+                _alt = fingerprints[-_alt_len:]
+                _a, _b = _alt[0], _alt[1]
+                if _a != _b and all(
+                    _alt[i] == _a and _alt[i+1] == _b
+                    for i in range(0, _alt_len, 2)
+                ):
                     self._trip_reason = (
-                        f"Macro loop (noise-tolerant): pair [{pair}] appeared "
-                        f"{count}x in window of {len(signatures)} actions "
-                        f"(threshold: {self.config.noise_tolerant_min_occurrences})."
+                        f"Macro loop (alternating): [{_a}] ↔ [{_b}] "
+                        f"repeated {self.config.min_repetitions}x."
                     )
                     logger.warning("MacroLoopDetector tripped: %s", self._trip_reason)
                     return True
 
         return False
-
-    @staticmethod
-    def _count_pattern_repetitions(
-        signatures: list[str], pattern_len: int
-    ) -> int:
-        """Count how many times the trailing pattern repeats consecutively.
-
-        E.g., signatures = [A, B, A, B, A, B], pattern_len = 2
-        → trailing pattern = [A, B], repeats = 3
-        """
-        if len(signatures) < pattern_len * 2:
-            return 0
-
-        trailing = signatures[-pattern_len:]
-        count = 1
-        pos = len(signatures) - pattern_len * 2
-
-        while pos >= 0:
-            segment = signatures[pos:pos + pattern_len]
-            if segment == trailing:
-                count += 1
-                pos -= pattern_len
-            else:
-                break
-
-        return count
 
     # ── Reset ──
 

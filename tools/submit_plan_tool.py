@@ -21,6 +21,7 @@ class SubmitReadPlanRef:
 
 
 class SubmitReadPlanTool(BaseTool):
+    is_read_only = True
     """Agent calls this tool to submit a structured read plan during plan_reads phase."""
 
     def __init__(self, ref: SubmitReadPlanRef) -> None:

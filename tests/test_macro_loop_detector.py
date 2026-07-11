@@ -36,7 +36,7 @@ class TestMacroActionRecord:
             tool_name="task",
             detail="explore",
         )
-        assert record.signature() == "spawn_subagent:task"
+        assert record.signature() == "spawn_subagent:task:explore"
 
     def test_signature_immutable(self):
         record = MacroActionRecord(
@@ -69,22 +69,21 @@ class TestMacroLoopDetectorBasic:
 
 class TestMacroLoopDetectorRepeatingPattern:
     def test_spawn_read_spawn_read_spawn_trips(self):
-        """Pattern: SPAWN → READ → SPAWN → READ → SPAWN — should detect."""
+        """Pattern: SPAWN→READ(same file)→SPAWN→READ(same file)→SPAWN — alternating fingerprint loop."""
         detector = MacroLoopDetector(config=MacroLoopDetectorConfig(
-            window_size=6, min_repetitions=2, min_pattern_length=2,
+            window_size=6, min_repetitions=2,
         ))
-        # Fill enough history for window
         detector.record_tool_call("file_read", {"path": "setup.py"})
         detector.record_tool_call("search_text", {"pattern": "foo"})
-        # Pattern starts: SPAWN → READ → SPAWN → READ → SPAWN (3 reps if len=2)
+        # Same SPAWN + same READ file → alternation detected
         detector.record_tool_call("task", {"subagent_type": "explore"})
-        detector.record_tool_call("file_read", {"path": "result1.txt"})
+        detector.record_tool_call("file_read", {"path": "result.txt"})
         detector.record_tool_call("task", {"subagent_type": "explore"})
-        detector.record_tool_call("file_read", {"path": "result2.txt"})
+        detector.record_tool_call("file_read", {"path": "result.txt"})
         detector.record_tool_call("task", {"subagent_type": "explore"})
-        detector.record_tool_call("file_read", {"path": "result3.txt"})
+        detector.record_tool_call("file_read", {"path": "result.txt"})
         assert detector.is_tripped
-        assert "spawn_subagent" in detector.trip_reason.lower()
+        assert "alternating" in detector.trip_reason.lower()
 
     def test_varied_actions_do_not_trip(self):
         """Normal workflow with diverse actions should not trip."""
@@ -164,31 +163,6 @@ class TestMacroLoopDetectorNoProgress:
         detector.record_tool_call("search_text", {"pattern": "c"})
         detector.record_tool_call("file_read", {"path": "g2.py"})
         assert not detector.is_tripped
-
-
-class TestMacroLoopDetectorPatternCounting:
-    def test_count_pattern_repetitions_basic(self):
-        # Pattern AB repeated 3 times
-        sigs = ["a:x", "b:y", "a:x", "b:y", "a:x", "b:y"]
-        count = MacroLoopDetector._count_pattern_repetitions(sigs, 2)
-        assert count == 3
-
-    def test_count_pattern_repetitions_no_repeat(self):
-        sigs = ["a:x", "b:y", "c:z"]
-        count = MacroLoopDetector._count_pattern_repetitions(sigs, 2)
-        assert count == 0
-
-    def test_count_pattern_repetitions_insufficient(self):
-        """When there's only one instance of the pattern (2 sigs, pattern_len=2),
-        there's no repetition — the minimum is pattern_len * 2 = 4 entries."""
-        sigs = ["a:x", "b:y"]  # only one pattern instance, need 4 for detection
-        count = MacroLoopDetector._count_pattern_repetitions(sigs, 2)
-        assert count == 0  # not enough for even 1 repetition
-
-    def test_count_pattern_repetitions_pattern_len_3(self):
-        sigs = ["a:x", "b:y", "c:z", "a:x", "b:y", "c:z"]
-        count = MacroLoopDetector._count_pattern_repetitions(sigs, 3)
-        assert count == 2
 
 
 class TestMacroLoopDetectorReset:

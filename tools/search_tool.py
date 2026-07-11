@@ -32,6 +32,7 @@ _SKIP_DIRS: frozenset[str] = frozenset({
 
 
 class SearchTextTool(BaseTool):
+    is_read_only = True
     """
     在 repo 文件中搜索文本，返回匹配行及其上下文。
 
@@ -131,6 +132,7 @@ class SearchTextTool(BaseTool):
 
 
 class FindFilesTool(BaseTool):
+    is_read_only = True
     """
     按文件名 pattern 查找文件。
 
@@ -200,6 +202,7 @@ class FindFilesTool(BaseTool):
 
 
 class FindSymbolTool(BaseTool):
+    is_read_only = True
     """
     在 Python 文件中查找函数/类定义。
     用正则匹配 def / class 语句，Day 5 可替换为 tree-sitter 精确实现。

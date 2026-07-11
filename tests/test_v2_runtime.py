@@ -268,11 +268,13 @@ def test_v2_build_agent_runs_to_completion(tmp_path):
         Action(action_type=ActionType.TOOL_CALL, thought="writing",
                tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "out.txt"), "content": "ok"})]),
         Action(action_type=ActionType.FINISH, thought="done", message="Task complete."),
+        # Stop Hook blocks first FINISH (no verification), agent retries
+        Action(action_type=ActionType.FINISH, thought="retry after verify", message="Task complete."),
     ])
     runtime, store = _make_runtime(tmp_path, backend)
     session = runtime.create_root_session(agent_name="build", repo_path=str(tmp_path), title="test")
     result = runtime.run_session(session.id, agent_name="build", task_description="do it", intent="edit")
-    assert result.summary == "Task complete."
+    assert "Task complete." in result.summary
 
 
 def test_v2_react_agent_stop_hook_blocks_then_continues(tmp_path):
@@ -403,11 +405,12 @@ def test_v2_parent_recovers_after_failed_child(tmp_path):
         Action(action_type=ActionType.TOOL_CALL, thought="writing",
                tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "x.txt"), "content": "x"})]),
         Action(action_type=ActionType.FINISH, thought="ok", message="parent done"),
+        Action(action_type=ActionType.FINISH, thought="retry", message="parent done"),
     ])
     runtime2, _ = _make_runtime(tmp_path, parent_backend)
     session = runtime2.create_root_session(agent_name="build", repo_path=str(tmp_path), title="recovery")
     result2 = runtime2.run_session(session.id, agent_name="build", task_description="recover", intent="edit")
-    assert result2.summary == "parent done"
+    assert "parent done" in result2.summary
 
 
 def test_v2_runtime_injects_subagent_descriptions(tmp_path):
