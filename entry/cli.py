@@ -240,13 +240,18 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     artifact_store_ref = ArtifactStoreRef()
     evidence_ledger_ref = EvidenceLedgerRef()
     submit_plan_ref = SubmitReadPlanRef()
+
+    # ── P1-1: Session-global FileReadCache shared across all agents ──
+    from tools.file_tool import FileReadCache
+    _global_read_cache = FileReadCache()
+
     registry = (
         ToolRegistry(permission_pipeline=pipeline)
         .register(ShellTool(runtime=runtime))
-        .register(FileReadTool())
-        .register(FileViewTool())
-        .register(FileWriteTool())
-        .register(FileEditTool())
+        .register(FileReadTool(read_cache=_global_read_cache))
+        .register(FileViewTool(read_cache=_global_read_cache))
+        .register(FileWriteTool(read_cache=_global_read_cache))
+        .register(FileEditTool(read_cache=_global_read_cache))
         .register(SearchTextTool())
         .register(FindFilesTool())
         .register(FindSymbolTool())

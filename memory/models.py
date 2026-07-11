@@ -33,24 +33,41 @@ GLOBAL_TYPES = frozenset({"user", "feedback"})
 
 @dataclass
 class Anchor:
-    """记忆锚点：将记忆关联到文件、符号或任务类型。"""
+    """记忆锚点：将记忆关联到文件、符号或任务类型。
+
+    content_hash: SHA256 of the anchored file content at write time.
+    When the file changes, the hash mismatches → memory is physically
+    discarded at injection time. Code is Truth.
+    """
     kind: str
     path: str | None = None
     name: str | None = None
     value: str | None = None
+    content_hash: str = ""  # SHA256 hex — empty = no hash binding
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            key: value
-            for key in ("kind", "path", "name", "value")
-            if (value := getattr(self, key)) is not None
-        }
+        result: dict[str, Any] = {}
+        for key in ("kind", "path", "name", "value"):
+            v = getattr(self, key)
+            if v is not None:
+                result[key] = v
+        if self.content_hash:
+            result["content_hash"] = self.content_hash
+        return result
 
 
 @dataclass
 class MemoryMetadata:
-    """记忆元数据。"""
+    """记忆元数据。
+
+    status lifecycle:
+      "active"     — memory is current, inject into context
+      "deprecated" — explicitly invalidated (superseded by code change, manual /deprecate command)
+                     NOT injected into context. Code is Truth.
+    """
     type: str = "project"  # "user" | "feedback" | "project" | "reference"
+    status: str = "active"  # "active" | "deprecated"
+    # Backward compat — still readable for old files:
     stale: bool = False
     access_count: int = 0
     validated_at: str = ""

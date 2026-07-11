@@ -11,9 +11,11 @@ MemoryContext — 管理记忆在 LLM 上下文中的注入。
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections import Counter
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from memory.store import MemoryStore
@@ -181,7 +183,8 @@ class MemoryContext:
         for s in always_mems:
             try:
                 mem = self._store.read_memory(s.name)
-                if mem and mem.content.strip():
+                # P1: skip deprecated memories — Code is Truth
+                if mem and mem.content.strip() and mem.metadata.status == "active":
                     lines.append(f"### {s.name} ({s.type})")
                     lines.append(mem.content.strip())
                     lines.append("")
@@ -224,6 +227,10 @@ class MemoryContext:
                 continue
             mem = self._store.read_memory(name)
             if mem and mem.content.strip():
+                # P1: skip deprecated memories — Code is Truth
+                if mem.metadata.status != "active":
+                    logger.debug("Skipping %s memory '%s' in selected section", mem.metadata.status, name)
+                    continue
                 freshness = SessionRuntime._memory_freshness_text(name, self._store)
                 lines.append(f"### {name}")
                 lines.append(mem.content.strip())
@@ -373,11 +380,38 @@ class MemoryContext:
                 anchor_path = anchor.path.replace("\\", "/").lstrip("./")
                 for f in normalized_files:
                     if f == anchor_path or f.startswith(anchor_path + "/"):
-                        stale_warn = ""
-                        if mem.metadata.stale:
-                            stale_warn = "\n> **⚠ STALE**: This rule may be outdated — the anchored file was modified since this memory was created."
+                        # ── P1: deprecated memories are NOT injected ──
+                        if mem.metadata.status != "active":
+                            logger.debug(
+                                "Skipping %s feedback memory '%s'",
+                                mem.metadata.status, mem.name,
+                            )
+                            break
+
+                        # ── P1-a: Content hash verification — Code is Truth ──
+                        # If the memory was bound to a specific file version (hash),
+                        # verify the current file matches. If not, physically discard.
+                        bound_hash = anchor.content_hash
+                        if bound_hash:
+                            try:
+                                _path = Path(anchor_path)
+                                if _path.exists():
+                                    _current = hashlib.sha256(
+                                        _path.read_bytes()
+                                    ).hexdigest()
+                                    if _current != bound_hash:
+                                        logger.info(
+                                            "Memory '%s' physically discarded: "
+                                            "content hash mismatch for %s",
+                                            mem.name, anchor_path,
+                                        )
+                                        mem.metadata.status = "deprecated"
+                                        self._store.write_memory(mem)
+                                        break
+                            except (OSError, ImportError):
+                                pass  # can't verify — let it through
                         matched_memories.append(
-                            f"### {mem.name}\n{mem.content.strip()}{stale_warn}"
+                            f"### {mem.name}\n{mem.content.strip()}"
                         )
                         matched_names.append(mem.name)
                         break

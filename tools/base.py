@@ -50,6 +50,9 @@ class ToolResult:
     output: str                         # 工具的文本输出，已做截断处理
     error: str | None = None            # 失败时的错误信息
     duration_ms: float = 0.0            # 工具执行耗时（毫秒），由 ToolRegistry 填充
+    cached: bool = False                # True = 结果来自缓存命中（无实际 I/O）
+    subagent_tokens_used: int = 0       # 子代理消耗的 token 数，父代理预算需计入
+    subagent_terminated_by_loop: bool = False  # 子代理被循环检测终止
 
     def to_observation(self, tool_name: str) -> Observation:
         """转换为 Observation，供 core.py 写入 EventLog 和注入上下文。"""
@@ -140,12 +143,13 @@ class ToolRegistry:
     3. 记录每个工具的执行耗时统计（get_timing_stats）
     """
 
-    def __init__(self, hitl_manager: Any = None, permission_pipeline: Any = None, hook_dispatcher: Any = None) -> None:
+    def __init__(self, hitl_manager: Any = None, permission_pipeline: Any = None, hook_dispatcher: Any = None, capability_registry: Any = None) -> None:
         self._tools: dict[str, BaseTool] = {}
         self._permission_pipeline = permission_pipeline
         # Backward compat: hitl_manager still accepted, pipeline takes precedence
         self._hitl_manager = hitl_manager
         self._hook_dispatcher = hook_dispatcher
+        self._capability_registry = capability_registry  # P1-6: dynamic capability check
         self._timing_stats: dict[str, dict[str, float | int]] = {}
 
     def register(self, tool: BaseTool) -> "ToolRegistry":
@@ -178,6 +182,29 @@ class ToolRegistry:
             return result
 
         tool = self._tools[name]
+
+        # ── P1-6: Physical interception with dedup (structured feedback) ──
+        if self._capability_registry is not None:
+            import json as _json
+            from agent.capability_registry import InterceptHardBlock
+            try:
+                intercept = self._capability_registry.intercept(
+                    name, session_id=getattr(self, "_session_id", ""),
+                )
+                if intercept.blocked:
+                    feedback_json = _json.dumps(intercept.feedback, ensure_ascii=False)
+                    result = ToolResult(
+                        success=False,
+                        output="",
+                        error=(
+                            f"[SYSTEM] Tool '{name}' blocked: {feedback_json}"
+                        ),
+                    )
+                    self._record_timing(name, start, result)
+                    return result
+            except InterceptHardBlock:
+                # Propagate to main loop — this session cannot continue
+                raise
 
         # Permission Pipeline gate (5-layer evaluation)
         if self._permission_pipeline is not None:
@@ -230,8 +257,11 @@ class ToolRegistry:
         return list(self._tools.keys())
 
     def filtered(self, allowed_tools: set[str] | frozenset[str]) -> "ToolRegistry":
-        """返回只包含指定工具的新注册表，保留 HITL 管理器但不共享统计数据。"""
-        filtered = ToolRegistry(hitl_manager=self._hitl_manager)
+        """返回只包含指定工具的新注册表，保留 HITL 管理器和 capability registry。"""
+        filtered = ToolRegistry(
+            hitl_manager=self._hitl_manager,
+            capability_registry=self._capability_registry,
+        )
         for tool_name in self.tool_names:
             if tool_name in allowed_tools:
                 filtered._tools[tool_name] = self._tools[tool_name]

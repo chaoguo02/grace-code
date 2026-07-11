@@ -1,7 +1,7 @@
 ---
 name: general
 description: General-purpose coding subagent with full tool access including shell. Use ONLY when Write, Edit, or Bash is required. For read-only analysis, code search, or bug-finding, use 'explore' instead.
-tools: Glob, Grep, Read, Write, Edit, Bash, WebFetch, WebSearch
+tools: Glob, Grep, Read, file_view, Write, Edit, Bash, WebFetch, WebSearch
 disallowedTools: Task, TaskStop
 model: inherit
 maxTurns: 60

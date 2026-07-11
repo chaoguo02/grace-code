@@ -68,17 +68,20 @@ class ForkResult:
     error: str = ""
     artifacts: tuple[str, ...] = ()
     turns_used: int = 0
+    tokens_used: int = 0
+    terminated_by_loop: bool = False  # subagent was killed by loop detection
+    structured_findings: tuple[dict[str, object], ...] = ()  # from SubmitFindingsTool
     failure_diagnosis: str = ""  # structured diagnosis when status is "failed"
 
 
 # ── Built-in agent definitions (fallback when no .md files exist) ──
 
 _DEFAULT_READONLY_TOOLS = frozenset({
-    "Read", "Glob", "Grep", "WebFetch", "WebSearch",
+    "Read", "Glob", "Grep", "file_view", "WebFetch", "WebSearch",
 })
 
 _DEFAULT_GENERAL_TOOLS = frozenset({
-    "Read", "Glob", "Grep", "Write", "Edit", "Bash", "WebFetch", "WebSearch",
+    "Read", "Glob", "Grep", "file_view", "Write", "Edit", "Bash", "WebFetch", "WebSearch",
 })
 
 _COORDINATOR_TOOLS = frozenset({"Task", "Read", "Glob", "Grep"})

@@ -22,7 +22,7 @@ from context.artifacts import ArtifactStore
 from context.evidence import EvidenceLedger
 from tools.file_tool import (
     FileReadCache, FileReadTool, FileViewTool,
-    MAX_READ_LINES, VIEW_WINDOW_LINES, MAX_READS_PER_FILE,
+    MAX_READ_LINES, VIEW_WINDOW_LINES,
 )
 
 
@@ -262,7 +262,11 @@ def test_v2_fork_result_fields():
 # ── Primary agent run ──
 
 def test_v2_build_agent_runs_to_completion(tmp_path):
+    # Include a file_write before FINISH — the completion guard requires
+    # at least one write for edit tasks.
     backend = MockBackend([
+        Action(action_type=ActionType.TOOL_CALL, thought="writing",
+               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "out.txt"), "content": "ok"})]),
         Action(action_type=ActionType.FINISH, thought="done", message="Task complete."),
     ])
     runtime, store = _make_runtime(tmp_path, backend)
@@ -296,7 +300,7 @@ def test_v2_react_agent_stop_hook_blocks_then_continues(tmp_path):
         tool_registry,
         AgentConfig(stream=False),
     )
-    task = Task("finish with stop hook", str(tmp_path), max_steps=5)
+    task = Task("finish with stop hook", str(tmp_path), max_steps=5, intent="analysis")
     with EventLog.create(task, log_dir=str(tmp_path / "logs")) as event_log:
         result = agent.run(task, event_log)
 
@@ -396,6 +400,8 @@ def test_v2_parent_recovers_after_failed_child(tmp_path):
     # Parent can still run after child — separate backend needed in real use,
     # but here we verify fork doesn't crash and session still works.
     parent_backend = MockBackend([
+        Action(action_type=ActionType.TOOL_CALL, thought="writing",
+               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "x.txt"), "content": "x"})]),
         Action(action_type=ActionType.FINISH, thought="ok", message="parent done"),
     ])
     runtime2, _ = _make_runtime(tmp_path, parent_backend)
@@ -422,9 +428,8 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "SPOT DESIGN PATTERNS" in text
     assert "Atomic Task Boundaries" in text
     assert "Subagent Failure Recovery" in text
-    assert "TRANSIENT ERROR" in text
-    assert "LOOP" in text
-    assert "CIRCUIT BREAKER" in text
+    assert "Runtime enforces retry limits" in text
+    assert "The system will stop you" in text
     assert "Task routing guide" in text
     assert "read-only analysis" in text
 
@@ -471,125 +476,42 @@ def test_list_subagents_excludes_primary_agents():
 # ── Subagent report format validation (Layer 2) ──
 
 from agent.v2.task_tool import (
-    _validate_subagent_report, _build_subagent_prompt,
-    _SUBAGENT_PROTOCOL, _KNOWN_DESIGN_DECISIONS, VIOLATION_MARKER,
+    _build_subagent_prompt,
+    _SUBAGENT_PROTOCOL, _KNOWN_DESIGN_DECISIONS,
 )
 
-
-def test_validate_report_passes_well_structured_report():
-    """Report with file:line refs, three sections, and code fences passes."""
-    report = (
-        "## Confirmed Bugs\n"
-        "- agent/core.py:142: wrong comparison operator\n"
-        "  ```python\n  if x = 1:  # assignment, not comparison\n  ```\n"
-        "- Verified by reading agent/core.py:140-145\n"
-        "## Improvement Suggestions\n"
-        "- Better naming in task_tool.py:95\n"
-        "## Unverified Hypotheses\n"
-        "- Could be a race condition [UNVERIFIED]"
-    )
-    assert _validate_subagent_report(report) == []
-
-
-def test_validate_report_passes_without_unverified_section():
-    """A report where all findings are confirmed (no unverified section
-    present) should NOT be flagged — UNVERIFIED markers are not mandatory."""
-    report = (
-        "## Confirmed Bugs\n"
-        "- agent/core.py:142: wrong comparison operator\n"
-        "  ```python\n  if x = 1:\n  ```\n"
-        "## Improvement Suggestions\n"
-        "- Better error messages in task_tool.py:101\n"
-        "  ```python\n  print(\"TODO\")\n  ```\n"
-    )
-    assert _validate_subagent_report(report) == []
-
-
-def test_validate_report_ok_for_non_bug_report():
-    """Reports that don't claim bugs produce zero violations."""
-    report = (
-        "## Summary\n"
-        "The task was completed successfully. File was read and everything "
-        "looks correct. No problems found."
-    )
-    assert _validate_subagent_report(report) == []
-
-
-def test_validate_report_warns_on_bug_claim_without_file_lines():
-    """Bug claims without file:line refs produce violations."""
-    report = (
-        "## Confirmed Bugs\n"
-        "1. The validation allows empty strings through\n"
-        "2. Success=True when it should be False"
-    )
-    violations = _validate_subagent_report(report)
-    assert len(violations) > 0
-    assert any("file:line" in v for v in violations)
-
-
-def test_validate_report_warns_on_missing_section_structure():
-    """Bug claims without proper three-section structure produce a violation.
-    UNVERIFIED absence is NOT checked — it depends on actual findings."""
-    report = (
-        "## Confirmed Bugs\n"
-        "- agent/core.py:142: wrong operator\n"
-        "## Observations\n"
-        "- Better error messages"
-    )
-    violations = _validate_subagent_report(report)
-    assert len(violations) > 0
-    assert any("report structure" in v for v in violations)
-
-
-def test_validate_report_warns_on_missing_code_fences():
-    """Bug claims without ``` code fences produce a violation."""
-    report = (
-        "## Confirmed Bugs\n"
-        "- agent/core.py:142: wrong operator\n"
-        "## Improvement Suggestions\n"
-        "- Style fixes\n"
-        "## Unverified Hypotheses\n"
-        "- Might be broken [UNVERIFIED]"
-    )
-    violations = _validate_subagent_report(report)
-    # Has file:line + three-section, but no code fences
-    assert any("code snippet" in v.lower() for v in violations)
-
-
-def test_validate_report_empty():
-    """Empty or blank reports produce zero violations."""
-    assert _validate_subagent_report("") == []
-    assert _validate_subagent_report("  ") == []
 
 
 # ── Subagent prompt wrapper (Layer 1) ──
 
 def test_build_subagent_prompt_includes_protocol():
-    """_build_subagent_prompt wraps the user prompt with the protocol."""
-    result = _build_subagent_prompt("Analyze task_tool.py for bugs.")
+    """_build_subagent_prompt wraps code-reviewer prompts with the full protocol."""
+    result = _build_subagent_prompt("Analyze task_tool.py for bugs.", "code-reviewer")
     assert "[SUBAGENT ANALYSIS PROTOCOL]" in result
     assert "READ BEFORE YOU CLAIM" in result
     assert "Phase 1" in result and "Phase 2" in result and "Phase 3" in result and "Phase 4" in result
     assert "Anti-Laziness" in result
-    assert "Output Format" in result
+    assert "submit_findings" in result
     assert "Analyze task_tool.py for bugs." in result
     # User prompt must come after the protocol
     assert result.index("Analyze task_tool.py for bugs.") > result.index("[SUBAGENT ANALYSIS PROTOCOL]")
 
 
+def test_build_subagent_prompt_non_reviewer_passthrough():
+    """Non-code-reviewer subagents get the prompt directly — no protocol wrapping."""
+    for agent_type in ("explore", "general"):
+        result = _build_subagent_prompt("Find all config files.", agent_type)
+        assert result == "Find all config files."
+        assert "[SUBAGENT ANALYSIS PROTOCOL]" not in result
+
+
 def test_known_design_decisions_injected_into_protocol():
     """The shareable _KNOWN_DESIGN_DECISIONS list is injected into the protocol."""
-    result = _build_subagent_prompt("Do X.")
+    result = _build_subagent_prompt("Do X.", "code-reviewer")
     assert "KNOWN DESIGN DECISIONS" in result
     for entry in _KNOWN_DESIGN_DECISIONS:
         # First 40 chars of each entry should appear in the protocol
         assert entry[:40] in result
-
-
-def test_violation_marker_is_shared_constant():
-    """VIOLATION_MARKER is a named constant for Layer 2 ↔ Layer 3 alignment."""
-    assert isinstance(VIOLATION_MARKER, str)
-    assert "SUBAGENT REPORT FORMAT VIOLATIONS" in VIOLATION_MARKER
 
 
 # ── Structured subagent failure diagnosis (P1) ──
@@ -693,30 +615,27 @@ def test_file_read_cache_non_overlapping_range_misses():
     assert cache.check("/abs/path/a.py", offset=200, limit=100) is None
 
 
-def test_file_read_cache_reset_clears_all():
-    """reset() clears all cached content and read counts."""
+def test_file_read_cache_invalidate_clears_path():
+    """invalidate() removes all cached entries for a path."""
     cache = FileReadCache()
 
     cache.store("/abs/path/a.py", offset=1, limit=100, content="data")
-    cache.read_counts["/abs/path/a.py"] = 2
+    assert cache.check("/abs/path/a.py", offset=1, limit=100) is not None
 
-    cache.reset()
+    cache.invalidate("/abs/path/a.py")
 
     assert cache.check("/abs/path/a.py", offset=1, limit=100) is None
-    assert cache.read_counts == {}
 
 
-def test_file_read_cache_count_and_check_caps_at_max():
-    """Files can be read at most MAX_READS_PER_FILE times."""
+def test_file_read_cache_no_frequency_cap():
+    """mtime-based cache has no artificial frequency cap.
+    Repeated reads of the same file are harmless — mtime verification
+    ensures freshness, so there's no reason to block them."""
     cache = FileReadCache()
-
-    # First 3 reads succeed
-    assert cache.count_and_check("/abs/path/a.py") == 1
-    assert cache.count_and_check("/abs/path/a.py") == 2
-    assert cache.count_and_check("/abs/path/a.py") == 3
-
-    # 4th read returns -1 (capped)
-    assert cache.count_and_check("/abs/path/a.py") == -1
+    # Store and verify repeated checks work (no -1 cap)
+    cache.store("/abs/path/a.py", offset=1, limit=100, content="data")
+    for _ in range(10):
+        assert cache.check("/abs/path/a.py", offset=1, limit=100) is not None
 
 
 def test_file_read_tool_cache_hit(tmp_path):
@@ -733,59 +652,54 @@ def test_file_read_tool_cache_hit(tmp_path):
     assert "[CACHED]" not in r1.output
     assert "line 1" in r1.output
 
-    # Second read — cached
+    # Second read — cached (mtime unchanged)
     r2 = tool.execute({"path": str(f)})
     assert r2.success
     assert "[CACHED]" in r2.output
-    assert "already read" in r2.output
 
 
-def test_file_read_tool_count_cap(tmp_path):
-    """After MAX_READS_PER_FILE unique range reads, further cache-miss reads return error.
-
-    The frequency cap is a secondary defense: it fires when the agent keeps
-    reading DIFFERENT offsets of the same file past the cap. Same-range
-    re-reads are handled by the primary cache-hit path (returns [CACHED]).
-    """
+def test_file_read_tool_cache_invalidates_after_mtime_change(tmp_path):
+    """When file mtime changes, cache misses and re-reads from disk."""
     tool = FileReadTool(read_cache=FileReadCache())
-    view_tool = FileViewTool(read_cache=tool._read_cache)
-
-    # Create a file with >500 lines so file_read (1-500) doesn't cover
-    # file_view reads beyond line 500.
-    lines = [f"line {i}" for i in range(1, 701)]
-    f = tmp_path / "big.py"
-    f.write_text("\n".join(lines))
-
-    # file_read covers lines 1-500 (offset=1, limit=500)
-    tool.execute({"path": str(f)})                                        # count 1
-
-    # file_view reads beyond 500 — not covered by file_read cache
-    view_tool.execute({"path": str(f), "start_line": 550})               # count 2
-    view_tool.execute({"path": str(f), "start_line": 600})               # count 3
-
-    # 4th unique read — blocked (count at cap, no cache hit)
-    r = view_tool.execute({"path": str(f), "start_line": 650})
-    assert not r.success
-    assert "already been read" in r.error
-    assert str(MAX_READS_PER_FILE) in r.error
-
-
-def test_file_read_tool_clone_has_isolated_cache(tmp_path):
-    """clone_with_fresh_cache() creates an independent cache."""
-    tool1 = FileReadTool(read_cache=FileReadCache())
-    tool2 = tool1.clone_with_fresh_cache()
 
     f = tmp_path / "test.py"
-    f.write_text("line 1\nline 2\n")
+    f.write_text("line 1\nline 2\nline 3\n")
 
-    # Tool1 reads the file
+    # First read — populate cache
+    r1 = tool.execute({"path": str(f)})
+    assert r1.success
+    assert "[CACHED]" not in r1.output
+
+    # Modify the file (mtime changes)
+    import time
+    time.sleep(0.01)  # ensure mtime changes (filesystem resolution)
+    f.write_text("modified line 1\nmodified line 2\n")
+
+    # Second read — mtime changed, should miss cache
+    r2 = tool.execute({"path": str(f)})
+    assert r2.success
+    assert "[CACHED]" not in r2.output
+    assert "modified" in r2.output
+
+
+def test_file_read_cache_shared_across_tools(tmp_path):
+    """Two tools sharing the same cache instance see each other's reads."""
+    cache = FileReadCache()
+    tool1 = FileReadTool(read_cache=cache)
+    tool2 = FileReadTool(read_cache=cache)
+
+    f = tmp_path / "test.py"
+    f.write_text("shared cache test\n")
+
+    # Tool1 reads, populating shared cache
     r1 = tool1.execute({"path": str(f)})
     assert r1.success
+    assert "[CACHED]" not in r1.output
 
-    # Tool2 (cloned) should NOT have tool1's cache
+    # Tool2 reads — cache hit from shared cache
     r2 = tool2.execute({"path": str(f)})
     assert r2.success
-    assert "[CACHED]" not in r2.output  # First read for tool2 — no cache hit
+    assert "[CACHED]" in r2.output
 
 
 def test_file_view_tool_cache_hit_on_exact_re_read(tmp_path):
@@ -801,11 +715,10 @@ def test_file_view_tool_cache_hit_on_exact_re_read(tmp_path):
     assert r1.success
     assert "[CACHED]" not in r1.output
 
-    # Exact same re-read — cached
+    # Exact same re-read — cached (mtime unchanged)
     r2 = tool.execute({"path": str(f), "start_line": 50})
     assert r2.success
     assert "[CACHED]" in r2.output
-    assert "already read" in r2.output
 
 
 def test_file_view_tool_cache_full_file_covers_subrange(tmp_path):
@@ -826,12 +739,12 @@ def test_file_view_tool_cache_full_file_covers_subrange(tmp_path):
     assert "[CACHED]" in r.output
 
 
-def test_file_view_and_file_read_share_count_cap(tmp_path):
-    """file_read and file_view share the same per-file count cap.
+def test_file_view_and_file_read_share_cache_no_cap(tmp_path):
+    """file_read and file_view share the same cache — no artificial frequency cap.
 
-    The cap only fires on cache-MISS reads past the limit. For files >500 lines,
-    file_read (1-500) and file_view beyond 500 are non-overlapping ranges that
-    each increment the shared count.
+    With mtime-verified caching, any number of reads is fine as long as the
+    file hasn't been modified. The cache handles overlapping ranges correctly:
+    file_read covers 1-500, file_view within that range hits cache.
     """
     cache = FileReadCache()
     read_tool = FileReadTool(read_cache=cache)
@@ -841,15 +754,19 @@ def test_file_view_and_file_read_share_count_cap(tmp_path):
     lines = [f"line {i}" for i in range(1, 701)]
     f.write_text("\n".join(lines))
 
-    # file_read covers 1-500 → count 1
+    # file_read covers 1-500
     assert read_tool.execute({"path": str(f)}).success
-    # file_view beyond 500 → count 2 (not covered by file_read cache)
-    assert view_tool.execute({"path": str(f), "start_line": 520}).success
-    # file_view at 600 → count 3
-    assert view_tool.execute({"path": str(f), "start_line": 600}).success
+    # file_view at 520 → cache miss (not covered by 1-500)
+    r2 = view_tool.execute({"path": str(f), "start_line": 520})
+    assert r2.success
+    assert "[CACHED]" not in r2.output
+    # file_view at 520 again → cache hit
+    r3 = view_tool.execute({"path": str(f), "start_line": 520})
+    assert r3.success
+    assert "[CACHED]" in r3.output
 
-    # 4th unique read — blocked (shared count cap across both tools)
-    r = view_tool.execute({"path": str(f), "start_line": 650})
-    assert not r.success
-    assert "already been read" in r.error
-    assert str(MAX_READS_PER_FILE) in r.error
+    # Many more reads still work — no frequency cap with mtime cache
+    for _ in range(10):
+        r = view_tool.execute({"path": str(f), "start_line": 520})
+        assert r.success
+        assert "[CACHED]" in r.output

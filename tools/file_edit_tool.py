@@ -13,9 +13,12 @@ file_edit 工具：基于 old_str/new_str 的精确字符串替换。
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from tools.base import BaseTool, RiskLevel, ToolResult
+
+if TYPE_CHECKING:
+    from tools.file_tool import FileReadCache
 
 
 class FileEditTool(BaseTool):
@@ -27,6 +30,9 @@ class FileEditTool(BaseTool):
         old_str (str): 要替换的精确字符串（必须在文件中唯一出现）
         new_str (str): 替换后的字符串
     """
+
+    def __init__(self, read_cache: "FileReadCache | None" = None) -> None:
+        self._read_cache = read_cache
 
     @property
     def name(self) -> str:
@@ -105,6 +111,8 @@ class FileEditTool(BaseTool):
             except OSError as e:
                 return ToolResult(success=False, output="", error=str(e))
             line_count = new_str.count("\n") + (1 if new_str and not new_str.endswith("\n") else 0)
+            if self._read_cache is not None:
+                self._read_cache.invalidate(str(path.resolve()))
             return ToolResult(
                 success=True,
                 output=f"Created new file: {path} ({line_count} lines)",
@@ -176,6 +184,10 @@ class FileEditTool(BaseTool):
             path.write_text(new_content, encoding="utf-8")
         except OSError as e:
             return ToolResult(success=False, output="", error=str(e))
+
+        # ── Invalidate read cache for this path ──
+        if self._read_cache is not None:
+            self._read_cache.invalidate(str(path.resolve()))
 
         old_lines = old_str.count("\n") + 1
         new_lines = new_str.count("\n") + 1

@@ -91,6 +91,7 @@ class PermissionPipeline:
         auto_approve: bool = False,
         settings_path: str | None = None,
         project_root: str | None = None,
+        circuit_breaker: Any = None,
     ) -> None:
         self._deny_rules: list[PermissionRule] = []
         self._ask_rules: list[PermissionRule] = []
@@ -102,6 +103,7 @@ class PermissionPipeline:
         self._project_root = project_root
         self._session_rules: list[PermissionRule] = []
         self._stats = PipelineStats()
+        self._circuit_breaker = circuit_breaker
 
         for r in (rules or []):
             if r.tier == "deny":
@@ -110,6 +112,10 @@ class PermissionPipeline:
                 self._ask_rules.append(r)
             else:
                 self._allow_rules.append(r)
+
+    def set_circuit_breaker(self, circuit_breaker: Any) -> None:
+        """Inject a CircuitBreaker after construction (session-scoped)."""
+        self._circuit_breaker = circuit_breaker
 
     @property
     def stats(self) -> PipelineStats:
@@ -168,6 +174,14 @@ class PermissionPipeline:
                 return l5
 
         self._stats.record(result)
+
+        # ── Circuit breaker: track denial rhythm ──
+        if self._circuit_breaker is not None:
+            if result.approved:
+                self._circuit_breaker.record_approval()
+            else:
+                self._circuit_breaker.record_denial()
+
         return result
 
     # ─── Layer 1: validateInput ────────────────────────────────────────

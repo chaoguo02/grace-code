@@ -101,12 +101,17 @@ def fork_subagent(
 
     restricted_registry = base_registry.filtered(allowed_tools)
 
-    # ── Isolate file read caches per subagent (Claude Code pattern) ──
-    # Each subagent gets a FRESH FileReadCache so it cannot accidentally
-    # lean on parent-read content.  The subagent must verify facts by
-    # reading files itself.  We clone the tool instances rather than
-    # sharing state — this avoids race conditions and cache leakage.
-    _isolate_file_read_caches(restricted_registry)
+    # ── Session-global FileReadCache (P1-1) ──
+    # Subagents share the parent's mtime-verified cache. If the file hasn't
+    # been modified (mtime unchanged), re-reading provides zero new information.
+    # Write tools invalidate cache entries, guaranteeing freshness.
+    # No per-agent cache isolation needed — mtime is the source of truth.
+
+    # ── P1-5: Structured findings tool (fresh accumulator per subagent) ──
+    from tools.submit_findings_tool import FindingsAccumulator, SubmitFindingsTool
+    _findings_accumulator = FindingsAccumulator()
+    _submit_findings_tool = SubmitFindingsTool(accumulator=_findings_accumulator)
+    restricted_registry.register(_submit_findings_tool)
 
     # Phase-policy wrap
     wrapped_registry = PolicyAwareToolRegistry(
@@ -128,6 +133,21 @@ def fork_subagent(
     cfg.stream_callback = None
     cfg.thought_callback = None
     cfg.compact_history = False
+
+    # ── P0-2: Per-subagent Circuit Breaker ──
+    # Each subagent gets its OWN circuit breaker cloned from the parent's.
+    # This prevents subagents from looping indefinitely — the subagent
+    # breaker trips independently of the parent's.
+    if root_agent_config is not None and root_agent_config.circuit_breaker is not None:
+        cfg.circuit_breaker = root_agent_config.circuit_breaker.clone_for_subagent()
+        # Set a per-subagent time limit (e.g., 120s default)
+        if cfg.circuit_breaker.config.max_elapsed_seconds == 0.0:
+            cfg.circuit_breaker.config.max_elapsed_seconds = 120.0
+    else:
+        from agent.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+        cfg.circuit_breaker = CircuitBreaker(config=CircuitBreakerConfig(
+            max_elapsed_seconds=120.0,
+        ))
 
     # Build agent
     agent = ReActAgent(backend, wrapped_registry, cfg)
@@ -170,26 +190,10 @@ def fork_subagent(
     finally:
         _fire_hook(hook_dispatcher, "SubagentStop", session_id=agent_id)
 
-    return _build_fork_result(definition.name, agent_id, result, _recent_actions)
-
-
-def _isolate_file_read_caches(registry: ToolRegistry) -> None:
-    """Replace FileReadTool/FileViewTool with fresh-cache clones.
-
-    This gives each subagent an independent read cache so that:
-    - Repeated reads within the SAME subagent are caught by the cache.
-    - Reads from DIFFERENT subagents do NOT share caches (each subagent
-      must verify facts independently).
-    """
-    from tools.file_tool import FileReadTool, FileViewTool
-
-    for tool_name, tool_cls in (
-        ("file_read", FileReadTool),
-        ("file_view", FileViewTool),
-    ):
-        old = registry._tools.get(tool_name)
-        if isinstance(old, tool_cls):
-            registry._tools[tool_name] = old.clone_with_fresh_cache()
+    return _build_fork_result(
+        definition.name, agent_id, result, _recent_actions,
+        structured_findings=tuple(_findings_accumulator.all_findings()),
+    )
 
 
 def _build_system_messages(definition: AgentDefinition) -> list[LLMMessage]:
@@ -234,6 +238,7 @@ def _snapshot_recent_actions(event_log: EventLog, window: int = 10) -> list[dict
 def _build_fork_result(
     agent_name: str, agent_id: str, result: RunResult,
     recent_actions: list[dict[str, Any]] | None = None,
+    structured_findings: tuple[dict[str, object], ...] = (),
 ) -> ForkResult:
     status = "completed"
     failure_diagnosis = ""
@@ -243,6 +248,23 @@ def _build_fork_result(
         status = "failed"
         diagnosis = _build_structured_diagnosis(result, recent_actions or [])
         failure_diagnosis = diagnosis
+
+    # ── P0-2: Enrich failure diagnosis with circuit breaker info ──
+    terminated_by_loop = False
+    if result.status == RunStatus.GAVE_UP:
+        if "Circuit breaker tripped" in (result.summary or ""):
+            failure_diagnosis = (
+                f"{failure_diagnosis}\n"
+                f"circuit_breaker: TRIPPED\n"
+                f"circuit_breaker_reason: {result.summary}"
+            ).strip()
+            status = "failed"
+        if "loop" in (result.summary or "").lower() or "Loop detected" in (result.summary or ""):
+            terminated_by_loop = True
+            failure_diagnosis = (
+                f"{failure_diagnosis}\n"
+                f"loop_detected: true"
+            ).strip()
 
     summary = (result.summary or "").strip()
     if not summary:
@@ -255,6 +277,9 @@ def _build_fork_result(
         summary=summary,
         error=result.error or "",
         turns_used=result.steps_taken,
+        tokens_used=result.total_tokens,
+        terminated_by_loop=terminated_by_loop,
+        structured_findings=structured_findings,
         failure_diagnosis=failure_diagnosis,
     )
 

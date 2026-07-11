@@ -2,10 +2,14 @@
 
 Architecture: three-layer defense for subagent output quality.
 
-  Layer 1 (prompt, ~80%): _SUBAGENT_PROTOCOL wraps every subagent prompt with
-    mandatory analysis constraints, a 4-phase verification flow, anti-laziness
-    rules, and a structured output format.
-  Layer 2 (code, 100%): _validate_subagent_report() checks that the subagent
+  Layer 0 (JSON Schema, ~95%): submit_findings tool with structured JSON Schema.
+    Subagent calls this tool → Runtime validates → parent receives typed data.
+    Replaces fragile regex parsing with deterministic schema enforcement.
+  Layer 1 (prompt, ~5%): _SUBAGENT_PROTOCOL wraps code-reviewer prompts with
+    mandatory analysis constraints, a 4-phase verification flow, and
+    anti-laziness rules. Text-only output still accepted as fallback.
+  Layer 2: Removed — replaced by Layer 0 (submit_findings JSON Schema).
+    No more regex parsing. No more format guessing.
     followed the format protocol before the result reaches the parent.
   Layer 3 (parent prompt): runtime._build_runtime_messages() injects review
     instructions so the parent doesn't rubber-stamp subagent output.
@@ -14,7 +18,6 @@ Architecture: three-layer defense for subagent output quality.
 from __future__ import annotations
 
 import logging
-import re
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
@@ -107,25 +110,16 @@ If you find yourself writing any of these, STOP — you are skipping verificatio
 | "我没有权限读取 X 文件"                 | Then DON'T report Confirmed findings about X. |
 | "从命名来看..."                        | Read the actual implementation.      |
 
-## Output Format (MANDATORY — three sections, in this exact order)
+## How to Submit Your Findings (REQUIRED)
 
-### Confirmed Bugs
-Each entry MUST contain:
-- **File and line**: e.g. `agent/task_tool.py:142`
-- **Actual code**: the exact lines you read (use ``` fence)
-- **Problem**: what's wrong
-- **Verification**: how you confirmed this (which file you cross-referenced)
+**You MUST call the `submit_findings` tool before finishing.** This is NOT optional.
+The tool accepts a structured JSON report. Calling it means:
+- Your findings are validated at the Runtime level (no format guessing)
+- The parent agent receives typed data (no regex parsing)
+- File paths, line numbers, and severities are machine-readable
 
-If you can't provide ALL four fields, move to Unverified Hypotheses.
-
-### Improvement Suggestions
-Style, clarity, robustness suggestions. NOT bugs.
-Each must still include a file:line reference.
-
-### Unverified Hypotheses
-Claims you suspect but could NOT verify.
-Each MUST explain: "Why unverified: <blocked by what>"
-If you have no unverified claims, write "None." — do NOT omit this section.
+You can call `submit_findings` multiple times (e.g., once per investigation phase).
+Call it with status='no_findings' and empty findings if you found nothing.
 
 ---
 
@@ -145,10 +139,11 @@ class AgentTool(BaseTool):
         AgentTool(runtime, parent_session_id)
     """
 
-    def __init__(self, runtime: "SessionRuntime", parent_session_id: str, caller_agent_name: str | None = None) -> None:
+    def __init__(self, runtime: "SessionRuntime", parent_session_id: str, caller_agent_name: str | None = None, circuit_breaker: Any = None) -> None:
         self._runtime = runtime
         self._parent_session_id = parent_session_id
         self._caller_agent_name = caller_agent_name
+        self._circuit_breaker = circuit_breaker
 
     # ── BaseTool interface ──
 
@@ -156,13 +151,31 @@ class AgentTool(BaseTool):
     def name(self) -> str:
         return "task"
 
-    @property
-    def description(self) -> str:
+    def _get_available_subagent_specs(self) -> list[Any]:
+        """Return subagent specs, excluding types blocked by CapabilityRegistry."""
         registry = self._runtime.agent_registry
         allowed = self._allowed_subagent_names()
         specs = registry.list_subagents()
         if allowed is not None:
             specs = [spec for spec in specs if spec.name in allowed]
+
+        # ── P2: Dynamic Tool Eviction — physically remove blocked types ──
+        cap_registry = getattr(self._runtime, "capability_registry", None)
+        if cap_registry is not None:
+            from agent.capability_registry import CapabilityKey
+            specs = [
+                spec for spec in specs
+                if cap_registry.is_available(CapabilityKey(
+                    f"subagent:{spec.name}",
+                    scope_type="session",
+                    scope_id=self._parent_session_id,
+                ))
+            ]
+        return specs
+
+    @property
+    def description(self) -> str:
+        specs = self._get_available_subagent_specs()
         subagents = [
             f"- {spec.name}: {spec.description}"
             for spec in specs
@@ -174,6 +187,11 @@ class AgentTool(BaseTool):
             "Available subagent types:",
             *subagents,
             "",
+            "Routing guide (MUST follow — wrong agent type causes loops):",
+            "- Read-only analysis, code search, bug finding → use 'explore' (NO shell, cannot write)",
+            "- Writing code, editing files, running shell commands → use 'general' (has shell + write)",
+            "- Code review / correctness audit → use 'code-reviewer' (read-only, structured output)",
+            "",
             "Guidelines:",
             "- Put ALL necessary context in the prompt — the subagent has no access to this conversation.",
             "- The subagent's final summary is the only thing returned to you.",
@@ -184,12 +202,24 @@ class AgentTool(BaseTool):
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
+        # P2: dynamic subagent_type description — only lists available types
+        available_specs = self._get_available_subagent_specs()
+        available_names = [s.name for s in available_specs]
+        type_desc = (
+            "Which subagent to spawn. CHOOSE CAREFULLY — wrong type causes loops. "
+            "Currently available: " + ", ".join(
+                f"'{n}'" for n in available_names
+            ) + ". "
+            "'explore' for read-only analysis/search (NO shell, NO write); "
+            "'general' ONLY when you need shell/write/edit; "
+            "'code-reviewer' for code review"
+        )
         return {
             "type": "object",
             "properties": {
                 "subagent_type": {
                     "type": "string",
-                    "description": "The type of subagent to spawn (e.g. 'explore', 'general', 'code-reviewer')",
+                    "description": type_desc,
                 },
                 "description": {
                     "type": "string",
@@ -239,14 +269,40 @@ class AgentTool(BaseTool):
                       f"Available: {sorted(available)}",
             )
 
+        # ── P2: Physical interception — blocked subagent types cannot be called ──
+        from agent.capability_registry import CapabilityKey
+        _subagent_key = CapabilityKey(
+            f"subagent:{subagent_type}",
+            scope_type="session",
+            scope_id=self._parent_session_id,
+        )
+        cap_registry = getattr(self._runtime, "capability_registry", None)
+        if cap_registry is not None and not cap_registry.is_available(_subagent_key):
+            _state = cap_registry.get_state(_subagent_key)
+            _reason = cap_registry.get_reason(_subagent_key)
+            return ToolResult(
+                success=False, output="",
+                error=(
+                    f"[SYSTEM] Subagent type '{subagent_type}' is {_state.value if _state else 'blocked'}. "
+                    f"{_reason + '. ' if _reason else ''}"
+                    f"Do NOT retry this subagent type. Handle the work directly or use a different subagent."
+                ),
+            )
+
         definition = self._runtime.agent_registry.get(subagent_type)
 
-        # Wrap user prompt with mandatory analysis protocol (Layer 1)
-        prompt = _build_subagent_prompt(user_prompt)
-        logger.debug(
-            "Injecting subagent protocol (%d chars) into prompt for agent %s",
-            len(_SUBAGENT_PROTOCOL), subagent_type,
-        )
+        # Wrap user prompt with agent-type-appropriate protocol (Layer 1)
+        prompt = _build_subagent_prompt(user_prompt, subagent_type)
+        if subagent_type == "code-reviewer":
+            logger.debug(
+                "Injecting subagent protocol (%d chars) into prompt for agent %s",
+                len(_SUBAGENT_PROTOCOL), subagent_type,
+            )
+        else:
+            logger.debug(
+                "Skipping subagent protocol for agent %s (not code-reviewer)",
+                subagent_type,
+            )
         logger.info(
             "Dispatching subagent '%s' for task: %s",
             subagent_type, description,
@@ -267,31 +323,43 @@ class AgentTool(BaseTool):
                 )
         except Exception as exc:
             logger.exception("Fork subagent '%s' crashed", subagent_type)
+            if self._circuit_breaker is not None:
+                self._circuit_breaker.record_subagent_failure()
             return ToolResult(
                 success=False, output="",
                 error=f"Subagent '{subagent_type}' failed: {exc}",
             )
 
-        is_failure = fork_result.status == "failed"
+        # ── Circuit breaker: track subagent success/failure rhythm ──
+        if self._circuit_breaker is not None:
+            if fork_result.status in ("failed",):
+                self._circuit_breaker.record_subagent_failure()
+            else:
+                self._circuit_breaker.record_subagent_success()
 
-        # Layer 2: deterministic format validation (code layer, 100% execution)
-        violations = _validate_subagent_report(fork_result.summary or "")
-        if violations:
-            violation_text = "\n".join(f"  • {v}" for v in violations)
+        # ── P2: Physical deprivation — block failed subagent types at Runtime ──
+        # The model doesn't need a "DO_NOT_RETRY" warning. The Runtime removes
+        # the subagent type from available tools. The model CANNOT retry because
+        # the tool call will be intercepted before execution.
+        if fork_result.terminated_by_loop and cap_registry is not None:
+            cap_registry.mark_circuit_open(
+                _subagent_key,
+                f"MacroLoop detected in subagent '{subagent_type}' — "
+                f"blocked for remainder of session",
+            )
             logger.warning(
-                "Subagent '%s' report format violations: %s",
-                subagent_type, violations,
+                "Subagent '%s' physically blocked after loop detection (session=%s)",
+                subagent_type, self._parent_session_id,
             )
-            output = (
-                f"{output}\n\n"
-                f"{VIOLATION_MARKER}:\n{violation_text}\n"
-                f"Treat all findings as [UNVERIFIED] until independently confirmed."
-            )
+
+        is_failure = fork_result.status == "failed"
 
         return ToolResult(
             success=not is_failure,
             output=output,
             error=fork_result.error if is_failure else "",
+            subagent_tokens_used=fork_result.tokens_used,
+            subagent_terminated_by_loop=fork_result.terminated_by_loop,
         )
 
     def _allowed_subagent_names(self) -> frozenset[str] | None:
@@ -305,7 +373,14 @@ class AgentTool(BaseTool):
 
 
 def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
-    """Format ForkResult as an XML <task-notification> block."""
+    """Format ForkResult as an XML <task-notification> block.
+
+    When structured_findings are present (from submit_findings tool),
+    they are displayed FIRST as the primary, reliable output. The text
+    summary follows as supplementary context.
+    """
+    import json as _json
+
     lines = [
         "<task-notification>",
         f"  <agent-type>{agent_type}</agent-type>",
@@ -317,6 +392,15 @@ def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
         lines.append(f"  <error>{_xml_escape(result.error)}</error>")
     if result.failure_diagnosis:
         lines.append(f"  <failure-diagnosis>{_xml_escape(result.failure_diagnosis)}</failure-diagnosis>")
+
+    # ── P1-5: Structured findings (primary output) ──
+    if result.structured_findings:
+        lines.append(f"  <structured-findings count='{len(result.structured_findings)}'>")
+        for f in result.structured_findings:
+            finding_json = _json.dumps(f, ensure_ascii=False, default=str)
+            lines.append(f"    <finding>{_xml_escape(finding_json)}</finding>")
+        lines.append("  </structured-findings>")
+
     lines.extend([
         "  <summary>",
         _xml_escape(str(result.summary or "").strip()),
@@ -330,75 +414,13 @@ def _xml_escape(text: Any) -> str:
     return escape(str(text or ""))
 
 
-def _build_subagent_prompt(user_prompt: str) -> str:
-    """Wrap the user's task prompt with the mandatory subagent analysis protocol.
+def _build_subagent_prompt(user_prompt: str, subagent_type: str) -> str:
+    """Wrap the user's task prompt with the subagent analysis protocol.
 
-    The protocol is hardcoded in the tool, not in memory — tool behavior
-    constraints belong to the tool, while memory is for project knowledge.
+    Only code-reviewer subagents get the full verification protocol.
+    For explore/general, pass the prompt cleanly — their system prompt
+    already has tool selection rules from _SUBAGENT_SUMMARY_RULE.
     """
-    return f"{_SUBAGENT_PROTOCOL}\n{user_prompt}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Layer 2: Format validation (code layer — deterministic, 100% execution)
-# ═══════════════════════════════════════════════════════════════════════════
-
-_BUG_CLAIM_PATTERN = re.compile(
-    r"\b(Confirmed Bugs?|Bug\s*[#\d]|🐞|bug:|issue:|error:)\b",
-    re.IGNORECASE,
-)
-_FILE_LINE_PATTERN = re.compile(r"\S+\.(?:py|ts|js|rs|go|java|rb):\d+")
-_SECTION_MARKERS = re.compile(
-    r"(Confirmed Bugs?|Improvement Suggestions?|Unverified Hypothes)",
-    re.IGNORECASE,
-)
-_CODE_FENCE_PATTERN = re.compile(r"```")
-
-VIOLATION_MARKER = "⚠️ SUBAGENT REPORT FORMAT VIOLATIONS"
-
-
-def _validate_subagent_report(summary: str) -> list[str]:
-    """Validate subagent report format — metadata-level, NOT semantic.
-
-    Checks whether the subagent followed the output format protocol:
-    - Each Confirmed entry has file:line references + code snippets.
-    - Report uses the three-section structure.
-
-    NOTE: [UNVERIFIED] markers are NOT mandatory. Their presence depends
-    on whether the subagent actually had unverifiable findings. A report
-    where everything was confirmed should not have them.
-
-    Returns a list of violation strings (empty = report format is clean).
-    """
-    text = summary.strip()
-    if not text:
-        return []
-
-    # Only inspect reports that claim to have found bugs/issues
-    if not _BUG_CLAIM_PATTERN.search(text):
-        return []
-
-    violations: list[str] = []
-    has_file_lines = bool(_FILE_LINE_PATTERN.search(text))
-    has_sections = len(_SECTION_MARKERS.findall(text)) >= 2
-    has_code_fences = bool(_CODE_FENCE_PATTERN.search(text))
-
-    # Confirmed section present → must provide evidence
-    if not has_file_lines:
-        violations.append(
-            "Missing file:line references — Confirmed Bugs must cite "
-            "specific code locations (e.g. agent/task_tool.py:142)"
-        )
-    if not has_code_fences:
-        violations.append(
-            "Missing code snippets (``` fences) — Confirmed Bugs "
-            "must include the actual code read"
-        )
-    # Three-section structure (at least 2 of the 3 required markers)
-    if not has_sections:
-        violations.append(
-            "Missing report structure — expected at least 2 of: "
-            "Confirmed Bugs / Improvement Suggestions / Unverified Hypotheses"
-        )
-
-    return violations
+    if subagent_type == "code-reviewer":
+        return f"{_SUBAGENT_PROTOCOL}\n{user_prompt}"
+    return user_prompt

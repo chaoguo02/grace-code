@@ -88,6 +88,11 @@ _BROAD_ANALYSIS_RE = re.compile(
 _DISCOVERY_TOOL_NAMES = frozenset({"find_files", "search_text", "find_symbol"})
 _READ_TOOL_NAMES = frozenset({"file_read", "file_view"})
 
+# Tools exempt from semantic (Level 2) loop detection — reading different
+# file sections is legitimate exploration, not a loop. FileReadCache already
+# prevents wasted re-reads. Exact match (Level 1) still catches true repeats.
+_READ_EXPLORE_TOOLS = frozenset({"file_read", "file_view"})
+
 
 @dataclass
 class AnalysisPhaseState:
@@ -136,6 +141,7 @@ class AgentConfig:
     confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
     compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
+    circuit_breaker: object = None         # CircuitBreaker | None — 代码级熔断器
 
 
 
@@ -380,8 +386,28 @@ class ReActAgent:
         total_tokens = 0
         steps_without_edit = 0
         consecutive_failures = 0
-        _max_consecutive_failures = 3
+        _max_consecutive_failures = (
+            self._cfg.circuit_breaker.config.max_consecutive_tool_errors
+            if self._cfg.circuit_breaker is not None
+            else 3
+        )
         reflection_counts: dict[str, int] = {}  # reason -> count
+        # ── Task completion guard (Runtime validates before accepting FINISH) ──
+        from agent.completion_guard import CompletionContext, TaskCompletionGuard
+        completion_ctx = CompletionContext()
+        completion_guard = TaskCompletionGuard()
+
+        # ── P0: Macro-action loop detector (catches global flow patterns) ──
+        from agent.v2.macro_loop_detector import MacroLoopDetector
+        _macro_loop_detector = MacroLoopDetector()
+
+        # ── P0: Unified execution budget ──
+        from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig, BudgetLevel
+        _execution_budget = ExecutionBudget(config=ExecutionBudgetConfig(
+            token_limit=task.budget_tokens,
+            step_limit=task.max_steps,
+        ))
+        _execution_budget.start()
         missing_test_target_followups: int | None = None
         missing_test_target_message: str | None = None
         missing_test_target_detected_step: int | None = None
@@ -446,6 +472,38 @@ class ReActAgent:
             self._current_step = step  # 用于 compaction 日志
             self.compactor.tick_step()
             logger.debug("Step %d/%d", step, task.max_steps)
+
+            # ── Circuit breaker check (code-level, not prompt-based) ──
+            # Claude Code pattern: check before every step. If tripped, terminate
+            # immediately — the model has no opportunity to override.
+            if self._cfg.circuit_breaker is not None and self._cfg.circuit_breaker.check():
+                reason = self._cfg.circuit_breaker.trip_reason
+                logger.warning("Circuit breaker tripped: %s", reason)
+                log.log_task_failed(steps=step, reason=reason)
+                _execution_budget.exhaust(reason)
+                return _finish_run(
+                    status=RunStatus.GAVE_UP,
+                    summary=reason,
+                    steps_taken=step,
+                    total_tokens_used=total_tokens,
+                    cache_stats=cumulative_cache,
+                )
+
+            # ── P0: Execution budget check ──
+            _budget_status = _execution_budget.check()
+            if _budget_status.level == BudgetLevel.EXHAUSTED:
+                logger.warning("Execution budget exhausted at step %d", step)
+                # Strip tools, inject force-finish, make one final call
+                tools = []
+                history.add(LLMMessage(
+                    role="user",
+                    content=ExecutionBudget.force_finish_message(),
+                ))
+                # Fall through to allow one more LLM call without tools
+            elif _budget_status.inject_message:
+                history.add(LLMMessage(
+                    role="user", content=_budget_status.inject_message,
+                ))
 
             # ── 1. 组装 messages，调用 LLM ──────────────────────────────
             # 设置最新用户消息，供 RAG 主动检索使用
@@ -536,6 +594,8 @@ class ReActAgent:
                 # trip this run's hard exploration budget on repeated short tasks.
                 billable_tokens = max(0, billable_tokens - response.cache_stats.cache_read_tokens)
             total_tokens += billable_tokens
+            _execution_budget.consume(billable_tokens)
+            _execution_budget.record_step()
             self._record_analysis_phase_llm_usage(billable_tokens)
 
             # ── Context window 空间检查（参考 Claude Code autoCompact.ts）────
@@ -605,10 +665,21 @@ class ReActAgent:
             # 阈值设计依据：
             #   - 2-3 次重试是正常的（网络错误、API 限流）
             #   - 4+ 次语义匹配说明 Agent 在原地打转
-            if self._is_looping(log):
-                diagnosis = self._build_loop_diagnosis(log)
+            #
+            # P0: Also check macro-action loop detector (global flow patterns)
+            _local_loop = self._is_looping(log)
+            _macro_loop = _macro_loop_detector.is_tripped
+            if _local_loop or _macro_loop:
+                if _local_loop:
+                    diagnosis = self._build_loop_diagnosis(log)
+                else:
+                    diagnosis = (
+                        f"Macro-action loop detected: {_macro_loop_detector.trip_reason}\n"
+                        f"Pattern: {_macro_loop_detector.to_summary()['recent_pattern']}"
+                    )
                 logger.warning("Loop detected — terminating: %s", diagnosis)
                 log.log_task_failed(steps=step, reason=diagnosis)
+                _execution_budget.exhaust(diagnosis)
                 return _finish_run(
                     status=RunStatus.GAVE_UP,
                     summary=diagnosis,
@@ -638,10 +709,32 @@ class ReActAgent:
                     continue
 
                 self._stop_hook_count = 0
+
+                # ── Completion guard: Runtime validates before accepting FINISH ──
+                # The model cannot unilaterally declare "done" — the Runtime must
+                # verify all completion conditions.
+                active_policy = getattr(self, "_active_policy", None)
+                guard_result = completion_guard.check(
+                    ctx=completion_ctx,
+                    task_intent=task.intent,
+                    task_max_steps=task.max_steps,
+                    current_step=step,
+                    completion_policy=active_policy.completion if active_policy is not None else None,
+                )
+                if not guard_result.can_complete:
+                    logger.warning(
+                        "Completion blocked: %s", guard_result.blocked_reason
+                    )
+                    history.add(LLMMessage(
+                        role="user", content=guard_result.inject_message
+                    ))
+                    continue
+
                 summary = action.message or "Task complete."
                 patch = self._get_git_diff(task.repo_path)
                 log.log_task_complete(steps=step, summary=summary)
                 self._extract_success_memories(task, log, summary)
+                _execution_budget.complete()
                 return _finish_run(
                     status=RunStatus.SUCCESS,
                     summary=summary,
@@ -733,6 +826,24 @@ class ReActAgent:
                             observation.metadata["expected_block"] = True
                             observation.metadata["block_kind"] = "v2_delegation_policy"
                     observations.append(observation)
+
+                    # ── Completion guard: track file operations for finish validation ──
+                    completion_ctx.record_tool_result(
+                        tool_name=tc.name,
+                        path=tc.params.get("path", ""),
+                        success=observation.is_success() and gated_decision is None,
+                    )
+
+                    # ── P0-4: Charge subagent token consumption to parent budget ──
+                    if tc.name == "task" and getattr(result, "subagent_tokens_used", 0) > 0:
+                        _execution_budget.consume(result.subagent_tokens_used)
+                        logger.debug(
+                            "Charged %d subagent tokens to parent budget (total: %d)",
+                            result.subagent_tokens_used, _execution_budget.token_used,
+                        )
+                    # Signal subagent loop detection to macro detector (breaks repetition)
+                    if tc.name == "task" and getattr(result, "subagent_terminated_by_loop", False):
+                        _macro_loop_detector.record_reflection("subagent_loop_killed")
 
                     if observation.is_success() and gated_decision is None:
                         # submit_read_plan: consume pending plan and transition
@@ -826,6 +937,13 @@ class ReActAgent:
 
                     log.log_observation(step=step, observation=observation)
 
+                    # ── P0: Macro loop detection & circuit breaker same-tool tracking ──
+                    _macro_loop_detector.record_tool_call(tc.name, tc.params)
+                    if self._cfg.circuit_breaker is not None:
+                        # Build a stable params hash for same-tool loop detection
+                        _params_key = str(sorted(tc.params.items())) if tc.params else ""
+                        self._cfg.circuit_breaker.record_tool_call(tc.name, _params_key)
+
                     if missing_test_target_observation is not None:
                         missing_test_target_message = self._format_missing_test_target_summary(
                             missing_test_target_observation
@@ -858,13 +976,17 @@ class ReActAgent:
                     else:
                         missing_test_target_followups = 0
 
-                # 连续失败计数器
+                # 连续失败计数器 — wired into CircuitBreaker
                 all_failed = all(not obs.is_success() for obs in observations)
                 expected_blocked = all(obs.is_expected_block() for obs in observations)
                 if all_failed and not expected_blocked:
                     consecutive_failures += 1
+                    if self._cfg.circuit_breaker is not None:
+                        self._cfg.circuit_breaker.record_tool_error()
                 else:
                     consecutive_failures = 0
+                    if self._cfg.circuit_breaker is not None:
+                        self._cfg.circuit_breaker.record_tool_success()
 
                 # 连续失败超过阈值：强制终止
                 if consecutive_failures >= _max_consecutive_failures:
@@ -1048,6 +1170,7 @@ class ReActAgent:
                         prompt=reflect_prompt,
                     )
                     history.add(LLMMessage(role="user", content=reflect_prompt))
+                    _macro_loop_detector.record_reflection("test_failed")
                     logger.debug("Reflection triggered: test_failed at step %d", step)
 
                 # 触发条件 B：连续 N 步无编辑（仅 edit 类型任务触发）
@@ -1077,6 +1200,7 @@ class ReActAgent:
                     )
                     history.add(LLMMessage(role="user", content=reflect_prompt))
                     steps_without_edit = 0  # 重置计数，避免每步都触发
+                    _macro_loop_detector.record_reflection("no_edit")
                     logger.debug("Reflection triggered: no_edit at step %d", step)
 
             elif action.action_type == ActionType.REFLECTION:
@@ -2243,9 +2367,12 @@ class ReActAgent:
 
         File operations (file_read, file_view, file_edit, file_write) are
         handled by FileReadCache at the tool layer — repeated reads return
-        cached content with [CACHED] markers. The semantic layer treats
-        them like any other tool: if the agent is calling file_read in a
-        pattern, that IS a real loop and should be terminated.
+        cached content with [CACHED] markers.
+
+        file_read and file_view are EXEMPT from Level 2 (semantic) detection:
+        reading different file sections is legitimate exploration. They are
+        still subject to Level 1 (exact) — identical params repeated N times
+        IS a loop regardless of tool type.
         """
         n = self._cfg.loop_detection_window
         actions = log.get_actions()
@@ -2275,13 +2402,17 @@ class ReActAgent:
             return True
 
         # Level 2: semantic match (window = N+1, more evidence needed)
+        # Exempt file_read/file_view — reading different file sections is
+        # legitimate exploration, not a loop. FileReadCache already prevents
+        # wasted re-reads. Exact match (Level 1) still catches true repeats.
         semantic_window = n + 1
         if len(actions) >= semantic_window:
             semantic_recent = actions[-semantic_window:]
             if all(a.action_type == ActionType.TOOL_CALL and a.tool_calls for a in semantic_recent):
                 first_names = _serialize_names(semantic_recent[0])
-                if first_names and all(_serialize_names(a) == first_names for a in semantic_recent[1:]):
-                    return True
+                if first_names and not set(first_names).issubset(_READ_EXPLORE_TOOLS):
+                    if all(_serialize_names(a) == first_names for a in semantic_recent[1:]):
+                        return True
 
         return False
 

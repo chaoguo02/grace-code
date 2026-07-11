@@ -15,7 +15,7 @@ from agent.v2.models import AgentDefinition, ForkResult
 from agent.policy_registry import PolicyAwareToolRegistry
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
-from agent.v2.task_tool import AgentTool, VIOLATION_MARKER
+from agent.v2.task_tool import AgentTool
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
@@ -56,9 +56,33 @@ class SessionRuntime:
         self._mcp_integration = mcp_integration
         self._event_callback = event_callback
 
+        # ── Circuit Breaker (code-level, not prompt-based) ──
+        from agent.circuit_breaker import CircuitBreaker
+        self._circuit_breaker = CircuitBreaker()
+
+        # ── P1-6: Dynamic Capability Registry ──
+        from agent.capability_registry import CapabilityRegistry
+        self._capability_registry = CapabilityRegistry()
+        # Register all builtin tools from the base registry
+        self._capability_registry.register_bulk(
+            self._base_registry.tool_names, source="builtin",
+        )
+        # Wire the registry into the base ToolRegistry for physical interception
+        self._base_registry._capability_registry = self._capability_registry
+        # Mark MCP tools as UNAVAILABLE if the bridge failed to connect
+        self._sync_mcp_capabilities()
+
     @property
     def agent_registry(self) -> AgentRegistryV2:
         return self._agent_registry
+
+    @property
+    def circuit_breaker(self):
+        return self._circuit_breaker
+
+    @property
+    def capability_registry(self):
+        return self._capability_registry
 
     # ── Root session ──
 
@@ -221,7 +245,14 @@ class SessionRuntime:
         # Agents with an explicit subagent allowlist get the task tool.
         if spec.allowed_subagents is not None:
             registry._tools.pop("task", None)
-            registry.register(AgentTool(self, session.id, caller_agent_name=spec.name))
+            registry.register(AgentTool(
+                self, session.id,
+                caller_agent_name=spec.name,
+                circuit_breaker=self._circuit_breaker,
+            ))
+
+        # ── P1-6: Tag registry with session_id for per-session intercept dedup ──
+        registry._session_id = session.id
 
         wrapped = PolicyAwareToolRegistry(
             base=registry,
@@ -232,15 +263,42 @@ class SessionRuntime:
         )
         return wrapped
 
+    def _sync_mcp_capabilities(self) -> None:
+        """Sync MCP tool states into the capability registry.
+
+        When MCP integration is absent or a server failed to connect,
+        mark those tools as UNAVAILABLE so the model never sees them.
+        """
+        if self._mcp_integration is None:
+            return
+        mcp_tool_names = getattr(self._mcp_integration, "tool_names", frozenset())
+        for name in mcp_tool_names:
+            self._capability_registry.register(name, source="mcp")
+
+        # Check for failed MCP servers
+        failed_servers = getattr(self._mcp_integration, "failed_servers", None)
+        if failed_servers:
+            for server_name, reason in failed_servers.items():
+                server_tools = getattr(self._mcp_integration, "server_tools", {}).get(server_name, [])
+                for tool_name in server_tools:
+                    self._capability_registry.mark_unavailable(
+                        tool_name, f"MCP server '{server_name}': {reason}",
+                    )
+
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()
         if spec.name not in {"build", "general", "coordinator"}:
             return frozenset()
-        return getattr(self._mcp_integration, "tool_names", frozenset())
+        # P1-6: Only return MCP tools that are ACTIVE in the capability registry
+        raw_names = getattr(self._mcp_integration, "tool_names", frozenset())
+        return frozenset(
+            n for n in raw_names if self._capability_registry.is_available(n)
+        )
 
     def _build_agent_config(self, spec: AgentDefinition) -> AgentConfig:
         cfg = copy.copy(self._root_agent_config)
+        cfg.circuit_breaker = self._circuit_breaker
         if spec.mode != "primary":
             cfg.max_steps = min(cfg.max_steps, spec.max_turns)
             cfg.compact_history = False
@@ -265,10 +323,11 @@ class SessionRuntime:
             "[Available Subagents]\n"
             "You have a `task` tool to delegate subtasks to isolated fork subagents.\n"
             f"Available subagent types:\n{subagent_descriptions}\n\n"
-            "Task routing guide (choose the RIGHT subagent for the task):\n"
-            "- Read-only analysis, code search, bug finding → use 'explore' (NO shell)\n"
-            "- Writing or editing code, running commands → use 'general' (has shell + write)\n"
-            "- Code review / correctness audit → use 'code-reviewer' (read-only)\n\n"
+            "Task routing guide (MUST follow — wrong agent type causes loops):\n"
+            "- Read-only: analysis, code search, bug finding, inspection → use 'explore' (NO shell, NO write)\n"
+            "- Write/edit/shell: writing code, editing files, running commands → use 'general' (has shell + write)\n"
+            "- Code review / correctness audit → use 'code-reviewer' (read-only, structured output)\n"
+            "When in doubt, use 'explore'. It has no shell and cannot accidentally modify files.\n\n"
             "Fork delegation rules:\n"
             "- Each fork subagent runs in a FRESH context — it sees NONE of your conversation history.\n"
             "- Put ALL necessary context in the prompt: constraints, key facts, file paths, expected output.\n"
@@ -293,10 +352,10 @@ class SessionRuntime:
             "   - A code snippet (``` fence) showing actual code read.\n"
             "   - A verification description (how the finding was confirmed).\n"
             "   If any of these is missing → DOWNGRADE to [UNVERIFIED]. Do NOT present as fact.\n"
-            "2. CHECK for format violations. If the subagent output contains "
-            f"\"{VIOLATION_MARKER}\", ALL findings must be "
-            "treated as [UNVERIFIED]. Report them under a separate section with "
-            "an explicit disclaimer.\n"
+            "2. CHECK findings structure. Prefer structured findings from the "
+            "submit_findings tool (in <structured-findings> XML block). "
+            "These are Runtime-validated and reliable. Text-only summaries are "
+            "supplementary — treat text claims without structured backing as unverified.\n"
             "3. SPOT DESIGN PATTERNS. Before accepting a bug report, ask yourself: "
             "\"Is this reported behavior actually documented as intentional?\" "
             "Examples of intentional patterns the subagent may misreport:\n"
@@ -308,29 +367,12 @@ class SessionRuntime:
             "   - Confirmed Issues (you or subagent verified with code evidence)\n"
             "   - Unverified Claims (subagent reported but lacks evidence → marked [UNVERIFIED])\n"
             "   - Design Observations (stylistic notes, not bugs)\n\n"
-            "Subagent Failure Recovery (decision tree — follow in order):\n"
-            "1. READ the <failure-diagnosis> block for failure_type, last_action,\n"
-            "   repeated_count, and diagnosis.\n"
-            "2. CLASSIFY and ACT:\n"
-            "   - TRANSIENT ERROR (network, timeout, rate-limit in error field)\n"
-            "     → Retry: same subagent, same task. Max 1 retry. State the reason.\n"
-            "   - LOOP (failure_type=gave_up + repeated_count ≥ 3)\n"
-            "     → Degrade and handle directly. The subagent was stuck repeating.\n"
-            "     Break the remaining work into atomic pieces and do it yourself.\n"
-            "     Do NOT retry with the same subagent type — it will loop again.\n"
-            "   - CAPABILITY LIMIT (failure_type=gave_up, no loop pattern)\n"
-            "     → Degrade. Take over the work yourself, starting from where the\n"
-            "     subagent left off. Report what the subagent completed so far.\n"
-            "   - RAN OUT OF TURNS (failure_type=max_steps / status=partial)\n"
-            "     → Split and retry. Break the original task into 2-3 smaller\n"
-            "     sub-tasks and delegate each to a fresh subagent.\n"
-            "   - NON-TRANSIENT ERROR (failure_type=error / failed)\n"
-            "     → Report to user. Subagent crashed. Do NOT retry. Tell the user\n"
-            "     what failed and present any partial results already obtained.\n"
-            "3. CIRCUIT BREAKER: after 2 consecutive failures → STOP ALL DELEGATION.\n"
-            "   Report: what was accomplished, what failed, and what the user should\n"
-            "   do next. Do not launch more subagents.\n"
-            "4. When degrading, state clearly: \"Subagent failed (type). Handling directly.\"\n"
+            "Subagent Failure Recovery:\n"
+            "The Runtime enforces retry limits, loop detection, and circuit breaking.\n"
+            "When a subagent fails, read the <failure-diagnosis> block and the status.\n"
+            "- If the error looks transient (timeout, network) → retry once with the same task.\n"
+            "- Otherwise → handle the work yourself or report to the user.\n"
+            "- The system will stop you if you retry too many times — no need to count.\n"
         )
         messages.append(LLMMessage(role="user", content=content))
         return messages

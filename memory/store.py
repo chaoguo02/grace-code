@@ -95,8 +95,8 @@ def _build_frontmatter(memory: Memory) -> str:
         "updated_at": memory.updated_at,
     }
     meta: dict[str, Any] = {}
-    if memory.metadata.stale:
-        meta["stale"] = True
+    if memory.metadata.status != "active":
+        meta["status"] = memory.metadata.status
     if memory.metadata.access_count > 0:
         meta["access_count"] = memory.metadata.access_count
     if memory.metadata.validated_at:
@@ -260,7 +260,13 @@ class MemoryStore:
                     path=a.get("path"),
                     name=a.get("name"),
                     value=a.get("value"),
+                    content_hash=str(a.get("content_hash", "")),
                 ))
+
+        # ── P1: status field with backward compat for stale boolean ──
+        raw_status = meta.get("status") or fm.get("status")
+        if not raw_status and bool(meta.get("stale", False)):
+            raw_status = "deprecated"  # migrate stale=True → status=deprecated
 
         memory = Memory(
             name=fm.get("name", name),
@@ -268,7 +274,7 @@ class MemoryStore:
             content=body,
             metadata=MemoryMetadata(
                 type=parse_memory_type(fm),
-                stale=bool(meta.get("stale", False)),
+                status=str(raw_status) if raw_status else "active",
                 access_count=int(meta.get("access_count", 0)),
                 validated_at=str(meta.get("validated_at", "")),
             ),
@@ -419,9 +425,52 @@ class MemoryStore:
             memory = self.read_memory(name)
             if memory is None or memory.metadata.stale:
                 continue
-            memory.metadata.stale = True
+            memory.metadata.status = "deprecated"
             self.write_memory(memory)
             count += 1
+        return count
+
+    def deprecate(self, name: str, reason: str = "") -> bool:
+        """Explicitly deprecate a memory. The authoritative invalidation path.
+
+        Unlike mtime-based stale marking (which guesses from file timestamps),
+        this is called when a developer intentionally changes the behavior that
+        the memory describes. The memory is marked 'deprecated' and will not be
+        injected into any future context.
+
+        Returns True if the memory was found and deprecated.
+        """
+        memory = self.read_memory(name)
+        if memory is None:
+            return False
+        memory.metadata.status = "deprecated"
+        if reason:
+            memory.content = (
+                f"[DEPRECATED: {reason}]\n\n{memory.content}"
+            )
+        self.write_memory(memory)
+        logger.info("Memory '%s' explicitly deprecated: %s", name, reason)
+        return True
+
+    def deprecate_by_pattern(self, name_pattern: str, reason: str = "") -> int:
+        """Bulk-deprecate memories matching a name glob pattern.
+
+        The authoritative invalidation path for code refactoring. When P1-5
+        deletes _validate_subagent_report(), call:
+            store.deprecate_by_pattern("*regex*", "Replaced by JSON Schema")
+
+        Returns the count of memories deprecated.
+        """
+        import fnmatch
+        count = 0
+        for summary in self.list_memories():
+            if fnmatch.fnmatch(summary.name, name_pattern):
+                if self.deprecate(summary.name, reason):
+                    count += 1
+        logger.info(
+            "Bulk-deprecated %d memories matching '%s': %s",
+            count, name_pattern, reason,
+        )
         return count
 
     def _get_anchor_index(self) -> dict[str, list[str]]:
@@ -472,7 +521,7 @@ class MemoryStore:
         if memory is None:
             return False
         from memory.models import _now
-        memory.metadata.stale = False
+        memory.metadata.status = "active"
         memory.metadata.validated_at = _now()
         return self.write_memory(memory)
 
