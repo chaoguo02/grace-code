@@ -35,6 +35,7 @@ def build_registry(
     from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
     from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
     from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
+    from tools.submit_analysis_tool import SubmitAnalysisTool
 
     from hitl.pipeline import PermissionPipeline
     from hitl.settings_loader import load_permission_settings
@@ -87,6 +88,7 @@ def build_registry(
         .register(EvidenceListTool(evidence_ledger_ref))
         .register(EvidenceGetTool(evidence_ledger_ref))
         .register(SubmitReadPlanTool(submit_plan_ref))
+        .register(SubmitAnalysisTool())
     )
     registry._artifact_store_ref = artifact_store_ref
     registry._evidence_ledger_ref = evidence_ledger_ref

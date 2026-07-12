@@ -1,12 +1,13 @@
-"""Unit tests for agent/completion_guard.py — Task completion validation."""
+"""Unit tests for agent/completion_guard.py — Git-fact-based completion validation."""
 
 import pytest
-from agent.completion_guard import (
-    CompletionCheckResult,
-    CompletionContext,
-    TaskCompletionGuard,
-)
-from agent.policy import CompletionPolicy
+from agent.completion_guard import CompletionCheckResult, CompletionContext, TaskCompletionGuard
+
+
+class _FakeGitState:
+    def __init__(self, has_changes=True, is_git_repo=True):
+        self.has_changes = has_changes
+        self.is_git_repo = is_git_repo
 
 
 class TestCompletionContext:
@@ -22,201 +23,85 @@ class TestCompletionContext:
         assert ctx.had_any_write
         assert "src/out.py" in ctx.files_written
 
-    def test_does_not_count_failures(self):
+    def test_failures_are_fully_invisible(self):
+        """Zero Trust: failed calls leave NO trace in progress state."""
         ctx = CompletionContext()
         ctx.record_tool_result("file_read", "src/missing.py", False)
+        ctx.record_tool_result("shell", None, False)
+        ctx.record_tool_result("file_write", "out.py", False)
         assert not ctx.had_any_read
+        assert not ctx.had_any_write
         assert len(ctx.files_read) == 0
-        assert ctx.total_tool_calls == 1
-        assert ctx.total_successful_tool_calls == 0
+        assert len(ctx.files_written) == 0
 
-    def test_tracks_total_calls(self):
+    def test_total_calls_is_diagnostic_only(self):
         ctx = CompletionContext()
         ctx.record_tool_result("file_read", "a.py", True)
         ctx.record_tool_result("file_write", "b.py", False)
         ctx.record_tool_result("shell", None, True)
         assert ctx.total_tool_calls == 3
-        assert ctx.total_successful_tool_calls == 2
+
+    def test_no_counters_exist(self):
+        """Killed: tool_success_counts, tool_failure_counts, tool_call_counts."""
+        ctx = CompletionContext()
+        assert not hasattr(ctx, "tool_success_counts")
+        assert not hasattr(ctx, "tool_failure_counts")
+        assert not hasattr(ctx, "tool_call_counts")
 
 
-class TestCompletionGuardEditTasks:
-    def test_allows_completion_after_write(self):
+class TestGitDiffGuard:
+    """The only completion check: does git diff show changes?"""
+
+    def test_edit_with_git_diff_passes(self):
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
         ctx.record_tool_result("file_write", "src/x.py", True)
-        result = guard.check(
-            ctx=ctx,
-            task_intent="edit",
-            completion_policy=CompletionPolicy(require_any_write=True),
-        )
+        git = _FakeGitState(has_changes=True, is_git_repo=True)
+        result = guard.check(ctx=ctx, task_intent="edit", git_state=git)
         assert result.can_complete
 
-    def test_blocks_completion_without_write(self):
+    def test_edit_without_git_diff_blocks(self):
+        """LLM wrote files but git diff shows nothing → blocked."""
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
-        # No writes recorded
-        result = guard.check(
-            ctx=ctx,
-            task_intent="edit",
-            completion_policy=CompletionPolicy(require_any_write=True),
-        )
+        ctx.record_tool_result("file_write", "src/x.py", True)
+        git = _FakeGitState(has_changes=False, is_git_repo=True)
+        result = guard.check(ctx=ctx, task_intent="edit", git_state=git)
         assert not result.can_complete
-        assert "no meaningful work" in result.blocked_reason.lower()
-        assert "meaningful work" in result.inject_message.lower()
+        assert "no git diff evidence" in result.blocked_reason.lower()
 
-    def test_allows_without_write_when_policy_does_not_require(self):
-        guard = TaskCompletionGuard(min_tool_calls_for_completion=0)
-        ctx = CompletionContext()
-        result = guard.check(
-            ctx=ctx,
-            task_intent="edit",
-            completion_policy=CompletionPolicy(require_any_write=False),
-        )
-        assert result.can_complete
-
-    def test_blocks_on_required_reads_missing(self):
+    def test_analysis_passes_without_git_changes(self):
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
         ctx.record_tool_result("file_read", "src/a.py", True)
-        result = guard.check(
-            ctx=ctx,
-            task_intent="edit",
-            completion_policy=CompletionPolicy(
-                required_reads=frozenset({"src/a.py", "src/b.py"}),
-            ),
-        )
-        assert not result.can_complete
-        assert "src/b.py" in result.inject_message
-
-    def test_passes_when_required_reads_satisfied(self):
-        guard = TaskCompletionGuard()
-        ctx = CompletionContext()
-        ctx.record_tool_result("file_read", "src/a.py", True)
-        ctx.record_tool_result("file_read", "src/b.py", True)
-        result = guard.check(
-            ctx=ctx,
-            task_intent="edit",
-            completion_policy=CompletionPolicy(
-                required_reads=frozenset({"src/a.py", "src/b.py"}),
-            ),
-        )
+        git = _FakeGitState(has_changes=False, is_git_repo=True)
+        result = guard.check(ctx=ctx, task_intent="analysis", git_state=git)
         assert result.can_complete
 
-
-class TestCompletionGuardAnalysisTasks:
-    def test_blocks_analysis_without_reads_when_required(self):
+    def test_no_writes_no_block(self):
+        """Analysis with no writes — no diff needed."""
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
-        result = guard.check(
-            ctx=ctx,
-            task_intent="analysis",
-            completion_policy=CompletionPolicy(require_any_read=True),
-        )
-        assert not result.can_complete
-        assert "no meaningful work" in result.blocked_reason.lower()
-
-    def test_allows_analysis_with_reads(self):
-        guard = TaskCompletionGuard()
-        ctx = CompletionContext()
-        ctx.record_tool_result("file_read", "src/app.py", True)
-        result = guard.check(
-            ctx=ctx,
-            task_intent="analysis",
-            completion_policy=CompletionPolicy(require_any_read=True),
-        )
+        git = _FakeGitState(has_changes=False, is_git_repo=True)
+        result = guard.check(ctx=ctx, task_intent="edit", git_state=git)
         assert result.can_complete
 
-    def test_allows_analysis_without_reads_when_not_required(self):
+    def test_non_git_repo_passes(self):
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
-        result = guard.check(
-            ctx=ctx,
-            task_intent="analysis",
-            completion_policy=CompletionPolicy(require_any_read=False),
-        )
-        assert result.can_complete
+        ctx.record_tool_result("file_write", "src/x.py", True)
+        git = _FakeGitState(has_changes=False, is_git_repo=False)
+        result = guard.check(ctx=ctx, task_intent="edit", git_state=git)
+        assert result.can_complete  # can't check git in non-git repo
 
-
-class TestCompletionGuardPrematureCompletion:
-    def test_blocks_zero_tool_calls(self):
-        guard = TaskCompletionGuard(min_tool_calls_for_completion=1)
-        ctx = CompletionContext()
-        result = guard.check(
-            ctx=ctx,
-            task_intent="edit",
-            current_step=1,
-            task_max_steps=40,
-        )
-        assert not result.can_complete
-
-    def test_allows_after_tool_calls(self):
-        guard = TaskCompletionGuard(min_tool_calls_for_completion=1)
-        ctx = CompletionContext()
-        ctx.record_tool_result("file_read", "x.py", True)
-        result = guard.check(
-            ctx=ctx,
-            task_intent="edit",
-            current_step=2,
-            task_max_steps=40,
-        )
-        assert result.can_complete
-
-    def test_allows_premature_when_late_in_run(self):
-        """If the model made it to step 30/40 with no tool calls,
-        something else is wrong; don't block on premature completion."""
-        guard = TaskCompletionGuard(
-            min_tool_calls_for_completion=1,
-            warn_premature_completion_at_step=3,
-            warn_premature_completion_ratio=0.3,
-        )
-        ctx = CompletionContext()
-        result = guard.check(
-            ctx=ctx,
-            task_intent="edit",
-            current_step=30,
-            task_max_steps=40,
-        )
-        assert result.can_complete  # past the warning threshold
-
-
-class TestCompletionGuardIntegration:
-    def test_multiple_checks_can_all_fail(self):
-        """When multiple checks fail, the first one wins."""
-        guard = TaskCompletionGuard(min_tool_calls_for_completion=1)
-        ctx = CompletionContext()
-        result = guard.check(
-            ctx=ctx,
-            task_intent="edit",
-            current_step=1,
-            task_max_steps=40,
-            completion_policy=CompletionPolicy(
-                require_any_write=True,
-                require_any_read=True,
-            ),
-        )
-        assert not result.can_complete
-        # First check fires: no meaningful work done
-        assert "meaningful work" in result.inject_message.lower()
-
-    def test_write_resets_after_check(self):
-        """After the guard blocks once and the model does the work,
-        a subsequent check should pass."""
+    def test_100_shell_calls_zero_diff_blocked(self):
+        """LLM called shell 100 times successfully but no file changes → blocked.
+        This is the key Zero Trust test: counts don't matter. Facts matter."""
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
-
-        # First check: blocked (no write)
-        r1 = guard.check(
-            ctx=ctx, task_intent="edit",
-            completion_policy=CompletionPolicy(require_any_write=True),
-        )
-        assert not r1.can_complete
-
-        # Model does the work
-        ctx.record_tool_result("file_write", "src/out.py", True)
-
-        # Second check: allowed
-        r2 = guard.check(
-            ctx=ctx, task_intent="edit",
-            completion_policy=CompletionPolicy(require_any_write=True),
-        )
-        assert r2.can_complete
+        for _ in range(100):
+            ctx.record_tool_result("shell", None, True)  # all "successful"
+        ctx.record_tool_result("file_write", "src/x.py", True)
+        git = _FakeGitState(has_changes=False, is_git_repo=True)
+        result = guard.check(ctx=ctx, task_intent="edit", git_state=git)
+        assert not result.can_complete

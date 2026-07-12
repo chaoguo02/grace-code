@@ -117,6 +117,10 @@ class PolicyAwareToolRegistry(ToolRegistry):
                 f"structured implementation plan instead of attempting writes."
             )
         if name not in self._tools:
+            # Distinguish: "tool doesn't exist" vs "tool exists but blocked by policy"
+            _base_names = self._base.tool_names if hasattr(self._base, "tool_names") else set()
+            if name not in _base_names:
+                return f"Unknown tool '{name}'. Did you mean 'file_read'? Available tools: {', '.join(self.tool_names) or 'none'}"
             return f"Tool '{name}' is blocked by task policy in {self._phase_name} phase. Available tools: {', '.join(self.tool_names) or 'none'}"
         if not self._is_tool_enabled(name):
             return f"Tool '{name}' is not available in the current environment. Available tools: {', '.join(self.tool_names) or 'none'}"
@@ -153,6 +157,8 @@ class PolicyAwareToolRegistry(ToolRegistry):
         if requested in allowed_paths:
             return None
         return (
-            f"Tool '{tool_name}' cannot {action} path '{requested}' because task policy "
-            f"allows only: {', '.join(sorted(allowed_paths)) or '(none)'}"
+            f"[RUNTIME BLOCK] PATH ACCESS DENIED: '{requested}' is outside the "
+            f"allowed {action} scope. You MUST choose a path within: "
+            f"{', '.join(sorted(allowed_paths)) or '(none)'}. "
+            f"This is a hard Runtime constraint — not a suggestion."
         )

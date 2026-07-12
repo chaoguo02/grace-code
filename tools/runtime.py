@@ -36,7 +36,7 @@ import subprocess
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -100,13 +100,122 @@ class RunResult:
 
 
 # ---------------------------------------------------------------------------
+# ShellProvider — OS-native command translation layer
+# ---------------------------------------------------------------------------
+
+class ShellProvider(ABC):
+    """Clean subprocess I/O for LLM consumption.
+
+    The control plane (System Prompt) declares the platform to the LLM.
+    The Runtime handles the dirty work: encoding detection, byte-to-text
+    conversion, and output normalization. The LLM always sees clean UTF-8
+    compatible text regardless of OS encoding quirks.
+    """
+
+    def decode_output(self, stdout_bytes: bytes, stderr_bytes: bytes) -> tuple[str, str]:
+        """Decode raw subprocess output to clean text for LLM consumption.
+
+        Tries the platform's native encoding first, falls back to UTF-8
+        with replacement. The LLM never sees raw bytes or encoding errors.
+        """
+        primary = self._primary_encoding()
+        fallbacks = ["utf-8", "latin-1"]
+
+        def _decode(data: bytes) -> str:
+            if not data:
+                return ""
+            try:
+                return data.decode(primary)
+            except (UnicodeDecodeError, LookupError):
+                for enc in fallbacks:
+                    try:
+                        return data.decode(enc, errors="replace")
+                    except LookupError:
+                        continue
+                return data.decode("utf-8", errors="replace")
+            except Exception:
+                return data.decode("utf-8", errors="replace")
+
+        return _decode(stdout_bytes), _decode(stderr_bytes)
+
+    @abstractmethod
+    def _primary_encoding(self) -> str:
+        """Primary encoding for this platform's subprocess output."""
+        ...
+
+
+class UnixBashProvider(ShellProvider):
+    def _primary_encoding(self) -> str:
+        return "utf-8"
+
+
+class WindowsPowerShellProvider(ShellProvider):
+    def _primary_encoding(self) -> str:
+        import locale
+        return locale.getpreferredencoding(do_setlocale=False) or "utf-8"
+
+
+def _auto_shell_provider() -> ShellProvider:
+    import os as _os
+    if _os.name == "nt":
+        return WindowsPowerShellProvider()
+    return UnixBashProvider()
+
+
+# ---------------------------------------------------------------------------
+# ExecuteParams — structured, parameterized command execution
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExecuteParams:
+    """Physically isolated execution parameters.
+
+    Each field is passed as a separate list item to subprocess.Popen
+    with shell=False. The model CANNOT concatenate these into a shell string.
+    No shell metacharacter injection is possible.
+    """
+    command: str
+    """The executable to run: 'git', 'pytest', 'python', etc."""
+
+    args: list[str] = field(default_factory=list)
+    """Arguments as separate list items. Each item is ONE argument, never parsed by shell."""
+
+    cwd: str | None = None
+    timeout: int = 30
+    env: dict[str, str] | None = None
+    stdin: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# GitState — Runtime-level git awareness
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GitState:
+    """Runtime git authority. Tracks base commit at task start, captures diff at end.
+
+    This is NOT exposed as an LLM tool. The Runtime owns git awareness —
+    the model can request git operations via tools, but the authoritative
+    state (base_commit, has_changes, incremental_diff) is Runtime-level.
+    """
+    repo_path: str
+    base_commit: str = ""
+    base_commit_short: str = ""
+    current_diff: str = ""
+    files_changed: list[str] = field(default_factory=list)
+    has_changes: bool = False
+    dirty_at_start: bool = False  # True if repo was dirty before task execution
+    is_git_repo: bool = False
+
+
+# ---------------------------------------------------------------------------
 # 抽象基类
 # ---------------------------------------------------------------------------
 
 class Runtime(ABC):
     """
     命令执行抽象基类。
-    所有工具通过 runtime.exec() 执行命令，不直接调 subprocess。
+    所有工具通过 runtime.exec() 或 runtime.execute() 执行命令，不直接调 subprocess。
     """
 
     @abstractmethod
@@ -118,6 +227,7 @@ class Runtime(ABC):
     ) -> RunResult:
         """
         执行 shell 命令，返回 RunResult。
+        DEPRECATED: prefer execute() with ExecuteParams for new code.
 
         Args:
             cmd:     shell 命令字符串
@@ -128,6 +238,71 @@ class Runtime(ABC):
             RunResult，不抛异常（超时/错误封装在里面）
         """
         ...
+
+    def execute(self, command: str, args: list[str] | None = None,
+                cwd: str | None = None, timeout: int = 30,
+                env: dict[str, str] | None = None) -> RunResult:
+        """Execute a command with physically isolated parameters.
+
+        Each parameter is passed as a separate list item to subprocess.Popen
+        with shell=False. The model CANNOT inject shell metacharacters.
+
+        Default implementation delegates to exec() for backward compat.
+        Subclasses should override with shell=False implementation.
+        """
+        import shlex
+        parts = [command] + (args or [])
+        cmd_str = " ".join(shlex.quote(p) for p in parts)
+        return self.exec(cmd_str, cwd=cwd, timeout=timeout)
+
+    # ── Git awareness (Runtime-level, not tool-level) ──
+
+    def capture_base_commit(self, repo_path: str) -> GitState:
+        """Record HEAD commit at task start. Called by agent loop, NOT exposed to LLM."""
+        state = GitState(repo_path=repo_path)
+        try:
+            result = self.execute("git", ["rev-parse", "HEAD"], cwd=repo_path, timeout=10)
+            if result.success:
+                state.base_commit = result.stdout.strip()
+                state.base_commit_short = state.base_commit[:8]
+                state.is_git_repo = True
+
+            # Check if working tree was already dirty
+            dirty = self.execute("git", ["diff", "HEAD", "--name-only"], cwd=repo_path, timeout=10)
+            if dirty.success and dirty.stdout.strip():
+                state.dirty_at_start = True
+                state.files_changed = [f.strip() for f in dirty.stdout.splitlines() if f.strip()]
+        except Exception:
+            logger.debug("capture_base_commit failed — not a git repo?", exc_info=True)
+        return state
+
+    def capture_diff(self, state: GitState) -> GitState:
+        """Capture git diff at task end. Updates state in place, returns it."""
+        if not state.is_git_repo:
+            return state
+        try:
+            result = self.execute("git", ["diff", "HEAD"], cwd=state.repo_path, timeout=10)
+            if result.success:
+                state.current_diff = result.stdout.strip()
+                current_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+                # Only count files changed THIS run (not pre-existing dirt)
+                new_files = [f for f in current_files if f not in state.files_changed] if state.dirty_at_start else current_files
+                state.files_changed = current_files
+                state.has_changes = bool(new_files) if state.dirty_at_start else bool(current_files)
+        except Exception:
+            logger.debug("capture_diff failed", exc_info=True)
+        return state
+
+    def setup_workspace(self, repo_path: str) -> bool:
+        """Ensure the workspace is ready for agent execution.
+
+        Called automatically at PENDING→RUNNING transition.
+        - Ensures the target directory is an independent git repo
+        - Subclasses (DockerRuntime) can add container setup
+
+        Returns True if workspace is ready, False if setup failed (non-fatal).
+        """
+        return True
 
     def cleanup(self) -> None:
         """释放 runtime 持有的资源（容器、连接等）。默认无操作。"""
@@ -165,11 +340,58 @@ class LocalRuntime(Runtime):
         r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, shell: str = "system", shell_provider: ShellProvider | None = None) -> None:
+        """Args:
+            shell: "system" (default — native OS shell), "bash" (opt-in Git Bash).
+            shell_provider: ShellProvider for command translation + encoding.
+                Auto-detected from platform if None.
+        """
         self._current_proc: subprocess.Popen | None = None
         self._bash_path: str | None = None
-        if os.name == "nt":
+        self._shell_mode = shell
+        self._shell_provider = shell_provider or _auto_shell_provider()
+        if os.name == "nt" and shell == "bash":
             self._bash_path = self._find_bash()
+            if self._bash_path is None:
+                logger.warning(
+                    "LocalRuntime(shell='bash'): Git Bash not found, "
+                    "falling back to system shell"
+                )
+                self._shell_mode = "system"
+
+    def setup_workspace(self, repo_path: str) -> bool:
+        """Ensure repo_path is an independent git repo with a CLEAN baseline.
+
+        If no .git exists, auto-init + commit all files.
+        If .git exists but working tree is dirty, auto-commit the dirt as
+        a baseline so the agent's own changes are the only ones visible in
+        git diff. This prevents the "pre-existing dirt" problem where the
+        GitDiffGuard cannot see the agent's edits because the file was
+        already modified before the agent started.
+        """
+        git_dir = Path(repo_path) / ".git"
+        if not git_dir.exists():
+            try:
+                self.execute("git", ["init"], cwd=repo_path, timeout=10)
+                self.execute("git", ["add", "-A"], cwd=repo_path, timeout=30)
+                self.execute("git", ["commit", "-m", "agent-workspace-init"],
+                            cwd=repo_path, timeout=10)
+                return True
+            except Exception as exc:
+                logger.warning("Failed to auto-init git in %s: %s", repo_path, exc)
+                return False
+
+        # .git exists — auto-commit any dirty state as baseline
+        try:
+            status = self.execute("git", ["status", "--porcelain"], cwd=repo_path, timeout=10)
+            if status.stdout.strip():
+                logger.info("Workspace dirty — auto-committing baseline")
+                self.execute("git", ["add", "-A"], cwd=repo_path, timeout=30)
+                self.execute("git", ["commit", "-m", "agent-baseline-snapshot"],
+                            cwd=repo_path, timeout=10)
+        except Exception:
+            pass  # non-fatal
+        return True
 
     @staticmethod
     def _find_bash() -> str | None:
@@ -186,7 +408,9 @@ class LocalRuntime(Runtime):
 
     @property
     def name(self) -> str:
-        return f"local({'bash' if self._bash_path else 'cmd'})"
+        if self._shell_mode == "system":
+            return "local(system)"
+        return f"local({'bash' if self._bash_path else 'system'})"
 
     def exec(
         self,
@@ -194,6 +418,9 @@ class LocalRuntime(Runtime):
         cwd: str | None = None,
         timeout: int = 30,
     ) -> RunResult:
+        # Normalize LLM-generated commands for current OS/shell
+        cmd = CommandNormalizer.normalize(cmd)
+
         proc: subprocess.Popen | None = None
         try:
             popen_kwargs: dict[str, Any] = {
@@ -201,15 +428,11 @@ class LocalRuntime(Runtime):
                 "shell": True,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
-                "text": True,
+                "text": False,  # binary mode — Runtime handles encoding
                 "cwd": cwd,
-                "encoding": "utf-8",
-                "errors": "replace",
             }
-            # Windows: use Git Bash instead of cmd.exe
-            # shell=True + executable on Windows passes /c which bash rejects.
-            # Instead, invoke bash -c directly without shell=True.
-            if os.name == "nt" and self._bash_path:
+            # Windows: bash is opt-in only. Default: native system shell.
+            if os.name == "nt" and self._bash_path and self._shell_mode == "bash":
                 popen_kwargs["args"] = [self._bash_path, "-c", cmd]
                 popen_kwargs["shell"] = False
             # Unix: 创建新 session，后续 killpg 不会误杀父进程
@@ -218,11 +441,12 @@ class LocalRuntime(Runtime):
 
             proc = subprocess.Popen(**popen_kwargs)
             self._current_proc = proc
-            stdout, stderr = proc.communicate(timeout=timeout)
+            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+            stdout, stderr = self._shell_provider.decode_output(stdout_bytes or b"", stderr_bytes or b"")
             return RunResult(
                 returncode=proc.returncode if proc.returncode is not None else -1,
-                stdout=stdout or "",
-                stderr=stderr or "",
+                stdout=stdout,
+                stderr=stderr,
             )
 
         except subprocess.TimeoutExpired:
@@ -257,10 +481,103 @@ class LocalRuntime(Runtime):
             if proc is not None:
                 self._current_proc = None
 
+    def execute(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        cwd: str | None = None,
+        timeout: int = 30,
+        env: dict[str, str] | None = None,
+    ) -> RunResult:
+        """Execute a command with physically isolated parameters (shell=False).
+
+        Each argument is a separate list element. The shell never parses
+        the command string, so shell metacharacters in args are inert.
+        """
+        cmd_list = [command] + (args or [])
+        proc: subprocess.Popen | None = None
+        try:
+            popen_kwargs: dict[str, Any] = {
+                "args": cmd_list,
+                "shell": False,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": False,  # binary mode — Runtime handles encoding
+                "cwd": cwd,
+            }
+            if env:
+                full_env = os.environ.copy()
+                full_env.update(env)
+                popen_kwargs["env"] = full_env
+            # Unix: create new session for clean process-tree kill
+            if os.name != "nt":
+                popen_kwargs["preexec_fn"] = os.setsid
+
+            proc = subprocess.Popen(**popen_kwargs)
+            self._current_proc = proc
+            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+            stdout, stderr = self._shell_provider.decode_output(stdout_bytes or b"", stderr_bytes or b"")
+            return RunResult(
+                returncode=proc.returncode if proc.returncode is not None else -1,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        except subprocess.TimeoutExpired:
+            if proc and proc.returncode is None:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
+            return RunResult(
+                returncode=-1,
+                stdout="",
+                stderr=f"Command timed out after {timeout}s: {command!r}",
+            )
+
+        except KeyboardInterrupt:
+            if proc and proc.returncode is None:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
+            return RunResult(
+                returncode=-1,
+                stdout="",
+                stderr=f"Command interrupted by user: {command!r}",
+            )
+
+        except Exception as e:
+            if proc and proc.returncode is None:
+                try:
+                    kill_process_tree(proc)
+                except Exception:
+                    pass
+            return RunResult(returncode=-1, stdout="", stderr=str(e))
+
+        finally:
+            if proc is not None:
+                self._current_proc = None
+
 
 # ---------------------------------------------------------------------------
 # DockerRuntime — Docker 沙箱
 # ---------------------------------------------------------------------------
+
+# ── Command Normalizer: OS-aware adaptation ──────────────────────────────
+
+class CommandNormalizer:
+    """Normalize LLM-generated commands before shell execution.
+
+    The LLM outputs intent-level commands. This layer adapts them to the
+    current OS and shell environment. Without it, Unix commands fail on
+    Windows, path quoting breaks, and cross-platform issues cascade.
+    """
+
+    @staticmethod
+    def normalize(cmd: str) -> str:
+        """Minimal normalization. Does NOT parse or rewrite shell commands —
+        that path leads to an unmaintainable regex graveyard. Claude Code
+        uses parameter-level isolation (cwd param, not text rewriting)."""
+        # Only fix trivial syntax issues, never semantic rewrites
+        return cmd
+
 
 # 沙箱容器使用的 Docker 镜像
 # 包含 Python、git、常用工具，体积合理
@@ -358,20 +675,20 @@ class DockerRuntime(Runtime):
                 "args": docker_cmd,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
-                "text": True,
-                "encoding": "utf-8",
-                "errors": "replace",
+                "text": False,  # binary mode — containers are UTF-8
             }
             if os.name != "nt":
                 popen_kwargs["preexec_fn"] = os.setsid
 
             proc = subprocess.Popen(**popen_kwargs)
             adjusted_timeout = timeout + 5  # docker exec 本身有少量开销
-            stdout, stderr = proc.communicate(timeout=adjusted_timeout)
+            stdout_bytes, stderr_bytes = proc.communicate(timeout=adjusted_timeout)
+            stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+            stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
             return RunResult(
                 returncode=proc.returncode if proc.returncode is not None else -1,
-                stdout=stdout or "",
-                stderr=stderr or "",
+                stdout=stdout,
+                stderr=stderr,
             )
 
         except subprocess.TimeoutExpired:
@@ -394,6 +711,93 @@ class DockerRuntime(Runtime):
                 stderr=f"Command interrupted by user in container: {cmd!r}",
             )
 
+        except Exception as e:
+            if proc and proc.returncode is None:
+                try:
+                    kill_process_tree(proc)
+                except Exception:
+                    pass
+            return RunResult(returncode=-1, stdout="", stderr=str(e))
+
+    def execute(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        cwd: str | None = None,
+        timeout: int = 30,
+        env: dict[str, str] | None = None,
+    ) -> RunResult:
+        """Execute a command in the container with physically isolated parameters.
+
+        Builds a docker exec command with proper argument escaping via shlex.quote().
+        Each argument is individually quoted so shell metacharacters are inert.
+        """
+        import shlex
+        if not self.is_running:
+            startup_result = self._start_container()
+            if startup_result is not None:
+                return startup_result
+
+        # Determine container working directory
+        if cwd:
+            host_cwd = str(Path(cwd).resolve())
+            if host_cwd.startswith(self._repo_path):
+                relative = host_cwd[len(self._repo_path):].lstrip("/\\").replace("\\", "/")
+                container_cwd = f"{CONTAINER_WORKDIR}/{relative}" if relative else CONTAINER_WORKDIR
+            else:
+                container_cwd = cwd
+        else:
+            container_cwd = CONTAINER_WORKDIR
+
+        # Build bash -c string with properly quoted arguments
+        arg_str = " ".join(shlex.quote(a) for a in (args or []))
+        bash_cmd = f"{shlex.quote(command)} {arg_str}".strip()
+
+        docker_cmd = [
+            "docker", "exec",
+            "--workdir", container_cwd,
+            self._container_id,
+            "bash", "-c", bash_cmd,
+        ]
+
+        proc: subprocess.Popen | None = None
+        try:
+            popen_kwargs: dict[str, Any] = {
+                "args": docker_cmd,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": False,  # binary mode — containers are UTF-8
+            }
+            if os.name != "nt":
+                popen_kwargs["preexec_fn"] = os.setsid
+
+            proc = subprocess.Popen(**popen_kwargs)
+            adjusted_timeout = timeout + 5
+            stdout_bytes, stderr_bytes = proc.communicate(timeout=adjusted_timeout)
+            stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+            stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+            return RunResult(
+                returncode=proc.returncode if proc.returncode is not None else -1,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+        except subprocess.TimeoutExpired:
+            if proc and proc.returncode is None:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
+            return RunResult(
+                returncode=-1, stdout="",
+                stderr=f"Command timed out after {timeout}s in container: {command!r}",
+            )
+        except KeyboardInterrupt:
+            if proc and proc.returncode is None:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
+            return RunResult(
+                returncode=-1, stdout="",
+                stderr=f"Command interrupted by user in container: {command!r}",
+            )
         except Exception as e:
             if proc and proc.returncode is None:
                 try:

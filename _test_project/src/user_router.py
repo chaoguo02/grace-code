@@ -107,3 +107,13 @@ def health():
     """Return server uptime and total request count served by this blueprint."""
     uptime = time.time() - _start_time
     return jsonify({"uptime": uptime, "request_count": _request_counter})
+
+
+@user_bp.route("/stats", methods=["GET"])
+@handle_errors
+def stats():
+    """Return total users and server uptime."""
+    users = user_service.get_all()
+    total_users = len(users)
+    uptime = time.time() - _start_time
+    return jsonify({"total_users": total_users, "uptime_seconds": uptime})

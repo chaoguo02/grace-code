@@ -95,25 +95,46 @@ class PytestTool(BaseTool):
 
         extra_args = params.get("args", "")
 
+        # ── Pre-flight: check pytest availability before execution ──
+        import shutil as _shutil
+        if not _shutil.which("pytest") and not _shutil.which("python"):
+            from tools.base import ToolError as _ToolError
+            return ToolResult(
+                success=False, output="",
+                error="pytest is not available in this environment.",
+                tool_error=_ToolError(
+                    error_type="unavailable", retryable=False,
+                    detail="pytest is not installed or not on PATH. Verify changes by reading the modified files.",
+                ),
+            )
+
         # 组装命令：--tb=short 足够 agent 理解，--no-header 减少噪音
-        cmd_parts = [
-            "python", "-m", "pytest",
+        args = [
+            "-m", "pytest",
             test_path,
             "--tb=short",
             "--no-header",
             "-q",               # 安静模式：只输出失败详情和最终统计
         ]
         if extra_args:
-            cmd_parts.extend(extra_args.split())
+            args.extend(extra_args.split())
 
-        cmd_str = " ".join(cmd_parts)
-        run_result = self._runtime.exec(cmd_str, cwd=cwd, timeout=PYTEST_TIMEOUT)
-        if "timed out" in run_result.stderr.lower():
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"pytest timed out after {PYTEST_TIMEOUT}s",
+        # Use parameterized execute() — shell=False, no string joining
+        run_result = self._runtime.execute("python", args=args, cwd=cwd, timeout=PYTEST_TIMEOUT)
+
+        # Use unified error classification for runtime-level failures
+        if not run_result.success:
+            from tools.base import classify_runtime_error
+            cmd_repr = f"python -m pytest {test_path}"
+            _runtime_err = classify_runtime_error(
+                run_result.returncode, run_result.stderr, run_result.stdout, cmd_repr,
             )
+            if _runtime_err and not _runtime_err.retryable:
+                # Unavailable / permission denied → don't retry
+                return ToolResult(
+                    success=False, output="",
+                    error=_runtime_err.to_message(), tool_error=_runtime_err,
+                )
         raw = run_result.output
         success = run_result.returncode == 0
 

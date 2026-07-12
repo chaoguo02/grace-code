@@ -11,7 +11,7 @@ def require_auth(f):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "unauthorized"}), 401
-        token = auth_header[7:]
+        token = auth_header.replace("Bearer ", "", 1).strip()
         session = verify_token(token)
         if not session:
             return jsonify({"error": "forbidden"}), 403

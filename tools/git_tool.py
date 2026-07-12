@@ -30,19 +30,19 @@ def _run_git(
     args: list[str],
     cwd: str | None = None,
     runtime: "Runtime | None" = None,
-) -> tuple[bool, str]:
-    """
-    运行 git 命令，返回 (success, output)。
-    runtime 为 None 时直接用 subprocess（向后兼容）。
-    """
+) -> tuple[bool, str, Any | None]:
+    """运行 git 命令，返回 (success, output, tool_error)。"""
     from tools.runtime import LocalRuntime
     rt = runtime or LocalRuntime()
-    cmd = "git " + " ".join(
-        f'"{a}"' if " " in a else a for a in args
-    )
-    result = rt.exec(cmd, cwd=cwd, timeout=30)
+    # Use parameterized execute() — shell=False, no string concatenation
+    result = rt.execute("git", args=args, cwd=cwd, timeout=30)
     output = result.output.strip()
-    return result.success, output
+    if not result.success:
+        from tools.base import classify_runtime_error
+        cmd_repr = f"git {' '.join(args)}"
+        _err = classify_runtime_error(result.returncode, result.stderr, result.stdout, cmd_repr)
+        return False, output, _err
+    return True, output, None
 
 
 class GitStatusTool(BaseTool):
@@ -85,10 +85,11 @@ class GitStatusTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         cwd = params.get("cwd")
-        success, output = _run_git(["status", "--short", "--branch"], cwd=cwd, runtime=self._runtime)
+        success, output, _tool_err = _run_git(["status", "--short", "--branch"], cwd=cwd, runtime=self._runtime)
         if not output:
             output = "Nothing to commit, working tree clean"
-        return ToolResult(success=success, output=output, error=None if success else output)
+        return ToolResult(success=success, output=output,
+                          error=None if success else output, tool_error=_tool_err)
 
 
 class GitDiffTool(BaseTool):
@@ -151,7 +152,7 @@ class GitDiffTool(BaseTool):
         if path:
             args += ["--", path]
 
-        success, output = _run_git(args, cwd=cwd, runtime=self._runtime)
+        success, output, _tool_err = _run_git(args, cwd=cwd, runtime=self._runtime)
 
         if not output:
             label = "staged" if staged else "unstaged"
@@ -163,7 +164,8 @@ class GitDiffTool(BaseTool):
             omitted = len(output) - kept
             output = output[:kept] + f"\n... [{omitted} chars truncated]"
 
-        return ToolResult(success=success, output=output, error=None if success else output)
+        return ToolResult(success=success, output=output,
+                          error=None if success else output, tool_error=_tool_err)
 
 
 class GitAddTool(BaseTool):
@@ -220,10 +222,10 @@ class GitAddTool(BaseTool):
         if not paths:
             paths = ["."]
 
-        success, output = _run_git(["add"] + paths, cwd=cwd, runtime=self._runtime)
+        success, output, _tool_err = _run_git(["add"] + paths, cwd=cwd, runtime=self._runtime)
         if success:
             return ToolResult(success=True, output=f"Staged: {', '.join(paths)}")
-        return ToolResult(success=False, output=output, error=output)
+        return ToolResult(success=False, output=output, error=output, tool_error=_tool_err)
 
 
 class GitCommitTool(BaseTool):
@@ -283,7 +285,7 @@ class GitCommitTool(BaseTool):
                 success=False, output="", error="commit message is required"
             )
 
-        success, output = _run_git(["commit", "-m", message], cwd=cwd, runtime=self._runtime)
+        success, output, _tool_err = _run_git(["commit", "-m", message], cwd=cwd, runtime=self._runtime)
         return ToolResult(
             success=success,
             output=output,

@@ -61,3 +61,84 @@ class TaskIntent:
     @property
     def is_execution(self) -> bool:
         return self.phase == IntentPhase.EXECUTION
+
+
+# ── Capability Snapshot: environment facts as Runtime input ──────────────
+
+@dataclass
+class CapabilitySnapshot:
+    """Deterministically probed environment facts. Injected into the agent
+    before execution so the model never has to guess what's available.
+
+    This is NOT reactive (like CapabilityRegistry) — it's proactive.
+    The Runtime tells the agent what tools are available BEFORE it tries them.
+    """
+
+    python_available: bool = True
+    pytest_available: bool = False
+    git_available: bool = True
+    bash_available: bool = False
+    repo_dirty: bool = False
+    os_name: str = ""
+
+    @classmethod
+    def probe(cls, repo_path: str = ".") -> "CapabilitySnapshot":
+        """Run deterministic pre-flight checks. Returns a snapshot of
+        what's actually available in the current environment."""
+        import os as _os
+        import shutil as _shutil
+        import subprocess as _sp
+
+        # OS detection
+        _os_name = "win32" if _os.name == "nt" else _os.uname().sysname.lower()
+
+        # Python
+        _python_ok = _shutil.which("python") is not None or _shutil.which("python3") is not None
+
+        # Pytest — runtime probe in CWD. Never trust config files.
+        # Can it actually RUN? That's the only question.
+        _pytest_ok = False
+        try:
+            _result = _sp.run(
+                ["python", "-m", "pytest", "--version"],
+                capture_output=True, timeout=5, cwd=repo_path,
+            )
+            _pytest_ok = _result.returncode == 0
+        except Exception:
+            pass
+
+        # Git
+        _git_ok = _shutil.which("git") is not None
+
+        # Bash (Git Bash on Windows, native bash on Unix)
+        _bash_ok = _shutil.which("bash") is not None
+
+        # Repo dirty check
+        _dirty = False
+        if _git_ok:
+            try:
+                _result = _sp.run(
+                    ["git", "status", "--porcelain"],
+                    capture_output=True, timeout=5, cwd=repo_path,
+                )
+                _dirty = bool(_result.stdout.strip())
+            except Exception:
+                pass
+
+        return cls(
+            python_available=_python_ok,
+            pytest_available=_pytest_ok,
+            git_available=_git_ok,
+            bash_available=_bash_ok,
+            repo_dirty=_dirty,
+            os_name=_os_name,
+        )
+
+    def render_for_agent(self) -> str:
+        """Format as a one-line system message for the agent."""
+        def _yn(b: bool) -> str: return "yes" if b else "no"
+        return (
+            f"[ENVIRONMENT] os={self.os_name} python={_yn(self.python_available)} "
+            f"pytest={_yn(self.pytest_available)} git={_yn(self.git_available)} "
+            f"bash={_yn(self.bash_available)} repo_dirty={_yn(self.repo_dirty)}"
+        )

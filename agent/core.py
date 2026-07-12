@@ -71,6 +71,7 @@ from tools.base import ToolRegistry
 if TYPE_CHECKING:
     from memory.context import MemoryContext
     from memory.session_memory import SessionMemoryTracker
+    from agent.v2.task_state_machine import TaskStateMachine
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ _READ_TOOL_NAMES = frozenset({"file_read", "file_view"})
 # Tools exempt from semantic (Level 2) loop detection — reading different
 # file sections is legitimate exploration, not a loop. FileReadCache already
 # prevents wasted re-reads. Exact match (Level 1) still catches true repeats.
-_READ_EXPLORE_TOOLS = frozenset({"file_read", "file_view"})
+_READ_EXPLORE_TOOLS = frozenset({"file_read", "file_view", "file_edit", "file_write"})
 
 
 @dataclass
@@ -162,6 +163,63 @@ def _git_diff(repo_path: str) -> str | None:
         return None
 
 
+def _capture_git_state(repo_path: str) -> "GitState":
+    """Capture git state at task start — Runtime-level, not LLM-visible."""
+    from tools.runtime import GitState
+    import subprocess
+    state = GitState(repo_path=repo_path)
+    try:
+        # Capture HEAD commit
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, cwd=repo_path,
+            encoding="utf-8", errors="replace",
+        )
+        if proc.returncode == 0:
+            state.base_commit = proc.stdout.strip()
+            state.base_commit_short = state.base_commit[:8]
+            state.is_git_repo = True
+
+        # Capture pre-existing dirty files
+        dirty = subprocess.run(
+            ["git", "diff", "HEAD", "--name-only"],
+            capture_output=True, text=True, timeout=10, cwd=repo_path,
+            encoding="utf-8", errors="replace",
+        )
+        if dirty.returncode == 0 and dirty.stdout.strip():
+            state.dirty_at_start = True
+            state.files_changed = [f.strip() for f in dirty.stdout.splitlines() if f.strip()]
+    except Exception:
+        pass
+    return state
+
+
+def _refresh_git_state(state: "GitState") -> "GitState":
+    """Refresh git state at task end — captures diff for COMPLETING→COMPLETED_VERIFIED gate."""
+    import subprocess
+    if not state.is_git_repo:
+        return state
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "HEAD"],
+            capture_output=True, text=True, timeout=10, cwd=state.repo_path,
+            encoding="utf-8", errors="replace",
+        )
+        if proc.returncode == 0:
+            state.current_diff = proc.stdout.strip()
+            current_files = [f.strip() for f in proc.stdout.splitlines() if f.strip()]
+            # Only count files changed THIS run (not pre-existing dirt)
+            if state.dirty_at_start:
+                new_files = [f for f in current_files if f not in state.files_changed]
+            else:
+                new_files = current_files
+            state.files_changed = current_files  # update to full current set
+            state.has_changes = bool(new_files)
+    except Exception:
+        pass
+    return state
+
+
 # ---------------------------------------------------------------------------
 # ReActAgent — ReAct (Reasoning + Acting) 主循环
 # ---------------------------------------------------------------------------
@@ -213,6 +271,7 @@ class ReActAgent:
         memory_context: "MemoryContext | None" = None,
         session_memory_tracker: "SessionMemoryTracker | None" = None,
         controller_factory: "type | None" = None,
+        state_machine: "TaskStateMachine | None" = None,
     ) -> None:
         self._backend = backend
         self._full_registry = registry
@@ -221,6 +280,7 @@ class ReActAgent:
         self._controller_factory = controller_factory  # injected by AgentFactory
         self._memory_context = memory_context
         self._session_memory_tracker = session_memory_tracker
+        self._state_machine = state_machine  # Runtime-centric: TSM is the SSOT for task lifecycle
         self._artifact_store = ArtifactStore(
             threshold_tokens=self._cfg.artifact_threshold_tokens,
         )
@@ -336,19 +396,35 @@ class ReActAgent:
                     intent=self._task_intent,
                 ),
             ))
+
+        # ── Capability Snapshot: environment facts as deterministic Runtime input ──
+        from agent.v2.task_intent import CapabilitySnapshot
+        _caps = CapabilitySnapshot.probe(task.repo_path)
+        history.add(LLMMessage(role="user", content=_caps.render_for_agent()))
+        logger.info("Capability: %s", _caps.render_for_agent())
+
         token_budget = TokenBudget(total=self._cfg.request_budget_tokens)
         repo_map = RepoMap(task.repo_path)
 
-        # ── Baseline diff: capture git state BEFORE this run ──
-        # Used to compute the incremental diff at finish time, so the
-        # summary reflects ONLY what THIS run changed — not prior worktree dirt.
-        _baseline_diff = _git_diff(task.repo_path) or ""
+        # ── Baseline git state: capture BEFORE this run ──
+        # Track file names (not raw diff) for true incremental diff at finish.
+        # This prevents prior worktree dirt from being reported as "this run's changes."
+        _git_state = _capture_git_state(task.repo_path)
 
         total_tokens = 0
         steps_without_edit = 0
-        _verification_ok = False  # set True if any test/validate tool succeeds
+        # If no test runner is available, skip verification blocking.
+        # Otherwise, start False — set True when a test/validate tool succeeds.
+        _verification_ok = not _caps.pytest_available
+        _test_was_run = False  # True if ANY test/validate tool was invoked (regardless of result)
         self._stop_hook_verify_count = 0  # Stop Hook: retry count for verification
-        consecutive_failures = 0
+        # consecutive_failures is now derived from CircuitBreaker — the single source of truth.
+        # No more manual local counter. See _get_consecutive_failures().
+        def _get_consecutive_failures() -> int:
+            if self._cfg.circuit_breaker is not None:
+                return getattr(self._cfg.circuit_breaker, "_consecutive_tool_errors", 0)
+            return 0
+
         _max_consecutive_failures = (
             self._cfg.circuit_breaker.config.max_consecutive_tool_errors
             if self._cfg.circuit_breaker is not None
@@ -361,11 +437,9 @@ class ReActAgent:
         completion_guard = TaskCompletionGuard()
 
         # ── P0: Macro-action loop detector (catches global flow patterns) ──
-        from agent.v2.macro_loop_detector import MacroLoopDetector
         from agent.v2.task_intent import TaskIntent
         _task_intent = TaskIntent.from_string(self._task_intent)
-        _macro_loop_detector = MacroLoopDetector()
-        _macro_loop_detector.task_intent = _task_intent
+        # TSM intent will be set after TSM is initialized below
 
         # ── P0: Unified execution budget ──
         from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig, BudgetLevel
@@ -388,12 +462,44 @@ class ReActAgent:
         _runtime_controller = _ControllerCls(
             budget=_execution_budget,
             breaker=self._cfg.circuit_breaker,
-            loop_detector=_macro_loop_detector,
+            loop_detector=None,  # loop detection now handled by TSM guards
             loop_check_fn=lambda: (self._is_looping(log), self._build_loop_diagnosis(log)),
             max_steps=task.max_steps,
             budget_tokens=task.budget_tokens,
             max_consecutive_failures=_max_consecutive_failures,
         )
+
+        # ── TaskStateMachine: Runtime's central authority for task lifecycle ──
+        # If AgentFactory injected a TSM, use it; otherwise create one here
+        # (backward compat for callers that don't go through AgentFactory).
+        _tsm = self._state_machine
+        if _tsm is None:
+            from agent.v2.task_state_machine import TaskStateMachine, TaskState
+            _tsm = TaskStateMachine(task_id=task.task_id)
+        else:
+            # Update placeholder task_id with the real one
+            _tsm.task_id = task.task_id
+
+        # TSM owns progress + loop detection. Set intent for progress heuristics.
+        _tsm.task_intent = _task_intent
+
+        # ── Register TSM guards — Runtime-enforced transition conditions ──
+        from agent.v2.task_state_machine import (
+            circuit_breaker_guard, budget_exhausted_guard,
+            consecutive_failures_guard, git_diff_guard,
+            stop_hook_retry_guard, progress_guard, loop_detect_guard,
+            self_critique_guard, evidence_validation_guard,
+            GuardContext,
+        )
+        _tsm.add_guard("RUNNING->FAILED", circuit_breaker_guard)
+        _tsm.add_guard("RUNNING->FAILED", budget_exhausted_guard)
+        _tsm.add_guard("RUNNING->FAILED", consecutive_failures_guard)
+        _tsm.add_guard("RUNNING->RUNNING", progress_guard)
+        _tsm.add_guard("RUNNING->RUNNING", loop_detect_guard)
+        _tsm.add_guard("COMPLETING->COMPLETED_VERIFIED", git_diff_guard)
+        _tsm.add_guard("COMPLETING->FAILED", stop_hook_retry_guard)
+        _tsm.add_guard("COMPLETING->RUNNING", self_critique_guard)
+        _tsm.add_guard("COMPLETING->RUNNING", evidence_validation_guard)
 
         def _finish_run(
             *,
@@ -407,22 +513,27 @@ class ReActAgent:
         ) -> RunResult:
             nonlocal task_obs_closed
 
-            # ── Compute incremental diff: what THIS run changed ──
-            _current_diff = _git_diff(task.repo_path) or ""
-            _incremental_diff = ""
-            if _current_diff and _current_diff != _baseline_diff:
-                _incremental_diff = _current_diff
-                # Inject diff evidence into summary so agent reports facts, not memory
+            # ── Refresh git state: capture diff for COMPLETED_VERIFIED gate ──
+            _refresh_git_state(_git_state)
+            if _git_state.has_changes:
                 summary = (
                     f"{summary}\n\n"
-                    f"--- INCREMENTAL DIFF (this run only) ---\n"
-                    f"{_incremental_diff[:3000]}"
+                    f"--- INCREMENTAL DIFF (this run: {len(_git_state.files_changed)} files) ---\n"
+                    f"Changed: {', '.join(sorted(_git_state.files_changed)[:10])}\n"
+                    f"{_git_state.current_diff[:3000]}"
                 )
 
-            # ── Verification downgrade: files edited but tests never passed ──
-            if completion_ctx.had_any_write and not _verification_ok:
+            # ── Verification downgrade: orthogonal failure_reason, not compound enum ──
+            if status == RunStatus.SUCCESS and completion_ctx.had_any_write and not _verification_ok:
+                _reason = getattr(_tsm, 'failure_reason', '') if _tsm else ''
+                if _reason == "no_env":
+                    _tag = "UNVERIFIED — no test environment available"
+                elif _reason == "test_failed":
+                    _tag = "UNVERIFIED — tests ran but failed"
+                else:
+                    _tag = "UNVERIFIED — test/validation did not run or was unavailable"
                 summary = (
-                    f"[UNVERIFIED — test/validation did not run or was unavailable. "
+                    f"[{_tag}. "
                     f"Code changes were made but NOT independently verified.]\n\n"
                     f"{summary}"
                 )
@@ -449,7 +560,7 @@ class ReActAgent:
                     {
                         "reflections": reflection_counts,
                         "steps_without_edit": steps_without_edit,
-                        "consecutive_failures": consecutive_failures,
+                        "consecutive_failures": _get_consecutive_failures(),
                     },
                     analysis_metadata,
                 ),
@@ -466,6 +577,15 @@ class ReActAgent:
                 task_context.__exit__(None, None, None)
                 task_obs_closed = True
             return result
+
+        # ── Workspace setup: ensure isolated environment before RUNNING ──
+        from tools.runtime import LocalRuntime as _SetupRuntime
+        _setup_rt = _SetupRuntime()
+        _setup_rt.setup_workspace(task.repo_path)
+
+        # Transition to RUNNING — the Runtime now owns the lifecycle
+        from agent.v2.task_state_machine import TaskState as TSMState
+        _tsm.transition(TSMState.RUNNING, "workspace ready")
 
         for step in range(1, task.max_steps + 1):
             self._current_step = step  # 用于 compaction 日志
@@ -485,14 +605,48 @@ class ReActAgent:
                 log=log,
                 context_size=_ctx_size,
                 request_budget=_req_budget,
-                consecutive_failures=consecutive_failures,
+                consecutive_failures=_get_consecutive_failures(),
             )
             if decision.action == StepAction.TERMINATE:
+                _tsm.force_transition(TSMState.FAILED, decision.terminate_reason)
                 log.log_task_failed(steps=step, reason=decision.terminate_reason)
                 _term_status = RunStatus(decision.terminate_status) if decision.terminate_status else RunStatus.GAVE_UP
                 return _finish_run(
                     status=_term_status,
                     summary=decision.terminate_summary,
+                    steps_taken=step,
+                    total_tokens_used=total_tokens,
+                    cache_stats=cumulative_cache,
+                )
+            if decision.inject_message:
+                history.add(LLMMessage(role="user", content=decision.inject_message))
+            if decision.strip_tools:
+                # Tools stripped for this step — model can only produce text
+                pass
+
+            # ── TSM Guard evaluation: second layer of Runtime defense ──
+            # Guards are evaluated AFTER RuntimeController (which handles budget
+            # escalation with inject_message). Guards that request termination
+            # provide an additional safety net.
+            _guard_ctx = GuardContext(
+                step=step, max_steps=task.max_steps,
+                consecutive_failures=_get_consecutive_failures(),
+                task_intent=task.intent,
+                budget=_execution_budget,
+                breaker=self._cfg.circuit_breaker,
+                loop_detector=None,  # TSM owns loop detection now
+                tsm=_tsm,
+            )
+            _guard_result = _tsm.evaluate_guards(
+                _tsm.make_transition_key(TSMState.RUNNING, TSMState.FAILED),
+                _guard_ctx,
+            )
+            if not _guard_result.passed and _guard_result.terminate:
+                _tsm.force_transition(TSMState.FAILED, _guard_result.reason)
+                log.log_task_failed(steps=step, reason=_guard_result.reason)
+                return _finish_run(
+                    status=RunStatus.GAVE_UP,
+                    summary=_guard_result.reason,
                     steps_taken=step,
                     total_tokens_used=total_tokens,
                     cache_stats=cumulative_cache,
@@ -542,6 +696,7 @@ class ReActAgent:
                 response = self._call_with_retry(messages, tools)
             except Exception as exc:
                 logger.error("LLM call failed at step %d after retries: %s", step, exc)
+                _tsm.force_transition(TSMState.FAILED, f"LLM error: {exc}")
                 log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
                 return _finish_run(
                     status=RunStatus.FAILED,
@@ -565,6 +720,43 @@ class ReActAgent:
             _execution_budget.record_step()
 
             action = _coerce_finish_tool_call(response.action)
+
+            # ── Control Plane: validate tool calls against registered schemas ──
+            # The LLM is an "action generator" — its output MUST conform to the
+            # tool contract. Invalid tool calls are rejected HERE, at the control
+            # plane, BEFORE they reach the Runtime. The LLM gets a structured
+            # error and can self-correct on the next turn.
+            if action.action_type == ActionType.TOOL_CALL and action.tool_calls and tools:
+                from llm.tool_call_validator import validate_tool_calls
+                _validation = validate_tool_calls(action.tool_calls, tools)
+                if not _validation.valid:
+                    logger.warning(
+                        "Control plane rejected tool call: %s — %s",
+                        _validation.error_type, _validation.error_message,
+                    )
+                    # Build a synthetic error observation — the LLM sees this
+                    # and can self-correct on the next turn.
+                    from tools.base import ToolResult as _TR, ToolError as _TE
+                    _fake_result = _TR(
+                        success=False,
+                        output="",
+                        error=_validation.error_message,
+                        tool_error=_TE(
+                            error_type="invalid_params",
+                            retryable=True,
+                            detail=_validation.error_message,
+                        ),
+                    )
+                    _observation = _fake_result.to_observation(
+                        _validation.offending_tool or (action.tool_calls[0].name if action.tool_calls else "unknown")
+                    )
+                    observations = [_observation]
+                    # Skip tool execution entirely — go straight to post-tool processing
+                    log.log_action(step=step, action=action, raw_content=response.raw_content)
+                    break  # exit the for-step loop, let the LLM see the error
+                else:
+                    # Validation passed — proceed to normal tool execution below
+                    pass
 
             # ── SessionMemory tick ─────────────────────────────────────
             _this_turn_has_tools = (
@@ -590,6 +782,7 @@ class ReActAgent:
             _is_local_loop, _loop_diagnosis = _runtime_controller.check_local_loop()
             if _is_local_loop:
                 logger.warning("Loop detected — terminating: %s", _loop_diagnosis)
+                _tsm.force_transition(TSMState.FAILED, f"loop detected: {_loop_diagnosis[:80]}")
                 log.log_task_failed(steps=step, reason=_loop_diagnosis)
                 _execution_budget.exhaust(_loop_diagnosis)
                 return _finish_run(
@@ -602,6 +795,9 @@ class ReActAgent:
 
             # ── 4. 终止 action ──────────────────────────────────────────
             if action.action_type == ActionType.FINISH:
+                # ── Runtime: transition to COMPLETING before guard evaluation ──
+                _tsm.transition(TSMState.COMPLETING, "model called FINISH")
+
                 stop_message = self._run_stop_hook(history)
                 if stop_message is not None:
                     next_count = self._stop_hook_count + 1
@@ -609,6 +805,7 @@ class ReActAgent:
                         reason = f"Stop hook retry limit reached: {_MAX_STOP_HOOK_RETRIES}"
                         logger.warning(reason)
                         log.log_task_failed(steps=step, reason=reason)
+                        _tsm.force_transition(TSMState.FAILED, reason)
                         return _finish_run(
                             status=RunStatus.GAVE_UP,
                             summary=reason,
@@ -618,6 +815,7 @@ class ReActAgent:
                         )
                     self._stop_hook_count = next_count
                     history.add(LLMMessage(role="user", content=stop_message))
+                    _tsm.transition(TSMState.RUNNING, "stop hook blocked — back to loop")
                     continue
 
                 self._stop_hook_count = 0
@@ -625,18 +823,18 @@ class ReActAgent:
                 # ── Completion guard: Runtime validates before accepting FINISH ──
                 # The model cannot unilaterally declare "done" — the Runtime must
                 # verify all completion conditions.
-                active_policy = getattr(self, "_active_policy", None)
+                # Git diff is the only fact that matters for completion
+                _refresh_git_state(_git_state)
                 guard_result = completion_guard.check(
                     ctx=completion_ctx,
                     task_intent=task.intent,
-                    task_max_steps=task.max_steps,
-                    current_step=step,
-                    completion_policy=active_policy.completion if active_policy is not None else None,
+                    git_state=_git_state,
                 )
                 if not guard_result.can_complete:
                     logger.warning(
                         "Completion blocked: %s", guard_result.blocked_reason
                     )
+                    _tsm.transition(TSMState.RUNNING, f"completion blocked: {guard_result.blocked_reason}")
                     history.add(LLMMessage(
                         role="user", content=guard_result.inject_message
                     ))
@@ -665,7 +863,47 @@ class ReActAgent:
                     # After 2 retries, allow finish with [UNVERIFIED] marker
 
                 if _stop_hook_blocked:
+                    _tsm.transition(TSMState.RUNNING, "stop hook blocked — verify changes")
                     continue
+
+                # ── REFLECTING: independent physical node between COMPLETING and terminal ──
+                # Zero Trust: reflection is NOT part of generation. It's a separate state
+                # that forces the LLM to stop and review its own output before completion.
+                _tsm.transition(TSMState.REFLECTING, "entering self-critique node")
+                # Evaluate reflection guards — but only ONCE per task
+                if not getattr(_tsm, "_reflection_done", False):
+                    _tsm._reflection_done = True
+                    _guard_ctx = GuardContext(task_intent=task.intent, tsm=_tsm)
+                    _reflection_msg = ""
+                    _reflection_guards = _tsm._guards.get("COMPLETING->RUNNING", [])
+                    for _guard_fn in _reflection_guards:
+                        try:
+                            _gr = _guard_fn(_guard_ctx)
+                            if _gr.inject_message:
+                                _reflection_msg += _gr.inject_message + "\n\n"
+                        except Exception:
+                            pass
+                    if _reflection_msg:
+                        history.add(LLMMessage(role="user", content=_reflection_msg.strip()))
+                        _tsm.transition(TSMState.RUNNING, "reflection — back to loop")
+                        continue
+
+                # Reflection passed. Determine verification level for terminal state.
+                # GitState already refreshed by completion_guard.check() above
+                if completion_ctx.had_any_write and _verification_ok and _git_state.has_changes:
+                    _tsm.transition(TSMState.COMPLETED_VERIFIED, "guards passed + git diff + verification confirmed")
+                elif completion_ctx.had_any_write and _test_was_run and not _verification_ok:
+                    _tsm.failure_reason = "test_failed"
+                    _tsm.transition(TSMState.COMPLETED_UNVERIFIED, "tests ran but failed")
+                elif completion_ctx.had_any_write and not _caps.pytest_available and not _verification_ok:
+                    _tsm.failure_reason = "no_env"
+                    _tsm.transition(TSMState.COMPLETED_UNVERIFIED, "no test environment available")
+                elif completion_ctx.had_any_write and _git_state.has_changes and not _verification_ok:
+                    _tsm.transition(TSMState.COMPLETED_UNVERIFIED, "guards passed — unverified")
+                elif completion_ctx.had_any_write and not _git_state.has_changes:
+                    _tsm.transition(TSMState.COMPLETED_UNVERIFIED, "guards passed — no net git changes detected")
+                else:
+                    _tsm.transition(TSMState.COMPLETED_UNVERIFIED, "guards passed — analysis/read-only task")
 
                 summary = action.message or "Task complete."
                 patch = self._get_git_diff(task.repo_path)
@@ -683,6 +921,7 @@ class ReActAgent:
 
             if action.action_type == ActionType.GIVE_UP:
                 reason = action.message or "Agent gave up."
+                _tsm.force_transition(TSMState.FAILED, f"agent gave up: {reason}")
                 log.log_task_failed(steps=step, reason=reason)
                 return _finish_run(
                     status=RunStatus.GAVE_UP,
@@ -700,7 +939,18 @@ class ReActAgent:
                 any_edit = False
                 gated_read_count = 0
 
+                # ── Batch dedup: skip duplicate (name, params) within same action ──
+                import hashlib as _hlib, json as _json
+                _batch_seen: set[str] = set()
+
                 for tc in action.tool_calls:
+                    # Dedup: same tool + same params in this batch → skip
+                    _tc_key = f"{tc.name}:{_hlib.sha256(_json.dumps(tc.params or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]}"
+                    if _tc_key in _batch_seen:
+                        logger.info("Batch dedup: skipping duplicate %s", tc.name)
+                        continue
+                    _batch_seen.add(_tc_key)
+
                     # V1 analysis gating (no-op in V2 — state.enabled is False)
                     gated_decision = None
                     if _analysis_active:
@@ -757,6 +1007,30 @@ class ReActAgent:
                                     metadata={"tool_name": tc.name, "duration_ms": result.duration_ms},
                                 )
                         observation = result.to_observation(tc.name)
+
+                        # ── Runtime env interception: detect env-level blockers BEFORE the LLM sees them ──
+                        if not observation.is_success():
+                            _tool_err = getattr(result, "tool_error", None)
+                            if _tool_err is not None and getattr(_tool_err, "is_environmental", False):
+                                _block_msg = (
+                                    f"[RUNTIME] Task BLOCKED — environment issue detected:\n"
+                                    f"{_tool_err.detail}\n"
+                                    f"Suggestion: {_tool_err.alternative}\n"
+                                    f"The task cannot continue until this is resolved. "
+                                    f"Summarize your findings and call finish."
+                                )
+                                _tsm.force_transition(TSMState.BLOCKED_BY_ENV, _tool_err.detail)
+                                _tsm.block_detail = {
+                                    "error_type": _tool_err.error_type,
+                                    "detail": _tool_err.detail,
+                                    "suggested_fix": _tool_err.alternative,
+                                    "tool": tc.name,
+                                }
+                                logger.warning("Runtime intercepted env blocker: %s", _tool_err.detail)
+                                history.add(LLMMessage(role="user", content=_block_msg))
+                                # Strip tools — model can only produce final summary
+                                break
+
                         if tc.name == "memory_write" and observation.is_success():
                             self._explicit_memory_write_this_run = True
                         if (
@@ -783,7 +1057,7 @@ class ReActAgent:
                         )
                     # Signal subagent loop detection to macro detector (breaks repetition)
                     if tc.name == "task" and getattr(result, "subagent_terminated_by_loop", False):
-                        _macro_loop_detector.record_reflection("subagent_loop_killed")
+                        _tsm.record_reflection("subagent_loop_killed")
                     _sf = getattr(result, "structured_findings", None)
                     if _sf:
                         self._accumulated_structured_findings.extend(_sf)
@@ -874,6 +1148,7 @@ class ReActAgent:
 
                     # 追踪测试是否失败
                     if tc.name in self._cfg.test_tool_names:
+                        _test_was_run = True
                         if observation.is_success():
                             _verification_ok = True
                         else:
@@ -884,7 +1159,12 @@ class ReActAgent:
                     log.log_observation(step=step, observation=observation)
 
                     # ── P0: Macro loop detection & circuit breaker same-tool tracking ──
-                    _macro_loop_detector.record_tool_call(tc.name, tc.params)
+                    # Feed tool result into TSM for progress + loop detection
+                    _tsm.feed(
+                        tool_name=tc.name, params=tc.params,
+                        success=observation.is_success() and gated_decision is None,
+                        file_path=tc.params.get("path", tc.params.get("file_path", "")),
+                    )
                     if self._cfg.circuit_breaker is not None:
                         # Build a stable params hash for same-tool loop detection
                         _params_key = str(sorted(tc.params.items())) if tc.params else ""
@@ -926,18 +1206,17 @@ class ReActAgent:
                 all_failed = all(not obs.is_success() for obs in observations)
                 expected_blocked = all(obs.is_expected_block() for obs in observations)
                 if all_failed and not expected_blocked:
-                    consecutive_failures += 1
                     if self._cfg.circuit_breaker is not None:
                         self._cfg.circuit_breaker.record_tool_error()
                 else:
-                    consecutive_failures = 0
                     if self._cfg.circuit_breaker is not None:
                         self._cfg.circuit_breaker.record_tool_success()
 
                 # 连续失败超过阈值：强制终止
-                if consecutive_failures >= _max_consecutive_failures:
+                _cf = _get_consecutive_failures()
+                if _cf >= _max_consecutive_failures:
                     reason = (
-                        f"Aborting: {consecutive_failures} consecutive tool failures. "
+                        f"Aborting: {_cf} consecutive tool failures. "
                         f"Last error: {observations[-1].error or observations[-1].output[:200]}"
                     )
                     logger.warning(reason)
@@ -1116,7 +1395,7 @@ class ReActAgent:
                         prompt=reflect_prompt,
                     )
                     history.add(LLMMessage(role="user", content=reflect_prompt))
-                    _macro_loop_detector.record_reflection("test_failed")
+                    _tsm.record_reflection("test_failed")
                     logger.debug("Reflection triggered: test_failed at step %d", step)
 
                 # 触发条件 B：连续 N 步无编辑（仅 edit 类型任务触发）
@@ -1146,7 +1425,7 @@ class ReActAgent:
                     )
                     history.add(LLMMessage(role="user", content=reflect_prompt))
                     steps_without_edit = 0  # 重置计数，避免每步都触发
-                    _macro_loop_detector.record_reflection("no_edit")
+                    _tsm.record_reflection("no_edit")
                     logger.debug("Reflection triggered: no_edit at step %d", step)
 
             elif action.action_type == ActionType.REFLECTION:
@@ -1160,6 +1439,7 @@ class ReActAgent:
         # Claude Code:
         #   return { reason: 'max_turns', turnCount: nextTurnCount };
         # 从 history 提取已收集的信息作为最终结果。
+        _tsm.force_transition(TSMState.FAILED, "max steps exceeded")
         summary = self._extract_summary_from_history(history)
         log.log_task_failed(steps=task.max_steps, reason="max_steps")
         return _finish_run(
@@ -1611,18 +1891,21 @@ class ReActAgent:
         if all(_serialize_exact(a) == first_exact for a in recent[1:]):
             return True
 
-        # Level 2: semantic match (window = N+1, more evidence needed)
-        # Exempt file_read/file_view — reading different file sections is
-        # legitimate exploration, not a loop. FileReadCache already prevents
-        # wasted re-reads. Exact match (Level 1) still catches true repeats.
-        semantic_window = n + 1
-        if len(actions) >= semantic_window:
-            semantic_recent = actions[-semantic_window:]
-            if all(a.action_type == ActionType.TOOL_CALL and a.tool_calls for a in semantic_recent):
-                first_names = _serialize_names(semantic_recent[0])
-                if first_names and not set(first_names).issubset(_READ_EXPLORE_TOOLS):
-                    if all(_serialize_names(a) == first_names for a in semantic_recent[1:]):
-                        return True
+        # Level 2: Git-fact-based loop detection
+        # The only question: is the agent touching new files on disk?
+        # If distinct files written/read is still growing → progress → NOT a loop.
+        # Claude Code pattern: rely on context window management (92% compaction
+        # trigger), not complex heuristics. Keep it simple.
+        _tsm = getattr(self, '_state_machine', None)
+        if _tsm is not None:
+            _files_written = len(getattr(_tsm, '_distinct_files_written', set()))
+            _files_read = len(getattr(_tsm, '_distinct_files_read', set()))
+            _prev_written = getattr(self, '_prev_distinct_files_written', 0)
+            _prev_read = getattr(self, '_prev_distinct_files_read', 0)
+            self._prev_distinct_files_written = _files_written
+            self._prev_distinct_files_read = _files_read
+            if _files_written > _prev_written or _files_read > _prev_read:
+                return False  # touching new files → agent is making progress
 
         return False
 

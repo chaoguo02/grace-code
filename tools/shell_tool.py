@@ -42,6 +42,12 @@ _BLOCKED_PATTERNS: tuple[str, ...] = (
     "chmod -R 777 /",
     "chown -R",
     "> /dev/sda",
+    # Process-blocking commands (agent hangs forever)
+    "sleep ",
+    "tail -f",
+    "watch ",
+    "ping ",
+    "tcpdump",
 )
 
 # 只读命令前缀白名单（直接执行，不询问）
@@ -90,6 +96,30 @@ _CONFIRM_KEYWORDS: tuple[str, ...] = (
     "| tee ",
 )
 
+# ── Read-only Shell: patterns blocked in analysis/plan mode ──
+# "Read-only" is NOT a boolean — it's a COMMAND-LEVEL whitelist.
+# When shell_read_only is True, any command matching these patterns
+# is blocked BEFORE execution. The LLM sees the Shell tool but
+# cannot use it for writes.
+_READ_ONLY_BLOCKED: tuple[str, ...] = (
+    ">", ">>", "2>", "1>",           # output redirects
+    "rm ", "del ", "rmdir",          # delete files/dirs
+    "cp ", "copy ", "mv ", "move ",  # file operations
+    "ren ", "rename ",
+    "mkdir ", "md ",
+    "curl ", "wget ",                # network downloads
+    "pip install", "npm install",    # package installation
+    "git add", "git commit",         # git writes
+    "git push", "git stash push",
+    "chmod", "chown", "attrib",     # permission changes
+    "sudo ", "su ",                  # privilege escalation
+    "shutdown", "reboot",
+    "docker ", "kubectl ",
+    "make ", "make install",
+    "pip uninstall", "npm uninstall",
+    "format ", "diskpart",
+)
+
 # 确认回调类型：接收命令字符串，返回 True=允许 / False=拒绝
 ConfirmCallback = Callable[[str], bool]
 
@@ -120,6 +150,7 @@ class ShellTool(BaseTool):
     ) -> None:
         self._confirm_callback = confirm_callback
         self._runtime = runtime or LocalRuntime()
+        self.read_only = False  # set True by PhasePolicy for analysis tasks
 
     @property
     def name(self) -> str:
@@ -130,6 +161,8 @@ class ShellTool(BaseTool):
         return (
             "Execute a shell command and return its output (stdout + stderr combined). "
             "Timeout is 30s by default. "
+            "CRITICAL: Use the 'cwd' parameter to set the working directory. "
+            "Never write 'cd /some/path' in the command string — use cwd instead. "
             "RESTRICTION: Do NOT use this tool to read files (use file_read instead) "
             "or modify files (use file_edit / file_write instead). "
             "Use shell ONLY for operations that have no dedicated tool: "
@@ -141,9 +174,19 @@ class ShellTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The program to run (e.g., 'pytest', 'git', 'ls'). PREFERRED over 'cmd' — uses parameterized execution with shell=False.",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Arguments as separate items. Each item is ONE argument, never parsed by shell.",
+                },
                 "cmd": {
                     "type": "string",
-                    "description": "Shell command to execute",
+                    "description": "DEPRECATED. Use 'command' + 'args' instead. Shell command string (legacy).",
+                    "deprecated": True,
                 },
                 "timeout": {
                     "type": "integer",
@@ -154,7 +197,7 @@ class ShellTool(BaseTool):
                     "description": "Working directory (optional)",
                 },
             },
-            "required": ["cmd"],
+            "required": [],  # either command or cmd must be provided
         }
 
     @property
@@ -165,8 +208,8 @@ class ShellTool(BaseTool):
     def classify_risk(self, params: dict[str, Any]) -> str:
         """动态风险分类：根据命令内容决定实际风险等级。"""
         from tools.base import RiskLevel
-        cmd = params.get("cmd", "").strip()
-        if not cmd:
+        cmd = params.get("cmd", "") or self._build_cmd_repr(params)
+        if not cmd.strip():
             return RiskLevel.NONE
         if _is_readonly(cmd):
             return RiskLevel.NONE
@@ -174,31 +217,91 @@ class ShellTool(BaseTool):
             return RiskLevel.HIGH
         return RiskLevel.LOW
 
+    def _build_cmd_repr(self, params: dict[str, Any]) -> str:
+        """Build a string representation for safety checks (L0/L1/L2)."""
+        command = params.get("command", "")
+        args = params.get("args", [])
+        if command:
+            return f"{command} {' '.join(args)}" if args else command
+        return params.get("cmd", "")
+
     def execute(self, params: dict[str, Any]) -> ToolResult:
         cmd: str = params.get("cmd", "").strip()
+        command: str = params.get("command", "").strip()
+        args: list[str] = params.get("args", [])
         timeout: int = int(params.get("timeout", 30))
         cwd: str | None = params.get("cwd", None)
 
-        if not cmd:
-            return ToolResult(success=False, output="", error="cmd is required")
+        # Prefer parameterized execution (command+args) over legacy (cmd)
+        if command:
+            return self._execute_parameterized(command, args, timeout, cwd)
+        if cmd:
+            return self._execute_legacy(cmd, timeout, cwd)
 
-        # L0 黑名单硬拦截（永远在 execute 内，不可被 policy 覆盖）
-        blocked = _check_blocked(cmd)
+        return ToolResult(success=False, output="", error="Either 'command' or 'cmd' is required")
+
+    def _execute_parameterized(self, command: str, args: list[str], timeout: int, cwd: str | None) -> ToolResult:
+        """Execute via Runtime.execute() — shell=False, physically isolated parameters."""
+        cmd_repr = f"{command} {' '.join(args)}" if args else command
+
+        # Read-only enforcement: block write operations at the COMMAND level
+        if self.read_only:
+            ro_blocked = _check_read_only_blocked(cmd_repr)
+            if ro_blocked:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"[READ-ONLY SHELL] Command blocked: '{ro_blocked}' is not allowed in analysis mode. Use read-only commands only (dir, type, findstr, Get-ChildItem, Select-String).",
+                )
+
+        # L0 blacklist check (operates on command semantics, same as legacy)
+        blocked = _check_blocked(cmd_repr)
         if blocked:
             return ToolResult(
-                success=False,
-                output="",
+                success=False, output="",
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
 
-        # 如果有 HitlManager（通过 ToolRegistry 接入），确认已在 execute 前完成。
-        # 降级路径：无 HitlManager 时使用内部 confirm_callback（兼容旧代码/测试）
+        # L2 confirm check
+        if self._confirm_callback is not None and _needs_confirm(cmd_repr):
+            allowed = self._confirm_callback(cmd_repr)
+            if not allowed:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"Command rejected by user: {cmd_repr!r}",
+                )
+
+        from tools.runtime import RunResult
+        run_result: RunResult = self._runtime.execute(
+            command, args=args, cwd=cwd, timeout=timeout,
+        )
+
+        return self._build_result(run_result, cmd_repr)
+
+    def _execute_legacy(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
+        """Execute via Runtime.exec() — shell=True, backward compatible."""
+        # Read-only enforcement: block write operations at the COMMAND level
+        if self.read_only:
+            ro_blocked = _check_read_only_blocked(cmd)
+            if ro_blocked:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"[READ-ONLY SHELL] Command blocked: '{ro_blocked}' is not allowed in analysis mode. Use read-only commands only.",
+                )
+
+        # L0 blacklist hard intercept
+        blocked = _check_blocked(cmd)
+        if blocked:
+            return ToolResult(
+                success=False, output="",
+                error=f"Command blocked for safety: matched '{blocked}'",
+            )
+
+        # L2 confirm check
         if self._confirm_callback is not None and _needs_confirm(cmd):
             allowed = self._confirm_callback(cmd)
             if not allowed:
                 return ToolResult(
-                    success=False,
-                    output="",
+                    success=False, output="",
                     error=f"Command rejected by user: {cmd!r}",
                 )
 
@@ -209,51 +312,38 @@ class ShellTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _run(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
-        """通过 runtime 执行命令（本地或 Docker 沙箱）。"""
+        """Execute via Runtime.exec() — legacy path with shell=True."""
         result = self._runtime.exec(cmd, cwd=cwd, timeout=timeout)
-        output = truncate_output(result.output, MAX_OUTPUT_CHARS)
-        if not result.success:
-            combined = f"{result.stdout}{result.stderr}".lower()
-            # ── Non-retryable: command not found / not recognized ──
-            _cmd_not_found = any(sig in combined for sig in (
-                "not recognized", "command not found",
-                "cannot find", "no such file",
-            ))
-            if _cmd_not_found:
-                from tools.base import ToolError as _ToolError
-                return ToolResult(
-                    success=False, output=output,
-                    error=f"Command not available on this system: {cmd.split()[0]!r}",
-                    tool_error=_ToolError(
-                        error_type="unavailable",
-                        retryable=False,
-                        detail=f"Command {cmd.split()[0]!r} is not installed or not available on this OS. "
-                               f"Use an alternative tool or approach — do NOT retry this command.",
-                    ),
-                )
-            # ── Timeout ──
-            if "timed out" in result.stderr.lower():
-                error = result.stderr.strip()
-            else:
-                error = f"Exit code: {result.returncode}"
-                if any(sig in combined for sig in (
-                    "modulenotfounderror", "no module named",
-                    "filenotfounderror",
-                )):
-                    effective_cwd = cwd or os.getcwd()
-                    error += (
-                        f"\n[HINT] Working directory was: {effective_cwd}\n"
-                        f"If the target file/module is in a subdirectory, use "
-                        f"the cwd parameter or prefix with 'cd <project_root> && '."
-                    )
-        else:
-            error = None
-        return ToolResult(success=result.success, output=output, error=error)
+        return self._build_result(result, cmd)
+
+    def _build_result(self, run_result: "Any", cmd_repr: str) -> ToolResult:
+        """Convert RunResult to ToolResult with proper error classification."""
+        from tools.base import classify_runtime_error
+        output = truncate_output(run_result.output, MAX_OUTPUT_CHARS)
+        if not run_result.success:
+            _tool_err = classify_runtime_error(
+                run_result.returncode, run_result.stderr, run_result.stdout, cmd_repr,
+            )
+            return ToolResult(
+                success=False, output=output,
+                error=_tool_err.to_message() if _tool_err else f"Exit code: {run_result.returncode}",
+                tool_error=_tool_err,
+            )
+        return ToolResult(success=True, output=output)
 
 
 # ---------------------------------------------------------------------------
 # 辅助函数（对外暴露供测试）
 # ---------------------------------------------------------------------------
+
+def _check_read_only_blocked(cmd: str) -> str | None:
+    """Check if cmd contains write operations blocked in read-only mode."""
+    cmd_lower = cmd.lower()
+    for pattern in _READ_ONLY_BLOCKED:
+        if pattern.lower() in cmd_lower:
+            return pattern
+    return None
+
 
 def _check_blocked(cmd: str) -> str | None:
     """返回匹配到的黑名单 pattern，没有匹配返回 None。"""

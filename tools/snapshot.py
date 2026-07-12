@@ -55,9 +55,15 @@ class WorktreeManager:
     避免多个 Executor 同时修改同一目录造成冲突。
     """
 
-    def __init__(self, repo_path: str) -> None:
+    def __init__(self, repo_path: str, runtime: "Runtime | None" = None) -> None:
         self._repo_path = Path(repo_path).resolve()
         self._worktrees: dict[str, Worktree] = {}
+        # Runtime injection: all git commands go through execute(), never raw subprocess.
+        # This ensures Docker sandbox compatibility and audit trail.
+        if runtime is None:
+            from tools.runtime import LocalRuntime as _LR
+            runtime = _LR()
+        self._runtime = runtime
 
     @property
     def repo_path(self) -> str:
@@ -215,17 +221,14 @@ class WorktreeManager:
     # 内部方法
     # ------------------------------------------------------------------
 
-    def _run_git(self, args: list[str]) -> str:
-        """执行 git 命令。"""
-        result = subprocess.run(
-            ["git"] + args,
-            cwd=str(self._repo_path),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            encoding="utf-8",
-            errors="replace",
-        )
+    def _run_git(self, args: list[str], cwd: str | None = None) -> str:
+        """Execute a git command through Runtime (NOT raw subprocess).
+
+        Uses Runtime.execute() with shell=False — works in Docker sandbox mode.
+        """
+        from tools.runtime import RunResult
+        target_cwd = cwd or str(self._repo_path)
+        result: RunResult = self._runtime.execute("git", args=args, cwd=target_cwd, timeout=30)
         if result.returncode != 0:
             raise subprocess.CalledProcessError(
                 result.returncode, ["git"] + args,

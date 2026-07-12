@@ -155,7 +155,7 @@ def fork_subagent(
     task = Task(
         description=prompt,
         repo_path=_effective_repo_path,
-        intent="analysis",
+        intent="edit",  # subagent returns compact summary, not full analysis report
         max_steps=cfg.max_steps,
         budget_tokens=cfg.budget_tokens,
         metadata={

@@ -18,7 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from agent.task import Observation, ObservationStatus
 from llm.base import LLMToolSchema
@@ -62,6 +62,7 @@ class ToolError:
     retryable: bool       # can the LLM retry with different params?
     alternative: str = "" # suggested alternative tool name, e.g. "shell" for "bash"
     detail: str = ""      # human-readable detail for the LLM
+    is_environmental: bool = False  # True = env-level blocker, task should BLOCKED_BY_ENV
 
     def to_message(self) -> str:
         """Format as a single line for LLM context injection."""
@@ -142,7 +143,106 @@ class ToolResult:
 
 
 # ---------------------------------------------------------------------------
+# Runtime error classification — framework-level, not tool-specific
+# ---------------------------------------------------------------------------
+
+def classify_runtime_error(
+    returncode: int,
+    stderr: str = "",
+    stdout: str = "",
+    cmd: str = "",
+) -> ToolError | None:
+    """Classify a runtime error from returncode + output.
+
+    Returns ToolError with is_environmental=True for errors that indicate
+    the execution environment is broken (missing deps, permission errors).
+    These should trigger BLOCKED_BY_ENV — the LLM cannot fix them.
+
+    Platform-aware: on Windows, provides specific recovery hints for
+    Unix commands that aren't available (find, wc, grep, etc.).
+    """
+    if returncode == 0:
+        return None
+
+    combined = f"{stdout}{stderr}".lower()
+    cmd_name = cmd.split()[0] if cmd.strip() else "command"
+
+    # Command not found (127=POSIX, 9009=Windows) — env blocker
+    if returncode in (127, 9009):
+        return ToolError(
+            error_type="env_blocked", retryable=False,
+            is_environmental=True,
+            detail=f"Command {cmd_name!r} is not installed or not on PATH.",
+            alternative=f"Install {cmd_name!r} or use an available alternative.",
+        )
+
+    # Timeout (returncode=-1 means killed by LocalRuntime)
+    if returncode == -1 and "timed out" in stderr.lower():
+        return ToolError(
+            error_type="timeout", retryable=True,
+            detail=f"Command timed out: {cmd[:80]!r}",
+        )
+
+    # Permission denied — env blocker (can't auto-fix)
+    if "permission denied" in combined or "access denied" in combined:
+        return ToolError(
+            error_type="env_blocked", retryable=False,
+            is_environmental=True,
+            detail=f"Permission denied executing: {cmd[:80]!r}",
+            alternative="Check file permissions or run with appropriate privileges.",
+        )
+
+    # ModuleNotFoundError / ImportError — env blocker (missing dependency)
+    if any(s in combined for s in ("modulenotfounderror", "no module named",
+                                     "importerror")):
+        return ToolError(
+            error_type="env_blocked", retryable=False,
+            is_environmental=True,
+            detail=f"Missing Python module. {stderr.strip()[:200]}",
+            alternative="Install the missing dependency before retrying.",
+        )
+
+    # File not found (not env-blocked — could be wrong path)
+    if "filenotfounderror" in combined or "no such file" in combined:
+        return ToolError(
+            error_type="not_found", retryable=True,
+            detail=f"File not found. {stderr.strip()[:200]}",
+        )
+
+    # Generic failure
+    return ToolError(
+        error_type="internal", retryable=True,
+        detail=f"Exit code {returncode}: {stderr.strip()[:200] or stdout.strip()[:200]}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # BaseTool
+# ---------------------------------------------------------------------------
+# ExecutionContext — unified environment passed to every tool invocation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExecutionContext:
+    """Environment context available to every tool at execution time.
+
+    Tools destructure what they need from this object. No more
+    requires_workspace / requires_git_root flags on BaseTool.
+    """
+    workspace_root: str = ""
+    repo_path: str = ""
+
+
+@runtime_checkable
+class WorkspaceAware(Protocol):
+    """Protocol: tools that accept a workspace_root for path resolution.
+
+    Use isinstance(tool, WorkspaceAware) instead of hasattr(tool, '_workspace_root').
+    This is type-safe — static checkers verify the attribute exists.
+    """
+    _workspace_root: str
+
+
 # ---------------------------------------------------------------------------
 
 class BaseTool(ABC):
@@ -154,6 +254,15 @@ class BaseTool(ABC):
     - schema:   JSON Schema 描述，告诉 LLM 这个工具怎么用
     - execute(): 实际执行逻辑
     """
+
+    aliases: tuple[str, ...] = ()
+    """Alternative names the LLM might use (Claude Code conventions)."""
+
+    is_read_only: bool = False
+    """True → available to plan/explore agents. Default False (fail-closed)."""
+
+    allows_delegation: bool = False
+    """True → this tool spawns sub-agents (e.g. task tool)."""
 
     @property
     @abstractmethod
@@ -189,25 +298,25 @@ class BaseTool(ABC):
 
     # ── Semantic properties (Claude Code style) ──
     # Tool Gateway filters on these. Fail-closed: defaults are conservative.
+    # IMPORTANT: These are class attributes (NOT @property), so subclasses
+    # can override them with simple class-level assignments like:
+    #   class MyTool(BaseTool):
+    #       is_read_only = True
 
-    @property
-    def is_read_only(self) -> bool:
-        """True if this tool never modifies filesystem or external state.
+    is_read_only: bool = False
+    """True if this tool never modifies filesystem or external state.
 
-        Read-only tools are automatically available to plan/explore agents.
-        Default False (fail-closed): a tool that forgets to declare this
-        is treated as potentially destructive.
-        """
-        return False
+    Read-only tools are automatically available to plan/explore agents.
+    Default False (fail-closed): a tool that forgets to declare this
+    is treated as potentially destructive.
+    """
 
-    @property
-    def allows_delegation(self) -> bool:
-        """True if this tool spawns sub-agents (e.g. task tool).
+    allows_delegation: bool = False
+    """True if this tool spawns sub-agents (e.g. task tool).
 
-        Delegation tools require explicit opt-in via TaskContract.allowed_actions.
-        Default False: a tool cannot spawn sub-agents unless declared.
-        """
-        return False
+    Delegation tools require explicit opt-in via TaskContract.allowed_actions.
+    Default False: a tool cannot spawn sub-agents unless declared.
+    """
 
     def classify_risk(self, params: dict[str, Any]) -> str:
         """
@@ -391,6 +500,7 @@ class ToolRegistry:
 
     def __init__(self, hitl_manager: Any = None, permission_pipeline: Any = None, hook_dispatcher: Any = None, capability_registry: Any = None) -> None:
         self._tools: dict[str, BaseTool] = {}
+        self._tool_aliases: dict[str, str] = {}  # alias → canonical name
         self._permission_pipeline = permission_pipeline
         # Backward compat: hitl_manager still accepted, pipeline takes precedence
         self._hitl_manager = hitl_manager
@@ -406,7 +516,23 @@ class ToolRegistry:
         if tool.name in self._tools:
             raise ValueError(f"Tool '{tool.name}' is already registered.")
         self._tools[tool.name] = tool
+        # Register aliases (tool naming aligned with LLM prior knowledge)
+        for alias in getattr(tool, "aliases", ()):
+            if alias in self._tool_aliases:
+                logger.warning("Tool alias '%s' → '%s' shadowed by existing alias → '%s'",
+                               alias, tool.name, self._tool_aliases[alias])
+            self._tool_aliases[alias] = tool.name
         return self
+
+    def resolve_name(self, name: str) -> str | None:
+        """Resolve a possibly-aliased tool name to its canonical name.
+
+        Returns the canonical name if the tool exists (directly or via alias),
+        or None if the tool is completely unknown.
+        """
+        if name in self._tools:
+            return name
+        return self._tool_aliases.get(name)
 
     def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
         """
@@ -417,7 +543,9 @@ class ToolRegistry:
         start = time.perf_counter()
         result: ToolResult
 
-        if name not in self._tools:
+        # Resolve aliases — LLM may use Claude Code naming conventions
+        canonical = self.resolve_name(name)
+        if canonical is None:
             available = ", ".join(self._tools.keys()) or "none"
             result = ToolResult.from_error(
                 error_type="not_found",
@@ -426,7 +554,7 @@ class ToolRegistry:
             self._record_timing(name, start, result)
             return result
 
-        tool = self._tools[name]
+        tool = self._tools[canonical]
 
         # ── P1-6: Physical interception with dedup (structured feedback) ──
         if self._capability_registry is not None:
@@ -434,7 +562,7 @@ class ToolRegistry:
             from agent.capability_registry import InterceptHardBlock
             try:
                 intercept = self._capability_registry.intercept(
-                    name, session_id=getattr(self, "_session_id", ""),
+                    canonical, session_id=getattr(self, "_session_id", ""),
                 )
                 if intercept.blocked:
                     feedback_json = _json.dumps(intercept.feedback, ensure_ascii=False)

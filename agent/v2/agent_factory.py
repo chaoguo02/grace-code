@@ -137,6 +137,12 @@ class AgentFactory:
             spec, root_agent_config, circuit_breaker,
         )
 
+        # ── 3.5. Create TaskStateMachine — the Runtime's central authority ──
+        # task_id is a placeholder; it will be updated when the actual Task
+        # is created in _run_body() / SessionRuntime.run_session().
+        from agent.v2.task_state_machine import TaskStateMachine
+        _tsm = TaskStateMachine(task_id=agent_name)
+
         # ── 4. Create agent (controller_factory injectable for DI) ──
         from agent.core import ReActAgent
         from agent.runtime_controller import RuntimeController
@@ -144,6 +150,7 @@ class AgentFactory:
             backend, registry, agent_cfg,
             memory_context=memory_context if spec.mode == "primary" else None,
             controller_factory=RuntimeController,  # DI: swap for custom controllers
+            state_machine=_tsm,
         )
 
         return AgentAssembly(

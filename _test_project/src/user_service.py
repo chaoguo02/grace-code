@@ -1,14 +1,29 @@
 """User business logic and data access."""
+import base64
 import hashlib
 import logging
-
-from config import SECRET_KEY
+import os
 
 logger = logging.getLogger(__name__)
 
+
 def _hash_password(password: str) -> str:
-    """Hash a password with SHA-256 using the app SECRET_KEY as pepper."""
-    return hashlib.sha256((password + SECRET_KEY).encode()).hexdigest()
+    """Hash a password with PBKDF2-SHA256 and a random 16-byte salt.
+
+    Returns a ``salt$hash`` string where both components are base64-encoded.
+    """
+    salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000)
+    return base64.b64encode(salt).decode() + "$" + base64.b64encode(key).decode()
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    """Verify a plaintext password against a ``salt$hash`` string."""
+    salt_b64, hash_b64 = stored.split("$")
+    salt = base64.b64decode(salt_b64)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000)
+    return base64.b64encode(key).decode() == hash_b64
+
 
 FAKE_DB = [
     {"id": 1, "name": "alice", "email": "alice@example.com", "password": _hash_password("pass123")},

@@ -302,7 +302,7 @@ def test_v2_react_agent_stop_hook_blocks_then_continues(tmp_path):
         tool_registry,
         AgentConfig(stream=False),
     )
-    task = Task("finish with stop hook", str(tmp_path), max_steps=5, intent="analysis")
+    task = Task("finish with stop hook", str(tmp_path), max_steps=5, intent="edit")
     with EventLog.create(task, log_dir=str(tmp_path / "logs")) as event_log:
         result = agent.run(task, event_log)
 

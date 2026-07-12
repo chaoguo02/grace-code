@@ -260,8 +260,16 @@ class MacroLoopDetector:
                      or len(self._distinct_files_read) % _MIN_NEW_FILES_FOR_PROGRESS == 0)
             )
         else:
-            # Edit: only writes, validates, and finishes count as progress
-            _made_progress = macro_type in _PROGRESS_ACTIONS_EDIT
+            # Edit or unknown intent: writes, validates, finishes = hard progress.
+            # Reading NEW files = soft progress ONLY if intent is explicitly edit
+            # (agent is exploring before editing). Unknown intent keeps old behavior.
+            _made_progress = (
+                macro_type in _PROGRESS_ACTIONS_EDIT
+                or (self.task_intent is not None
+                    and not self.task_intent.is_analysis
+                    and macro_type == MacroActionType.READ_FILE
+                    and _is_new)
+            )
 
         if _made_progress:
             self._no_progress_count = 0
@@ -334,7 +342,13 @@ class MacroLoopDetector:
         #   a) Same action (type+payload) repeated consecutively (鬼打墙)
         #   b) Alternating pair A→B→A→B repeated (spawn→read→spawn→read)
         # Does NOT catch READ(A)→SEARCH(B)→READ(C)→SEARCH(D) — normal exploration.
-        if len(recent) >= self.config.min_repetitions:
+        #
+        # CRITICAL: only trip the fingerprint check when there is NO progress.
+        # Consecutive identical tool calls during active exploration (new files
+        # being read, distinct searches) are NOT a loop — they're the agent
+        # being thorough. The no_progress_count gates this: the agent must
+        # have made ZERO progress actions for at least min_repetitions cycles.
+        if len(recent) >= self.config.min_repetitions and self._no_progress_count >= self.config.min_repetitions:
             fingerprints = [r.signature() for r in recent]
 
             # a) Consecutive identical: last N fingerprints all the same
@@ -342,7 +356,8 @@ class MacroLoopDetector:
             if len(set(_last_n)) == 1:
                 self._trip_reason = (
                     f"Macro loop (exact): [{_last_n[0]}] "
-                    f"repeated {self.config.min_repetitions}x consecutively."
+                    f"repeated {self.config.min_repetitions}x consecutively "
+                    f"(no progress for {self._no_progress_count} actions)."
                 )
                 logger.warning("MacroLoopDetector tripped: %s", self._trip_reason)
                 return True
@@ -358,7 +373,8 @@ class MacroLoopDetector:
                 ):
                     self._trip_reason = (
                         f"Macro loop (alternating): [{_a}] ↔ [{_b}] "
-                        f"repeated {self.config.min_repetitions}x."
+                        f"repeated {self.config.min_repetitions}x "
+                        f"(no progress for {self._no_progress_count} actions)."
                     )
                     logger.warning("MacroLoopDetector tripped: %s", self._trip_reason)
                     return True

@@ -36,8 +36,8 @@ def build_registry_for_session(
       declared = agent_registry.tool_names_for(spec.name)
       registry = base_registry.filtered(declared | mcp_tool_names)
 
-    No per-agent hardcoding. No Gateway auth — security is enforced at
-    execution time by PermissionPipeline and path safety checks.
+    All tools are available. Permissions are restricted at execution time
+    by PhasePolicy (e.g., analysis tasks get read-only shell).
     """
     from agent.v2.task_tool import AgentTool
     from agent.policy_registry import PolicyAwareToolRegistry
@@ -46,12 +46,12 @@ def build_registry_for_session(
     declared = agent_registry.tool_names_for(spec.name)
     registry = base_registry.filtered(declared | mcp_tool_names)
 
-    # ── Set workspace_root on file tools for path safety checks ──
+    # ── Set workspace_root on all WorkspaceAware tools (Protocol, not hasattr) ──
     _ws = getattr(session, "repo_path", None)
     if _ws:
-        for _tn in ("file_write", "file_edit"):
-            _tool = registry._tools.get(_tn)
-            if _tool is not None:
+        from tools.base import WorkspaceAware
+        for _tool in registry._tools.values():
+            if isinstance(_tool, WorkspaceAware):
                 _tool._workspace_root = str(_ws)
 
     # Agents with an explicit subagent allowlist get the task tool

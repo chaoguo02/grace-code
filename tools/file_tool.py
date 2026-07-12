@@ -193,6 +193,8 @@ class FileReadTool(BaseTool):
     def name(self) -> str:
         return "file_read"
 
+    aliases = ("read_file",)  # Claude Code naming convention
+
     @property
     def description(self) -> str:
         return (
