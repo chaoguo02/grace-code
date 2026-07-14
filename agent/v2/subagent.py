@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import logging
-import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
@@ -70,6 +69,7 @@ class _ForkContext:
 
 def fork_subagent(
     *,
+    agent_id: str,
     definition: AgentDefinition,
     prompt: str,
     repo_path: str,
@@ -78,6 +78,7 @@ def fork_subagent(
     log_dir: str,
     root_agent_config: AgentConfig | None = None,
     hook_dispatcher: Any = None,
+    message_sink: Callable[[list[LLMMessage]], None] | None = None,
 ) -> ForkResult:
     """Run a subagent in a forked context.
 
@@ -89,7 +90,6 @@ def fork_subagent(
 
     Returns a ForkResult with the subagent's final summary.
     """
-    agent_id = uuid.uuid4().hex[:12]
     logger.info("Fork subagent '%s' (%s) starting: %s", definition.name, agent_id, prompt[:80])
 
     # ── Phase 6.2: Git Worktree isolation ──
@@ -145,6 +145,7 @@ def fork_subagent(
 
     # User prompt
     history.add(LLMMessage(role="user", content=prompt))
+    _persisted_history_boundary = len(history)
 
     agent._pending_history = history
 
@@ -220,6 +221,22 @@ def fork_subagent(
         )
 
     finally:
+        if message_sink is not None:
+            try:
+                message_sink(history.to_list()[_persisted_history_boundary:])
+            except Exception as exc:
+                logger.exception(
+                    "Fork subagent '%s' transcript persistence failed: %s",
+                    definition.name, exc,
+                )
+                result = RunResult(
+                    task_id=agent_id,
+                    status=RunStatus.FAILED,
+                    summary="Subagent transcript persistence failed",
+                    steps_taken=result.steps_taken,
+                    total_tokens=result.total_tokens,
+                    error=str(exc),
+                )
         from agent.v2.worktree_service import discard_worktree
         discard_worktree(_worktree, repo_path)
         _fire_hook(hook_dispatcher, "SubagentStop", session_id=agent_id)

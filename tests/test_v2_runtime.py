@@ -56,12 +56,20 @@ class _StubRuntime:
         return str(Path.cwd())
 
 
-def _make_runtime(tmp_path, backend: MockBackend) -> tuple[SessionRuntime, SessionStore]:
+def _make_runtime(
+    tmp_path,
+    backend: MockBackend,
+    *,
+    tool_overrides: dict[str, NoopTool] | None = None,
+) -> tuple[SessionRuntime, SessionStore]:
     agent_registry = AgentRegistryV2(project_dir=tmp_path)
     base_registry = ToolRegistry()
+    overrides = tool_overrides or {}
 
     for tool_name in sorted(agent_registry.tool_names_for("build")):
-        base_registry.register(NoopTool(tool_name, output=f"{tool_name} ok"))
+        base_registry.register(
+            overrides.get(tool_name, NoopTool(tool_name, output=f"{tool_name} ok"))
+        )
 
     store = SessionStore(str(tmp_path / ".forge-agent" / "v2" / "sessions.db"))
     runtime = SessionRuntime(
@@ -91,6 +99,40 @@ def test_v2_session_store_persists_parent_child_relationships(tmp_path):
     assert store.get_session(root.id).parent_id is None
     assert store.get_session(child.id).parent_id == root.id
     assert [item.id for item in store.list_child_sessions(root.id)] == [child.id]
+
+
+def test_v2_session_store_rejects_invalid_child_topology(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    root = store.create_session(
+        agent_name="build", mode=SessionMode.PRIMARY,
+        repo_path=str(tmp_path), title="root",
+    )
+
+    with pytest.raises(ValueError, match="requires parent_id"):
+        store.create_session(
+            agent_name="explore", mode=SessionMode.SUBAGENT,
+            repo_path=str(tmp_path), title="orphan",
+        )
+    with pytest.raises(ValueError, match="must use subagent mode"):
+        store.create_session(
+            agent_name="build", mode=SessionMode.PRIMARY,
+            repo_path=str(tmp_path), title="fake child", parent_id=root.id,
+        )
+    with pytest.raises(ValueError, match="must match its parent"):
+        store.create_session(
+            agent_name="explore", mode=SessionMode.SUBAGENT,
+            repo_path=str(tmp_path), title="wrong root",
+            parent_id=root.id, root_id="forged-root",
+        )
+
+
+def test_v2_session_store_rejects_messages_for_unknown_session(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+
+    with pytest.raises(ValueError, match="Unknown v2 session"):
+        store.append_message(
+            "missing", LLMMessage(role="user", content="not persisted"),
+        )
 
 
 # ── Agent Registry ──
@@ -741,15 +783,101 @@ def test_v2_build_gets_task_tool(tmp_path):
 def test_v2_fork_subagent_builds_restricted_registry(tmp_path):
     backend = MockBackend([Action(action_type=ActionType.FINISH, thought="ok", message="summary")])
     runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
     result = runtime.fork_session(
+        parent_session_id=parent.id,
         definition=runtime.agent_registry.get("explore"),
         description="explore auth",
         prompt="Find login flow",
-        repo_path=str(tmp_path),
     )
     assert result.status == "completed"
     assert result.summary == "summary"
     assert result.agent_name == "explore"
+    child = store.get_session(result.session_id)
+    assert child is not None
+    assert child.parent_id == parent.id
+    assert child.root_id == parent.root_id
+    assert child.mode is SessionMode.SUBAGENT
+    assert child.status is SessionStatus.COMPLETED
+    assert child.summary == "summary"
+    child_messages = store.list_messages(child.id)
+    assert (child_messages[0].role, child_messages[0].content) == (
+        "user", "Find login flow",
+    )
+    assert child_messages[-1].role == "assistant"
+    assert child_messages[-1].content == "summary"
+    assert any("[ENVIRONMENT]" in str(message.content) for message in child_messages)
+    assert store.list_messages(parent.id) == []
+
+
+def test_v2_subagent_persists_native_tool_pairs_in_child_transcript(tmp_path):
+    class WorkspaceReadNoop(NoopTool):
+        metadata = ToolMetadata(effects=frozenset({ToolEffect.READ_WORKSPACE}))
+
+    backend = MockBackend([
+        Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="inspect",
+            tool_calls=[ToolCall(name="file_read", params={})],
+        ),
+        Action(action_type=ActionType.FINISH, thought="done", message="inspected"),
+    ])
+    runtime, store = _make_runtime(
+        tmp_path,
+        backend,
+        tool_overrides={"file_read": WorkspaceReadNoop("file_read")},
+    )
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+
+    result = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=runtime.agent_registry.get("explore"),
+        description="inspect file",
+        prompt="Inspect a.py",
+    )
+
+    messages = store.list_messages(result.session_id)
+    tool_request = next(message for message in messages if message.tool_calls)
+    tool_response = next(message for message in messages if message.role == "tool")
+    assert tool_request.role == "assistant"
+    assert tool_request.tool_calls[0].name == "file_read"
+    assert tool_request.tool_calls[0].id is not None
+    assert tool_response.tool_call_id == tool_request.tool_calls[0].id
+    assert messages[-1].role == "assistant"
+    assert messages[-1].content == "inspected"
+
+
+def test_v2_failed_subagent_converges_session_state(tmp_path):
+    backend = MockBackend([
+        Action(
+            action_type=ActionType.GIVE_UP,
+            thought="blocked",
+            message="cannot inspect safely",
+        ),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+
+    result = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=runtime.agent_registry.get("explore"),
+        description="blocked inspection",
+        prompt="Inspect unavailable input",
+    )
+
+    child = store.get_session(result.session_id)
+    assert result.status is ForkStatus.FAILED
+    assert child is not None
+    assert child.status is SessionStatus.FAILED
+    assert child.summary == "cannot inspect safely"
+    assert child.error == "cannot inspect safely"
+    assert child.completed_at is not None
 
 
 def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):
@@ -762,12 +890,19 @@ def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):
         ))
     backend = MockBackend(actions)
     runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
     result = runtime.fork_session(
+        parent_session_id=parent.id,
         definition=runtime.agent_registry.get("explore"),
         description="exhaustive search", prompt="Find everything",
-        repo_path=str(tmp_path),
     )
     assert result.status in ("partial", "failed")
+    child = store.get_session(result.session_id)
+    assert child is not None
+    assert child.status in (SessionStatus.PARTIAL, SessionStatus.FAILED)
+    assert child.completed_at is not None
 
 
 def test_v2_parent_recovers_after_failed_child(tmp_path):
@@ -776,10 +911,13 @@ def test_v2_parent_recovers_after_failed_child(tmp_path):
         Action(action_type=ActionType.FINISH, thought="sub", message="child done"),
     ])
     runtime, store = _make_runtime(tmp_path, child_backend)
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
     result = runtime.fork_session(
+        parent_session_id=parent.id,
         definition=runtime.agent_registry.get("general"),
         description="fast task", prompt="Do quick thing",
-        repo_path=str(tmp_path),
     )
     assert result.status == "completed"
 

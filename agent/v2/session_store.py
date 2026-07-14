@@ -83,8 +83,23 @@ class SessionStore:
         metadata: dict | None = None,
     ) -> SessionRecord:
         mode = SessionMode(mode)
+        parent = None
+        if parent_id is not None:
+            parent = self.get_session(parent_id)
+            if parent is None:
+                raise ValueError(f"Unknown parent session: {parent_id}")
+            if mode is not SessionMode.SUBAGENT:
+                raise ValueError("A session with parent_id must use subagent mode")
+            if root_id is not None and root_id != parent.root_id:
+                raise ValueError(
+                    "Child root_id must match its parent root_id: "
+                    f"parent={parent.root_id!r}, child={root_id!r}"
+                )
+        elif mode is SessionMode.SUBAGENT:
+            raise ValueError("A subagent session requires parent_id")
+
         session_id = uuid.uuid4().hex[:12]
-        resolved_root_id = root_id or session_id
+        resolved_root_id = parent.root_id if parent is not None else (root_id or session_id)
         now = _utc_now()
         metadata_json = json.dumps(metadata or {}, ensure_ascii=True)
         with self._connect() as conn:
@@ -132,6 +147,8 @@ class SessionStore:
         return [self._row_to_session(row) for row in rows]
 
     def append_message(self, session_id: str, message: LLMMessage) -> None:
+        if self.get_session(session_id) is None:
+            raise ValueError(f"Unknown v2 session: {session_id}")
         tool_name = None
         tool_calls_json = None
         if message.tool_calls:
@@ -198,7 +215,7 @@ class SessionStore:
     ) -> None:
         status = SessionStatus(status)
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE sessions
                 SET status = ?, error = ?, updated_at = ?
@@ -206,6 +223,8 @@ class SessionStore:
                 """,
                 (status.value, error, _utc_now(), session_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown v2 session: {session_id}")
 
     def set_summary(
         self, session_id: str, summary: str, *, status: SessionStatus
@@ -213,7 +232,7 @@ class SessionStore:
         status = SessionStatus(status)
         now = _utc_now()
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE sessions
                 SET summary = ?, status = ?, updated_at = ?, completed_at = ?
@@ -221,6 +240,8 @@ class SessionStore:
                 """,
                 (summary, status.value, now, now, session_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown v2 session: {session_id}")
 
     def touch_session(self, session_id: str) -> None:
         with self._connect() as conn:

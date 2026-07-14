@@ -13,6 +13,7 @@ from agent.v2.agent_registry import AgentRegistryV2
 from agent.v2.models import (
     AgentDefinition,
     ForkResult,
+    ForkStatus,
     SessionMode,
     SessionStatus,
 )
@@ -249,10 +250,10 @@ class SessionRuntime:
     def fork_session(
         self,
         *,
+        parent_session_id: str,
         definition: AgentDefinition,
         description: str,
         prompt: str,
-        repo_path: str | None = None,
     ) -> ForkResult:
         """Dispatch a fork subagent.
 
@@ -260,22 +261,80 @@ class SessionRuntime:
         Tools are restricted to the agent definition's allow-list.
         Only the final summary is returned to the caller.
 
-        repo_path: parent session's verified working directory.
-        Const rule: subagent MUST inherit the parent session's repo scope.
+        The parent session is the sole source for project and root scope.
         """
-        if repo_path is None:
-            raise ValueError("fork_session requires a verified parent repo_path")
-        _repo = self._require_project_scope(repo_path)
-        return fork_subagent(
-            definition=definition,
-            prompt=prompt,
+        parent = self._store.get_session(parent_session_id)
+        if parent is None:
+            raise ValueError(f"Unknown v2 session: {parent_session_id}")
+        _repo = self._require_project_scope(parent.repo_path)
+        child = self._store.create_session(
+            agent_name=definition.name,
+            mode=SessionMode.SUBAGENT,
             repo_path=_repo,
-            base_registry=self._base_registry,
-            backend=self._backend,
-            log_dir=self._log_dir,
-            root_agent_config=self._root_agent_config,
-            hook_dispatcher=self._hook_dispatcher,
+            title=description[:80] or definition.name,
+            parent_id=parent.id,
+            root_id=parent.root_id,
+            metadata={
+                "entrypoint": "task",
+                "isolation": definition.isolation.value,
+                "intent": definition.intent.value,
+            },
         )
+        self._store.append_message(child.id, LLMMessage(role="user", content=prompt))
+        self._store.update_status(child.id, SessionStatus.RUNNING)
+
+        fork_result: ForkResult | None = None
+
+        def _persist_child_messages(messages: list[LLMMessage]) -> None:
+            for message in messages:
+                self._store.append_message(child.id, message)
+
+        try:
+            fork_result = fork_subagent(
+                agent_id=child.id,
+                definition=definition,
+                prompt=prompt,
+                repo_path=_repo,
+                base_registry=self._base_registry,
+                backend=self._backend,
+                log_dir=self._log_dir,
+                root_agent_config=self._root_agent_config,
+                hook_dispatcher=self._hook_dispatcher,
+                message_sink=_persist_child_messages,
+            )
+            self._store.append_message(
+                child.id,
+                LLMMessage(role="assistant", content=fork_result.summary),
+            )
+            return fork_result
+        except Exception as exc:
+            self._store.append_message(
+                child.id,
+                LLMMessage(role="assistant", content=f"Subagent failed: {exc}"),
+            )
+            raise
+        finally:
+            if fork_result is None or fork_result.status is ForkStatus.FAILED:
+                summary = (
+                    fork_result.summary if fork_result is not None
+                    else "Subagent execution failed before producing a result"
+                )
+                error = (
+                    (fork_result.error or summary)
+                    if fork_result is not None else summary
+                )
+                self._store.update_status(child.id, SessionStatus.FAILED, error=error)
+                self._store.set_summary(
+                    child.id, summary, status=SessionStatus.FAILED,
+                )
+            elif fork_result.status is ForkStatus.PARTIAL:
+                self._store.set_summary(
+                    child.id, fork_result.summary, status=SessionStatus.PARTIAL,
+                )
+            else:
+                self._store.set_summary(
+                    child.id, fork_result.summary, status=SessionStatus.COMPLETED,
+                )
 
     # ── Internal helpers ──
 

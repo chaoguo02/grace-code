@@ -273,15 +273,11 @@ class AgentTool(BaseTool):
         )
 
         try:
-            # Runtime owns parent-session lookup and project-scope validation.
-            _parent_repo = self._runtime.get_session_repo_path(
-                self._parent_session_id
-            )
             fork_result = self._runtime.fork_session(
+                parent_session_id=self._parent_session_id,
                 definition=definition,
                 description=description,
                 prompt=prompt,
-                repo_path=_parent_repo,
             )
             output = _format_fork_result(subagent_type, fork_result)
             if fork_result.status == ForkStatus.PARTIAL:
