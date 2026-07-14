@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,8 @@ from agent.v2.models import (
     ForkStatus,
     SessionMode,
     SessionStatus,
+    WorktreeDisposition,
+    WorktreeEvidence,
 )
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
@@ -30,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent.policy import PhasePolicy
+    from agent.v2.models import SessionRecord
+    from agent.v2.worktree_service import WorktreeOperationResult
+    from tools.snapshot import Worktree
 
 
 class SessionRuntime:
@@ -116,6 +122,147 @@ class SessionRuntime:
         if session is None:
             raise ValueError(f"Unknown v2 session: {session_id}")
         return self._require_project_scope(session.repo_path)
+
+    def inspect_subagent_worktree(
+        self, parent_session_id: str, child_session_id: str,
+    ) -> WorktreeEvidence:
+        """Return fresh Git facts for one direct child's preserved worktree."""
+        _, _, worktree = self._require_preserved_worktree(
+            parent_session_id, child_session_id,
+        )
+        from agent.v2.worktree_service import inspect_worktree
+        return inspect_worktree(worktree)
+
+    def apply_subagent_worktree(
+        self,
+        parent_session_id: str,
+        child_session_id: str,
+        *,
+        expected_revision: str,
+    ) -> "WorktreeOperationResult":
+        """Explicitly apply one reviewed child result to the current branch."""
+        child, fork_result, worktree = self._require_preserved_worktree(
+            parent_session_id, child_session_id,
+        )
+        from agent.v2.worktree_service import (
+            WorktreeOperationStatus,
+            apply_worktree,
+        )
+        result = apply_worktree(
+            worktree,
+            child.repo_path,
+            expected_revision=expected_revision,
+        )
+        if result.status in {
+            WorktreeOperationStatus.APPLIED,
+            WorktreeOperationStatus.NO_CHANGES,
+        }:
+            disposition = (
+                WorktreeDisposition.APPLIED
+                if result.status is WorktreeOperationStatus.APPLIED
+                else WorktreeDisposition.CLEANED
+            )
+            self._store.set_fork_result(
+                child.id,
+                replace(
+                    fork_result,
+                    worktree=None,
+                    worktree_disposition=disposition,
+                ),
+            )
+        return result
+
+    def discard_subagent_worktree(
+        self,
+        parent_session_id: str,
+        child_session_id: str,
+        *,
+        expected_revision: str,
+    ) -> "WorktreeOperationResult":
+        """Explicitly discard one reviewed child result."""
+        child, fork_result, worktree = self._require_preserved_worktree(
+            parent_session_id, child_session_id,
+        )
+        from agent.v2.worktree_service import (
+            WorktreeOperationStatus,
+            discard_reviewed_worktree,
+        )
+        result = discard_reviewed_worktree(
+            worktree,
+            child.repo_path,
+            expected_revision=expected_revision,
+        )
+        if result.status is WorktreeOperationStatus.DISCARDED:
+            self._store.set_fork_result(
+                child.id,
+                replace(
+                    fork_result,
+                    worktree=None,
+                    worktree_disposition=WorktreeDisposition.DISCARDED,
+                ),
+            )
+        return result
+
+    def _require_preserved_worktree(
+        self, parent_session_id: str, child_session_id: str,
+    ) -> tuple["SessionRecord", ForkResult, "Worktree"]:
+        """Resolve a persisted worktree handle without trusting stored paths."""
+        parent = self._store.get_session(parent_session_id)
+        if parent is None:
+            raise ValueError(f"Unknown parent session: {parent_session_id}")
+        self._require_project_scope(parent.repo_path)
+        child = self._store.get_session(child_session_id)
+        if child is None or child.parent_id != parent.id:
+            raise ValueError("Worktree session must be a direct child of the caller")
+        if child.repo_path != parent.repo_path:
+            raise ValueError("Parent and child project roots do not match")
+        fork_result = child.fork_result
+        if (
+            fork_result is None
+            or fork_result.worktree_disposition is not WorktreeDisposition.PRESERVED
+            or fork_result.worktree is None
+        ):
+            raise ValueError("Child session has no preserved worktree result")
+
+        evidence = fork_result.worktree
+        from runtime.state_paths import ProjectStatePaths
+        allowed_root = ProjectStatePaths.for_project(parent.repo_path).worktrees.resolve()
+        worktree_path = Path(evidence.path).resolve()
+        try:
+            worktree_path.relative_to(allowed_root)
+        except ValueError as exc:
+            raise ValueError("Stored child worktree path is outside Agent state") from exc
+
+        from tools.runtime import LocalRuntime
+        parent_runtime = LocalRuntime(workspace_root=parent.repo_path)
+        listed = parent_runtime.execute(
+            "git", args=["worktree", "list", "--porcelain"],
+            cwd=parent.repo_path, timeout=30,
+        )
+        if not listed.success:
+            raise ValueError(listed.stderr or "Unable to list project worktrees")
+        registered: dict[Path, str] = {}
+        listed_path: Path | None = None
+        for line in listed.stdout.splitlines():
+            if line.startswith("worktree "):
+                listed_path = Path(line.removeprefix("worktree ")).resolve()
+                registered.setdefault(listed_path, "")
+            elif line.startswith("branch ") and listed_path is not None:
+                registered[listed_path] = line.removeprefix("branch refs/heads/")
+        if worktree_path not in registered:
+            raise ValueError("Stored child worktree is not registered with the project")
+        if registered[worktree_path] != evidence.branch:
+            raise ValueError("Stored child worktree branch does not match Git facts")
+
+        from tools.snapshot import Worktree
+        worktree = Worktree(
+            name=worktree_path.name,
+            path=str(worktree_path),
+            branch=evidence.branch,
+            base_branch=evidence.base_branch,
+            base_commit=evidence.base_commit,
+        )
+        return child, fork_result, worktree
 
     # ── Root session ──
 

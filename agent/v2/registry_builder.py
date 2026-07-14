@@ -56,12 +56,20 @@ def build_registry_for_session(
 
     # Agents with an explicit subagent allowlist get the task tool
     if spec.allowed_subagents is not None:
+        from agent.v2.worktree_tool import (
+            SubagentWorktreeApplyTool,
+            SubagentWorktreeDiscardTool,
+            SubagentWorktreeInspectTool,
+        )
         registry._tools.pop("task", None)
         registry.register(AgentTool(
             runtime, session.id,
             caller_agent_name=spec.name,
             circuit_breaker=circuit_breaker,
         ))
+        registry.register(SubagentWorktreeInspectTool(runtime, session.id))
+        registry.register(SubagentWorktreeApplyTool(runtime, session.id))
+        registry.register(SubagentWorktreeDiscardTool(runtime, session.id))
 
     # Tag registry with session_id for per-session intercept dedup
     registry._session_id = session.id

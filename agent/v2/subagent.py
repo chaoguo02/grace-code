@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING, Any, Callable
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
 from agent.task import RunResult, RunStatus, Task, TerminationReason
-from agent.v2.models import AgentDefinition, ForkResult, ForkStatus
+from agent.v2.models import (
+    AgentDefinition,
+    ForkResult,
+    ForkStatus,
+    WorktreeChange,
+    WorktreeDisposition,
+)
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
@@ -201,9 +207,13 @@ def fork_subagent(
         },
     )
 
-    from agent.v2.models import WorktreeChange
     _recent_actions: list[Any] = []
     _worktree_evidence: "WorktreeEvidence | None" = None
+    _worktree_disposition = (
+        WorktreeDisposition.CLEANED
+        if _worktree is not None
+        else WorktreeDisposition.NOT_APPLICABLE
+    )
 
     # ── Result object fallback: never let a bare exception escape ──
     # The parent MUST receive a structured ForkResult regardless of what
@@ -273,6 +283,7 @@ def fork_subagent(
             evidence = finalize_worktree(_worktree, repo_path)
             if evidence.change is not WorktreeChange.NONE:
                 _worktree_evidence = evidence
+                _worktree_disposition = WorktreeDisposition.PRESERVED
 
     # ── Contract: result is ALWAYS a valid RunResult at this point ──
     warnings: list[str] = []
@@ -283,11 +294,6 @@ def fork_subagent(
                 f"worktree was preserved at {_worktree_evidence.path}: "
                 f"{_worktree_evidence.error or 'unknown Git inspection error'}"
             )
-        elif _worktree_evidence.change is not WorktreeChange.NONE:
-            warnings.append(
-                "Subagent changes were isolated and preserved for explicit "
-                f"review at {_worktree_evidence.path}; no merge was performed."
-            )
     if result.status == RunStatus.MAX_STEPS:
         warnings.append("Subagent reached max steps; its result may be incomplete.")
 
@@ -295,6 +301,7 @@ def fork_subagent(
         definition.name, agent_id, result, _recent_actions,
         report=_findings_accumulator.combined_report(),
         warning=" ".join(warnings), worktree=_worktree_evidence,
+        worktree_disposition=_worktree_disposition,
     )
 
 
@@ -343,6 +350,7 @@ def _build_fork_result(
     report: SubagentReport | None = None,
     warning: str = "",
     worktree: "WorktreeEvidence | None" = None,
+    worktree_disposition: WorktreeDisposition = WorktreeDisposition.NOT_APPLICABLE,
 ) -> ForkResult:
     status = ForkStatus.COMPLETED
     failure_diagnosis = ""
@@ -388,6 +396,7 @@ def _build_fork_result(
         failure_diagnosis=failure_diagnosis,
         warning=warning,
         worktree=worktree,
+        worktree_disposition=worktree_disposition,
     )
 
 

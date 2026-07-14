@@ -12,7 +12,7 @@ from hooks.events import HookContext, HookEvent
 from hooks.protocol import DispatchResult, HookControl
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
-from agent.policy import PhasePolicy
+from agent.policy import PhasePolicy, build_task_policy
 from agent.policy_registry import PolicyAwareToolRegistry
 from agent.task import (
     Action,
@@ -35,6 +35,7 @@ from agent.v2.models import (
     SessionMode,
     SessionStatus,
     WorktreeChange,
+    WorktreeDisposition,
     WorktreeEvidence,
 )
 from agent.v2.task_tool import _format_fork_result
@@ -107,6 +108,7 @@ def _make_runtime(
     tool_overrides: dict[str, NoopTool] | None = None,
     hook_dispatcher=None,
     event_callback=None,
+    state_dir: Path | None = None,
 ) -> tuple[SessionRuntime, SessionStore]:
     agent_registry = AgentRegistryV2(project_dir=tmp_path)
     base_registry = ToolRegistry()
@@ -117,7 +119,8 @@ def _make_runtime(
             overrides.get(tool_name, NoopTool(tool_name, output=f"{tool_name} ok"))
         )
 
-    store = SessionStore(str(tmp_path / ".forge-agent" / "v2" / "sessions.db"))
+    runtime_state = state_dir or (tmp_path / ".forge-agent" / "v2")
+    store = SessionStore(str(runtime_state / "sessions.db"))
     runtime = SessionRuntime(
         store=store,
         backend=backend,
@@ -127,7 +130,7 @@ def _make_runtime(
             max_steps=10, budget_tokens=50_000, request_budget_tokens=20_000,
             history_max_messages=20, stream=False,
         ),
-        log_dir=str(tmp_path / "logs"),
+        log_dir=str(runtime_state / "logs"),
         hook_dispatcher=hook_dispatcher,
         event_callback=event_callback,
     )
@@ -746,6 +749,7 @@ def test_fork_result_round_trips_typed_worktree_evidence():
     result = ForkResult(
         agent_name="general", session_id="child", status="completed",
         summary="done", worktree=evidence,
+        worktree_disposition=WorktreeDisposition.PRESERVED,
     )
 
     restored = ForkResult.from_dict(result.to_dict())
@@ -768,6 +772,7 @@ def test_v2_format_fork_result_exposes_worktree_git_facts():
             changed_files=("src/a.py",),
             revision="revision-1",
         ),
+        worktree_disposition=WorktreeDisposition.PRESERVED,
     )
 
     output = _format_fork_result("general", result)
@@ -1179,6 +1184,37 @@ def test_v2_build_gets_task_tool(tmp_path):
     session = runtime.create_root_session(agent_name="build", repo_path=str(tmp_path), title="test")
     definition = runtime.agent_registry.get("build")
     assert definition is not None
+
+
+def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
+    from agent.v2.registry_builder import build_registry_for_session
+
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    session = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="test",
+    )
+    registry = build_registry_for_session(
+        runtime.agent_registry.get("build"),
+        session,
+        base_registry=runtime._base_registry,
+        agent_registry=runtime.agent_registry,
+        runtime=runtime,
+    )
+
+    assert "subagent_worktree_inspect" in registry.tool_names
+    assert "subagent_worktree_apply" in registry.tool_names
+    assert "subagent_worktree_discard" in registry.tool_names
+
+    analysis_policy = build_task_policy(Task(
+        "inspect child worktree",
+        str(tmp_path),
+        intent=TaskIntent.ANALYSIS,
+    )).execution
+    analysis_registry = registry.with_phase_policy(analysis_policy)
+
+    assert "subagent_worktree_inspect" in analysis_registry.tool_names
+    assert "subagent_worktree_apply" not in analysis_registry.tool_names
+    assert "subagent_worktree_discard" not in analysis_registry.tool_names
 
 
 # ── Fork execution ──
@@ -1695,9 +1731,7 @@ def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, 
 def test_v2_worktree_child_preserves_changes_without_mutating_parent(
     tmp_path, monkeypatch,
 ):
-    from agent.v2.worktree_service import discard_worktree
     from runtime.state_paths import STATE_HOME_ENV
-    from tools.snapshot import Worktree
 
     subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
     subprocess.run(
@@ -1729,7 +1763,11 @@ def test_v2_worktree_child_preserves_changes_without_mutating_parent(
         )
 
     monkeypatch.setattr(ReActAgent, "run", write_in_child)
-    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    runtime, store = _make_runtime(
+        tmp_path,
+        MockBackend([]),
+        state_dir=tmp_path.parent / "wt-runtime-state",
+    )
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
     )
@@ -1752,19 +1790,28 @@ def test_v2_worktree_child_preserves_changes_without_mutating_parent(
     assert result.worktree.changed_files == ("child.txt",)
     assert Path(result.worktree.path, "child.txt").is_file()
     assert not (tmp_path / "child.txt").exists()
-    assert "no merge was performed" in result.warning
+    assert result.worktree_disposition is WorktreeDisposition.PRESERVED
     assert store.get_session(result.session_id).fork_result == result
 
-    discard_worktree(
-        Worktree(
-            name=Path(result.worktree.path).name,
-            path=result.worktree.path,
-            branch=result.worktree.branch,
-            base_branch=result.worktree.base_branch,
-            base_commit=result.worktree.base_commit,
-        ),
-        str(tmp_path),
+    unrelated_parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="unrelated",
     )
+    with pytest.raises(ValueError, match="direct child"):
+        runtime.inspect_subagent_worktree(unrelated_parent.id, result.session_id)
+
+    inspected = runtime.inspect_subagent_worktree(parent.id, result.session_id)
+    applied = runtime.apply_subagent_worktree(
+        parent.id,
+        result.session_id,
+        expected_revision=inspected.revision,
+    )
+
+    assert applied.status.value == "applied"
+    assert (tmp_path / "child.txt").read_text(encoding="utf-8") == "child\n"
+    assert not Path(inspected.path).exists()
+    resolved = store.get_session(result.session_id).fork_result
+    assert resolved.worktree is None
+    assert resolved.worktree_disposition is WorktreeDisposition.APPLIED
 
 
 def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):

@@ -421,6 +421,20 @@ project tree, and the `ForkResult` carries typed evidence: absolute worktree
 path, branch, base branch, base commit, changed paths, and workspace revision.
 Applying or discarding those changes is a separate explicit operation.
 
+Coordinators receive three Runtime-managed tools:
+
+- `subagent_worktree_inspect` refreshes read-only Git evidence;
+- `subagent_worktree_apply` merges the reviewed revision into the parent's
+  current branch without switching branches;
+- `subagent_worktree_discard` permanently removes the reviewed child result.
+
+Apply and discard require the exact revision returned by inspection. A changed
+revision fails as `stale` rather than being guessed safe. Apply also fails
+closed when the parent worktree is dirty. Merge conflicts are identified from
+Git's unmerged-path facts, the merge is aborted, and the child worktree remains
+preserved. Successful resolution updates the persisted `ForkResult` with a
+typed disposition (`applied`, `discarded`, or `cleaned`).
+
 ## 10. Permissions
 
 ## 10.1 Phase 1 model

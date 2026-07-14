@@ -434,6 +434,7 @@ def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
         f"  <session-id>{result.session_id}</session-id>",
         f"  <status>{result.status.value}</status>",
         f"  <turns-used>{result.turns_used}</turns-used>",
+        f"  <worktree-disposition>{result.worktree_disposition.value}</worktree-disposition>",
     ]
     if result.error:
         lines.append(f"  <error>{_xml_escape(result.error)}</error>")

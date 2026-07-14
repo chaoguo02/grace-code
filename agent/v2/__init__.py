@@ -9,12 +9,18 @@ from agent.v2.models import (
     AgentVisibility,
     ForkResult,
     WorktreeChange,
+    WorktreeDisposition,
     WorktreeEvidence,
 )
 from agent.v2.runtime import SessionRuntime, default_session_db_path
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
 from agent.v2.task_tool import AgentTool
+from agent.v2.worktree_tool import (
+    SubagentWorktreeApplyTool,
+    SubagentWorktreeDiscardTool,
+    SubagentWorktreeInspectTool,
+)
 
 __all__ = [
     "AgentDefinition",
@@ -24,11 +30,15 @@ __all__ = [
     "AgentTool",
     "ForkResult",
     "WorktreeChange",
+    "WorktreeDisposition",
     "WorktreeEvidence",
     "MCPRuntimeToolProxy",
     "MCPToolIntegration",
     "SessionRuntime",
     "SessionStore",
+    "SubagentWorktreeApplyTool",
+    "SubagentWorktreeDiscardTool",
+    "SubagentWorktreeInspectTool",
     "default_session_db_path",
     "fork_subagent",
     "load_agent_definitions",

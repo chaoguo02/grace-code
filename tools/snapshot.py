@@ -195,12 +195,24 @@ class WorktreeManager:
         Args:
             wt: 要丢弃的 worktree
         """
+        wt_path = Path(wt.path).resolve()
+        try:
+            wt_path.relative_to(self._worktree_root)
+        except ValueError as exc:
+            raise WorktreeError(
+                f"Refusing to discard worktree outside managed root: {wt_path}"
+            ) from exc
+        expected_branch = f"multi-agent/{wt.name}"
+        if wt.branch != expected_branch:
+            raise WorktreeError(
+                f"Refusing to discard unexpected branch: {wt.branch!r}"
+            )
+
         try:
             self._run_git(["worktree", "remove", "--force", str(wt.path)])
         except subprocess.CalledProcessError:
             # worktree remove 失败时尝试手动清理
             import shutil
-            wt_path = Path(wt.path)
             if wt_path.exists():
                 shutil.rmtree(wt_path, ignore_errors=True)
             try:

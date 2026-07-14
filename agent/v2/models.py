@@ -31,6 +31,16 @@ class WorktreeChange(str, Enum):
     UNKNOWN = "unknown"
 
 
+class WorktreeDisposition(str, Enum):
+    """Lifecycle state of an isolated child workspace result."""
+
+    NOT_APPLICABLE = "not_applicable"
+    CLEANED = "cleaned"
+    PRESERVED = "preserved"
+    APPLIED = "applied"
+    DISCARDED = "discarded"
+
+
 class AgentVisibility(str, Enum):
     PUBLIC = "public"
     HIDDEN = "hidden"
@@ -181,11 +191,23 @@ class ForkResult:
     failure_diagnosis: str = ""  # structured diagnosis when status is "failed"
     warning: str = ""
     worktree: "WorktreeEvidence | None" = None
+    worktree_disposition: WorktreeDisposition = WorktreeDisposition.NOT_APPLICABLE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", ForkStatus(self.status))
+        object.__setattr__(
+            self,
+            "worktree_disposition",
+            WorktreeDisposition(self.worktree_disposition),
+        )
         if self.worktree is not None and not isinstance(self.worktree, WorktreeEvidence):
             raise TypeError("worktree must be WorktreeEvidence when provided")
+        if (
+            self.worktree_disposition is WorktreeDisposition.PRESERVED
+        ) != (self.worktree is not None):
+            raise ValueError(
+                "worktree evidence must exist exactly while disposition is preserved"
+            )
 
     @property
     def structured_findings(self) -> tuple[Finding, ...]:
@@ -205,6 +227,7 @@ class ForkResult:
             "failure_diagnosis": self.failure_diagnosis,
             "warning": self.warning,
             "worktree": self.worktree.to_dict() if self.worktree is not None else None,
+            "worktree_disposition": self.worktree_disposition.value,
         }
 
     @classmethod
@@ -214,6 +237,14 @@ class ForkResult:
             SubagentReport.from_dict(raw_report)
             if isinstance(raw_report, dict) else None
         )
+        raw_worktree = data.get("worktree")
+        raw_disposition = data.get("worktree_disposition")
+        if raw_disposition is None:
+            raw_disposition = (
+                WorktreeDisposition.PRESERVED.value
+                if isinstance(raw_worktree, dict)
+                else WorktreeDisposition.NOT_APPLICABLE.value
+            )
         return cls(
             agent_name=str(data["agent_name"]),
             session_id=str(data["session_id"]),
@@ -227,9 +258,10 @@ class ForkResult:
             failure_diagnosis=str(data.get("failure_diagnosis", "")),
             warning=str(data.get("warning", "")),
             worktree=(
-                WorktreeEvidence.from_dict(data["worktree"])
-                if isinstance(data.get("worktree"), dict) else None
+                WorktreeEvidence.from_dict(raw_worktree)
+                if isinstance(raw_worktree, dict) else None
             ),
+            worktree_disposition=WorktreeDisposition(raw_disposition),
         )
 
 
