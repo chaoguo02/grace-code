@@ -309,7 +309,9 @@ class AgentTool(BaseTool):
             output=output,
             error=fork_result.error if is_failure else "",
             subagent_tokens_used=fork_result.tokens_used,
-            structured_findings=fork_result.structured_findings,
+            structured_findings=tuple(
+                finding.to_dict() for finding in fork_result.structured_findings
+            ),
         )
 
     def _allowed_subagent_names(self) -> frozenset[str] | None:
@@ -333,8 +335,6 @@ def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
     they are displayed FIRST as the primary, reliable output. The text
     summary follows as supplementary context.
     """
-    import json as _json
-
     lines = [
         "<task-notification>",
         f"  <agent-type>{agent_type}</agent-type>",
@@ -352,12 +352,41 @@ def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
         lines.append(f"  <failure-diagnosis>{_xml_escape(result.failure_diagnosis)}</failure-diagnosis>")
 
     # ── P1-5: Structured findings (primary output) ──
-    if result.structured_findings:
-        lines.append(f"  <structured-findings count='{len(result.structured_findings)}'>")
-        for f in result.structured_findings:
-            finding_json = _json.dumps(f, ensure_ascii=False, default=str)
-            lines.append(f"    <finding>{_xml_escape(finding_json)}</finding>")
-        lines.append("  </structured-findings>")
+    if result.report is not None:
+        lines.append(
+            f"  <subagent-report status='{result.report.status.value}' "
+            f"count='{len(result.report.findings)}'>"
+        )
+        if result.report.summary:
+            lines.append(
+                f"    <report-summary>{_xml_escape(result.report.summary)}</report-summary>"
+            )
+        for finding in result.report.findings:
+            lines.append(
+                f"    <finding severity='{finding.severity.value}' "
+                f"category='{finding.category.value}'>"
+            )
+            lines.append(f"      <title>{_xml_escape(finding.title)}</title>")
+            lines.append(f"      <description>{_xml_escape(finding.description)}</description>")
+            if finding.file_path:
+                lines.append(
+                    f"      <location path='{_xml_escape(finding.file_path)}' "
+                    f"line-start='{finding.line_start}' line-end='{finding.line_end}' />"
+                )
+            if finding.code_snippet:
+                lines.append(
+                    f"      <code-snippet>{_xml_escape(finding.code_snippet)}</code-snippet>"
+                )
+            if finding.verification:
+                lines.append(
+                    f"      <verification>{_xml_escape(finding.verification)}</verification>"
+                )
+            if finding.recommendation:
+                lines.append(
+                    f"      <recommendation>{_xml_escape(finding.recommendation)}</recommendation>"
+                )
+            lines.append("    </finding>")
+        lines.append("  </subagent-report>")
 
     lines.extend([
         "  <summary>",

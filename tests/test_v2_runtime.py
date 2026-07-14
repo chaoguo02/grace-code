@@ -42,6 +42,12 @@ from tools.file_tool import (
     FileReadCache, FileReadTool, FileViewTool,
     MAX_READ_LINES, VIEW_WINDOW_LINES,
 )
+from tools.submit_findings_tool import (
+    FindingCategory,
+    FindingSeverity,
+    SubagentReportStatus,
+    SubmitFindingsTool,
+)
 
 
 class _StubRuntime:
@@ -849,6 +855,111 @@ def test_v2_subagent_persists_native_tool_pairs_in_child_transcript(tmp_path):
     assert tool_response.tool_call_id == tool_request.tool_calls[0].id
     assert messages[-1].role == "assistant"
     assert messages[-1].content == "inspected"
+
+
+def test_submit_findings_normalizes_and_validates_project_evidence(tmp_path):
+    source = tmp_path / "runtime.py"
+    source.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    tool = SubmitFindingsTool(repo_path=str(tmp_path))
+
+    accepted = tool.execute({"report": {
+        "status": "completed",
+        "summary": "verified",
+        "findings": [{
+            "severity": "HIGH",
+            "category": "bug",
+            "title": "Incorrect branch",
+            "description": "The second line selects the wrong branch.",
+            "file_path": "runtime.py",
+            "line_start": 2,
+            "line_end": 2,
+            "code_snippet": "two",
+            "verification": "Read the cited source line.",
+        }],
+    }})
+
+    assert accepted.success is True
+    report = tool.accumulator.combined_report()
+    assert report is not None
+    assert report.status is SubagentReportStatus.COMPLETED
+    finding = report.findings[0]
+    assert finding.severity is FindingSeverity.HIGH
+    assert finding.category is FindingCategory.BUG
+    assert finding.file_path == str(source.resolve())
+
+    missing_evidence = tool.execute({"report": {
+        "status": "completed",
+        "findings": [{
+            "severity": "LOW", "category": "bug",
+            "title": "Claim", "description": "No evidence",
+        }],
+    }})
+    assert missing_evidence.success is False
+    assert "lacks evidence" in (missing_evidence.error or "")
+
+    outside_scope = tool.execute({"report": {
+        "status": "completed",
+        "findings": [{
+            "severity": "LOW", "category": "hypothesis",
+            "title": "External", "description": "Outside path",
+            "file_path": str(tmp_path.parent / "outside.py"),
+        }],
+    }})
+    assert outside_scope.success is False
+    assert "outside project scope" in (outside_scope.error or "")
+
+
+def test_v2_subagent_persists_typed_report_and_report_partial_status(tmp_path):
+    source = tmp_path / "runtime.py"
+    source.write_text("safe = False\n", encoding="utf-8")
+    backend = MockBackend([
+        Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="submit verified result",
+            tool_calls=[ToolCall(name="submit_findings", params={"report": {
+                "status": "partial",
+                "summary": "One branch remains unverified.",
+                "findings": [{
+                    "severity": "MEDIUM",
+                    "category": "improvement",
+                    "title": "Explicit state needed",
+                    "description": "The state is represented as a boolean.",
+                    "file_path": str(source.resolve()),
+                    "line_start": 1,
+                    "line_end": 1,
+                    "code_snippet": "safe = False",
+                    "verification": "Read runtime.py line 1.",
+                }],
+            }})],
+        ),
+        Action(action_type=ActionType.FINISH, thought="done", message="partial review"),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+
+    result = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=runtime.agent_registry.get("code-reviewer"),
+        description="review runtime",
+        prompt="Review runtime.py",
+    )
+
+    assert result.status is ForkStatus.PARTIAL
+    assert result.report is not None
+    assert result.report.status is SubagentReportStatus.PARTIAL
+    child = store.get_session(result.session_id)
+    assert child is not None
+    assert child.status is SessionStatus.PARTIAL
+    assert child.fork_result == result
+    output = _format_fork_result("code-reviewer", result)
+    assert "<subagent-report status='partial' count='1'>" in output
+    assert str(source.resolve()) in output
+    source.unlink()
+    historical_child = store.get_session(result.session_id)
+    assert historical_child is not None
+    assert historical_child.fork_result == result
 
 
 def test_v2_failed_subagent_converges_session_state(tmp_path):

@@ -250,7 +250,10 @@ def build_task_policy(task: Task) -> TaskPolicy:
         planning_allowed = frozenset()
         execution_allowed = None
         execution_allowed_effects = (
-            frozenset({ToolEffect.READ_WORKSPACE})
+            frozenset({
+                ToolEffect.READ_WORKSPACE,
+                ToolEffect.PRODUCE_DELIVERABLE,
+            })
             if allowed_read_paths else READ_ONLY_EFFECTS
         )
         planning_allowed_effects = frozenset()

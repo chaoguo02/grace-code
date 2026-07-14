@@ -13,6 +13,7 @@ from agent.v2.models import AgentDefinition, ForkResult, ForkStatus
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
+from agent.v2.result_contract import SubagentReport, SubagentReportStatus
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +259,7 @@ def fork_subagent(
 
     return _build_fork_result(
         definition.name, agent_id, result, _recent_actions,
-        structured_findings=tuple(_findings_accumulator.all_findings()),
+        report=_findings_accumulator.combined_report(),
         warning=_warning, merge_conflict=_merge_conflict,
     )
 
@@ -305,7 +306,7 @@ def _snapshot_recent_actions(event_log: EventLog, window: int = 10) -> list[dict
 def _build_fork_result(
     agent_name: str, agent_id: str, result: RunResult,
     recent_actions: list[dict[str, Any]] | None = None,
-    structured_findings: tuple[dict[str, object], ...] = (),
+    report: SubagentReport | None = None,
     warning: str = "",
     merge_conflict: bool = False,
 ) -> ForkResult:
@@ -328,6 +329,13 @@ def _build_fork_result(
             ).strip()
             status = ForkStatus.FAILED
 
+    if (
+        status is ForkStatus.COMPLETED
+        and report is not None
+        and report.status is SubagentReportStatus.PARTIAL
+    ):
+        status = ForkStatus.PARTIAL
+
     summary = (result.summary or "").strip()
     if not summary:
         summary = "Subagent finished without a summary."
@@ -340,7 +348,7 @@ def _build_fork_result(
         error=result.error or "",
         turns_used=result.steps_taken,
         tokens_used=result.total_tokens,
-        structured_findings=structured_findings,
+        report=report,
         failure_diagnosis=failure_diagnosis,
         warning=warning,
         merge_conflict=merge_conflict,

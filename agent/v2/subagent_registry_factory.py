@@ -59,7 +59,10 @@ def build_restricted_registry(
     # ── Structured findings tool (fresh accumulator per subagent) ──
     from tools.submit_findings_tool import FindingsAccumulator, SubmitFindingsTool
     findings_accumulator = FindingsAccumulator()
-    submit_findings_tool = SubmitFindingsTool(accumulator=findings_accumulator)
+    submit_findings_tool = SubmitFindingsTool(
+        repo_path=repo_path,
+        accumulator=findings_accumulator,
+    )
     restricted_registry.register(submit_findings_tool)
 
     # Phase-policy wrap

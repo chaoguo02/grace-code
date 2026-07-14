@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from agent.task import TaskIntent
+from agent.v2.result_contract import Finding, SubagentReport
 
 
 class SessionMode(str, Enum):
@@ -62,6 +63,7 @@ class SessionRecord:
     updated_at: str = ""
     completed_at: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    fork_result: ForkResult | None = None
 
     def __post_init__(self) -> None:
         self.mode = SessionMode(self.mode)
@@ -158,13 +160,55 @@ class ForkResult:
     artifacts: tuple[str, ...] = ()
     turns_used: int = 0
     tokens_used: int = 0
-    structured_findings: tuple[dict[str, object], ...] = ()  # from SubmitFindingsTool
+    report: SubagentReport | None = None
     failure_diagnosis: str = ""  # structured diagnosis when status is "failed"
     warning: str = ""  # non-fatal warning (e.g. "partial changes were merged")
     merge_conflict: bool = False  # True if worktree merge had conflicts
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", ForkStatus(self.status))
+
+    @property
+    def structured_findings(self) -> tuple[Finding, ...]:
+        return self.report.findings if self.report is not None else ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "agent_name": self.agent_name,
+            "session_id": self.session_id,
+            "status": self.status.value,
+            "summary": self.summary,
+            "error": self.error,
+            "artifacts": list(self.artifacts),
+            "turns_used": self.turns_used,
+            "tokens_used": self.tokens_used,
+            "report": self.report.to_dict() if self.report is not None else None,
+            "failure_diagnosis": self.failure_diagnosis,
+            "warning": self.warning,
+            "merge_conflict": self.merge_conflict,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ForkResult":
+        raw_report = data.get("report")
+        report = (
+            SubagentReport.from_dict(raw_report)
+            if isinstance(raw_report, dict) else None
+        )
+        return cls(
+            agent_name=str(data["agent_name"]),
+            session_id=str(data["session_id"]),
+            status=ForkStatus(data["status"]),
+            summary=str(data.get("summary", "")),
+            error=str(data.get("error", "")),
+            artifacts=tuple(str(item) for item in data.get("artifacts", [])),
+            turns_used=int(data.get("turns_used", 0)),
+            tokens_used=int(data.get("tokens_used", 0)),
+            report=report,
+            failure_diagnosis=str(data.get("failure_diagnosis", "")),
+            warning=str(data.get("warning", "")),
+            merge_conflict=bool(data.get("merge_conflict", False)),
+        )
 
 # ── Built-in agent definitions (fallback when no .md files exist) ──
 

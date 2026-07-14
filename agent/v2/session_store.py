@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.task import ToolCall
-from agent.v2.models import SessionMode, SessionRecord, SessionStatus
+from agent.v2.models import ForkResult, SessionMode, SessionRecord, SessionStatus
 from llm.base import LLMMessage
 
 
@@ -46,6 +46,7 @@ class SessionStore:
                     summary TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                    fork_result_json TEXT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     completed_at TEXT NULL
@@ -70,6 +71,11 @@ class SessionStore:
                     ON session_messages(session_id, id);
                 """
             )
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(sessions)")
+            }
+            if "fork_result_json" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN fork_result_json TEXT NULL")
 
     def create_session(
         self,
@@ -243,6 +249,21 @@ class SessionStore:
             if cursor.rowcount != 1:
                 raise ValueError(f"Unknown v2 session: {session_id}")
 
+    def set_fork_result(self, session_id: str, result: ForkResult) -> None:
+        """Persist the typed child result at the session boundary."""
+        payload = json.dumps(result.to_dict(), ensure_ascii=True)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE sessions
+                SET fork_result_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (payload, _utc_now(), session_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown v2 session: {session_id}")
+
     def touch_session(self, session_id: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -251,6 +272,7 @@ class SessionStore:
             )
 
     def _row_to_session(self, row: sqlite3.Row) -> SessionRecord:
+        raw_fork_result = row["fork_result_json"]
         return SessionRecord(
             id=row["id"],
             parent_id=row["parent_id"],
@@ -266,4 +288,8 @@ class SessionStore:
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
             metadata=json.loads(row["metadata_json"] or "{}"),
+            fork_result=(
+                ForkResult.from_dict(json.loads(raw_fork_result))
+                if raw_fork_result else None
+            ),
         )

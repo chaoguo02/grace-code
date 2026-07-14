@@ -39,7 +39,10 @@ def test_single_file_analysis_policy_scopes_allowed_reads() -> None:
 
     assert policy.execution.allowed_read_paths == frozenset({"agent/core.py"})
     assert policy.execution.strict_file_scope is True
-    assert policy.execution.allowed_effects == frozenset({ToolEffect.READ_WORKSPACE})
+    assert policy.execution.allowed_effects == frozenset({
+        ToolEffect.READ_WORKSPACE,
+        ToolEffect.PRODUCE_DELIVERABLE,
+    })
     assert ToolEffect.NETWORK in policy.execution.denied_effects
     assert ToolEffect.READ_AGENT_STATE in policy.execution.denied_effects
 

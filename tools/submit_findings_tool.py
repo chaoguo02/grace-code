@@ -1,246 +1,144 @@
-"""
-tools/submit_findings_tool.py
-
-SubmitFindingsTool: structured analysis report submission for subagents.
-
-Claude Code pattern: the model MUST call a dedicated tool with a JSON Schema
-to submit findings. No regex parsing, no format guessing — the Runtime validates
-the structure before the parent agent ever sees it.
-
-This replaces the fragile regex-based report validation in task_tool.py
-(_BUG_CLAIM_PATTERN, _FILE_LINE_PATTERN, _SECTION_MARKERS) with a single
-deterministic tool call. The parent receives structured data, not free text.
-"""
+"""Runtime-validated structured report submission for analysis subagents."""
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from agent.v2.result_contract import (
+    Finding,
+    FindingCategory,
+    FindingSeverity,
+    SubagentReport,
+    SubagentReportStatus,
+)
 from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 
 logger = logging.getLogger(__name__)
 
-
-# ── Type-safe data contracts (Python layer — parent agent can iterate directly) ──
-
-@dataclass
-class Finding:
-    """A single analysis finding with typed fields.
-
-    This is the canonical in-memory representation. When the parent agent
-    receives structured findings, it gets a tuple[Finding, ...] — no
-    regex parsing, no format guessing.
-    """
-
-    severity: str       # HIGH | MEDIUM | LOW
-    category: str       # bug | improvement | hypothesis
-    title: str
-    description: str
-    file_path: str = ""
-    line_start: int = 0
-    line_end: int = 0
-    code_snippet: str = ""
-    verification: str = ""
-    recommendation: str = ""
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Finding":
-        return cls(
-            severity=d.get("severity", ""),
-            category=d.get("category", ""),
-            title=d.get("title", ""),
-            description=d.get("description", ""),
-            file_path=d.get("file_path", ""),
-            line_start=d.get("line_start", 0),
-            line_end=d.get("line_end", 0),
-            code_snippet=d.get("code_snippet", ""),
-            verification=d.get("verification", ""),
-            recommendation=d.get("recommendation", ""),
-        )
-
-
-@dataclass
-class SubagentReport:
-    """Complete structured report from a subagent.
-
-    The canonical result of an analysis subagent. When submit_findings
-    is called, the Runtime validates the JSON Schema, constructs this
-    object, and the parent agent receives it as typed data.
-    """
-
-    status: str          # completed | partial | no_findings
-    findings: tuple[Finding, ...] = ()
-    summary: str = ""
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SubagentReport":
-        findings = tuple(
-            Finding.from_dict(f) for f in d.get("findings", [])
-        )
-        return cls(
-            status=d.get("status", "completed"),
-            findings=findings,
-            summary=d.get("summary", ""),
-        )
-
-    @property
-    def bugs(self) -> tuple[Finding, ...]:
-        return tuple(f for f in self.findings if f.category == "bug")
-
-    @property
-    def improvements(self) -> tuple[Finding, ...]:
-        return tuple(f for f in self.findings if f.category == "improvement")
-
-    @property
-    def hypotheses(self) -> tuple[Finding, ...]:
-        return tuple(f for f in self.findings if f.category == "hypothesis")
-
-    @property
-    def high_severity(self) -> tuple[Finding, ...]:
-        return tuple(f for f in self.findings if f.severity == "HIGH")
-
-
-# ── JSON Schema (for LLM tool-call validation) ──
 
 FINDING_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "severity": {
             "type": "string",
-            "enum": ["HIGH", "MEDIUM", "LOW"],
-            "description": "Impact/urgency of this finding",
+            "enum": [item.value for item in FindingSeverity],
+            "description": "Impact and urgency of this finding",
         },
         "category": {
             "type": "string",
-            "enum": ["bug", "improvement", "hypothesis"],
-            "description": "bug=confirmed defect, improvement=style/robustness suggestion, hypothesis=unverified suspicion",
+            "enum": [item.value for item in FindingCategory],
+            "description": (
+                "bug=confirmed defect, improvement=robustness suggestion, "
+                "hypothesis=unverified suspicion"
+            ),
         },
         "file_path": {
             "type": "string",
-            "description": "Repo-relative path to the file, e.g. agent/v2/task_tool.py",
+            "description": "Absolute path inside the target project",
         },
         "line_start": {
             "type": "integer",
-            "description": "1-indexed starting line number (required if file_path is set)",
+            "minimum": 1,
+            "description": "1-indexed starting line number",
         },
         "line_end": {
             "type": "integer",
-            "description": "1-indexed ending line number (can equal line_start for single-line)",
+            "minimum": 1,
+            "description": "1-indexed ending line number",
         },
-        "title": {
-            "type": "string",
-            "description": "One-line summary of the finding",
-        },
+        "title": {"type": "string", "description": "One-line finding summary"},
         "description": {
             "type": "string",
-            "description": "Detailed explanation of what's wrong or what could be improved",
+            "description": "Detailed explanation of the finding",
         },
         "code_snippet": {
             "type": "string",
-            "description": "The actual code lines this finding refers to",
+            "description": "Actual cited source lines",
         },
         "verification": {
             "type": "string",
-            "description": "How you confirmed this finding (cross-reference file, test, etc.)",
+            "description": "How the finding was confirmed",
         },
         "recommendation": {
             "type": "string",
-            "description": "What should be done to address this finding",
+            "description": "Recommended corrective action",
         },
     },
     "required": ["severity", "category", "title", "description"],
 }
-
-
-# ── JSON Schema for the full report ──
 
 REPORT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "status": {
             "type": "string",
-            "enum": ["completed", "partial", "no_findings"],
-            "description": "completed=analysis finished, partial=incomplete (hit limits), no_findings=nothing found",
+            "enum": [item.value for item in SubagentReportStatus],
+            "description": "Completion status of this submitted report batch",
         },
         "summary": {
             "type": "string",
-            "description": "1-3 sentence summary of the analysis results",
+            "description": "Short summary of the analysis results",
         },
         "findings": {
             "type": "array",
             "items": FINDING_SCHEMA,
-            "description": "List of findings. Empty if status=no_findings.",
+            "description": "Validated findings; empty for no_findings",
         },
     },
     "required": ["status", "findings"],
 }
 
 
-# ── Accumulator ──
-
 @dataclass
 class FindingsAccumulator:
-    """Mutable collector for structured findings during a subagent run."""
+    """Collect typed report batches for one isolated child run."""
 
-    reports: list[dict[str, Any]] = field(default_factory=list)
+    reports: list[SubagentReport] = field(default_factory=list)
 
-    def submit(self, report: dict[str, Any]) -> None:
-        """Record a submitted report."""
+    def submit(self, report: SubagentReport) -> None:
         self.reports.append(report)
 
-    def all_findings(self) -> list[dict[str, Any]]:
-        """Flatten all findings across all reports."""
-        findings: list[dict[str, Any]] = []
-        for report in self.reports:
-            for f in report.get("findings", []):
-                findings.append(f)
-        return findings
+    def all_findings(self) -> list[Finding]:
+        return [finding for report in self.reports for finding in report.findings]
+
+    def combined_report(self) -> SubagentReport | None:
+        if not self.reports:
+            return None
+        statuses = {report.status for report in self.reports}
+        if SubagentReportStatus.PARTIAL in statuses:
+            status = SubagentReportStatus.PARTIAL
+        elif any(report.findings for report in self.reports):
+            status = SubagentReportStatus.COMPLETED
+        elif SubagentReportStatus.COMPLETED in statuses:
+            status = SubagentReportStatus.COMPLETED
+        else:
+            status = SubagentReportStatus.NO_FINDINGS
+        summaries = [report.summary.strip() for report in self.reports if report.summary.strip()]
+        return SubagentReport(
+            status=status,
+            findings=tuple(self.all_findings()),
+            summary="\n".join(summaries),
+        )
 
     def has_any(self) -> bool:
-        """Whether any findings were submitted."""
-        return len(self.all_findings()) > 0
+        return bool(self.all_findings())
 
     def reset(self) -> None:
-        """Clear all accumulated reports. Call before each subagent run."""
         self.reports.clear()
 
 
-# ── Tool ──
-
 class SubmitFindingsTool(BaseTool):
+    """Accept a report only after Runtime validation and path normalization."""
+
     metadata = ToolMetadata(effects=frozenset({ToolEffect.PRODUCE_DELIVERABLE}))
-    """Submit a structured analysis report.
 
-    Subagents MUST call this tool (possibly multiple times) before finishing.
-    Each call submits a batch of findings. The Runtime validates the JSON
-    Schema, and the parent agent receives the structured data directly —
-    no regex parsing, no format guessing.
-
-    Usage (by subagent):
-        submit_findings({
-            "status": "completed",
-            "summary": "Found 3 bugs in task_tool.py",
-            "findings": [
-                {
-                    "severity": "LOW",
-                    "category": "bug",
-                    "file_path": "agent/v2/task_tool.py",
-                    "line_start": 348,
-                    "line_end": 356,
-                    "title": "Redundant str() call",
-                    "description": "...",
-                    "code_snippet": "...",
-                    "verification": "Cross-referenced with _xml_escape at L355",
-                    "recommendation": "Remove outer str() call"
-                }
-            ]
-        })
-    """
-
-    def __init__(self, accumulator: FindingsAccumulator | None = None) -> None:
+    def __init__(
+        self, *, repo_path: str, accumulator: FindingsAccumulator | None = None,
+    ) -> None:
+        self._repo_path = str(Path(repo_path).resolve())
         self._accumulator = accumulator or FindingsAccumulator()
 
     @property
@@ -254,95 +152,90 @@ class SubmitFindingsTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Submit a structured analysis report with findings. "
-            "MUST be called before finishing an analysis task. "
-            "Each finding requires severity, category, title, and description. "
-            "Use multiple calls to submit findings in batches. "
-            "Call with status='no_findings' and empty findings array if nothing was found."
+            "Submit a Runtime-validated structured analysis report. "
+            "Confirmed bugs require an absolute project file path, line, "
+            "source snippet, and verification. Call with status=no_findings "
+            "and an empty findings array when nothing was found."
         )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
-            "properties": {
-                "report": REPORT_SCHEMA,
-            },
+            "properties": {"report": REPORT_SCHEMA},
             "required": ["report"],
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        report = params.get("report")
-        if not isinstance(report, dict):
-            return ToolResult(
-                success=False, output="",
-                error="'report' parameter must be a JSON object matching the report schema",
+        raw_report = params.get("report")
+        if not isinstance(raw_report, dict):
+            return _invalid("'report' must be an object matching the report schema")
+
+        try:
+            report_status = SubagentReportStatus(raw_report.get("status"))
+        except (TypeError, ValueError):
+            return _invalid(
+                "Invalid report status; expected completed, partial, or no_findings"
             )
 
-        # ── Validate required fields ──
-        status = report.get("status")
-        if status not in ("completed", "partial", "no_findings"):
-            return ToolResult(
-                success=False, output="",
-                error=(
-                    f"Invalid status: {status!r}. "
-                    "Must be 'completed', 'partial', or 'no_findings'."
-                ),
+        raw_findings = raw_report.get("findings")
+        if not isinstance(raw_findings, list):
+            return _invalid("'findings' must be an array")
+        if report_status is SubagentReportStatus.NO_FINDINGS and raw_findings:
+            return _invalid("status=no_findings requires an empty findings array")
+
+        for index, raw_finding in enumerate(raw_findings):
+            error = _validate_finding_shape(raw_finding, index)
+            if error:
+                return _invalid(error)
+
+        try:
+            typed_report = SubagentReport.from_dict(
+                raw_report, repo_path=self._repo_path,
             )
+        except (OSError, TypeError, ValueError) as exc:
+            return _invalid(f"Invalid report evidence: {exc}")
 
-        findings = report.get("findings")
-        if not isinstance(findings, list):
-            return ToolResult(
-                success=False, output="",
-                error="'findings' must be an array",
-            )
-
-        # ── Validate each finding ──
-        valid_severities = {"HIGH", "MEDIUM", "LOW"}
-        valid_categories = {"bug", "improvement", "hypothesis"}
-        for i, f in enumerate(findings):
-            if not isinstance(f, dict):
-                return ToolResult(
-                    success=False, output="",
-                    error=f"findings[{i}] must be an object",
-                )
-            severity = f.get("severity")
-            if severity not in valid_severities:
-                return ToolResult(
-                    success=False, output="",
-                    error=f"findings[{i}].severity must be HIGH, MEDIUM, or LOW, got {severity!r}",
-                )
-            category = f.get("category")
-            if category not in valid_categories:
-                return ToolResult(
-                    success=False, output="",
-                    error=f"findings[{i}].category must be bug, improvement, or hypothesis, got {category!r}",
-                )
-            if not f.get("title"):
-                return ToolResult(
-                    success=False, output="",
-                    error=f"findings[{i}].title is required",
-                )
-            if not f.get("description"):
-                return ToolResult(
-                    success=False, output="",
-                    error=f"findings[{i}].description is required",
-                )
-
-        # ── Store ──
-        self._accumulator.submit(report)
-        total_findings = len(findings)
+        self._accumulator.submit(typed_report)
+        total_findings = len(typed_report.findings)
         logger.info(
             "SubmitFindings: status=%s, findings=%d, total_accumulated=%d",
-            status, total_findings, len(self._accumulator.all_findings()),
+            typed_report.status.value,
+            total_findings,
+            len(self._accumulator.all_findings()),
         )
-
         return ToolResult(
             success=True,
             output=(
-                f"✓ Report accepted. "
-                f"Status: {status}. "
+                f"Report accepted. Status: {typed_report.status.value}. "
                 f"Findings submitted: {total_findings}. "
-                f"Total accumulated in this session: {len(self._accumulator.all_findings())}."
+                f"Total accumulated: {len(self._accumulator.all_findings())}."
             ),
         )
+
+
+def _validate_finding_shape(raw_finding: object, index: int) -> str:
+    if not isinstance(raw_finding, dict):
+        return f"findings[{index}] must be an object"
+    try:
+        FindingSeverity(raw_finding.get("severity"))
+    except (TypeError, ValueError):
+        return f"findings[{index}].severity must be HIGH, MEDIUM, or LOW"
+    try:
+        category = FindingCategory(raw_finding.get("category"))
+    except (TypeError, ValueError):
+        return f"findings[{index}].category is invalid"
+    if not raw_finding.get("title"):
+        return f"findings[{index}].title is required"
+    if not raw_finding.get("description"):
+        return f"findings[{index}].description is required"
+    if category is FindingCategory.BUG:
+        required_evidence = ("file_path", "line_start", "code_snippet", "verification")
+        missing = [name for name in required_evidence if not raw_finding.get(name)]
+        if missing:
+            return f"findings[{index}] confirmed bug lacks evidence: {', '.join(missing)}"
+    return ""
+
+
+def _invalid(error: str) -> ToolResult:
+    return ToolResult(success=False, output="", error=error)

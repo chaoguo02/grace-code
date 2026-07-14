@@ -302,6 +302,7 @@ class SessionRuntime:
                 hook_dispatcher=self._hook_dispatcher,
                 message_sink=_persist_child_messages,
             )
+            self._store.set_fork_result(child.id, fork_result)
             self._store.append_message(
                 child.id,
                 LLMMessage(role="assistant", content=fork_result.summary),
