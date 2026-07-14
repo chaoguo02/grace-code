@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from tools.base import ToolRole
+
 if TYPE_CHECKING:
     from agent.task import Observation
 
@@ -43,6 +45,7 @@ def build_tool_result_content(
     *,
     artifact_store=None,
     exempt_tools: frozenset = ARTIFACT_EXEMPT_TOOLS,
+    tool_roles: "frozenset[ToolRole]" = frozenset(),
 ) -> str:
     """Build tool result content for native tool_use mode (no [Tool:] wrapper).
 
@@ -51,7 +54,7 @@ def build_tool_result_content(
         artifact_store: Optional ArtifactStore for large-output offloading
         exempt_tools: Tool names whose output is always inline
     """
-    if observation.tool_name == "task":
+    if ToolRole.DELEGATE in tool_roles:
         output = observation.output or ""
         if observation.error:
             output += f"\n<error>{observation.error}</error>"
@@ -86,12 +89,22 @@ def format_observations_for_history(
     *,
     artifact_store=None,
     exempt_tools: frozenset = ARTIFACT_EXEMPT_TOOLS,
+    roles_by_tool: "dict[str, frozenset[ToolRole]] | None" = None,
 ) -> str:
     """Format multiple observations as one user message (parallel tool_calls, text fallback)."""
     lines = []
     for obs in observations:
         status = "SUCCESS" if obs.is_success() else "ERROR"
         lines.append(f"[Tool: {obs.tool_name} | {status}]")
+        roles = (roles_by_tool or {}).get(obs.tool_name, frozenset())
+        if ToolRole.DELEGATE in roles:
+            lines.append(build_tool_result_content(
+                obs,
+                artifact_store=artifact_store,
+                exempt_tools=exempt_tools,
+                tool_roles=roles,
+            ))
+            continue
         if obs.output:
             output = obs.output
             if (

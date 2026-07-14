@@ -324,6 +324,12 @@ class AgentTool(BaseTool):
                 retry=ToolRetryDirective.DO_NOT_RETRY,
                 detail="Delegation requires the parent's effective tool effects",
             )
+        if run_context.delegation_step_limit is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires the parent's effective step limit",
+            )
         if run_context.cancellation.is_cancelled:
             return ToolResult.from_error(
                 error_type=ToolErrorType.INTERRUPTED,
@@ -362,6 +368,7 @@ class AgentTool(BaseTool):
                 description=description,
                 prompt=prompt,
                 budget_tokens=child_token_limit,
+                parent_max_steps=run_context.delegation_step_limit,
                 cancellation_token=run_context.cancellation,
                 parent_policy=run_context.phase_policy.with_allowed_effects(
                     run_context.delegation_effects

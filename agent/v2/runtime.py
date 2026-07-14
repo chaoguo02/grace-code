@@ -93,7 +93,7 @@ class SessionRuntime:
         return self._capability_registry
 
     def cancel_session(self, session_id: str, detail: str = "") -> bool:
-        """Cancel an active session and every descendant sharing its token."""
+        """Cancel one active session; hierarchical tokens propagate to descendants."""
         token = self._cancellation_tokens.get(session_id)
         if token is None:
             return False
@@ -314,6 +314,7 @@ class SessionRuntime:
         description: str,
         prompt: str,
         budget_tokens: int,
+        parent_max_steps: int,
         cancellation_token: CancellationToken,
         parent_policy: "PhasePolicy",
     ) -> ForkResult:
@@ -327,11 +328,20 @@ class SessionRuntime:
         """
         if budget_tokens <= 0:
             raise ValueError("fork budget_tokens must be positive")
+        if parent_max_steps <= 0:
+            raise ValueError("fork parent_max_steps must be positive")
         if not isinstance(cancellation_token, CancellationToken):
             raise TypeError("fork cancellation_token must be a CancellationToken")
         from agent.policy import PhasePolicy
         if not isinstance(parent_policy, PhasePolicy):
             raise TypeError("fork parent_policy must be a PhasePolicy")
+        from agent.v2.task_contract import TaskContract
+        child_contract = TaskContract.for_subagent(
+            definition,
+            self._root_agent_config,
+            parent_budget_tokens=budget_tokens,
+            parent_max_steps=parent_max_steps,
+        )
         parent = self._store.get_session(parent_session_id)
         if parent is None:
             raise ValueError(f"Unknown v2 session: {parent_session_id}")
@@ -347,10 +357,13 @@ class SessionRuntime:
                 "entrypoint": "task",
                 "isolation": definition.isolation.value,
                 "intent": definition.intent.value,
-                "budget_tokens": budget_tokens,
+                "requested_budget_tokens": budget_tokens,
+                "budget_tokens": child_contract.budget_tokens,
+                "max_steps": child_contract.max_steps,
             },
         )
-        self._cancellation_tokens[child.id] = cancellation_token
+        child_cancellation = cancellation_token.child()
+        self._cancellation_tokens[child.id] = child_cancellation
         self._store.append_message(child.id, LLMMessage(role="user", content=prompt))
         self._store.update_status(child.id, SessionStatus.RUNNING)
         self._emit_subagent_event(
@@ -385,8 +398,8 @@ class SessionRuntime:
                 log_dir=self._log_dir,
                 root_agent_config=self._root_agent_config,
                 message_sink=_persist_child_messages,
-                budget_tokens=budget_tokens,
-                cancellation_token=cancellation_token,
+                contract=child_contract,
+                cancellation_token=child_cancellation,
                 parent_policy=parent_policy,
                 event_callback=self._event_callback,
             )

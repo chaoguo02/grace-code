@@ -99,6 +99,7 @@ class AgentDefinition:
     isolation: AgentIsolation = AgentIsolation.FORK
     visibility: AgentVisibility = AgentVisibility.PUBLIC
     max_turns: int = 50
+    max_tokens: int | None = None
     system_prompt: str = ""
     # ── Runtime-enforced contracts (not prompt-based) ──
     required_tools: frozenset[str] = frozenset()
@@ -123,6 +124,10 @@ class AgentDefinition:
             object.__setattr__(
                 self, "delegation_scope", DelegationScope(self.delegation_scope)
             )
+        if self.max_turns < 1:
+            raise ValueError("max_turns must be positive")
+        if self.max_tokens is not None and self.max_tokens < 1:
+            raise ValueError("max_tokens must be positive when provided")
 
     @property
     def mode(self) -> SessionMode:
@@ -267,6 +272,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         tools=_DEFAULT_READONLY_TOOLS,
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task"}),
         max_turns=50,
+        max_tokens=40_000,
         system_prompt="""You are a read-only code analysis agent. Analyze code and return findings.
 - Read files with file_read (NEVER use shell commands to read files).
 - Search code with search_text (NEVER use grep or find in shell).
@@ -304,6 +310,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         tools=_DEFAULT_READONLY_TOOLS,
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task", "WebFetch", "WebSearch"}),
         max_turns=40,
+        max_tokens=30_000,
         required_tools=frozenset({"submit_findings"}),
         completion_requires={"submit_findings": 1},
         system_prompt="""You are a code reviewer. Find bugs and quality issues.

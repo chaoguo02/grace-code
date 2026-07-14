@@ -22,8 +22,9 @@ class CancellationState(str, Enum):
 
 @dataclass
 class CancellationToken:
-    """Thread-safe cooperative cancellation fact shared by a run tree."""
+    """Thread-safe hierarchical cancellation fact for one run-tree node."""
 
+    _parent: "CancellationToken | None" = field(default=None, repr=False)
     _event: Event = field(default_factory=Event, init=False, repr=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _reason: TerminationReason = field(
@@ -36,6 +37,7 @@ class CancellationToken:
         return (
             CancellationState.CANCELLED
             if self._event.is_set()
+            or (self._parent is not None and self._parent.is_cancelled)
             else CancellationState.ACTIVE
         )
 
@@ -45,11 +47,19 @@ class CancellationToken:
 
     @property
     def reason(self) -> TerminationReason:
-        return self._reason
+        if self._event.is_set() or self._parent is None:
+            return self._reason
+        return self._parent.reason
 
     @property
     def detail(self) -> str:
-        return self._detail
+        if self._event.is_set() or self._parent is None:
+            return self._detail
+        return self._parent.detail
+
+    def child(self) -> "CancellationToken":
+        """Create an independently cancellable token inheriting this token."""
+        return CancellationToken(_parent=self)
 
     def cancel(
         self,
@@ -71,12 +81,15 @@ class RunContext:
     budget: ExecutionBudget
     cancellation: CancellationToken
     delegation_width: int = 1
+    delegation_step_limit: int | None = None
     phase_policy: "PhasePolicy | None" = None
     delegation_effects: "frozenset[ToolEffect] | None" = None
 
     def __post_init__(self) -> None:
         if self.delegation_width < 1:
             raise ValueError("delegation_width must be positive")
+        if self.delegation_step_limit is not None and self.delegation_step_limit < 1:
+            raise ValueError("delegation_step_limit must be positive when provided")
 
     @property
     def delegation_token_limit(self) -> int:

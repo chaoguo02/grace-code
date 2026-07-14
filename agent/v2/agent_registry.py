@@ -19,7 +19,6 @@ _TOOL_ALIASES: dict[str, str] = {
     "WebSearch": "web_search",
     "WebFetch": "web_fetch",
     "Task": "task",
-    "TaskStop": "task_stop",
 }
 
 def resolve_tool_name(name: str) -> str:

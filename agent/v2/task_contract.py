@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agent.core import AgentConfig
+    from agent.v2.models import AgentDefinition
 
 
 @dataclass(frozen=True)
@@ -57,18 +58,20 @@ class TaskContract:
         )
 
     @classmethod
-    def for_explore(cls, cfg: "AgentConfig") -> "TaskContract":
-        """Explore subagent: limited budget."""
+    def for_subagent(
+        cls,
+        definition: "AgentDefinition",
+        cfg: "AgentConfig",
+        *,
+        parent_budget_tokens: int,
+        parent_max_steps: int,
+    ) -> "TaskContract":
+        """Narrow parent resources using declarative child limits."""
+        token_limits = [cfg.budget_tokens, parent_budget_tokens]
+        if definition.max_tokens is not None:
+            token_limits.append(definition.max_tokens)
         return cls(
-            max_steps=min(cfg.max_steps, 50),
-            budget_tokens=min(cfg.budget_tokens, 40000),
-        )
-
-    @classmethod
-    def for_code_review(cls, cfg: "AgentConfig") -> "TaskContract":
-        """Code reviewer: limited budget, structured output required."""
-        return cls(
-            max_steps=min(cfg.max_steps, 40),
-            budget_tokens=min(cfg.budget_tokens, 30000),
-            require_deliverables={"submit_findings": 1},
+            max_steps=min(cfg.max_steps, parent_max_steps, definition.max_turns),
+            budget_tokens=min(token_limits),
+            require_deliverables=dict(definition.completion_requires),
         )

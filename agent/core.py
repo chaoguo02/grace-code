@@ -384,6 +384,7 @@ class ReActAgent:
         self._registry = self._registry.with_run_context(RunContext(
             budget=_execution_budget,
             cancellation=_cancellation,
+            delegation_step_limit=task.max_steps,
             phase_policy=policy.execution,
             delegation_effects=_delegation_effects,
         ))
@@ -948,6 +949,7 @@ class ReActAgent:
                         budget=_execution_budget,
                         cancellation=_cancellation,
                         delegation_width=len(effective_tool_calls),
+                        delegation_step_limit=task.max_steps,
                         phase_policy=policy.execution,
                         delegation_effects=_delegation_effects,
                     ))
@@ -1609,8 +1611,11 @@ class ReActAgent:
     def _build_tool_result_content(self, observation: Observation) -> str:
         """委托给 observation_rendering。"""
         from agent.observation_rendering import build_tool_result_content
+        metadata = self._registry.metadata_for(observation.tool_name)
         return build_tool_result_content(
-            observation, artifact_store=self._artifact_store,
+            observation,
+            artifact_store=self._artifact_store,
+            tool_roles=metadata.roles if metadata is not None else frozenset(),
         )
 
     @staticmethod
@@ -1622,8 +1627,16 @@ class ReActAgent:
     def _format_observations_for_history(self, observations: list[Observation]) -> str:
         """委托给 observation_rendering。"""
         from agent.observation_rendering import format_observations_for_history
+        roles_by_tool = {}
+        for observation in observations:
+            metadata = self._registry.metadata_for(observation.tool_name)
+            roles_by_tool[observation.tool_name] = (
+                metadata.roles if metadata is not None else frozenset()
+            )
         return format_observations_for_history(
-            observations, artifact_store=self._artifact_store,
+            observations,
+            artifact_store=self._artifact_store,
+            roles_by_tool=roles_by_tool,
         )
 
     def _call_with_retry(

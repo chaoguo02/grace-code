@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent.policy import PhasePolicy
+    from agent.v2.task_contract import TaskContract
 
 _SUBAGENT_SUMMARY_RULE = """Your final answer is returned to the parent as a tool result.
 The parent only sees your final message — not your full reasoning or tool history.
@@ -83,7 +84,7 @@ def fork_subagent(
     log_dir: str,
     root_agent_config: AgentConfig | None = None,
     message_sink: Callable[[list[LLMMessage]], None] | None = None,
-    budget_tokens: int,
+    contract: "TaskContract",
     cancellation_token: CancellationToken,
     parent_policy: "PhasePolicy",
     event_callback: Callable[[Any], None] | None = None,
@@ -142,8 +143,8 @@ def fork_subagent(
     else:
         cfg = AgentConfig()
 
-    cfg.max_steps = definition.max_turns
-    cfg.budget_tokens = budget_tokens
+    cfg.max_steps = contract.max_steps
+    cfg.budget_tokens = contract.budget_tokens
     cfg.cancellation_token = cancellation_token
     cfg.stream = False
     cfg.stream_callback = None
@@ -186,15 +187,15 @@ def fork_subagent(
         description=prompt,
         repo_path=_effective_repo_path,
         intent=definition.intent,
-        max_steps=cfg.max_steps,
-        budget_tokens=cfg.budget_tokens,
+        max_steps=contract.max_steps,
+        budget_tokens=contract.budget_tokens,
         metadata={
             "entrypoint": "fork",
             "agent_name": definition.name,
             "agent_id": agent_id,
             "isolation": definition.isolation.value,
             "worktree_path": _worktree.path if _worktree else "",
-            "completion_requires": dict(definition.completion_requires),
+            "completion_requires": dict(contract.require_deliverables),
             "required_tools": sorted(definition.required_tools),
         },
     )

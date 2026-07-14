@@ -39,7 +39,8 @@ from agent.v2.run_context import CancellationToken, RunContext
 from llm.base import LLMBackend, LLMMessage, LLMResponse, MockBackend
 from tools.artifact_tool import ArtifactReadTool, ArtifactStoreRef
 from tools.base import (
-    NoopTool, PathAccess, ToolConcurrency, ToolEffect, ToolMetadata, ToolRegistry,
+    NoopTool, PathAccess, ToolConcurrency, ToolEffect, ToolMetadata,
+    ToolRegistry, ToolRole,
 )
 from tools.evidence_tool import EvidenceLedgerRef, EvidenceListTool
 from context.artifacts import ArtifactStore
@@ -80,6 +81,7 @@ def _run_context(tokens: int = 50_000) -> RunContext:
     return RunContext(
         budget=budget,
         cancellation=CancellationToken(),
+        delegation_step_limit=50,
         phase_policy=PhasePolicy(),
         delegation_effects=frozenset(ToolEffect),
     )
@@ -88,6 +90,7 @@ def _run_context(tokens: int = 50_000) -> RunContext:
 def _fork_resources(tokens: int = 50_000) -> dict[str, object]:
     return {
         "budget_tokens": tokens,
+        "parent_max_steps": 50,
         "cancellation_token": CancellationToken(),
         "parent_policy": PhasePolicy(),
     }
@@ -348,6 +351,27 @@ def test_agent_definition_parses_hidden_visibility(tmp_path):
     assert definition.visibility is AgentVisibility.HIDDEN
 
 
+def test_agent_definition_parses_and_validates_resource_limits(tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    valid = tmp_path / "bounded.md"
+    valid.write_text(
+        "---\nname: bounded\nintent: analysis\nmaxTurns: 7\nmaxTokens: 1234\n---\nInspect.",
+        encoding="utf-8",
+    )
+    invalid = tmp_path / "invalid.md"
+    invalid.write_text(
+        "---\nname: invalid\nintent: analysis\nmaxTokens: 0\n---\nInspect.",
+        encoding="utf-8",
+    )
+
+    definition = _parse_definition(valid)
+    assert definition is not None
+    assert definition.max_turns == 7
+    assert definition.max_tokens == 1234
+    assert _parse_definition(invalid) is None
+
+
 def test_v2_agent_registry_resolves_tool_names():
     registry = AgentRegistryV2()
     names = registry.tool_names_for("explore")
@@ -478,6 +502,31 @@ def test_v2_analysis_delegation_defaults_to_read_only_scope():
     )
 
     assert parent.permits_subagent(child) is False
+
+
+def test_subagent_contract_intersects_parent_and_definition_limits():
+    from agent.v2.task_contract import TaskContract
+
+    definition = AgentDefinition(
+        name="bounded",
+        description="bounded child",
+        intent=TaskIntent.ANALYSIS,
+        max_turns=12,
+        max_tokens=3_000,
+        completion_requires={"submit_findings": 1},
+    )
+    cfg = AgentConfig(max_steps=20, budget_tokens=10_000)
+
+    contract = TaskContract.for_subagent(
+        definition,
+        cfg,
+        parent_budget_tokens=5_000,
+        parent_max_steps=9,
+    )
+
+    assert contract.max_steps == 9
+    assert contract.budget_tokens == 3_000
+    assert contract.require_deliverables == {"submit_findings": 1}
 
 
 def test_hidden_subagent_is_delegatable_only_when_parent_explicitly_allows_it():
@@ -622,6 +671,7 @@ def test_v2_task_tool_passes_narrowed_parent_authority_to_fork():
     context = RunContext(
         budget=budget,
         cancellation=CancellationToken(),
+        delegation_step_limit=8,
         phase_policy=PhasePolicy(
             denied_effects=frozenset({ToolEffect.NETWORK}),
             allowed_read_paths=frozenset({"src/a.py"}),
@@ -692,16 +742,79 @@ def test_v2_format_fork_result_handles_none_summary():
 
 
 def test_v2_task_tool_result_bypasses_artifacts_and_truncation_for_parent():
-    agent = ReActAgent(MockBackend([]), ToolRegistry(), AgentConfig(stream=False))
+    registry = ToolRegistry()
+    delegate = NoopTool("dispatch_child")
+    delegate.metadata = ToolMetadata(roles=frozenset({ToolRole.DELEGATE}))
+    registry.register(delegate)
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
     long_summary = "x" * 20_000
     observation = Observation(
         status=ObservationStatus.SUCCESS,
         output=f"<task-notification><summary>{long_summary}</summary></task-notification>",
-        tool_name="task",
+        tool_name="dispatch_child",
     )
     content = agent._build_tool_result_content(observation)
     assert long_summary in content
     assert "omitted" not in content
+    fallback = agent._format_observations_for_history([observation])
+    assert long_summary in fallback
+    assert "omitted" not in fallback
+
+
+def test_cancellation_tokens_isolate_siblings_and_inherit_parent_cancel():
+    root = CancellationToken()
+    first = root.child()
+    second = root.child()
+
+    first.cancel(detail="cancel first only")
+    assert first.is_cancelled is True
+    assert first.detail == "cancel first only"
+    assert root.is_cancelled is False
+    assert second.is_cancelled is False
+
+    root.cancel(detail="cancel whole tree")
+    assert second.is_cancelled is True
+    assert second.detail == "cancel whole tree"
+
+
+def test_fork_session_creates_child_cancellation_scope(tmp_path, monkeypatch):
+    import agent.v2.runtime as runtime_module
+
+    captured = {}
+
+    def fake_fork_subagent(**kwargs):
+        captured.update(kwargs)
+        return ForkResult(
+            agent_name=kwargs["definition"].name,
+            session_id=kwargs["agent_id"],
+            status=ForkStatus.COMPLETED,
+            summary="done",
+        )
+
+    monkeypatch.setattr(runtime_module, "fork_subagent", fake_fork_subagent)
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    parent_token = CancellationToken()
+
+    result = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=runtime.agent_registry.get("explore"),
+        description="inspect",
+        prompt="Inspect safely",
+        budget_tokens=50_000,
+        parent_max_steps=10,
+        cancellation_token=parent_token,
+        parent_policy=PhasePolicy(),
+    )
+
+    child_token = captured["cancellation_token"]
+    assert result.status is ForkStatus.COMPLETED
+    assert child_token is not parent_token
+    child_token.cancel(detail="child only")
+    assert child_token.is_cancelled is True
+    assert parent_token.is_cancelled is False
 
 
 # ── Dynamic tool visibility ──
@@ -1045,6 +1158,9 @@ def test_v2_fork_subagent_builds_restricted_registry(tmp_path):
     assert child.mode is SessionMode.SUBAGENT
     assert child.status is SessionStatus.COMPLETED
     assert child.summary == "summary"
+    assert child.metadata["requested_budget_tokens"] == 50_000
+    assert child.metadata["budget_tokens"] == 40_000
+    assert child.metadata["max_steps"] == 10
     child_messages = store.list_messages(child.id)
     assert (child_messages[0].role, child_messages[0].content) == (
         "user", "Find login flow",
@@ -1295,6 +1411,7 @@ def test_v2_cancelled_fork_converges_to_cancelled_session(tmp_path):
         description="cancelled exploration",
         prompt="Do not start",
         budget_tokens=5_000,
+        parent_max_steps=10,
         cancellation_token=token,
         parent_policy=PhasePolicy(),
     )

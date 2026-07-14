@@ -357,8 +357,8 @@ Phase 1 guidance:
 
 - do not add a separate `task_batch`;
 - do not implement DAG ordering;
-- do not implement worktree isolation;
 - allow concurrent shared-workspace execution only for read-only children;
+- keep write-capable delegation serial even when optional worktree isolation is used;
 - let the model decide whether sequencing is necessary.
 
 ## 9. Parent and child context rules
@@ -394,6 +394,17 @@ Example result shape:
 ```
 
 The prompt-facing content should remain summary-first.
+
+## 9.4 Resource and cancellation inheritance
+
+Each child receives an immutable `TaskContract` computed from the minimum of
+the parent allocation, root Runtime limits, and declarative agent limits
+(`max_turns` and optional `max_tokens`). Child-session metadata stores both the
+requested and effective limits.
+
+Cancellation tokens form a hierarchy. Cancelling a parent propagates to every
+descendant; cancelling one child affects only that child and its descendants,
+not its parent or siblings.
 
 ## 10. Permissions
 

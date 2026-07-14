@@ -133,6 +133,17 @@ def _parse_definition(path: Path) -> AgentDefinition | None:
     except ValueError:
         logger.warning("Agent definition %s has invalid delegation scope", path)
         return None
+    try:
+        max_turns = int(frontmatter.get("maxTurns", frontmatter.get("max_turns", 50)))
+        max_tokens_raw = frontmatter.get(
+            "maxTokens", frontmatter.get("max_tokens")
+        )
+        max_tokens = int(max_tokens_raw) if max_tokens_raw is not None else None
+        if max_turns < 1 or (max_tokens is not None and max_tokens < 1):
+            raise ValueError
+    except (TypeError, ValueError):
+        logger.warning("Agent definition %s has invalid resource limits", path)
+        return None
 
     return AgentDefinition(
         name=str(name),
@@ -145,7 +156,8 @@ def _parse_definition(path: Path) -> AgentDefinition | None:
         model=str(frontmatter.get("model", "inherit")),
         isolation=isolation,
         visibility=visibility,
-        max_turns=int(frontmatter.get("maxTurns", frontmatter.get("max_turns", 50))),
+        max_turns=max_turns,
+        max_tokens=max_tokens,
         system_prompt=body or str(frontmatter.get("instructions", "")),
     )
 
