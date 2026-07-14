@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent.policy import PhasePolicy
+    from agent.v2.models import WorktreeEvidence
     from agent.v2.task_contract import TaskContract
 
 _SUBAGENT_SUMMARY_RULE = """Your final answer is returned to the parent as a tool result.
@@ -200,14 +201,9 @@ def fork_subagent(
         },
     )
 
-    from agent.v2.worktree_service import (
-        WorktreeChange,
-        WorktreeMergeResult,
-        WorktreeMergeStatus,
-    )
+    from agent.v2.models import WorktreeChange
     _recent_actions: list[Any] = []
-    _worktree_change = WorktreeChange.NONE
-    _merge_result = WorktreeMergeResult(WorktreeMergeStatus.NOT_APPLICABLE)
+    _worktree_evidence: "WorktreeEvidence | None" = None
 
     # ── Result object fallback: never let a bare exception escape ──
     # The parent MUST receive a structured ForkResult regardless of what
@@ -235,18 +231,6 @@ def fork_subagent(
                 event_log._append = _append_and_emit
             result = agent.run(task, event_log)
             _recent_actions = _snapshot_recent_actions(event_log)
-
-        # ── Worktree merge: driven by physical diff, not logical status ──
-        # Claude Code pattern: a subagent that wrote real code but hit
-        # MAX_STEPS should still have its changes preserved. The parent
-        # gets a warning so it can review the partial output.
-        if _worktree is not None:
-            from agent.v2.worktree_service import inspect_changes, merge_worktree
-            _worktree_change = inspect_changes(_worktree)
-            if result.is_success() or _worktree_change is not WorktreeChange.NONE:
-                _merge_result = merge_worktree(
-                    _worktree, repo_path, definition.name, prompt,
-                )
 
     except MemoryError:
         logger.critical("Fork subagent '%s' OOM — aborting", definition.name)
@@ -282,41 +266,35 @@ def fork_subagent(
                     total_tokens=result.total_tokens,
                     error=str(exc),
                 )
-        if (
-            _worktree is not None
-            and (
-                _worktree_change is WorktreeChange.NONE
-                or _merge_result.status in {
-                    WorktreeMergeStatus.MERGED,
-                    WorktreeMergeStatus.NO_CHANGES,
-                }
-            )
-        ):
-            from agent.v2.worktree_service import discard_worktree
-            discard_worktree(_worktree, repo_path)
+        if _worktree is not None:
+            # Always finalize from Git facts, including crash/cancellation paths.
+            # Only an objectively unchanged worktree may be removed.
+            from agent.v2.worktree_service import finalize_worktree
+            evidence = finalize_worktree(_worktree, repo_path)
+            if evidence.change is not WorktreeChange.NONE:
+                _worktree_evidence = evidence
 
     # ── Contract: result is ALWAYS a valid RunResult at this point ──
-    _warning = ""
-    _merge_conflict = False
-    if (
-        _merge_result.status is WorktreeMergeStatus.MERGED
-        and result.status == RunStatus.MAX_STEPS
-    ):
-        _warning = (
-            "Subagent reached max steps, but partial file changes were "
-            "successfully merged. Review the changes before relying on them."
-        )
-    if _merge_result.status is WorktreeMergeStatus.FAILED:
-        _merge_conflict = "conflict" in _merge_result.error.lower()
-        _warning = (
-            f"Subagent worktree was preserved at {_worktree.path}: "
-            f"{_merge_result.error}. Manual recovery is required."
-        )
+    warnings: list[str] = []
+    if _worktree_evidence is not None:
+        if _worktree_evidence.change is WorktreeChange.UNKNOWN:
+            warnings.append(
+                "Subagent worktree inspection was inconclusive and the "
+                f"worktree was preserved at {_worktree_evidence.path}: "
+                f"{_worktree_evidence.error or 'unknown Git inspection error'}"
+            )
+        elif _worktree_evidence.change is not WorktreeChange.NONE:
+            warnings.append(
+                "Subagent changes were isolated and preserved for explicit "
+                f"review at {_worktree_evidence.path}; no merge was performed."
+            )
+    if result.status == RunStatus.MAX_STEPS:
+        warnings.append("Subagent reached max steps; its result may be incomplete.")
 
     return _build_fork_result(
         definition.name, agent_id, result, _recent_actions,
         report=_findings_accumulator.combined_report(),
-        warning=_warning, merge_conflict=_merge_conflict,
+        warning=" ".join(warnings), worktree=_worktree_evidence,
     )
 
 
@@ -364,7 +342,7 @@ def _build_fork_result(
     recent_actions: list[dict[str, Any]] | None = None,
     report: SubagentReport | None = None,
     warning: str = "",
-    merge_conflict: bool = False,
+    worktree: "WorktreeEvidence | None" = None,
 ) -> ForkResult:
     status = ForkStatus.COMPLETED
     failure_diagnosis = ""
@@ -409,7 +387,7 @@ def _build_fork_result(
         report=report,
         failure_diagnosis=failure_diagnosis,
         warning=warning,
-        merge_conflict=merge_conflict,
+        worktree=worktree,
     )
 
 

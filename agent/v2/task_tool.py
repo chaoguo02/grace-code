@@ -439,8 +439,19 @@ def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
         lines.append(f"  <error>{_xml_escape(result.error)}</error>")
     if result.warning:
         lines.append(f"  <warning>{_xml_escape(result.warning)}</warning>")
-    if result.merge_conflict:
-        lines.append(f"  <merge-conflict>true</merge-conflict>")
+    if result.worktree is not None:
+        evidence = result.worktree
+        lines.append(f"  <worktree change='{evidence.change.value}'>")
+        lines.append(f"    <path>{_xml_escape(evidence.path)}</path>")
+        lines.append(f"    <branch>{_xml_escape(evidence.branch)}</branch>")
+        lines.append(f"    <base-branch>{_xml_escape(evidence.base_branch)}</base-branch>")
+        lines.append(f"    <base-commit>{_xml_escape(evidence.base_commit)}</base-commit>")
+        lines.append(f"    <revision>{_xml_escape(evidence.revision)}</revision>")
+        for changed_file in evidence.changed_files:
+            lines.append(f"    <changed-file>{_xml_escape(changed_file)}</changed-file>")
+        if evidence.error:
+            lines.append(f"    <inspection-error>{_xml_escape(evidence.error)}</inspection-error>")
+        lines.append("  </worktree>")
     if result.failure_diagnosis:
         lines.append(f"  <failure-diagnosis>{_xml_escape(result.failure_diagnosis)}</failure-diagnosis>")
 

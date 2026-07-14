@@ -40,6 +40,7 @@ class Worktree:
     path: str
     branch: str
     base_branch: str
+    base_commit: str
 
 
 class WorktreeError(Exception):
@@ -62,10 +63,10 @@ class WorktreeManager:
         worktree_root: str | Path | None = None,
     ) -> None:
         self._repo_path = Path(repo_path).resolve()
-        self._worktree_root = (
-            Path(worktree_root).resolve()
-            if worktree_root is not None else self._repo_path / ".worktrees"
-        )
+        if worktree_root is None:
+            from runtime.state_paths import ProjectStatePaths
+            worktree_root = ProjectStatePaths.for_project(self._repo_path).worktrees
+        self._worktree_root = Path(worktree_root).resolve()
         self._worktrees: dict[str, Worktree] = {}
         # Runtime injection: all git commands go through execute(), never raw subprocess.
         # This ensures Docker sandbox compatibility and audit trail.
@@ -99,7 +100,7 @@ class WorktreeManager:
         if name in self._worktrees:
             raise WorktreeError(f"Worktree '{name}' already exists")
 
-        # 确定 worktree 路径：放在 .worktrees/ 子目录下
+        # Runtime state is physically external to the user's tracked project.
         wt_dir = self._worktree_root
         wt_dir.mkdir(parents=True, exist_ok=True)
         wt_path = wt_dir / name
@@ -110,13 +111,14 @@ class WorktreeManager:
         # 确定基础分支
         if base_branch is None:
             base_branch = self._current_branch()
+        base_commit = self._run_git(["rev-parse", base_branch]).strip()
 
         # 创建新分支名
         branch_name = f"multi-agent/{name}"
 
         try:
             self._run_git(
-                ["worktree", "add", "-b", branch_name, str(wt_path), base_branch],
+                ["worktree", "add", "-b", branch_name, str(wt_path), base_commit],
             )
         except subprocess.CalledProcessError as e:
             raise WorktreeError(f"Failed to create worktree: {e.stderr}") from e
@@ -126,6 +128,7 @@ class WorktreeManager:
             path=str(wt_path),
             branch=branch_name,
             base_branch=base_branch,
+            base_commit=base_commit,
         )
         self._worktrees[name] = wt
         logger.info("Created worktree '%s' at %s (branch: %s)", name, wt_path, branch_name)
@@ -148,7 +151,7 @@ class WorktreeManager:
         # 检查 worktree 是否有 commit
         try:
             diff_output = self._run_git(
-                ["log", "--oneline", f"{wt.base_branch}..{wt.branch}"],
+                ["log", "--oneline", f"{wt.base_commit}..{wt.branch}"],
             )
         except subprocess.CalledProcessError:
             diff_output = ""
@@ -222,7 +225,7 @@ class WorktreeManager:
     def get_diff(self, wt: Worktree) -> str:
         """获取 worktree 相对于基础分支的 diff。"""
         try:
-            return self._run_git(["diff", f"{wt.base_branch}...{wt.branch}"])
+            return self._run_git(["diff", f"{wt.base_commit}...{wt.branch}"])
         except subprocess.CalledProcessError:
             return ""
 

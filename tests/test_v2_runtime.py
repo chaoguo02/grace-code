@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -19,6 +20,7 @@ from agent.task import (
     EventType,
     Observation,
     ObservationStatus,
+    RunResult,
     RunStatus,
     Task,
     TaskIntent,
@@ -32,6 +34,8 @@ from agent.v2.models import (
     ForkStatus,
     SessionMode,
     SessionStatus,
+    WorktreeChange,
+    WorktreeEvidence,
 )
 from agent.v2.task_tool import _format_fork_result
 from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
@@ -727,6 +731,50 @@ def test_fork_result_coerces_status_at_boundary():
         agent_name="explore", session_id="typed", status="completed", summary="done"
     )
     assert result.status is ForkStatus.COMPLETED
+
+
+def test_fork_result_round_trips_typed_worktree_evidence():
+    evidence = WorktreeEvidence(
+        change=WorktreeChange.UNCOMMITTED,
+        path="C:/state/worktrees/child",
+        branch="multi-agent/child",
+        base_branch="main",
+        base_commit="abc123",
+        changed_files=("src/a.py", "tests/test_a.py"),
+        revision="revision-1",
+    )
+    result = ForkResult(
+        agent_name="general", session_id="child", status="completed",
+        summary="done", worktree=evidence,
+    )
+
+    restored = ForkResult.from_dict(result.to_dict())
+
+    assert restored.worktree == evidence
+
+
+def test_v2_format_fork_result_exposes_worktree_git_facts():
+    result = ForkResult(
+        agent_name="general",
+        session_id="child",
+        status="completed",
+        summary="changes ready",
+        worktree=WorktreeEvidence(
+            change=WorktreeChange.COMMITTED,
+            path="C:/state/worktrees/child",
+            branch="multi-agent/child",
+            base_branch="main",
+            base_commit="abc123",
+            changed_files=("src/a.py",),
+            revision="revision-1",
+        ),
+    )
+
+    output = _format_fork_result("general", result)
+
+    assert "<worktree change='committed'>" in output
+    assert "<base-commit>abc123</base-commit>" in output
+    assert "<changed-file>src/a.py</changed-file>" in output
 
 
 def test_v2_format_fork_result_handles_none_summary():
@@ -1642,6 +1690,81 @@ def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, 
     assert child is not None
     assert child.status is SessionStatus.FAILED
     assert child.fork_result == result
+
+
+def test_v2_worktree_child_preserves_changes_without_mutating_parent(
+    tmp_path, monkeypatch,
+):
+    from agent.v2.worktree_service import discard_worktree
+    from runtime.state_paths import STATE_HOME_ENV
+    from tools.snapshot import Worktree
+
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=tmp_path, capture_output=True, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Forge Tests"],
+        cwd=tmp_path, capture_output=True, check=True,
+    )
+    (tmp_path / "tracked.txt").write_text("parent\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=tmp_path, capture_output=True, check=True,
+    )
+    monkeypatch.setenv(
+        STATE_HOME_ENV, str(tmp_path.parent / "wt-state"),
+    )
+
+    def write_in_child(_agent, task, _event_log):
+        (Path(task.repo_path) / "child.txt").write_text("child\n", encoding="utf-8")
+        return RunResult(
+            task_id="child-run",
+            status=RunStatus.SUCCESS,
+            summary="child changes ready",
+            steps_taken=1,
+            total_tokens=10,
+        )
+
+    monkeypatch.setattr(ReActAgent, "run", write_in_child)
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    definition = replace(
+        runtime.agent_registry.get("general"),
+        isolation=AgentIsolation.WORKTREE,
+    )
+
+    result = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=definition,
+        description="isolated edit",
+        prompt="Create child.txt",
+        **_fork_resources(),
+    )
+
+    assert result.status is ForkStatus.COMPLETED
+    assert result.worktree is not None
+    assert result.worktree.change is WorktreeChange.UNCOMMITTED
+    assert result.worktree.changed_files == ("child.txt",)
+    assert Path(result.worktree.path, "child.txt").is_file()
+    assert not (tmp_path / "child.txt").exists()
+    assert "no merge was performed" in result.warning
+    assert store.get_session(result.session_id).fork_result == result
+
+    discard_worktree(
+        Worktree(
+            name=Path(result.worktree.path).name,
+            path=result.worktree.path,
+            branch=result.worktree.branch,
+            base_branch=result.worktree.base_branch,
+            base_commit=result.worktree.base_commit,
+        ),
+        str(tmp_path),
+    )
 
 
 def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):

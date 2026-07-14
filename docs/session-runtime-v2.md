@@ -22,7 +22,7 @@ This document reflects the decisions already confirmed for v2:
 - built-in subagents are `explore` and `general`;
 - child sessions are persisted in SQLite from day one;
 - the `task` tool only accepts `description`, `subagent_type`, and `prompt`;
-- child sessions return summary text only;
+- child sessions return a typed result with summary-first parent rendering;
 - dependency management is primarily model-driven, not DAG-driven;
 - child sessions do not inherit parent conversation history by default.
 
@@ -34,7 +34,7 @@ Out of scope:
 
 - replacing existing `react`, `plan`, `dag`, or `multi-agent` flows;
 - implementing `plan_exit`-style agent switching;
-- adding worktree isolation, file locks, or merge orchestration;
+- adding file locks or automatic worktree merge orchestration;
 - building a full TUI for parent/child session navigation;
 - replaying full child event streams back into the parent prompt;
 - implementing DAG scheduling or explicit dependency planning;
@@ -43,7 +43,8 @@ Out of scope:
 The first milestone is smaller:
 
 > Parent agent calls `task` -> runtime creates a child session -> subagent runs
-> its own ReAct loop -> child returns summary text -> parent continues reasoning.
+> its own ReAct loop -> child returns a typed, summary-first result -> parent
+> continues reasoning.
 
 ## 3. Design principles
 
@@ -71,18 +72,19 @@ Child sessions are not temporary helper structs. Each child session must:
 - own its own execution lifecycle;
 - be queryable and resumable later.
 
-### 3.3 The parent only receives the conclusion
+### 3.3 The parent receives a bounded result
 
-The parent session should receive the child session's final summary text, not the
-full intermediate tool history. This keeps the parent prompt clean and aligns
-with the target OpenCode-like model.
+The parent session receives the child's final summary and bounded structured
+facts, not the full intermediate tool history. This keeps the parent prompt
+clean while preserving Runtime-owned evidence such as worktree change state.
 
 ### 3.4 The model manages most task decomposition
 
 The runtime supports multiple `task` tool calls in one model response. Calls
 whose selected children declare read-only analysis intent and fork isolation run
-in parallel. Write-capable delegation remains serial until independent worktree
-and merge safety can be guaranteed. The runtime does not impose a DAG planner.
+in parallel. Write-capable delegation remains serial; worktree isolation keeps
+its edits separate, and applying those edits is outside child execution. The
+runtime does not impose a DAG planner.
 If the model needs sequencing, it waits for earlier child results and issues
 later `task` calls in a subsequent ReAct turn.
 
@@ -405,6 +407,19 @@ requested and effective limits.
 Cancellation tokens form a hierarchy. Cancelling a parent propagates to every
 descendant; cancelling one child affects only that child and its descendants,
 not its parent or siblings.
+
+## 9.5 Worktree result boundary
+
+A child declared with `isolation: worktree` runs against an immutable base
+commit captured when the worktree is created. Completion never implies
+acceptance: the child Runtime must not stage, commit, switch the parent's
+branch, or merge changes as a side effect of returning a result.
+
+Finalization is driven only by Git facts. An objectively unchanged worktree is
+removed. A changed or uninspectable worktree is preserved outside the tracked
+project tree, and the `ForkResult` carries typed evidence: absolute worktree
+path, branch, base branch, base commit, changed paths, and workspace revision.
+Applying or discarding those changes is a separate explicit operation.
 
 ## 10. Permissions
 

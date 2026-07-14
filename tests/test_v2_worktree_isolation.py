@@ -8,11 +8,11 @@ import pytest
 from agent.v2.worktree_service import (
     WorktreeChange,
     WorktreeIsolationError,
-    WorktreeMergeStatus,
     create_worktree,
     discard_worktree,
+    finalize_worktree,
     inspect_changes,
-    merge_worktree,
+    inspect_worktree,
 )
 from agent.v2.models import AgentIsolation
 from runtime.state_paths import STATE_HOME_ENV, ProjectStatePaths
@@ -92,7 +92,7 @@ def test_registry_scoping_clones_tools_without_mutating_parent(tmp_path):
     assert str(parent / "value.txt").lower() in (denied.error or "").lower()
 
 
-def test_worktree_state_is_external_and_untracked_files_are_merged(tmp_path, monkeypatch):
+def test_worktree_state_is_external_and_changes_are_preserved(tmp_path, monkeypatch):
     repo = _git_repo(tmp_path / "repo")
     state_home = tmp_path / "agent-state"
     monkeypatch.setenv(STATE_HOME_ENV, str(state_home))
@@ -109,11 +109,69 @@ def test_worktree_state_is_external_and_untracked_files_are_merged(tmp_path, mon
     (effective / "new-file.txt").write_text("child output\n", encoding="utf-8")
     assert inspect_changes(worktree) is WorktreeChange.UNCOMMITTED
 
-    merged = merge_worktree(worktree, str(repo), "general", "add output")
-    assert merged.status is WorktreeMergeStatus.MERGED
+    evidence = finalize_worktree(worktree, str(repo))
+    assert evidence.change is WorktreeChange.UNCOMMITTED
+    assert evidence.changed_files == ("new-file.txt",)
+    assert evidence.base_commit
+    assert evidence.revision
+    assert not (repo / "new-file.txt").exists()
+    assert effective.exists()
     discard_worktree(worktree, str(repo))
-    assert (repo / "new-file.txt").read_text(encoding="utf-8") == "child output\n"
     assert not effective.exists()
+
+
+def test_unchanged_worktree_is_removed_during_finalization(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "repo")
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "agent-state"))
+    worktree, effective_path = create_worktree(
+        str(repo), "general", "clean-child", isolation=AgentIsolation.WORKTREE,
+    )
+
+    evidence = finalize_worktree(worktree, str(repo))
+
+    assert evidence.change is WorktreeChange.NONE
+    assert not Path(effective_path).exists()
+
+
+def test_head_change_is_preserved_even_without_file_diff(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "repo")
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "agent-state"))
+    worktree, effective_path = create_worktree(
+        str(repo), "general", "empty-commit", isolation=AgentIsolation.WORKTREE,
+    )
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "child checkpoint"],
+        cwd=effective_path, capture_output=True, check=True,
+    )
+
+    evidence = finalize_worktree(worktree, str(repo))
+
+    assert evidence.change is WorktreeChange.COMMITTED
+    assert evidence.changed_files == ()
+    assert Path(effective_path).exists()
+    discard_worktree(worktree, str(repo))
+
+
+def test_worktree_evidence_uses_immutable_creation_commit(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "repo")
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "agent-state"))
+    worktree, effective_path = create_worktree(
+        str(repo), "general", "fixed-base", isolation=AgentIsolation.WORKTREE,
+    )
+    original_base = worktree.base_commit
+    (repo / "parent-only.txt").write_text("parent\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "parent moved"],
+        cwd=repo, capture_output=True, check=True,
+    )
+    (Path(effective_path) / "child-only.txt").write_text("child\n", encoding="utf-8")
+
+    evidence = inspect_worktree(worktree)
+
+    assert evidence.base_commit == original_base
+    assert evidence.changed_files == ("child-only.txt",)
+    discard_worktree(worktree, str(repo))
 
 
 def test_declared_worktree_isolation_fails_closed(tmp_path, monkeypatch):

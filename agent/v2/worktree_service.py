@@ -3,40 +3,15 @@
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
-from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
-from agent.v2.models import AgentIsolation
+from agent.v2.models import AgentIsolation, WorktreeChange, WorktreeEvidence
 
 logger = logging.getLogger(__name__)
 
 
 class WorktreeIsolationError(RuntimeError):
     """Raised when declared worktree isolation cannot be provisioned."""
-
-
-class WorktreeChange(str, Enum):
-    NONE = "none"
-    UNCOMMITTED = "uncommitted"
-    COMMITTED = "committed"
-    BOTH = "both"
-    UNKNOWN = "unknown"
-
-
-class WorktreeMergeStatus(str, Enum):
-    NOT_APPLICABLE = "not_applicable"
-    NO_CHANGES = "no_changes"
-    MERGED = "merged"
-    FAILED = "failed"
-
-
-@dataclass(frozen=True)
-class WorktreeMergeResult:
-    status: WorktreeMergeStatus
-    error: str = ""
 
 
 def _get_runtime(repo_path: str) -> Any:
@@ -79,100 +54,101 @@ def create_worktree(
         ) from exc
 
 
-def inspect_changes(worktree: Any, runtime: Any | None = None) -> WorktreeChange:
-    """Inspect tracked, untracked, and committed changes using Git facts."""
+def inspect_worktree(worktree: Any, runtime: Any | None = None) -> WorktreeEvidence:
+    """Capture immutable Git facts without mutating either checkout."""
     if worktree is None:
-        return WorktreeChange.NONE
+        return WorktreeEvidence(
+            change=WorktreeChange.NONE,
+            path="",
+            branch="",
+            base_branch="",
+            base_commit="",
+        )
     try:
         child_runtime = runtime or _get_runtime(str(worktree.path))
         status = child_runtime.execute(
             "git", args=["status", "--porcelain", "--untracked-files=all"],
             cwd=worktree.path, timeout=30,
         )
-        ahead = child_runtime.execute(
-            "git", args=["rev-list", "--count", f"{worktree.base_branch}..HEAD"],
+        head = child_runtime.execute(
+            "git", args=["rev-parse", "HEAD"],
             cwd=worktree.path, timeout=30,
         )
-        if not status.success or not ahead.success:
-            return WorktreeChange.UNKNOWN
-        has_uncommitted = bool(status.stdout.strip())
-        has_committed = int(ahead.stdout.strip() or "0") > 0
-        if has_uncommitted and has_committed:
-            return WorktreeChange.BOTH
-        if has_uncommitted:
-            return WorktreeChange.UNCOMMITTED
-        if has_committed:
-            return WorktreeChange.COMMITTED
-        return WorktreeChange.NONE
-    except (OSError, TypeError, ValueError):
-        return WorktreeChange.UNKNOWN
-
-
-def merge_worktree(
-    worktree: Any,
-    repo_path: str,
-    definition_name: str,
-    prompt: str = "",
-    runtime: Any | None = None,
-) -> WorktreeMergeResult:
-    """Commit child changes and merge them through project-bound runtimes."""
-    if worktree is None:
-        return WorktreeMergeResult(WorktreeMergeStatus.NOT_APPLICABLE)
-    change = inspect_changes(worktree)
-    if change is WorktreeChange.UNKNOWN:
-        return WorktreeMergeResult(
-            WorktreeMergeStatus.FAILED,
-            "Unable to determine worktree change state",
+        tracked = child_runtime.execute(
+            "git", args=["diff", "--name-only", "-z", worktree.base_commit, "--"],
+            cwd=worktree.path, timeout=30,
         )
-    if change is WorktreeChange.NONE:
-        return WorktreeMergeResult(WorktreeMergeStatus.NO_CHANGES)
-    try:
-        child_runtime = _get_runtime(str(worktree.path))
-        if change in (WorktreeChange.UNCOMMITTED, WorktreeChange.BOTH):
-            staged = child_runtime.execute(
-                "git", args=["add", "-A"], cwd=worktree.path, timeout=30,
+        untracked = child_runtime.execute(
+            "git", args=["ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=worktree.path, timeout=30,
+        )
+        results = (status, head, tracked, untracked)
+        failed = [result for result in results if not result.success]
+        if failed:
+            return WorktreeEvidence(
+                change=WorktreeChange.UNKNOWN,
+                path=str(worktree.path),
+                branch=str(worktree.branch),
+                base_branch=str(worktree.base_branch),
+                base_commit=str(worktree.base_commit),
+                error="; ".join(
+                    result.stderr.strip() or "git inspection failed"
+                    for result in failed
+                ),
             )
-            if not staged.success:
-                return WorktreeMergeResult(
-                    WorktreeMergeStatus.FAILED, staged.stderr or "git add failed",
-                )
-            message = f"Subagent {definition_name}: {prompt[:200]}"
-            message_path = ""
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".txt", delete=False, encoding="utf-8",
-                ) as handle:
-                    handle.write(message)
-                    message_path = handle.name
-                committed = child_runtime.execute(
-                    "git", args=["commit", "-F", message_path],
-                    cwd=worktree.path, timeout=30,
-                )
-                if not committed.success:
-                    return WorktreeMergeResult(
-                        WorktreeMergeStatus.FAILED,
-                        committed.stderr or "git commit failed",
-                    )
-            finally:
-                if message_path:
-                    try:
-                        os.unlink(message_path)
-                    except OSError:
-                        pass
-
-        from tools.snapshot import WorktreeManager
-        parent_runtime = runtime or _get_runtime(repo_path)
-        manager = WorktreeManager(
-            repo_path,
-            runtime=parent_runtime,
-            worktree_root=_worktree_root(repo_path),
+        has_uncommitted = bool(status.stdout.strip())
+        has_committed = head.stdout.strip() != worktree.base_commit
+        if has_uncommitted and has_committed:
+            change = WorktreeChange.BOTH
+        elif has_uncommitted:
+            change = WorktreeChange.UNCOMMITTED
+        elif has_committed:
+            change = WorktreeChange.COMMITTED
+        else:
+            change = WorktreeChange.NONE
+        from runtime.workspace_facts import capture_workspace_snapshot
+        snapshot = capture_workspace_snapshot(worktree.path)
+        changed_files = tuple(sorted(set(
+            _nul_paths(tracked.stdout) | _nul_paths(untracked.stdout)
+        )))
+        return WorktreeEvidence(
+            change=change,
+            path=str(worktree.path),
+            branch=str(worktree.branch),
+            base_branch=str(worktree.base_branch),
+            base_commit=str(worktree.base_commit),
+            changed_files=changed_files,
+            revision=snapshot.revision,
+            error=snapshot.error,
         )
-        manager.merge(worktree, delete_after=False)
-        logger.info("Worktree merged: %s -> %s", worktree.branch, repo_path)
-        return WorktreeMergeResult(WorktreeMergeStatus.MERGED)
-    except Exception as exc:
-        logger.warning("Worktree merge failed: %s", exc)
-        return WorktreeMergeResult(WorktreeMergeStatus.FAILED, str(exc))
+    except (OSError, TypeError, ValueError) as exc:
+        return WorktreeEvidence(
+            change=WorktreeChange.UNKNOWN,
+            path=str(worktree.path),
+            branch=str(worktree.branch),
+            base_branch=str(worktree.base_branch),
+            base_commit=str(worktree.base_commit),
+            error=str(exc),
+        )
+
+
+def _nul_paths(raw: str) -> set[str]:
+    return {item for item in raw.split("\0") if item}
+
+
+def inspect_changes(worktree: Any, runtime: Any | None = None) -> WorktreeChange:
+    """Compatibility view over the typed worktree evidence."""
+    return inspect_worktree(worktree, runtime).change
+
+
+def finalize_worktree(
+    worktree: Any, repo_path: str, runtime: Any | None = None,
+) -> WorktreeEvidence:
+    """Clean an unchanged child or preserve its changes for explicit review."""
+    evidence = inspect_worktree(worktree, runtime)
+    if evidence.change is WorktreeChange.NONE:
+        discard_worktree(worktree, repo_path)
+    return evidence
 
 
 def has_changes(worktree: Any, runtime: Any | None = None) -> bool:

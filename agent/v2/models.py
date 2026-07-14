@@ -21,6 +21,16 @@ class AgentIsolation(str, Enum):
     WORKTREE = "worktree"
 
 
+class WorktreeChange(str, Enum):
+    """Git-observed state of an isolated child workspace."""
+
+    NONE = "none"
+    UNCOMMITTED = "uncommitted"
+    COMMITTED = "committed"
+    BOTH = "both"
+    UNKNOWN = "unknown"
+
+
 class AgentVisibility(str, Enum):
     PUBLIC = "public"
     HIDDEN = "hidden"
@@ -169,11 +179,13 @@ class ForkResult:
     tokens_used: int = 0
     report: SubagentReport | None = None
     failure_diagnosis: str = ""  # structured diagnosis when status is "failed"
-    warning: str = ""  # non-fatal warning (e.g. "partial changes were merged")
-    merge_conflict: bool = False  # True if worktree merge had conflicts
+    warning: str = ""
+    worktree: "WorktreeEvidence | None" = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", ForkStatus(self.status))
+        if self.worktree is not None and not isinstance(self.worktree, WorktreeEvidence):
+            raise TypeError("worktree must be WorktreeEvidence when provided")
 
     @property
     def structured_findings(self) -> tuple[Finding, ...]:
@@ -192,7 +204,7 @@ class ForkResult:
             "report": self.report.to_dict() if self.report is not None else None,
             "failure_diagnosis": self.failure_diagnosis,
             "warning": self.warning,
-            "merge_conflict": self.merge_conflict,
+            "worktree": self.worktree.to_dict() if self.worktree is not None else None,
         }
 
     @classmethod
@@ -214,7 +226,52 @@ class ForkResult:
             report=report,
             failure_diagnosis=str(data.get("failure_diagnosis", "")),
             warning=str(data.get("warning", "")),
-            merge_conflict=bool(data.get("merge_conflict", False)),
+            worktree=(
+                WorktreeEvidence.from_dict(data["worktree"])
+                if isinstance(data.get("worktree"), dict) else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class WorktreeEvidence:
+    """Immutable Git facts returned for a preserved child worktree."""
+
+    change: WorktreeChange
+    path: str
+    branch: str
+    base_branch: str
+    base_commit: str = ""
+    changed_files: tuple[str, ...] = ()
+    revision: str = ""
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "change", WorktreeChange(self.change))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "change": self.change.value,
+            "path": self.path,
+            "branch": self.branch,
+            "base_branch": self.base_branch,
+            "base_commit": self.base_commit,
+            "changed_files": list(self.changed_files),
+            "revision": self.revision,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WorktreeEvidence":
+        return cls(
+            change=WorktreeChange(data["change"]),
+            path=str(data.get("path", "")),
+            branch=str(data.get("branch", "")),
+            base_branch=str(data.get("base_branch", "")),
+            base_commit=str(data.get("base_commit", "")),
+            changed_files=tuple(str(item) for item in data.get("changed_files", [])),
+            revision=str(data.get("revision", "")),
+            error=str(data.get("error", "")),
         )
 
 # ── Built-in agent definitions (fallback when no .md files exist) ──

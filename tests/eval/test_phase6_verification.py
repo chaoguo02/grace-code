@@ -228,8 +228,10 @@ class TestWorktreeIsolation:
     """Verify worktree-based isolation actually isolates filesystem changes."""
 
     @pytest.fixture
-    def git_repo(self, tmp_path):
+    def git_repo(self, tmp_path, monkeypatch):
         """Create a real git repo for worktree testing."""
+        from runtime.state_paths import STATE_HOME_ENV
+        monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "agent-state"))
         repo = tmp_path / "repo"
         repo.mkdir()
         subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
