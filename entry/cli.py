@@ -383,7 +383,7 @@ def run(
     if mode in ("v2-build", "plan", "v2-plan"):
         try:
             from entry.modes.interaction import cli_plan_adapter
-            _run_v2_mode(
+            mode_result = _run_v2_mode(
                 mode=mode,
                 description=description,
                 repo_path=repo_path,
@@ -404,6 +404,8 @@ def run(
             if mcp_integration is not None:
                 mcp_integration.shutdown()
         flush_observability()
+        if not mode_result.is_success():
+            raise click.exceptions.Exit(1)
         return
 
     click.echo(red(f"Error: mode '{mode}' has been removed. Use --mode v2-build or --mode v2-plan."), err=True)

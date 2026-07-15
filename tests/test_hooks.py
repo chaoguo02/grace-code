@@ -536,6 +536,67 @@ class TestTypedPermissionPipeline:
         assert result.decision is PermissionDecision.DENY
         assert result.layer is PermissionLayer.TOOL_CHECK
 
+    def test_path_check_resolves_relative_path_from_declared_project_root(
+        self, tmp_path, monkeypatch,
+    ):
+        from hitl.pipeline import PermissionDecision, PermissionPipeline, ToolApprovalMode
+        from tools.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
+
+        project = tmp_path / "project"
+        elsewhere = tmp_path / "elsewhere"
+        project.mkdir()
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        tool = NoopTool("writer")
+        tool.metadata = ToolMetadata(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            path_access=PathAccess.WRITE,
+            path_parameter="path",
+        )
+
+        result = PermissionPipeline(
+            approval_mode=ToolApprovalMode.AUTO,
+            project_root=str(project),
+        ).check(tool, {"path": "child.txt"})
+
+        assert result.decision is PermissionDecision.ALLOW
+
+    def test_registry_scope_rebinds_permission_project_root(self, tmp_path):
+        from hitl.pipeline import PermissionDecision, PermissionPipeline, ToolApprovalMode
+        from tools.base import (
+            ExecutionContext,
+            NoopTool,
+            PathAccess,
+            ToolEffect,
+            ToolMetadata,
+            ToolRegistry,
+        )
+
+        parent = tmp_path / "parent"
+        child = tmp_path / "child"
+        parent.mkdir()
+        child.mkdir()
+        pipeline = PermissionPipeline(
+            approval_mode=ToolApprovalMode.AUTO,
+            project_root=str(parent),
+        )
+        tool = NoopTool("writer")
+        tool.metadata = ToolMetadata(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            path_access=PathAccess.WRITE,
+            path_parameter="path",
+        )
+        registry = ToolRegistry(permission_pipeline=pipeline)
+        registry.register(tool)
+
+        original = pipeline.check(tool, {"path": str(child / "child.txt")})
+        scoped = registry.scoped(ExecutionContext(
+            workspace_root=str(child), repo_path=str(child),
+        )).execute_tool("writer", {"path": str(child / "child.txt")})
+
+        assert original.decision is PermissionDecision.DENY
+        assert scoped.success is True
+
 
 # ─── P1-2: ProactiveMemory.check_plan_feedback ───────────────────────────────
 

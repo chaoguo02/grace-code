@@ -300,6 +300,14 @@ class ScopableRuntime(Protocol):
 
 
 @runtime_checkable
+class ProjectScopablePermissionPipeline(Protocol):
+    """Permission pipeline that can bind its path sandbox to a child project root."""
+
+    def scoped(self, project_root: str) -> Any:
+        ...
+
+
+@runtime_checkable
 class RuntimeBoundTool(Protocol):
     _runtime: Any
 
@@ -724,9 +732,14 @@ class ToolRegistry:
 
     def scoped(self, context: ExecutionContext) -> "ToolRegistry":
         """Clone registered tools into an isolated per-session context."""
+        permission_pipeline = self._permission_pipeline
+        if isinstance(permission_pipeline, ProjectScopablePermissionPipeline):
+            permission_pipeline = permission_pipeline.scoped(
+                context.repo_path or context.workspace_root
+            )
         scoped = ToolRegistry(
             hitl_manager=self._hitl_manager,
-            permission_pipeline=self._permission_pipeline,
+            permission_pipeline=permission_pipeline,
             hook_dispatcher=self._hook_dispatcher,
             capability_registry=self._capability_registry,
         )

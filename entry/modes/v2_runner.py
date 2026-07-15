@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import click
 
-from agent.task import TaskIntent
+from agent.task import RunResult, RunStatus, TaskIntent, TerminationReason
 
 
 # ── Color helpers (from cli.py) ──────────────────────────────────────────
@@ -115,6 +116,17 @@ def _plan_filename(description: str) -> str:
     return f"plan-{digest}.md"
 
 
+def _workflow_failure(result: RunResult, detail: str) -> RunResult:
+    """Convert a post-model workflow rejection into a truthful run result."""
+    return replace(
+        result,
+        status=RunStatus.FAILED,
+        summary=detail,
+        error=detail,
+        termination_reason=TerminationReason.GUARD_REJECTED,
+    )
+
+
 # ── V2 mode runner ───────────────────────────────────────────────────────
 
 def run_v2_mode(
@@ -134,13 +146,12 @@ def run_v2_mode(
     proactive_memory=None,
     mcp_integration=None,
     renderer=None,
-) -> None:
+) -> RunResult:
     """Run a v2 session (plan, build, or v2-plan with approval loop).
 
     All dependencies are passed in — this module does NOT import agent/
     or memory/ internals. It only orchestrates what it receives.
     """
-    from agent.task import RunStatus
     from agent.factory import resolve_task_intent
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
     from llm.base import LLMMessage
@@ -221,7 +232,7 @@ def run_v2_mode(
             result,
             show_summary=rend is None,
         )
-        return
+        return result
 
     # --- plan / v2-plan: read-only tools, plan→approve→execute loop ---
     if mode == "v2-plan":
@@ -270,13 +281,14 @@ def run_v2_mode(
                     f"Plan session failed (status={result.status.value}). "
                     "Cannot proceed to approval.", style="error",
                 )
-                return
+                return result
 
             if not plan_text.strip():
+                detail = "Plan session produced no output. Nothing to review."
                 interaction.show_message(
-                    "Plan session produced no output. Nothing to review.", style="warning",
+                    detail, style="warning",
                 )
-                return
+                return _workflow_failure(result, detail)
 
             # ── Plan Contract: extract JSON → validate → reject or approve ──
             from entry.modes.plan_contract import (
@@ -285,11 +297,11 @@ def run_v2_mode(
             _data = extract_and_parse_json(plan_text)
             if _data is None:
                 if contract_repair_attempts >= max_contract_repairs:
+                    detail = "Plan contract is still invalid after 2 repair attempts; aborting."
                     interaction.show_message(
-                        "Plan contract is still invalid after 2 repair attempts; aborting.",
-                        style="error",
+                        detail, style="error",
                     )
-                    return
+                    return _workflow_failure(result, detail)
                 contract_repair_attempts += 1
                 interaction.show_message(
                     "Plan has no valid JSON contract. Asking agent to add one...",
@@ -320,11 +332,11 @@ def run_v2_mode(
                 _contract = PlanContract.model_validate(_data)
             except Exception as exc:
                 if contract_repair_attempts >= max_contract_repairs:
+                    detail = "Plan contract is still invalid after 2 repair attempts; aborting."
                     interaction.show_message(
-                        "Plan contract is still invalid after 2 repair attempts; aborting.",
-                        style="error",
+                        detail, style="error",
                     )
-                    return
+                    return _workflow_failure(result, detail)
                 contract_repair_attempts += 1
                 interaction.show_message(
                     f"Plan contract validation failed: {exc}", style="warning",
@@ -348,11 +360,11 @@ def run_v2_mode(
             _valid, _err = PlanValidator.validate(_contract)
             if not _valid:
                 if contract_repair_attempts >= max_contract_repairs:
+                    detail = "Plan contract is still invalid after 2 repair attempts; aborting."
                     interaction.show_message(
-                        "Plan contract is still invalid after 2 repair attempts; aborting.",
-                        style="error",
+                        detail, style="error",
                     )
-                    return
+                    return _workflow_failure(result, detail)
                 contract_repair_attempts += 1
                 interaction.show_message(
                     f"Plan contract rejected: {_err}", style="warning",
@@ -397,7 +409,7 @@ def run_v2_mode(
                     "Plan approved. Executing...",
                     style="success",
                 )
-                run_v2_mode(
+                return run_v2_mode(
                     mode="v2-build", description=description, repo_path=repo_path,
                     backend=backend, registry=registry, agent_config=agent_config,
                     memory_context=memory_context, log_dir=log_dir,
@@ -406,13 +418,12 @@ def run_v2_mode(
                     hook_dispatcher=hook_dispatcher,
                     proactive_memory=proactive_memory, renderer=renderer,
                 )
-                return
 
             elif action is PlanAction.COMPLETE_PLAN:
                 interaction.show_message(
                     f"Plan saved without execution: {plan_path}", style="success",
                 )
-                return
+                return result
 
             elif action is PlanAction.CONTINUE_EDIT:
                 updated = _read_manual_plan_edit(plan_path, interaction)
@@ -450,15 +461,17 @@ def run_v2_mode(
                 continue
 
             elif action is PlanAction.ABORT_REVISIONS:
+                detail = f"Max revisions ({service.max_revisions}) reached. Aborting."
                 interaction.show_message(
-                    f"Max revisions ({service.max_revisions}) reached. Aborting.",
-                    style="warning",
+                    detail, style="warning",
                 )
-                return
+                return _workflow_failure(result, detail)
 
             else:  # ABORT_SESSION
                 interaction.show_message(
                     f"Aborted. Plan saved at: {plan_path}", style="info",
                 )
-                return
-        return
+                return result
+        return result
+
+    raise ValueError(f"Unsupported v2 mode: {mode!r}")

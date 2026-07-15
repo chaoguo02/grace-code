@@ -155,6 +155,16 @@ class PermissionPipeline:
         """Inject a CircuitBreaker after construction (session-scoped)."""
         self._circuit_breaker = circuit_breaker
 
+    def scoped(self, project_root: str) -> "PermissionPipeline":
+        """Clone session-local state and bind path checks to an effective project."""
+        import copy
+
+        scoped = copy.copy(self)
+        scoped._project_root = os.path.abspath(project_root)
+        scoped._session_rules = list(self._session_rules)
+        scoped._stats = PipelineStats()
+        return scoped
+
     @property
     def stats(self) -> PipelineStats:
         return self._stats
@@ -384,8 +394,10 @@ class PermissionPipeline:
         ):
             path = params.get(metadata.path_parameter, "")
             if path:
-                abs_path = os.path.normcase(os.path.abspath(path))
                 abs_root = os.path.normcase(os.path.abspath(self._project_root))
+                abs_path = os.path.normcase(os.path.abspath(
+                    path if os.path.isabs(path) else os.path.join(abs_root, path)
+                ))
                 # Ensure the path is within project root (with separator boundary)
                 if not (abs_path == abs_root or abs_path.startswith(abs_root + os.sep)):
                     return PermissionResult(
