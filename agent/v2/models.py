@@ -42,6 +42,20 @@ class WorktreeDisposition(str, Enum):
     DISCARDED = "discarded"
 
 
+class WorktreeAvailability(str, Enum):
+    """Physical availability of a persisted managed worktree."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+class WorktreeResolutionAction(str, Enum):
+    """Explicit administrative action for a managed worktree."""
+
+    APPLY = "apply"
+    DISCARD = "discard"
+
+
 class AgentVisibility(str, Enum):
     PUBLIC = "public"
     HIDDEN = "hidden"
@@ -311,6 +325,32 @@ class WorktreeEvidence:
             revision=str(data.get("revision", "")),
             error=str(data.get("error", "")),
         )
+
+
+@dataclass(frozen=True)
+class ManagedWorktreeRecord:
+    """Fresh inventory view joining Session DB state with Git facts."""
+
+    child_session_id: str
+    parent_session_id: str
+    disposition: WorktreeDisposition
+    availability: WorktreeAvailability
+    evidence: WorktreeEvidence
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "disposition", WorktreeDisposition(self.disposition))
+        object.__setattr__(self, "availability", WorktreeAvailability(self.availability))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "child_session_id": self.child_session_id,
+            "parent_session_id": self.parent_session_id,
+            "disposition": self.disposition.value,
+            "availability": self.availability.value,
+            "evidence": self.evidence.to_dict(),
+            "error": self.error,
+        }
 
 # ── Built-in agent definitions (fallback when no .md files exist) ──
 

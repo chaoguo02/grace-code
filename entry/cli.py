@@ -156,6 +156,10 @@ def cli(ctx: click.Context, config: str | None) -> None:
     ctx.obj["config_path"] = config
 
 
+from entry.worktree_admin import worktree_admin  # noqa: E402
+cli.add_command(worktree_admin)
+
+
 # ---------------------------------------------------------------------------
 # Multi-Agent config helper
 # ---------------------------------------------------------------------------

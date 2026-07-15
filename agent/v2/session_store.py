@@ -7,7 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.task import ToolCall
-from agent.v2.models import ForkResult, SessionMode, SessionRecord, SessionStatus
+from agent.v2.models import (
+    ForkResult,
+    SessionMode,
+    SessionRecord,
+    SessionStatus,
+    WorktreeDisposition,
+)
 from llm.base import LLMMessage
 
 
@@ -151,6 +157,30 @@ class SessionStore:
                 (parent_id,),
             ).fetchall()
         return [self._row_to_session(row) for row in rows]
+
+    def list_worktree_sessions(
+        self,
+        dispositions: frozenset[WorktreeDisposition],
+    ) -> list[SessionRecord]:
+        """Return typed worktree sessions selected by lifecycle disposition."""
+        if not dispositions:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM sessions
+                WHERE fork_result_json IS NOT NULL
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        records = [self._row_to_session(row) for row in rows]
+        return [
+            record for record in records
+            if (
+                record.fork_result is not None
+                and record.fork_result.worktree_disposition in dispositions
+            )
+        ]
 
     def append_message(self, session_id: str, message: LLMMessage) -> None:
         if self.get_session(session_id) is None:

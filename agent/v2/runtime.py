@@ -16,9 +16,11 @@ from agent.v2.models import (
     AgentDefinition,
     ForkResult,
     ForkStatus,
+    ManagedWorktreeRecord,
     SessionMode,
     SessionStatus,
     WorktreeChange,
+    WorktreeAvailability,
     WorktreeDisposition,
     WorktreeEvidence,
 )
@@ -134,6 +136,41 @@ class SessionRuntime:
         )
         from agent.v2.worktree_service import inspect_worktree
         return inspect_worktree(worktree)
+
+    def list_managed_worktrees(self) -> list[ManagedWorktreeRecord]:
+        """Join persisted retained/preserved sessions with fresh Git facts."""
+        records: list[ManagedWorktreeRecord] = []
+        sessions = self._store.list_worktree_sessions(frozenset({
+            WorktreeDisposition.PRESERVED,
+            WorktreeDisposition.RETAINED,
+        }))
+        for child in sessions:
+            result = child.fork_result
+            if (
+                result is None
+                or result.worktree is None
+                or child.parent_id is None
+            ):
+                continue
+            try:
+                evidence = self.inspect_subagent_worktree(
+                    child.parent_id, child.id,
+                )
+                availability = WorktreeAvailability.AVAILABLE
+                error = ""
+            except ValueError as exc:
+                evidence = result.worktree
+                availability = WorktreeAvailability.UNAVAILABLE
+                error = str(exc)
+            records.append(ManagedWorktreeRecord(
+                child_session_id=child.id,
+                parent_session_id=child.parent_id,
+                disposition=result.worktree_disposition,
+                availability=availability,
+                evidence=evidence,
+                error=error,
+            ))
+        return records
 
     def apply_subagent_worktree(
         self,
