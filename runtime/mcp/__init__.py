@@ -29,7 +29,7 @@ from runtime.mcp.sync_bridge import (
     SyncMCPToolManager,
 )
 from runtime.mcp.tool_adapter import adapt_mcp_tools, deferred_mcp_tool, mcp_tool_to_runtime_tool
-from runtime.mcp.types import MCPServerConfig, MCPServerConnection, MCPToolInfo, slugify_mcp_name
+from runtime.mcp.types import MCPServerConfig, MCPServerConnection, MCPToolInfo, MCPToolProps, slugify_mcp_name
 
 __all__ = [
     "ExecutionPolicy",
@@ -44,6 +44,7 @@ __all__ = [
     "MCPToolExhaustedError",
     "MCPToolTimeoutError",
     "MCPToolInfo",
+    "MCPToolProps",
     "adapt_mcp_tools",
     "deferred_mcp_tool",
     "expand_mcp_env_vars",

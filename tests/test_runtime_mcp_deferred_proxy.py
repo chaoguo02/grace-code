@@ -26,7 +26,7 @@ class TestDeferredMCPTool:
     def test_not_connected_initially(self):
         tool = _make_tool(connect_fn=MagicMock())
 
-        assert tool.should_defer is True
+        assert tool.mcp_props.is_deferred is True
         assert tool.is_connected() is False
 
     def test_first_call_triggers_connect(self):

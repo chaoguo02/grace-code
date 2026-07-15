@@ -11,6 +11,7 @@ from agent.v2.runtime import SessionRuntime
 from agent.v2.session_store import SessionStore
 from llm.base import MockBackend
 from runtime.mcp import MCPServerConfig
+from runtime.mcp.types import MCPToolProps
 from runtime.tool import ToolResult as RuntimeToolResult, ToolUseContext, build_tool
 from tools.base import (
     NoopTool,
@@ -33,8 +34,8 @@ def _runtime_tool(name: str, output: str = "ok", *, is_error: bool = False):
         input_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         call_fn=call_fn,
         description_text=f"{name} description",
+        mcp_props=MCPToolProps(server_name="test"),
     )
-    tool.is_mcp = True
     tool.metadata = {"is_mcp": True}
     return tool
 

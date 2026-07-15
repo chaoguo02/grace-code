@@ -48,3 +48,19 @@ def slugify_mcp_name(value: str) -> str:
     slug = re.sub(r"[^0-9A-Za-z_]+", "_", value.strip().lower())
     slug = re.sub(r"_+", "_", slug).strip("_")
     return slug or "unnamed"
+
+
+@dataclass(frozen=True)
+class MCPToolProps:
+    """Declarative MCP attachment for a runtime ConcreteTool.
+
+    Replaces the previous pattern of dynamically injecting ``is_mcp``,
+    ``always_load``, ``should_defer``, ``server_name`` etc. as bare
+    attributes on the tool object.  The tool owns this payload as a
+    single structured field so consumers don't need hasattr() duck-typing.
+    """
+
+    server_name: str = ""
+    original_tool_name: str = ""
+    is_deferred: bool = False
+    always_load: bool = False

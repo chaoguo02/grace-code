@@ -19,9 +19,15 @@ class MCPRuntimeToolProxy(BaseTool):
 
     def __init__(self, runtime_tool: Any) -> None:
         self._runtime_tool = runtime_tool
-        self.is_mcp = bool(getattr(runtime_tool, "is_mcp", True))
-        self.always_load = bool(getattr(runtime_tool, "always_load", False))
-        self.should_defer = bool(getattr(runtime_tool, "should_defer", False))
+        mcp_props = getattr(runtime_tool, "mcp_props", None)
+        if mcp_props is not None:
+            self.is_mcp = True
+            self.always_load = mcp_props.always_load
+            self.should_defer = mcp_props.is_deferred
+        else:
+            self.is_mcp = bool(getattr(runtime_tool, "is_mcp", True))
+            self.always_load = bool(getattr(runtime_tool, "always_load", False))
+            self.should_defer = bool(getattr(runtime_tool, "should_defer", False))
         self.metadata = dict(getattr(runtime_tool, "metadata", {}) or {})
 
     @property

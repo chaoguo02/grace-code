@@ -8,7 +8,7 @@ import threading
 from typing import Any, Callable
 
 from runtime.mcp.client import MCPToolBridge, MCPToolCallError
-from runtime.mcp.types import MCPToolInfo
+from runtime.mcp.types import MCPToolInfo, MCPToolProps
 from runtime.tool import ToolResult, ToolUseContext, build_tool
 
 
@@ -46,19 +46,14 @@ def mcp_tool_to_runtime_tool(bridge: MCPToolBridge, tool_info: MCPToolInfo, alwa
         is_concurrency_safe=lambda _input: False,
         is_read_only=lambda _input: False,
         is_destructive=lambda _input: False,
+        mcp_props=MCPToolProps(
+            server_name=tool_info.server_name,
+            original_tool_name=tool_info.name,
+            always_load=always_load,
+            is_deferred=not always_load,  # MCP tools are deferred unless always_load
+        ),
     )
-    metadata = dict(tool_info.metadata)
-    metadata.update({
-        "is_mcp": True,
-        "mcp_server": tool_info.server_name,
-        "mcp_tool_name": tool_info.name,
-        "always_load": always_load,
-        "should_defer": False,
-    })
-    tool.is_mcp = True
-    tool.always_load = always_load
-    tool.should_defer = False
-    tool.metadata = metadata
+    tool.metadata = dict(tool_info.metadata)  # keep for backward compat
     return tool
 
 
@@ -119,23 +114,15 @@ def deferred_mcp_tool(
         is_concurrency_safe=lambda _input: False,
         is_read_only=lambda _input: False,
         is_destructive=lambda _input: False,
+        mcp_props=MCPToolProps(
+            server_name=server_name,
+            original_tool_name=original_tool_name or name,
+            is_deferred=True,
+            always_load=False,
+        ),
     )
 
-    tool_metadata = dict(metadata or {})
-    tool_metadata.update({
-        "is_mcp": True,
-        "is_deferred": True,
-        "mcp_server": server_name,
-        "mcp_tool_name": original_tool_name,
-        "always_load": False,
-        "should_defer": True,
-    })
-    tool.is_mcp = True
-    tool.always_load = False
-    tool.should_defer = True
-    tool.metadata = tool_metadata
-    tool.server_name = server_name
-    tool.original_tool_name = original_tool_name
+    tool.metadata = dict(metadata or {})
     tool.ensure_connected = ensure_connected
     tool.execute = lambda arguments: _sync_execute(tool, arguments)
     tool.is_connected = lambda: bool(state["connected"])
