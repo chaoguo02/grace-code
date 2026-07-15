@@ -13,9 +13,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal
+from enum import Enum
+from typing import Any
 
-MemoryType = Literal["user", "feedback", "project", "reference"]
+
+class MemoryType(str, Enum):
+    """Typed memory categories. String-valued for JSON/YAML interop."""
+    USER = "user"
+    FEEDBACK = "feedback"
+    PROJECT = "project"
+    REFERENCE = "reference"
+
+
+class MemoryStatus(str, Enum):
+    """Typed lifecycle status. Code is Truth — status drives injection."""
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
+
+
+class MemoryScope(str, Enum):
+    """Typed visibility scope for memory routing."""
+    SESSION = "session"
+    PROJECT = "project"
+    GLOBAL = "global"
+
 
 # Old 3-type system → new 4-type system (for reading legacy files)
 _OLD_TYPE_MAP: dict[str, str] = {
@@ -23,12 +44,11 @@ _OLD_TYPE_MAP: dict[str, str] = {
     "procedural": "feedback",
     "semantic": "project",
 }
-_VALID_MEMORY_TYPES = frozenset({"user", "feedback", "project", "reference"})
 
 # Injection strategy constants (aligned with Claude Code)
-ALWAYS_INJECT_TYPES = frozenset({"user", "feedback"})
-ON_DEMAND_TYPES = frozenset({"project", "reference"})
-GLOBAL_TYPES = frozenset({"user", "feedback"})
+ALWAYS_INJECT_TYPES: frozenset[MemoryType] = frozenset({MemoryType.USER, MemoryType.FEEDBACK})
+ON_DEMAND_TYPES: frozenset[MemoryType] = frozenset({MemoryType.PROJECT, MemoryType.REFERENCE})
+GLOBAL_TYPES: frozenset[MemoryType] = frozenset({MemoryType.USER, MemoryType.FEEDBACK})
 
 
 @dataclass
@@ -61,14 +81,14 @@ class MemoryMetadata:
     """记忆元数据。
 
     status lifecycle:
-      "active"     — memory is current, inject into context
-      "deprecated" — explicitly invalidated (superseded by code change, manual /deprecate command)
-                     NOT injected into context. Code is Truth.
+      ACTIVE     — memory is current, inject into context
+      DEPRECATED — explicitly invalidated (superseded by code change, manual /deprecate command)
+                   NOT injected into context. Code is Truth.
 
     scope: where the memory applies:
-      "session"  — only this session (cleared on exit)
-      "project"  — this project (shared across sessions)
-      "global"   — all projects (user preferences, universal rules)
+      SESSION  — only this session (cleared on exit)
+      PROJECT  — this project (shared across sessions)
+      GLOBAL   — all projects (user preferences, universal rules)
 
     confidence: 0.0–1.0, how confident we are in this memory.
       - 1.0: confirmed by user explicitly
@@ -79,16 +99,29 @@ class MemoryMetadata:
     ttl_seconds: time-to-live in seconds. None = permanent (default for user/feedback).
       Project/reference memories may have shorter TTLs.
     """
-    type: str = "project"  # "user" | "feedback" | "project" | "reference"
-    status: str = "active"  # "active" | "deprecated"
-    scope: str = "project"  # "session" | "project" | "global"
+    type: MemoryType = MemoryType.PROJECT
+    status: MemoryStatus = MemoryStatus.ACTIVE
+    scope: MemoryScope = MemoryScope.PROJECT
     confidence: float = 0.7  # 0.0–1.0
     ttl_seconds: int | None = None  # None = permanent
     expires_at: str = ""  # computed ISO timestamp when TTL expires
-    # Backward compat — still readable for old files:
-    stale: bool = False
     access_count: int = 0
     validated_at: str = ""
+
+    def __post_init__(self) -> None:
+        """Normalize string values to their enum equivalents for backward compat."""
+        if isinstance(self.type, str) and not isinstance(self.type, MemoryType):
+            object.__setattr__(self, "type", normalize_memory_type(self.type))
+        if isinstance(self.status, str) and not isinstance(self.status, MemoryStatus):
+            try:
+                object.__setattr__(self, "status", MemoryStatus(self.status))
+            except ValueError:
+                object.__setattr__(self, "status", MemoryStatus.ACTIVE)
+        if isinstance(self.scope, str) and not isinstance(self.scope, MemoryScope):
+            try:
+                object.__setattr__(self, "scope", MemoryScope(self.scope))
+            except ValueError:
+                object.__setattr__(self, "scope", MemoryScope.PROJECT)
 
 
 @dataclass
@@ -136,34 +169,36 @@ class MemorySummary:
     updated_at: str = ""
 
 
-def normalize_memory_type(raw_type: str | None) -> str:
+def normalize_memory_type(raw_type: str | None) -> MemoryType:
     """
-    Normalize memory type to the 4-type system (user/feedback/project/reference).
+    Normalize memory type to the 4-type enum.
 
     Handles:
-    - None/empty → "project" (default)
+    - None/empty → MemoryType.PROJECT (default)
     - Old 3-type names (episodic/semantic/procedural) → mapped to new equivalents
     - Valid new type names → pass through
-    - Unknown → "project" (default)
+    - Unknown → MemoryType.PROJECT (default)
     """
     if not raw_type:
-        return "project"
-    if raw_type in _VALID_MEMORY_TYPES:
-        return raw_type
+        return MemoryType.PROJECT
+    try:
+        return MemoryType(raw_type)
+    except ValueError:
+        pass
     mapped = _OLD_TYPE_MAP.get(raw_type)
     if mapped:
-        return mapped
-    return "project"
+        return MemoryType(mapped)
+    return MemoryType.PROJECT
 
 
-def parse_memory_type(frontmatter: dict[str, Any]) -> str:
+def parse_memory_type(frontmatter: dict[str, Any]) -> MemoryType:
     """
     Parse memory type from frontmatter, preferring Claude Code's top-level type.
 
     Compatibility order:
     1. top-level `type`
     2. legacy `metadata.type`
-    3. default `project`
+    3. default MemoryType.PROJECT
     """
     top_level_type = frontmatter.get("type")
     if top_level_type:
@@ -177,7 +212,7 @@ def parse_memory_type(frontmatter: dict[str, Any]) -> str:
     elif isinstance(metadata, str):
         return normalize_memory_type(metadata)
 
-    return "project"
+    return MemoryType.PROJECT
 
 
 def _now() -> str:

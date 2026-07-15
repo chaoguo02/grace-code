@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from memory.models import (
-    Anchor, Memory, MemoryMetadata, MemorySummary,
+    Anchor, Memory, MemoryMetadata, MemoryScope, MemoryStatus, MemorySummary, MemoryType,
     normalize_memory_type, parse_memory_type,
 )
 
@@ -41,12 +41,12 @@ class CachedMetadata:
 
     name: str
     description: str
-    type: str
-    scope: str
+    type: MemoryType
+    scope: MemoryScope
     confidence: float
     ttl_seconds: int | None
     expires_at: str
-    status: str
+    status: MemoryStatus
     access_count: int
     validated_at: str
     updated_at: str
@@ -57,7 +57,7 @@ class CachedMetadata:
         return MemorySummary(
             name=self.name,
             description=self.description,
-            type=self.type,
+            type=self.type.value,
             updated_at=self.updated_at,
         )
 
@@ -172,8 +172,18 @@ class MetadataCache:
         # Resolve status
         raw_status = meta.get("status") or fm.get("status")
         if not raw_status and bool(meta.get("stale", False)):
-            raw_status = "deprecated"
-        status = str(raw_status) if raw_status else "active"
+            raw_status = MemoryStatus.DEPRECATED.value
+        try:
+            status = MemoryStatus(str(raw_status)) if raw_status else MemoryStatus.ACTIVE
+        except ValueError:
+            status = MemoryStatus.ACTIVE
+
+        # Resolve scope
+        scope_raw = str(meta.get("scope") or fm.get("scope") or "project")
+        try:
+            scope = MemoryScope(scope_raw)
+        except ValueError:
+            scope = MemoryScope.PROJECT
 
         # Parse anchors
         anchors = []
@@ -191,7 +201,7 @@ class MetadataCache:
             name=name,
             description=str(fm.get("description", "")),
             type=parse_memory_type(fm),
-            scope=str(meta.get("scope") or fm.get("scope") or "project"),
+            scope=scope,
             confidence=float(meta.get("confidence") or fm.get("confidence") or 0.7),
             ttl_seconds=_parse_optional_int(meta.get("ttl_seconds") or fm.get("ttl_seconds")),
             expires_at=str(meta.get("expires_at") or fm.get("expires_at") or ""),
@@ -220,11 +230,15 @@ class MetadataCache:
 
         Sorted by confidence DESC, then access_count DESC.
         """
+        try:
+            target_scope = MemoryScope(scope)
+        except ValueError:
+            target_scope = MemoryScope.PROJECT
         results: list[tuple[float, CachedMetadata]] = []
         for entry in self._entries.values():
-            if entry.status == "deprecated":
+            if entry.status is MemoryStatus.DEPRECATED:
                 continue
-            if entry.scope != scope:
+            if entry.scope is not target_scope:
                 continue
             if entry.confidence < min_confidence:
                 continue

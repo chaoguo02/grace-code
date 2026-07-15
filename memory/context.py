@@ -18,6 +18,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from memory.models import MemoryStatus, MemoryType
 from memory.store import MemoryStore
 
 if TYPE_CHECKING:
@@ -164,7 +165,7 @@ class MemoryContext:
             try:
                 mem = self._store.read_memory(s.name)
                 # P1: skip deprecated memories — Code is Truth
-                if mem and mem.content.strip() and mem.metadata.status == "active":
+                if mem and mem.content.strip() and mem.metadata.status is MemoryStatus.ACTIVE:
                     lines.append(f"### {s.name} ({s.type})")
                     lines.append(mem.content.strip())
                     lines.append("")
@@ -216,7 +217,7 @@ class MemoryContext:
         for m in all_mems:
             if m.name in seen:
                 continue
-            if getattr(m.metadata, "status", "active") != "active":
+            if getattr(m.metadata, "status", MemoryStatus.ACTIVE) is not MemoryStatus.ACTIVE:
                 continue
             if m.name in self._already_surfaced:
                 continue
@@ -272,7 +273,7 @@ class MemoryContext:
                 p = Path(anchor.path)
                 if not p.exists():
                     # File deleted — memory is orphaned
-                    memory.metadata.status = "deprecated"
+                    memory.metadata.status = MemoryStatus.DEPRECATED
                     try:
                         self._store.write_memory(memory)
                     except Exception:
@@ -462,10 +463,10 @@ class MemoryContext:
                 for f in normalized_files:
                     if f == anchor_path or f.startswith(anchor_path + "/"):
                         # ── P1: deprecated memories are NOT injected ──
-                        if mem.metadata.status != "active":
+                        if mem.metadata.status is not MemoryStatus.ACTIVE:
                             logger.debug(
                                 "Skipping %s feedback memory '%s'",
-                                mem.metadata.status, mem.name,
+                                mem.metadata.status.value, mem.name,
                             )
                             break
 
@@ -486,7 +487,7 @@ class MemoryContext:
                                             "content hash mismatch for %s",
                                             mem.name, anchor_path,
                                         )
-                                        mem.metadata.status = "deprecated"
+                                        mem.metadata.status = MemoryStatus.DEPRECATED
                                         self._store.write_memory(mem)
                                         break
                             except (OSError, ImportError):

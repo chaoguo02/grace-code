@@ -39,7 +39,7 @@ from typing import Any
 
 import yaml
 
-from memory.models import Anchor, Memory, MemoryMetadata, MemorySummary, normalize_memory_type, parse_memory_type
+from memory.models import Anchor, Memory, MemoryMetadata, MemoryScope, MemoryStatus, MemorySummary, MemoryType, normalize_memory_type, parse_memory_type
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ _MAX_INDEX_LINES = 200  # MEMORY.md 默认最大行数
 _MAX_INDEX_BYTES = 25_600  # MEMORY.md 最大字节数 (25KB)
 
 # user 和 feedback 类型默认存储到全局（跨项目共享）
-_GLOBAL_MEMORY_TYPES = frozenset({"user", "feedback"})
+_GLOBAL_MEMORY_TYPES: frozenset[MemoryType] = frozenset({MemoryType.USER, MemoryType.FEEDBACK})
 
 # ---------------------------------------------------------------------------
 # YAML frontmatter 解析
@@ -91,19 +91,19 @@ def _build_frontmatter(memory: Memory) -> str:
     fm: dict[str, Any] = {
         "name": memory.name,
         "description": memory.description,
-        "type": memory.metadata.type,
+        "type": memory.metadata.type.value,  # use .value for clean YAML serialization
         "updated_at": memory.updated_at,
     }
     meta: dict[str, Any] = {}
-    if memory.metadata.status != "active":
-        meta["status"] = memory.metadata.status
+    if memory.metadata.status is not MemoryStatus.ACTIVE:
+        meta["status"] = memory.metadata.status.value
     if memory.metadata.access_count > 0:
         meta["access_count"] = memory.metadata.access_count
     if memory.metadata.validated_at:
         meta["validated_at"] = memory.metadata.validated_at
     # Phase 4: persist scope, confidence, ttl
-    if memory.metadata.scope and memory.metadata.scope != "project":
-        meta["scope"] = memory.metadata.scope
+    if memory.metadata.scope is not MemoryScope.PROJECT:
+        meta["scope"] = memory.metadata.scope.value
     if memory.metadata.confidence != 0.7:  # only persist non-default
         meta["confidence"] = memory.metadata.confidence
     if memory.metadata.ttl_seconds is not None:
@@ -132,15 +132,21 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def _needs_type_migration(frontmatter: dict[str, Any]) -> bool:
-    from memory.models import _OLD_TYPE_MAP, _VALID_MEMORY_TYPES
+    from memory.models import MemoryType
 
     top_level_type = frontmatter.get("type")
     metadata = frontmatter.get("metadata")
     metadata_has_type = isinstance(metadata, dict) and "type" in metadata
     if metadata_has_type:
         return True
-    if top_level_type and top_level_type not in _VALID_MEMORY_TYPES:
-        return top_level_type in _OLD_TYPE_MAP
+    if top_level_type:
+        try:
+            MemoryType(top_level_type)
+            return False  # valid current type
+        except ValueError:
+            # Check old type names
+            from memory.models import _OLD_TYPE_MAP
+            return top_level_type in _OLD_TYPE_MAP
     return not top_level_type
 
 
@@ -279,14 +285,25 @@ class MemoryStore:
         # ── P1: status field with backward compat for stale boolean ──
         raw_status = meta.get("status") or fm.get("status")
         if not raw_status and bool(meta.get("stale", False)):
-            raw_status = "deprecated"  # migrate stale=True → status=deprecated
+            raw_status = MemoryStatus.DEPRECATED.value  # migrate stale=True → status=deprecated
 
         # Phase 4: read scope, confidence, ttl from frontmatter
-        _scope = str(meta.get("scope") or fm.get("scope") or "project")
+        _scope_raw = str(meta.get("scope") or fm.get("scope") or "project")
         _confidence = float(meta.get("confidence") or fm.get("confidence") or 0.7)
         _ttl = meta.get("ttl_seconds") or fm.get("ttl_seconds")
         _ttl = int(_ttl) if _ttl is not None else None
         _expires = str(meta.get("expires_at") or fm.get("expires_at") or "")
+
+        # Parse scope string → MemoryScope enum
+        try:
+            _scope = MemoryScope(_scope_raw)
+        except ValueError:
+            _scope = MemoryScope.PROJECT
+        # Parse status string → MemoryStatus enum
+        try:
+            _status = MemoryStatus(str(raw_status)) if raw_status else MemoryStatus.ACTIVE
+        except ValueError:
+            _status = MemoryStatus.ACTIVE
 
         memory = Memory(
             name=fm.get("name", name),
@@ -294,7 +311,7 @@ class MemoryStore:
             content=body,
             metadata=MemoryMetadata(
                 type=parse_memory_type(fm),
-                status=str(raw_status) if raw_status else "active",
+                status=_status,
                 scope=_scope,
                 confidence=_confidence,
                 ttl_seconds=_ttl,
@@ -455,9 +472,9 @@ class MemoryStore:
 
         for name in candidates:
             memory = self.read_memory(name)
-            if memory is None or memory.metadata.stale:
+            if memory is None or memory.metadata.status is MemoryStatus.DEPRECATED:
                 continue
-            memory.metadata.status = "deprecated"
+            memory.metadata.status = MemoryStatus.DEPRECATED
             self.write_memory(memory)
             count += 1
         return count
@@ -475,7 +492,7 @@ class MemoryStore:
         memory = self.read_memory(name)
         if memory is None:
             return False
-        memory.metadata.status = "deprecated"
+        memory.metadata.status = MemoryStatus.DEPRECATED
         if reason:
             memory.content = (
                 f"[DEPRECATED: {reason}]\n\n{memory.content}"
@@ -553,7 +570,7 @@ class MemoryStore:
         if memory is None:
             return False
         from memory.models import _now
-        memory.metadata.status = "active"
+        memory.metadata.status = MemoryStatus.ACTIVE
         memory.metadata.validated_at = _now()
         return self.write_memory(memory)
 
@@ -582,7 +599,7 @@ class MemoryStore:
             memory = self.read_memory(name)
             if memory is None:
                 continue
-            if memory.metadata.type != "user":
+            if memory.metadata.type is not MemoryType.USER:
                 continue
             if not memory.updated_at:
                 continue
@@ -656,16 +673,19 @@ class MemoryStore:
         if cache is not None and cache.is_built:
             return cache.list_by_scope(scope, min_confidence)
         # Fallback: old file-I/O path
+        try:
+            target_scope = MemoryScope(scope)
+        except ValueError:
+            target_scope = MemoryScope.PROJECT
         summaries = self.list_memories()
         results = []
         for summary in summaries:
             memory = self.read_memory(summary.name)
             if memory is None:
                 continue
-            if memory.metadata.status == "deprecated":
+            if memory.metadata.status is MemoryStatus.DEPRECATED:
                 continue
-            mem_scope = getattr(memory.metadata, "scope", "project")
-            if mem_scope != scope:
+            if memory.metadata.scope is not target_scope:
                 continue
             mem_confidence = getattr(memory.metadata, "confidence", 0.5)
             if mem_confidence < min_confidence:
@@ -702,13 +722,13 @@ class MemoryStore:
         memory = candidate.to_memory()
 
         # 类型降级：feedback 无 file/symbol anchor → project
-        if memory.metadata.type == "feedback":
+        if memory.metadata.type is MemoryType.FEEDBACK:
             has_valid_anchor = any(
                 a.kind in ("file", "symbol") and (a.path or a.name)
                 for a in memory.anchors
             )
             if not has_valid_anchor:
-                memory.metadata.type = "project"
+                memory.metadata.type = MemoryType.PROJECT
 
         # 检查同名记忆
         existing = self.read_memory(candidate.name)

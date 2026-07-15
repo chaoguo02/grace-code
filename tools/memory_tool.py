@@ -27,12 +27,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # 可选类型字面量，帮助 LLM 决定用什么类型
-_TYPE_DESCRIPTIONS = {
+_TYPE_DESCRIPTIONS: dict[str, str] = {
     "user": "User role, goals, preferences, expertise level — private, always loaded",
     "feedback": "User corrections, confirmed approaches, rules to follow — private, always loaded",
     "project": "Ongoing work, decisions, architecture, build commands — project-scoped, on-demand",
     "reference": "Pointers to external resources (docs, dashboards, issue trackers) — project-scoped, on-demand",
 }
+_VALID_TYPES: frozenset[str] = frozenset(_TYPE_DESCRIPTIONS.keys())
 
 
 MEMORY_LIST_DEFAULT_LIMIT = 20
@@ -192,7 +193,7 @@ class MemoryWriteTool(BaseTool):
     def execute(self, params: dict[str, Any]) -> ToolResult:
         name: str = (params.get("name") or "").strip()
         description: str = (params.get("description") or "").strip()
-        mem_type: str = (params.get("type") or "semantic").strip()
+        mem_type: str = (params.get("type") or "project").strip()
         content: str = (params.get("content") or "").strip()
         raw_anchors = params.get("anchors") or []
 
@@ -202,8 +203,8 @@ class MemoryWriteTool(BaseTool):
             return ToolResult(success=False, output="", error="description is required")
         if not content:
             return ToolResult(success=False, output="", error="content is required")
-        if mem_type not in _TYPE_DESCRIPTIONS:
-            valid = ", ".join(_TYPE_DESCRIPTIONS.keys())
+        if mem_type not in _VALID_TYPES:
+            valid = ", ".join(sorted(_VALID_TYPES))
             return ToolResult(
                 success=False, output="",
                 error=f"Invalid type '{mem_type}'. Valid types: {valid}",
@@ -227,12 +228,17 @@ class MemoryWriteTool(BaseTool):
                 value=(raw_anchor.get("value") or None),
             ))
 
-        from memory.models import _now
+        from memory.models import MemoryType, _now
+        try:
+            mem_type_enum = MemoryType(mem_type)
+        except ValueError:
+            mem_type_enum = MemoryType.PROJECT
+
         memory = Memory(
             name=name,
             description=description,
             content=content,
-            metadata=MemoryMetadata(type=mem_type, stale=False, validated_at=_now()),
+            metadata=MemoryMetadata(type=mem_type_enum, validated_at=_now()),
             anchors=anchors,
         )
 
