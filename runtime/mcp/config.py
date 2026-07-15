@@ -10,10 +10,20 @@ from pathlib import Path
 from typing import Any
 
 from runtime.mcp.allowlist import MCPServerPolicy, is_mcp_server_allowed
-from runtime.mcp.types import MCPServerConfig
+from runtime.mcp.types import (
+    DEFAULT_IDLE_TIMEOUT_HTTP,
+    DEFAULT_IDLE_TIMEOUT_STDIO,
+    MCPServerConfig,
+)
 
-DEFAULT_GLOBAL_MCP_CONFIG = Path.home() / ".forge-agent" / "mcp.json"
+# ── CC-aligned config paths ──
+# Project-level: .mcp.json in the project root (standard across tools)
 DEFAULT_PROJECT_MCP_CONFIG = Path(".mcp.json")
+# User-level: ~/.forge-agent.json mirrors the ~/.claude.json convention
+DEFAULT_USER_MCP_CONFIG = Path.home() / ".forge-agent.json"
+# Legacy path: pre-alignment location, checked as fallback only
+_LEGACY_USER_MCP_CONFIG = Path.home() / ".forge-agent" / "mcp.json"
+
 _ENV_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
 
 
@@ -40,12 +50,32 @@ def load_mcp_config(
     global_config_path: str | Path | None = None,
     project_config_path: str | Path | None = None,
 ) -> MCPConfigLoadResult:
-    """Load global + project MCP config, with project overriding global by name."""
+    """Load global + project MCP config, with project overriding global by name.
+
+    CC-aligned config resolution order:
+      1. Explicit global_config_path (CLI override)
+      2. ~/.forge-agent.json (new CC-aligned user config)
+      3. ~/.forge-agent/mcp.json (legacy fallback, for existing users)
+      4. <project>/.mcp.json (CC-aligned project config)
+    """
     project_root = Path(project_dir) if project_dir is not None else Path.cwd()
-    paths = [
-        Path(global_config_path) if global_config_path is not None else DEFAULT_GLOBAL_MCP_CONFIG,
-        Path(project_config_path) if project_config_path is not None else project_root / DEFAULT_PROJECT_MCP_CONFIG,
-    ]
+
+    # Resolve user-level config with legacy fallback
+    if global_config_path is not None:
+        user_path = Path(global_config_path)
+    elif DEFAULT_USER_MCP_CONFIG.exists():
+        user_path = DEFAULT_USER_MCP_CONFIG
+    elif _LEGACY_USER_MCP_CONFIG.exists():
+        user_path = _LEGACY_USER_MCP_CONFIG
+    else:
+        user_path = DEFAULT_USER_MCP_CONFIG  # non-existent, will be skipped
+
+    project_path = (
+        Path(project_config_path)
+        if project_config_path is not None
+        else project_root / DEFAULT_PROJECT_MCP_CONFIG
+    )
+    paths = [user_path, project_path]
 
     merged_servers: dict[str, MCPServerConfig] = {}
     allowed: list[str] = []
@@ -150,6 +180,18 @@ def _parse_server_config(name: str, raw: Any, *, base_dir: Path) -> MCPServerCon
     except (TypeError, ValueError):
         timeout_seconds = 60.0
 
+    # Idle timeout: per-transport defaults when not explicitly configured
+    idle_timeout_raw = raw.get("idle_timeout_seconds")
+    if idle_timeout_raw is not None:
+        try:
+            idle_timeout_seconds = float(idle_timeout_raw)
+        except (TypeError, ValueError):
+            idle_timeout_seconds = None
+    elif server_type in ("http", "sse", "ws"):
+        idle_timeout_seconds = DEFAULT_IDLE_TIMEOUT_HTTP
+    else:
+        idle_timeout_seconds = DEFAULT_IDLE_TIMEOUT_STDIO
+
     resolved_cwd = cwd
     if resolved_cwd and not Path(resolved_cwd).is_absolute():
         resolved_cwd = str(base_dir / resolved_cwd)
@@ -161,6 +203,7 @@ def _parse_server_config(name: str, raw: Any, *, base_dir: Path) -> MCPServerCon
         env={str(key): str(value) for key, value in env.items()} if env else None,
         cwd=resolved_cwd,
         timeout_seconds=timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
     )
 
 

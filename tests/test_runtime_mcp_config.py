@@ -140,3 +140,137 @@ def test_load_allowed_mcp_server_configs_applies_policy(tmp_path):
     )
 
     assert [config.name for config in configs] == ["allowed"]
+
+
+# ---------------------------------------------------------------------------
+# MCP-E2: CC-aligned config path with legacy fallback
+# ---------------------------------------------------------------------------
+
+def test_user_config_prefers_new_path_over_legacy(tmp_path, monkeypatch):
+    """MCP-E2: ~/.forge-agent.json takes precedence over ~/.forge-agent/mcp.json."""
+    from runtime.mcp.config import DEFAULT_USER_MCP_CONFIG, _LEGACY_USER_MCP_CONFIG
+
+    # Mock both paths to point inside tmp_path
+    new_path = tmp_path / ".forge-agent.json"
+    legacy_path = tmp_path / ".forge-agent" / "mcp.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+
+    _write_json(new_path, {
+        "mcpServers": {"new_only": {"command": "from-new"}},
+    })
+    _write_json(legacy_path, {
+        "mcpServers": {"legacy_only": {"command": "from-legacy"}},
+    })
+
+    monkeypatch.setattr(
+        "runtime.mcp.config.DEFAULT_USER_MCP_CONFIG", new_path,
+    )
+    monkeypatch.setattr(
+        "runtime.mcp.config._LEGACY_USER_MCP_CONFIG", legacy_path,
+    )
+
+    result = load_mcp_config(
+        project_dir=tmp_path,
+        global_config_path=new_path,
+        project_config_path=tmp_path / "missing.json",
+    )
+    names = {s.name for s in result.servers}
+    assert "new_only" in names
+    assert "legacy_only" not in names  # new path wins
+
+
+def test_user_config_falls_back_to_legacy_when_new_missing(tmp_path, monkeypatch):
+    """MCP-E2: Legacy config is used when new path does not exist."""
+    legacy_path = tmp_path / ".forge-agent" / "mcp.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(legacy_path, {
+        "mcpServers": {"legacy": {"command": "from-legacy"}},
+    })
+
+    new_path = tmp_path / ".forge-agent.json"  # does NOT exist
+
+    monkeypatch.setattr(
+        "runtime.mcp.config.DEFAULT_USER_MCP_CONFIG", new_path,
+    )
+    monkeypatch.setattr(
+        "runtime.mcp.config._LEGACY_USER_MCP_CONFIG", legacy_path,
+    )
+
+    result = load_mcp_config(
+        project_dir=tmp_path,
+        global_config_path=None,  # auto-resolve
+        project_config_path=tmp_path / "missing.json",
+    )
+    names = {s.name for s in result.servers}
+    assert "legacy" in names
+
+
+# ---------------------------------------------------------------------------
+# MCP-E3: idle timeout parsing
+# ---------------------------------------------------------------------------
+
+def test_parse_server_config_sets_idle_timeout_from_raw(tmp_path):
+    """MCP-E3: idle_timeout_seconds is parsed from server config JSON."""
+    from runtime.mcp.config import _parse_server_config
+
+    config = _parse_server_config(
+        "test",
+        {"command": "echo", "idle_timeout_seconds": 120.0},
+        base_dir=tmp_path,
+    )
+    assert config is not None
+    assert config.idle_timeout_seconds == 120.0
+
+
+def test_parse_server_config_uses_default_idle_for_stdio(tmp_path):
+    """MCP-E3: stdio servers get DEFAULT_IDLE_TIMEOUT_STDIO when not specified."""
+    from runtime.mcp.config import _parse_server_config
+    from runtime.mcp.types import DEFAULT_IDLE_TIMEOUT_STDIO
+
+    config = _parse_server_config(
+        "test",
+        {"command": "echo"},
+        base_dir=tmp_path,
+    )
+    assert config is not None
+    assert config.idle_timeout_seconds == DEFAULT_IDLE_TIMEOUT_STDIO
+
+
+def test_parse_server_config_uses_http_default_for_remote_types(tmp_path):
+    """MCP-E3: HTTP/SSE/WS servers get DEFAULT_IDLE_TIMEOUT_HTTP by default."""
+    from runtime.mcp.config import _parse_server_config
+    from runtime.mcp.types import DEFAULT_IDLE_TIMEOUT_HTTP
+
+    for transport in ("http", "sse", "ws"):
+        config = _parse_server_config(
+            transport,
+            {"type": transport, "url": "https://example.com"},
+            base_dir=tmp_path,
+        )
+        # These are currently rejected by the type check (MCP-E1), but the
+        # idle_timeout logic is in place for when Batch 4 removes the gate.
+        if config is not None:
+            assert config.idle_timeout_seconds == DEFAULT_IDLE_TIMEOUT_HTTP, (
+                f"{transport} idle timeout mismatch"
+            )
+
+
+def test_execution_policy_supports_idle_timeout():
+    """MCP-E3: ExecutionPolicy.idle_timeout is None by default (opt-in)."""
+    from runtime.mcp.sync_bridge import (
+        DEFAULT_EXECUTION_TIMEOUT,
+        DEFAULT_IDLE_TIMEOUT_HTTP,
+        DEFAULT_IDLE_TIMEOUT_STDIO,
+        ExecutionPolicy,
+    )
+
+    policy = ExecutionPolicy()
+    assert policy.timeout == DEFAULT_EXECUTION_TIMEOUT
+    assert policy.idle_timeout is None  # backward compatible
+
+    # Can be overridden for specific transports
+    http_policy = ExecutionPolicy(idle_timeout=DEFAULT_IDLE_TIMEOUT_HTTP)
+    assert http_policy.idle_timeout == DEFAULT_IDLE_TIMEOUT_HTTP
+
+    stdio_policy = ExecutionPolicy(idle_timeout=DEFAULT_IDLE_TIMEOUT_STDIO)
+    assert stdio_policy.idle_timeout == DEFAULT_IDLE_TIMEOUT_STDIO

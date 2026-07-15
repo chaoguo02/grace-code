@@ -7,9 +7,21 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# ── Per-transport idle timeout defaults (Claude Code alignment) ──
+# stdio servers are long-lived processes; HTTP/SSE connections should be
+# monitored more aggressively to detect hung remote servers.
+DEFAULT_IDLE_TIMEOUT_STDIO = 1800.0   # 30 min
+DEFAULT_IDLE_TIMEOUT_HTTP = 300.0     #  5 min
+
+
 @dataclass(frozen=True)
 class MCPServerConfig:
-    """Configuration for one stdio MCP server."""
+    """Configuration for one MCP server.
+
+    Supports stdio, HTTP, SSE, and WebSocket transports.
+    Transport-agnostic fields are always present; transport-specific
+    fields (command, url, etc.) are validated by _parse_server_config().
+    """
 
     name: str
     command: str
@@ -17,6 +29,7 @@ class MCPServerConfig:
     env: dict[str, str] | None = None
     cwd: str | None = None
     timeout_seconds: float = 60.0
+    idle_timeout_seconds: float | None = None  # None = use transport default
 
 
 @dataclass(frozen=True)

@@ -18,11 +18,26 @@ from runtime.mcp.types import MCPServerConfig
 logger = logging.getLogger(__name__)
 
 
+# ── Per-transport defaults (Claude Code alignment) ──
+# These are used when the server config does not specify explicit values.
+DEFAULT_EXECUTION_TIMEOUT = 30.0       # total timeout per attempt
+DEFAULT_IDLE_TIMEOUT_STDIO = 1800.0    # 30 min idle for local processes
+DEFAULT_IDLE_TIMEOUT_HTTP = 300.0      #  5 min idle for remote servers
+
+
 @dataclass(frozen=True)
 class ExecutionPolicy:
-    """Synchronous MCP tool execution policy."""
+    """Synchronous MCP tool execution policy.
 
-    timeout: float = 30.0
+    timeout:     total wall-clock timeout per attempt (including retries).
+    idle_timeout: max idle time waiting for a single future result.
+                  None means no idle check (backward compatible).
+                  For stdio servers this should be very long (30 min);
+                  for HTTP servers this should be shorter (5 min).
+    """
+
+    timeout: float = DEFAULT_EXECUTION_TIMEOUT
+    idle_timeout: float | None = None
     max_retries: int = 2
     backoff_base: float = 0.5
     backoff_factor: float = 2.0
@@ -133,7 +148,12 @@ class SyncMCPToolManager:
                 time.sleep(backoff)
 
             try:
-                return self._execute_once(runtime_tool_name, arguments, timeout=active_policy.timeout, attempt=attempt)
+                return self._execute_once(
+                    runtime_tool_name, arguments,
+                    timeout=active_policy.timeout,
+                    idle_timeout=active_policy.idle_timeout,
+                    attempt=attempt,
+                )
             except active_policy.retryable_exceptions as exc:
                 last_error = exc
                 logger.warning(
@@ -183,6 +203,7 @@ class SyncMCPToolManager:
         arguments: dict[str, Any],
         *,
         timeout: float,
+        idle_timeout: float | None = None,
         attempt: int = 0,
     ) -> MCPCallResult:
         parsed = self._tool_map.get(runtime_tool_name)
@@ -196,14 +217,17 @@ class SyncMCPToolManager:
         if bridge is None or not bridge.is_connected:
             raise ConnectionError(f"MCP server '{server_name}' is not connected")
 
+        # Use idle_timeout from server config if available, else fall back to total timeout
+        effective_timeout = idle_timeout if idle_timeout is not None else timeout
+
         future = asyncio.run_coroutine_threadsafe(bridge.call_tool(tool_name, arguments), self._loop)
         try:
-            return future.result(timeout=timeout)
+            return future.result(timeout=effective_timeout)
         except (FutureTimeoutError, asyncio.TimeoutError) as exc:
             future.cancel()
-            raise MCPToolTimeoutError(runtime_tool_name, timeout, attempt) from exc
+            raise MCPToolTimeoutError(runtime_tool_name, effective_timeout, attempt) from exc
         except asyncio.CancelledError as exc:
-            raise MCPToolTimeoutError(runtime_tool_name, timeout, attempt) from exc
+            raise MCPToolTimeoutError(runtime_tool_name, effective_timeout, attempt) from exc
 
     def _parse_namespaced_name(self, namespaced_name: str) -> tuple[str, str] | None:
         parts = namespaced_name.split("__", 2)
