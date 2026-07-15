@@ -103,15 +103,15 @@ class TestSubagentRepoInheritance:
     """Subagent MUST work in the parent session's repo context."""
 
     def test_agent_definition_isolation_field(self):
-        """isolation field distinguishes fork vs worktree vs primary."""
+        """isolation field distinguishes shared vs worktree vs primary."""
         from agent.v2.models import AgentIsolation
 
         primary = AgentDefinition(name="build", description="primary", intent=TaskIntent.EDIT, isolation=AgentIsolation.NONE)
-        fork_agent = AgentDefinition(name="explore", description="fork", intent=TaskIntent.ANALYSIS, isolation=AgentIsolation.FORK)
+        shared_agent = AgentDefinition(name="explore", description="shared", intent=TaskIntent.ANALYSIS, isolation=AgentIsolation.SHARED)
         worktree_agent = AgentDefinition(name="general", description="worktree", intent=TaskIntent.EDIT, isolation=AgentIsolation.WORKTREE)
 
         assert primary.mode == "primary"
-        assert fork_agent.mode == "subagent"
+        assert shared_agent.mode == "subagent"
         assert worktree_agent.mode == "subagent"
 
     def test_repo_path_flow_in_fork_result(self):

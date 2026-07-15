@@ -17,7 +17,7 @@ class SessionMode(str, Enum):
 
 class AgentIsolation(str, Enum):
     NONE = "none"
-    FORK = "fork"
+    SHARED = "shared"
     WORKTREE = "worktree"
 
 
@@ -207,7 +207,7 @@ class AgentDefinition:
     )
     delegation_scope: DelegationScope | None = None
     model: AgentModel = AgentModel.INHERIT
-    isolation: AgentIsolation = AgentIsolation.FORK
+    isolation: AgentIsolation = AgentIsolation.SHARED
     visibility: AgentVisibility = AgentVisibility.PUBLIC
     max_turns: int = 50
     max_tokens: int | None = None
@@ -486,7 +486,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         "Use for: finding files, searching code, analyzing code for bugs, "
         "answering questions about the codebase. Uses file_read/search_text — NO shell.",
         intent=TaskIntent.ANALYSIS,
-        isolation=AgentIsolation.FORK,
+        isolation=AgentIsolation.SHARED,
         visibility=AgentVisibility.PUBLIC,
         tools=_DEFAULT_READONLY_TOOLS,
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task"}),
@@ -506,7 +506,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         "including shell. Use ONLY when Write, Edit, or Bash is required. "
         "For read-only analysis, code search, or bug-finding, use 'explore' instead.",
         intent=TaskIntent.EDIT,
-        isolation=AgentIsolation.FORK,
+        isolation=AgentIsolation.SHARED,
         visibility=AgentVisibility.PUBLIC,
         tools=_DEFAULT_GENERAL_TOOLS,
         disallowed_tools=frozenset({"Task"}),
@@ -524,7 +524,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         name="code-reviewer",
         description="Reviews code for correctness and quality.",
         intent=TaskIntent.ANALYSIS,
-        isolation=AgentIsolation.FORK,
+        isolation=AgentIsolation.SHARED,
         visibility=AgentVisibility.HIDDEN,
         tools=_DEFAULT_READONLY_TOOLS,
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task", "WebFetch", "WebSearch"}),

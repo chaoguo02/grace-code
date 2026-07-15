@@ -317,11 +317,11 @@ class TestWorktreeIsolation:
         assert agent.isolation is AgentIsolation.WORKTREE
         assert agent.mode == "subagent"  # worktree → subagent mode
 
-    def test_fork_isolation_default(self):
-        """Default isolation is "fork" — no filesystem isolation."""
+    def test_shared_workspace_is_default(self):
+        """Default workspace is shared while the child context stays fresh."""
         agent = AgentDefinition(
-            name="test-fork-agent",
-            description="Default fork agent",
+            name="test-shared-agent",
+            description="Default shared-workspace agent",
             intent=TaskIntent.EDIT,
         )
-        assert agent.isolation is AgentIsolation.FORK
+        assert agent.isolation is AgentIsolation.SHARED

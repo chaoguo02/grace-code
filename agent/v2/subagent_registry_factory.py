@@ -1,4 +1,4 @@
-"""Subagent registry factory — builds restricted tool registries for forks.
+"""Subagent registry factory — builds restricted child tool registries.
 
 Extracted from fork_subagent().
 Constitution: subagent.py should "run subagents", not assemble tool registries.
@@ -26,7 +26,7 @@ def build_restricted_registry(
     repo_path: str,
     parent_policy: "PhasePolicy",
 ) -> tuple["ToolRegistry", Any]:
-    """Build a permission-scoped tool registry for a subagent fork.
+    """Build a permission-scoped tool registry for a child subagent.
 
     Resolves both allowed and disallowed tools through alias resolution.
     Injects SubmitFindingsTool for structured output. Wraps in policy layer.
@@ -57,7 +57,7 @@ def build_restricted_registry(
     )
     if disallowed:
         logger.debug(
-            "Fork subagent '%s': allowed=%d tools, disallowed=%d (resolved: %s), final=%d",
+            "Subagent '%s': allowed=%d tools, disallowed=%d (resolved: %s), final=%d",
             definition.name, len(allowed_tools), len(disallowed),
             sorted(disallowed), len(final_tools),
         )

@@ -1,4 +1,4 @@
-"""AgentTool — spawn a fork subagent to handle a delegated subtask.
+"""AgentTool — dispatch a fresh-context child for a delegated subtask.
 
 Architecture: three-layer defense for subagent output quality.
 
@@ -139,9 +139,9 @@ class AgentTool(BaseTool):
         effects=frozenset({ToolEffect.DELEGATE_WRITE}),
         roles=frozenset({ToolRole.DELEGATE}),
     )
-    """Dispatch a fork subagent. Claude Code `task` tool equivalent.
+    """Dispatch a fresh-context child subagent.
 
-    The subagent runs in a fresh context (Fork model):
+    The subagent runs in a fresh context with an explicitly declared workspace mode:
     - No parent conversation history.
     - Tools restricted to the agent definition's allowlist.
     - Its final message is the return value.
@@ -200,7 +200,7 @@ class AgentTool(BaseTool):
         definition = self._runtime.agent_registry.get(subagent_type)
         if (
             definition.intent is TaskIntent.ANALYSIS
-            and definition.isolation is AgentIsolation.FORK
+            and definition.isolation is AgentIsolation.SHARED
         ):
             return ToolConcurrency.PARALLEL_SAFE
         return ToolConcurrency.SERIAL
@@ -384,7 +384,7 @@ class AgentTool(BaseTool):
                     f"{output}"
                 )
         except Exception as exc:
-            logger.exception("Fork subagent '%s' crashed", subagent_type)
+            logger.exception("Subagent '%s' crashed", subagent_type)
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_subagent_failure()
             return ToolResult(

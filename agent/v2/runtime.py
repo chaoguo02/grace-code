@@ -1,4 +1,4 @@
-"""V2 Session Runtime — fork-based multi-agent orchestration."""
+"""V2 Session Runtime — fresh-context child-session orchestration."""
 
 from __future__ import annotations
 
@@ -50,10 +50,10 @@ if TYPE_CHECKING:
 
 
 class SessionRuntime:
-    """V2 session runtime with fork-based subagent orchestration.
+    """V2 session runtime with fresh-context subagent orchestration.
 
     Coordinator agents (build, plan) carry the `task` tool and can
-    dispatch fork subagents.  Each fork runs in a fresh context with
+    dispatch child subagents. Each child runs in a fresh context with
     tools restricted to its agent definition allow-list.
     """
 
@@ -680,7 +680,7 @@ class SessionRuntime:
                 session_id=session_id,
             ))
 
-    # ── Fork subagent ──
+    # ── Child subagent ──
 
     def fork_session(
         self,
@@ -695,7 +695,7 @@ class SessionRuntime:
         parent_policy: "PhasePolicy",
         origin: DelegationOrigin = DelegationOrigin.TOOL,
     ) -> ForkResult:
-        """Dispatch a fork subagent.
+        """Dispatch a fresh-context child subagent.
 
         The subagent runs in a fresh context — no parent history inherited.
         Tools are restricted to the agent definition's allow-list.

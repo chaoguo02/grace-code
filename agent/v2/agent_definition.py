@@ -117,7 +117,13 @@ def _parse_definition(path: Path) -> AgentDefinition:
         intent = TaskIntent(intent_raw)
     except ValueError as exc:
         raise _invalid(path, f"field 'intent' has invalid value {intent_raw!r}") from exc
-    isolation_raw = frontmatter.get("isolation", AgentIsolation.FORK.value)
+    isolation_raw = frontmatter.get("isolation", AgentIsolation.SHARED.value)
+    if isolation_raw == "fork":
+        raise _invalid(
+            path,
+            "field 'isolation' value 'fork' was removed because it implied "
+            "inherited context; use 'shared' for fresh context in the parent workspace",
+        )
     try:
         isolation = AgentIsolation(isolation_raw)
     except ValueError as exc:

@@ -1,4 +1,4 @@
-"""Fail-closed Git worktree isolation for forked agents."""
+"""Fail-closed Git worktree isolation for child agents."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def create_worktree(
     definition_name: str,
     agent_id: str,
     *,
-    isolation: AgentIsolation = AgentIsolation.FORK,
+    isolation: AgentIsolation = AgentIsolation.SHARED,
     runtime: Any | None = None,
 ) -> tuple[Any | None, str]:
     """Provision declared isolation and return its effective project root."""

@@ -1,4 +1,4 @@
-"""Typed, Runtime-validated result contract for forked analysis agents."""
+"""Typed, Runtime-validated result contract for analysis subagents."""
 
 from __future__ import annotations
 

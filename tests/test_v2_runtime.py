@@ -1,4 +1,4 @@
-"""Tests for V2 fork-based subagent runtime."""
+"""Tests for the V2 fresh-context subagent runtime."""
 
 from __future__ import annotations
 
@@ -207,7 +207,7 @@ def test_v2_agent_registry_loads_builtins():
     assert registry.get("explore").intent is TaskIntent.ANALYSIS
     assert registry.get("code-reviewer").intent is TaskIntent.ANALYSIS
     assert registry.get("general").intent is TaskIntent.EDIT
-    assert registry.get("general").isolation is AgentIsolation.FORK
+    assert registry.get("general").isolation is AgentIsolation.SHARED
     assert registry.has("coordinator") is False
 
 
@@ -291,7 +291,7 @@ def test_agent_definition_frontmatter_declares_intent(tmp_path):
 
     assert definition is not None
     assert definition.intent is TaskIntent.ANALYSIS
-    assert definition.isolation is AgentIsolation.FORK
+    assert definition.isolation is AgentIsolation.SHARED
     assert definition.visibility is AgentVisibility.PUBLIC
 
 
@@ -329,6 +329,34 @@ def test_agent_definition_rejects_unknown_isolation(tmp_path):
 
     with pytest.raises(AgentDefinitionError, match="field 'isolation' has invalid value"):
         _parse_definition(path)
+
+
+def test_agent_definition_rejects_removed_fork_isolation(tmp_path):
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+
+    path = tmp_path / "removed-fork-isolation.md"
+    path.write_text(
+        "---\nname: invalid\nintent: analysis\nisolation: fork\n---\nInvalid.",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentDefinitionError, match="use 'shared'"):
+        _parse_definition(path)
+
+
+def test_agent_definition_accepts_explicit_shared_workspace(tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    path = tmp_path / "shared-workspace.md"
+    path.write_text(
+        "---\nname: shared\nintent: analysis\nisolation: shared\n---\nAnalyze.",
+        encoding="utf-8",
+    )
+
+    definition = _parse_definition(path)
+
+    assert definition is not None
+    assert definition.isolation is AgentIsolation.SHARED
 
 
 @pytest.mark.parametrize("configured", (None, "inherit", " INHERIT "))
@@ -408,7 +436,7 @@ def test_project_agent_definitions_declare_typed_intents():
     assert _parse_definition(project_agents / "explore.md").intent is TaskIntent.ANALYSIS
     general = _parse_definition(project_agents / "general.md")
     assert general.intent is TaskIntent.EDIT
-    assert general.isolation is AgentIsolation.FORK
+    assert general.isolation is AgentIsolation.SHARED
 
 
 @pytest.mark.parametrize(
@@ -2218,7 +2246,7 @@ def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):
 
 
 def test_v2_parent_recovers_after_failed_child(tmp_path):
-    # Fork subagent finishes immediately
+    # Child subagent finishes immediately
     child_backend = MockBackend([
         Action(action_type=ActionType.FINISH, thought="sub", message="child done"),
     ])
@@ -2259,8 +2287,8 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "task" in text
     assert "explore" in text
     assert "general" in text
-    assert "isolation=fork" in text
-    assert "shares the parent project working tree" in text
+    assert "isolation=shared" in text
+    assert "fresh context in the parent project working tree" in text
     assert "Worktree Result Protocol" not in text
     assert "Subagent Output Review Protocol" in text
     assert "INSPECT before you relay" in text

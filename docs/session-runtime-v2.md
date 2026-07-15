@@ -81,7 +81,7 @@ clean while preserving Runtime-owned evidence such as worktree change state.
 ### 3.4 The model manages most task decomposition
 
 The runtime supports multiple `task` tool calls in one model response. Calls
-whose selected children declare read-only analysis intent and fork isolation run
+whose selected children declare read-only analysis intent and shared workspace isolation run
 in parallel. Write-capable delegation remains serial; worktree isolation keeps
 its edits separate, and applying those edits is outside child execution. The
 runtime does not impose a DAG planner.

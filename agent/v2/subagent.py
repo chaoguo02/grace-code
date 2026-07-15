@@ -1,4 +1,4 @@
-"""Fork subagent — Claude Code style child agent with fresh context."""
+"""Fresh-context child-agent execution with declared workspace isolation."""
 
 from __future__ import annotations
 
@@ -69,7 +69,11 @@ SELF-CHECK before submitting: "Did I read the actual lines I'm citing? Did I che
 
 @dataclass
 class _ForkContext:
-    """Internal context for a fork subagent run."""
+    """Internal context for a fresh child-agent run.
+
+    The name is retained as an internal compatibility detail; this context
+    never inherits the parent's conversation.
+    """
     agent_id: str
     definition: AgentDefinition
     prompt: str
@@ -96,7 +100,7 @@ def fork_subagent(
     parent_policy: "PhasePolicy",
     event_callback: Callable[[Any], None] | None = None,
 ) -> ForkResult:
-    """Run a subagent in a forked context.
+    """Run a subagent in a fresh context using its declared workspace isolation.
 
     The subagent gets:
     - A fresh conversation context (no parent history)
@@ -106,7 +110,7 @@ def fork_subagent(
 
     Returns a ForkResult with the subagent's final summary.
     """
-    logger.info("Fork subagent '%s' (%s) starting: %s", definition.name, agent_id, prompt[:80])
+    logger.info("Subagent '%s' (%s) starting: %s", definition.name, agent_id, prompt[:80])
 
     if cancellation_token.is_cancelled:
         return ForkResult(
@@ -243,7 +247,7 @@ def fork_subagent(
             _recent_actions = _snapshot_recent_actions(event_log)
 
     except MemoryError:
-        logger.critical("Fork subagent '%s' OOM — aborting", definition.name)
+        logger.critical("Subagent '%s' OOM — aborting", definition.name)
         result = RunResult(
             task_id=agent_id, status=RunStatus.FAILED,
             summary="Subagent ran out of memory",
@@ -252,7 +256,7 @@ def fork_subagent(
         )
 
     except Exception as exc:
-        logger.exception("Fork subagent '%s' crashed: %s", definition.name, exc)
+        logger.exception("Subagent '%s' crashed: %s", definition.name, exc)
         result = RunResult(
             task_id=agent_id, status=RunStatus.FAILED,
             summary=f"Subagent crashed: {exc}",
@@ -265,7 +269,7 @@ def fork_subagent(
                 message_sink(history.to_list()[_persisted_history_boundary:])
             except Exception as exc:
                 logger.exception(
-                    "Fork subagent '%s' transcript persistence failed: %s",
+                    "Subagent '%s' transcript persistence failed: %s",
                     definition.name, exc,
                 )
                 result = RunResult(

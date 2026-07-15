@@ -1,4 +1,4 @@
-# V2 Multi-Agent Session Runtime (Fork-based)
+# V2 Multi-Agent Session Runtime (fresh-context child sessions)
 
 from agent.v2.agent_definition import AgentDefinitionError, load_agent_definitions
 from agent.v2.agent_registry import AgentRegistryV2, resolve_tool_name, resolve_tool_set
