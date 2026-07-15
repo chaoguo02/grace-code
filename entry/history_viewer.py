@@ -22,6 +22,17 @@ from entry.renderer import (
     _highlight_diff, format_diagnostic,
 )
 
+# Read-only display tools whose full output is never useful in history view.
+# Prefer effects-based decisions (tools/display.py) when registry is available;
+# this set is a pragmatic fallback for serialized history data.
+_READ_ONLY_DISPLAY_TOOLS = frozenset({
+    "file_read", "file_view", "find_files", "find_symbol",
+})
+
+
+def _is_read_only_display(tool_name: str) -> bool:
+    return tool_name in _READ_ONLY_DISPLAY_TOOLS
+
 
 # ---------------------------------------------------------------------------
 # 历史目录管理
@@ -201,9 +212,7 @@ def _render_event(event: dict) -> str | None:
         if status == "success":
             preview = output.splitlines()[:5]
             text = _green("  ✓")
-            if preview and obs.get("tool_name") not in (
-                "file_read", "file_view", "find_files"
-            ):
+            if preview and not _is_read_only_display(obs.get("tool_name", "")):
                 text += "\n" + "\n".join(
                     f"    {_dim(l)}" for l in preview
                 )

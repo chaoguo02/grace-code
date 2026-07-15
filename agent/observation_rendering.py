@@ -20,13 +20,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Tools whose output should NOT be artifacted (always inline)
+# Tools whose output should NOT be artifacted (always inline).
+# Derived from effect categories, not tool names. Use build_artifact_exempt_set()
+# to compute from a registry rather than maintaining this list manually.
+from tools.display import INLINE_EFFECTS as _INLINE_EFFECTS
+
 ARTIFACT_EXEMPT_TOOLS = frozenset({
     "file_read", "file_view", "file_edit", "file_write",
     "find_files", "find_symbol",
     "git_status", "git_add", "git_commit",
     "memory_read", "memory_list", "memory_search",
 })
+
+
+def build_artifact_exempt_set(registry) -> frozenset[str]:
+    """Derive exempt tools from registry metadata instead of a hardcoded name list.
+
+    Any tool whose effects are purely read-only (READ_WORKSPACE, READ_VCS,
+    READ_AGENT_STATE) is exempt from artifact externalization.
+    """
+    return frozenset({
+        name for name in registry.tool_names
+        if (metadata := registry.metadata_for(name)) is not None
+        and bool(metadata.effects & _INLINE_EFFECTS)
+        and ToolEffect.WRITE_WORKSPACE not in metadata.effects
+        and ToolEffect.EXECUTE not in metadata.effects
+    })
 
 
 def truncate_output(text: str, max_chars: int = 8000) -> str:

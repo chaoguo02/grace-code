@@ -531,17 +531,13 @@ class InlineRenderer(RendererBase):
         with self._lock:
             self._clear_status_bar()
 
-            silent = tool_name in {
-                "file_read", "file_view", "file_write",
-                "find_files", "find_symbol",
-            }
-
             if tool_name == "task":
                 sys.stdout.write(f"{self._format_task_observation(output, error)}\n")
             elif status == "success":
                 if tool_name in {"file_read", "file_view"}:
                     sys.stdout.write(f"{self._format_file_read_summary(tool_name, output)}\n")
-                elif silent:
+                elif tool_name in {"file_write", "find_files", "find_symbol"}:
+                    sys.stdout.write(_dim(f"  [{tool_name}] ok\n"))
                     sys.stdout.write(_green("    ╰─ ✓\n"))
                 else:
                     formatted = self._format_tool_output(status, output, error)
