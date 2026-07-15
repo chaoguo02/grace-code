@@ -16,7 +16,7 @@ from memory.metadata_cache import MetadataCache, CachedMetadata
 from memory.models import Anchor, Memory, MemoryMetadata, MemorySummary
 from memory.store import MemoryStore
 from memory.context import MemoryContext
-from agent.v2.models import AgentDefinition, AgentIsolation
+from agent.v2.models import AgentDefinition, AgentKind, WorkspaceMode
 from agent.task import TaskIntent
 
 
@@ -306,16 +306,17 @@ class TestWorktreeIsolation:
         assert main_content == "print('hello')\n"
         assert not os.path.isdir(wt.path)
 
-    def test_isolation_field_recognized(self):
-        """AgentDefinition.isolation="worktree" creates correct definition."""
+    def test_workspace_field_recognized(self):
+        """Workspace placement does not define the agent's identity."""
         agent = AgentDefinition(
             name="test-worktree-agent",
             description="Agent with worktree isolation",
             intent=TaskIntent.EDIT,
-            isolation=AgentIsolation.WORKTREE,
+            workspace_mode=WorkspaceMode.WORKTREE,
         )
-        assert agent.isolation is AgentIsolation.WORKTREE
-        assert agent.mode == "subagent"  # worktree → subagent mode
+        assert agent.workspace_mode is WorkspaceMode.WORKTREE
+        assert agent.agent_kind is AgentKind.NAMED_SUBAGENT
+        assert agent.mode == "subagent"
 
     def test_shared_workspace_is_default(self):
         """Default workspace is shared while the child context stays fresh."""
@@ -324,4 +325,4 @@ class TestWorktreeIsolation:
             description="Default shared-workspace agent",
             intent=TaskIntent.EDIT,
         )
-        assert agent.isolation is AgentIsolation.SHARED
+        assert agent.workspace_mode is WorkspaceMode.CURRENT

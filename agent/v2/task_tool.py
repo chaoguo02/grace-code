@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
 from agent.task import TaskIntent
-from agent.v2.models import AgentIsolation, DelegationScope, ForkStatus
+from agent.v2.models import DelegationScope, ForkStatus, WorkspaceMode
 from tools.base import (
     ToolConcurrency, ToolEffect, ToolErrorType, ToolMetadata,
     ToolRetryDirective, ToolRole,
@@ -31,7 +31,7 @@ from tools.base import (
 from tools.base import BaseTool, ToolResult
 
 if TYPE_CHECKING:
-    from agent.v2.models import ForkResult
+    from agent.v2.models import AgentRunResult
     from agent.v2.runtime import SessionRuntime
 
 logger = logging.getLogger(__name__)
@@ -200,7 +200,7 @@ class AgentTool(BaseTool):
         definition = self._runtime.agent_registry.get(subagent_type)
         if (
             definition.intent is TaskIntent.ANALYSIS
-            and definition.isolation is AgentIsolation.SHARED
+            and definition.workspace_mode is WorkspaceMode.CURRENT
         ):
             return ToolConcurrency.PARALLEL_SAFE
         return ToolConcurrency.SERIAL
@@ -421,8 +421,8 @@ class AgentTool(BaseTool):
         )
 
 
-def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
-    """Format ForkResult as an XML <task-notification> block.
+def _format_fork_result(agent_type: str, result: "AgentRunResult") -> str:
+    """Render AgentRunResult as an XML <task-notification> block.
 
     When structured_findings are present (from submit_findings tool),
     they are displayed FIRST as the primary, reliable output. The text

@@ -102,22 +102,24 @@ class TestMainLoopGate:
 class TestSubagentRepoInheritance:
     """Subagent MUST work in the parent session's repo context."""
 
-    def test_agent_definition_isolation_field(self):
-        """isolation field distinguishes shared vs worktree vs primary."""
-        from agent.v2.models import AgentIsolation
+    def test_agent_identity_and_workspace_are_orthogonal(self):
+        """Agent identity does not derive from filesystem placement."""
+        from agent.v2.models import AgentKind, WorkspaceMode
 
-        primary = AgentDefinition(name="build", description="primary", intent=TaskIntent.EDIT, isolation=AgentIsolation.NONE)
-        shared_agent = AgentDefinition(name="explore", description="shared", intent=TaskIntent.ANALYSIS, isolation=AgentIsolation.SHARED)
-        worktree_agent = AgentDefinition(name="general", description="worktree", intent=TaskIntent.EDIT, isolation=AgentIsolation.WORKTREE)
+        primary = AgentDefinition(name="build", description="primary", intent=TaskIntent.EDIT, agent_kind=AgentKind.PRIMARY)
+        current_agent = AgentDefinition(name="explore", description="current", intent=TaskIntent.ANALYSIS)
+        worktree_agent = AgentDefinition(name="general", description="worktree", intent=TaskIntent.EDIT, workspace_mode=WorkspaceMode.WORKTREE)
 
         assert primary.mode == "primary"
-        assert shared_agent.mode == "subagent"
+        assert current_agent.mode == "subagent"
         assert worktree_agent.mode == "subagent"
+        assert current_agent.workspace_mode is WorkspaceMode.CURRENT
+        assert worktree_agent.workspace_mode is WorkspaceMode.WORKTREE
 
-    def test_repo_path_flow_in_fork_result(self):
-        """ForkResult carries agent_name and session_id for traceability."""
-        from agent.v2.models import ForkResult
-        fr = ForkResult(
+    def test_repo_path_flow_in_agent_result(self):
+        """AgentRunResult carries agent and session identity for traceability."""
+        from agent.v2.models import AgentRunResult
+        fr = AgentRunResult(
             agent_name="explore", session_id="abc123", status="completed",
             summary="Done", turns_used=3, tokens_used=500,
         )

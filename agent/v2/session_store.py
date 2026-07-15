@@ -8,11 +8,16 @@ from pathlib import Path
 
 from agent.task import ToolCall
 from agent.v2.models import (
+    AgentKind,
+    AgentRunResult,
+    ContextOrigin,
+    ExecutionPlacement,
     ForkResult,
     SessionMode,
     SessionRecord,
     SessionStatus,
     WorktreeDisposition,
+    WorkspaceMode,
 )
 from llm.base import LLMMessage
 
@@ -52,6 +57,11 @@ class SessionStore:
                     summary TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                    agent_kind TEXT NOT NULL DEFAULT 'primary',
+                    context_origin TEXT NOT NULL DEFAULT 'fresh',
+                    execution_placement TEXT NOT NULL DEFAULT 'foreground',
+                    workspace_mode TEXT NOT NULL DEFAULT 'current',
+                    agent_result_json TEXT NULL,
                     fork_result_json TEXT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -82,12 +92,72 @@ class SessionStore:
             }
             if "fork_result_json" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN fork_result_json TEXT NULL")
+            contract_columns = {
+                "agent_kind": "TEXT NOT NULL DEFAULT 'primary'",
+                "context_origin": "TEXT NOT NULL DEFAULT 'fresh'",
+                "execution_placement": "TEXT NOT NULL DEFAULT 'foreground'",
+                "workspace_mode": "TEXT NOT NULL DEFAULT 'current'",
+                "agent_result_json": "TEXT NULL",
+            }
+            added_contract = False
+            for name, declaration in contract_columns.items():
+                if name not in columns:
+                    conn.execute(
+                        f"ALTER TABLE sessions ADD COLUMN {name} {declaration}"
+                    )
+                    added_contract = True
+            if added_contract:
+                rows = conn.execute(
+                    "SELECT id, mode, metadata_json FROM sessions"
+                ).fetchall()
+                for row in rows:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                    legacy_workspace = metadata.get(
+                        "workspace_mode", metadata.get("isolation")
+                    )
+                    workspace_mode = (
+                        WorkspaceMode.WORKTREE
+                        if legacy_workspace == "worktree"
+                        else WorkspaceMode.CURRENT
+                    )
+                    agent_kind = (
+                        AgentKind.PRIMARY
+                        if row["mode"] == SessionMode.PRIMARY.value
+                        else AgentKind.NAMED_SUBAGENT
+                    )
+                    conn.execute(
+                        """
+                        UPDATE sessions
+                        SET agent_kind = ?, context_origin = ?,
+                            execution_placement = ?, workspace_mode = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            agent_kind.value,
+                            ContextOrigin.FRESH.value,
+                            ExecutionPlacement.FOREGROUND.value,
+                            workspace_mode.value,
+                            row["id"],
+                        ),
+                    )
+            conn.execute(
+                """
+                UPDATE sessions
+                SET agent_result_json = fork_result_json
+                WHERE agent_result_json IS NULL
+                  AND fork_result_json IS NOT NULL
+                """
+            )
 
     def create_session(
         self,
         *,
         agent_name: str,
         mode: SessionMode,
+        agent_kind: AgentKind | None = None,
+        context_origin: ContextOrigin = ContextOrigin.FRESH,
+        execution_placement: ExecutionPlacement = ExecutionPlacement.FOREGROUND,
+        workspace_mode: WorkspaceMode = WorkspaceMode.CURRENT,
         repo_path: str,
         title: str,
         parent_id: str | None = None,
@@ -95,6 +165,28 @@ class SessionStore:
         metadata: dict | None = None,
     ) -> SessionRecord:
         mode = SessionMode(mode)
+        agent_kind = AgentKind(
+            agent_kind
+            or (
+                AgentKind.PRIMARY
+                if mode is SessionMode.PRIMARY
+                else AgentKind.NAMED_SUBAGENT
+            )
+        )
+        context_origin = ContextOrigin(context_origin)
+        execution_placement = ExecutionPlacement(execution_placement)
+        workspace_mode = WorkspaceMode(workspace_mode)
+        if (mode is SessionMode.PRIMARY) != (agent_kind is AgentKind.PRIMARY):
+            raise ValueError("Session mode and agent kind must describe the same role")
+        if execution_placement is ExecutionPlacement.AUTO:
+            raise ValueError("Session creation requires a resolved execution placement")
+        if (
+            context_origin is ContextOrigin.PARENT_SNAPSHOT
+            and agent_kind is not AgentKind.FORK
+        ):
+            raise ValueError("Only fork sessions may use a parent snapshot")
+        if agent_kind is AgentKind.FORK and context_origin is ContextOrigin.FRESH:
+            raise ValueError("Fork sessions require a parent snapshot or resume history")
         parent = None
         if parent_id is not None:
             parent = self.get_session(parent_id)
@@ -119,10 +211,11 @@ class SessionStore:
                 """
                 INSERT INTO sessions (
                     id, parent_id, root_id, agent_name, mode, title, status,
-                    repo_path, summary, error, metadata_json, created_at,
-                    updated_at, completed_at
+                    repo_path, summary, error, metadata_json, agent_kind,
+                    context_origin, execution_placement, workspace_mode,
+                    created_at, updated_at, completed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (
                     session_id,
@@ -134,6 +227,10 @@ class SessionStore:
                     SessionStatus.QUEUED.value,
                     repo_path,
                     metadata_json,
+                    agent_kind.value,
+                    context_origin.value,
+                    execution_placement.value,
+                    workspace_mode.value,
                     now,
                     now,
                 ),
@@ -169,7 +266,7 @@ class SessionStore:
             rows = conn.execute(
                 """
                 SELECT * FROM sessions
-                WHERE fork_result_json IS NOT NULL
+                WHERE agent_result_json IS NOT NULL
                 ORDER BY created_at, id
                 """
             ).fetchall()
@@ -177,8 +274,8 @@ class SessionStore:
         return [
             record for record in records
             if (
-                record.fork_result is not None
-                and record.fork_result.worktree_disposition in dispositions
+                record.agent_result is not None
+                and record.agent_result.worktree_disposition in dispositions
             )
         ]
 
@@ -279,20 +376,24 @@ class SessionStore:
             if cursor.rowcount != 1:
                 raise ValueError(f"Unknown v2 session: {session_id}")
 
-    def set_fork_result(self, session_id: str, result: ForkResult) -> None:
-        """Persist the typed child result at the session boundary."""
+    def set_agent_result(self, session_id: str, result: AgentRunResult) -> None:
+        """Persist the generic typed child result at the session boundary."""
         payload = json.dumps(result.to_dict(), ensure_ascii=True)
         with self._connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE sessions
-                SET fork_result_json = ?, updated_at = ?
+                SET agent_result_json = ?, fork_result_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (payload, _utc_now(), session_id),
+                (payload, payload, _utc_now(), session_id),
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"Unknown v2 session: {session_id}")
+
+    def set_fork_result(self, session_id: str, result: ForkResult) -> None:
+        """Compatibility adapter for execution APIs migrated in Batch 3."""
+        self.set_agent_result(session_id, result)
 
     def touch_session(self, session_id: str) -> None:
         with self._connect() as conn:
@@ -302,7 +403,7 @@ class SessionStore:
             )
 
     def _row_to_session(self, row: sqlite3.Row) -> SessionRecord:
-        raw_fork_result = row["fork_result_json"]
+        raw_agent_result = row["agent_result_json"] or row["fork_result_json"]
         return SessionRecord(
             id=row["id"],
             parent_id=row["parent_id"],
@@ -312,14 +413,18 @@ class SessionStore:
             title=row["title"],
             status=SessionStatus(row["status"]),
             repo_path=row["repo_path"],
+            agent_kind=AgentKind(row["agent_kind"]),
+            context_origin=ContextOrigin(row["context_origin"]),
+            execution_placement=ExecutionPlacement(row["execution_placement"]),
+            workspace_mode=WorkspaceMode(row["workspace_mode"]),
             summary=row["summary"],
             error=row["error"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
             metadata=json.loads(row["metadata_json"] or "{}"),
-            fork_result=(
-                ForkResult.from_dict(json.loads(raw_fork_result))
-                if raw_fork_result else None
+            agent_result=(
+                AgentRunResult.from_dict(json.loads(raw_agent_result))
+                if raw_agent_result else None
             ),
         )

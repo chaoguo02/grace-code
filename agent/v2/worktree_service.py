@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from agent.v2.models import AgentIsolation, WorktreeChange, WorktreeEvidence
+from agent.v2.models import WorkspaceMode, WorktreeChange, WorktreeEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +61,11 @@ def create_worktree(
     definition_name: str,
     agent_id: str,
     *,
-    isolation: AgentIsolation = AgentIsolation.SHARED,
+    isolation: WorkspaceMode = WorkspaceMode.CURRENT,
     runtime: Any | None = None,
 ) -> tuple[Any | None, str]:
     """Provision declared isolation and return its effective project root."""
-    if isolation is not AgentIsolation.WORKTREE:
+    if isolation is not WorkspaceMode.WORKTREE:
         return None, repo_path
     try:
         from tools.snapshot import WorktreeManager

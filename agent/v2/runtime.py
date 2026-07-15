@@ -14,10 +14,13 @@ from agent.task import Event, EventType, RunResult, RunStatus, Task, TaskIntent
 from agent.v2.agent_registry import AgentRegistryV2
 from agent.v2.models import (
     AgentDefinition,
+    AgentKind,
+    ContextOrigin,
     DelegationOrigin,
     DelegationScope,
     ExplicitDelegationRequest,
-    ForkResult,
+    ExecutionPlacement,
+    AgentRunResult,
     ForkStatus,
     ManagedWorktreeRecord,
     SessionMode,
@@ -26,6 +29,7 @@ from agent.v2.models import (
     WorktreeAvailability,
     WorktreeDisposition,
     WorktreeEvidence,
+    WorkspaceMode,
 )
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
@@ -152,7 +156,7 @@ class SessionRuntime:
             WorktreeDisposition.RETAINED,
         }))
         for child in sessions:
-            result = child.fork_result
+            result = child.agent_result
             if (
                 result is None
                 or result.worktree is None
@@ -208,7 +212,7 @@ class SessionRuntime:
                 if result.status is WorktreeOperationStatus.APPLIED
                 else WorktreeDisposition.CLEANED
             )
-            self._store.set_fork_result(
+            self._store.set_agent_result(
                 child.id,
                 replace(
                     fork_result,
@@ -239,7 +243,7 @@ class SessionRuntime:
             expected_revision=expected_revision,
         )
         if result.status is WorktreeOperationStatus.DISCARDED:
-            self._store.set_fork_result(
+            self._store.set_agent_result(
                 child.id,
                 replace(
                     fork_result,
@@ -278,7 +282,7 @@ class SessionRuntime:
                 evidence,
                 "Child worktree revision changed after review",
             )
-        self._store.set_fork_result(
+        self._store.set_agent_result(
             child.id,
             replace(
                 fork_result,
@@ -292,7 +296,7 @@ class SessionRuntime:
 
     def _require_available_worktree(
         self, parent_session_id: str, child_session_id: str,
-    ) -> tuple["SessionRecord", ForkResult, "Worktree"]:
+    ) -> tuple["SessionRecord", AgentRunResult, "Worktree"]:
         """Resolve a persisted worktree handle without trusting stored paths."""
         parent = self._store.get_session(parent_session_id)
         if parent is None:
@@ -303,7 +307,7 @@ class SessionRuntime:
             raise ValueError("Worktree session must be a direct child of the caller")
         if child.repo_path != parent.repo_path:
             raise ValueError("Parent and child project roots do not match")
-        fork_result = child.fork_result
+        fork_result = child.agent_result
         if (
             fork_result is None
             or fork_result.worktree_disposition not in {
@@ -362,7 +366,7 @@ class SessionRuntime:
 
         pending = []
         for child in self._store.list_child_sessions(session_id):
-            result = child.fork_result
+            result = child.agent_result
             if (
                 result is not None
                 and result.worktree_disposition is WorktreeDisposition.PRESERVED
@@ -399,10 +403,18 @@ class SessionRuntime:
         metadata: dict | None = None,
     ):
         spec = self._agent_registry.get(agent_name)
+        if spec.agent_kind is not AgentKind.PRIMARY:
+            raise ValueError(
+                f"Agent {agent_name!r} is not declared as a primary entrypoint"
+            )
         normalized_repo = self._require_project_scope(repo_path)
         return self._store.create_session(
             agent_name=agent_name,
             mode=SessionMode.PRIMARY,
+            agent_kind=AgentKind.PRIMARY,
+            context_origin=ContextOrigin.FRESH,
+            execution_placement=ExecutionPlacement.FOREGROUND,
+            workspace_mode=WorkspaceMode.CURRENT,
             repo_path=normalized_repo,
             title=title,
             metadata=metadata or {},
@@ -415,7 +427,7 @@ class SessionRuntime:
         request: ExplicitDelegationRequest,
         parent_intent: TaskIntent,
         contract: "TaskContract",
-    ) -> ForkResult:
+    ) -> AgentRunResult:
         """Guarantee one named child run without asking the parent model to route it."""
         from agent.policy import PhasePolicy, READ_ONLY_EFFECTS
         from agent.v2.task_contract import TaskContract
@@ -487,7 +499,7 @@ class SessionRuntime:
         )
 
     def finalize_parent_from_explicit_child(
-        self, parent_session_id: str, child_result: ForkResult,
+        self, parent_session_id: str, child_result: AgentRunResult,
     ) -> None:
         """Converge an unrun parent when explicit delegation is terminal."""
         parent = self._store.get_session(parent_session_id)
@@ -694,7 +706,7 @@ class SessionRuntime:
         cancellation_token: CancellationToken,
         parent_policy: "PhasePolicy",
         origin: DelegationOrigin = DelegationOrigin.TOOL,
-    ) -> ForkResult:
+    ) -> AgentRunResult:
         """Dispatch a fresh-context child subagent.
 
         The subagent runs in a fresh context — no parent history inherited.
@@ -724,17 +736,23 @@ class SessionRuntime:
         parent = self._store.get_session(parent_session_id)
         if parent is None:
             raise ValueError(f"Unknown v2 session: {parent_session_id}")
+        if definition.agent_kind is not AgentKind.NAMED_SUBAGENT:
+            raise ValueError("Child execution requires a named subagent definition")
         _repo = self._require_project_scope(parent.repo_path)
         child = self._store.create_session(
             agent_name=definition.name,
             mode=SessionMode.SUBAGENT,
+            agent_kind=AgentKind.NAMED_SUBAGENT,
+            context_origin=ContextOrigin.FRESH,
+            execution_placement=ExecutionPlacement.FOREGROUND,
+            workspace_mode=definition.workspace_mode,
             repo_path=_repo,
             title=description[:80] or definition.name,
             parent_id=parent.id,
             root_id=parent.root_id,
             metadata={
                 "entrypoint": origin.value,
-                "isolation": definition.isolation.value,
+                "workspace_mode": definition.workspace_mode.value,
                 "intent": definition.intent.value,
                 "requested_budget_tokens": budget_tokens,
                 "budget_tokens": child_contract.budget_tokens,
@@ -760,7 +778,7 @@ class SessionRuntime:
             agent_type=definition.name,
         ))
 
-        fork_result: ForkResult | None = None
+        fork_result: AgentRunResult | None = None
 
         def _persist_child_messages(messages: list[LLMMessage]) -> None:
             for message in messages:
@@ -782,7 +800,7 @@ class SessionRuntime:
                 parent_policy=parent_policy,
                 event_callback=self._event_callback,
             )
-            self._store.set_fork_result(child.id, fork_result)
+            self._store.set_agent_result(child.id, fork_result)
             self._store.append_message(
                 child.id,
                 LLMMessage(role="assistant", content=fork_result.summary),
@@ -866,7 +884,7 @@ class SessionRuntime:
         child_session_id: str,
         agent_name: str,
         status: SessionStatus,
-        fork_result: ForkResult | None = None,
+        fork_result: AgentRunResult | None = None,
     ) -> None:
         if self._event_callback is None:
             return

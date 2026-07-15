@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent.v2.agent_definition import load_agent_definitions
-from agent.v2.models import AgentDefinition, AgentIsolation, AgentVisibility
+from agent.v2.models import AgentDefinition, AgentKind, AgentVisibility
 
 # ── Tool name mapping: Claude Code → forge-agent ──
 
@@ -125,7 +125,7 @@ class AgentRegistryV2:
             spec for spec in self._agents.values()
             if (
                 spec.visibility is AgentVisibility.PUBLIC
-                and spec.isolation is not AgentIsolation.NONE
+                and spec.agent_kind is not AgentKind.PRIMARY
             )
         ]
 
@@ -138,7 +138,7 @@ class AgentRegistryV2:
             (
                 child
                 for child in self._agents.values()
-                if child.isolation is not AgentIsolation.NONE
+                if child.agent_kind is not AgentKind.PRIMARY
                 and (
                     child.visibility is AgentVisibility.PUBLIC
                     or child.name in explicitly_allowed
@@ -152,7 +152,7 @@ class AgentRegistryV2:
         return [
             spec for spec in self._agents.values()
             if (
-                spec.isolation is AgentIsolation.NONE
+                spec.agent_kind is AgentKind.PRIMARY
                 and spec.visibility is AgentVisibility.PUBLIC
             )
         ]

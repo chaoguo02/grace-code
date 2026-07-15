@@ -11,7 +11,7 @@ from agent.event_log import EventLog
 from agent.task import RunResult, RunStatus, Task, TerminationReason
 from agent.v2.models import (
     AgentDefinition,
-    ForkResult,
+    AgentRunResult,
     ForkStatus,
     WorktreeChange,
     WorktreeDisposition,
@@ -99,7 +99,7 @@ def fork_subagent(
     cancellation_token: CancellationToken,
     parent_policy: "PhasePolicy",
     event_callback: Callable[[Any], None] | None = None,
-) -> ForkResult:
+) -> AgentRunResult:
     """Run a subagent in a fresh context using its declared workspace isolation.
 
     The subagent gets:
@@ -108,12 +108,12 @@ def fork_subagent(
     - Its own system prompt (from the agent definition's body)
     - The prompt as the first user message
 
-    Returns a ForkResult with the subagent's final summary.
+    Returns an AgentRunResult with the subagent's final summary.
     """
     logger.info("Subagent '%s' (%s) starting: %s", definition.name, agent_id, prompt[:80])
 
     if cancellation_token.is_cancelled:
-        return ForkResult(
+        return AgentRunResult(
             agent_name=definition.name,
             session_id=agent_id,
             status=ForkStatus.CANCELLED,
@@ -126,10 +126,10 @@ def fork_subagent(
     try:
         _worktree, _effective_repo_path = create_worktree(
             repo_path, definition.name, agent_id,
-            isolation=definition.isolation,
+            isolation=definition.workspace_mode,
         )
     except WorktreeIsolationError as exc:
-        return ForkResult(
+        return AgentRunResult(
             agent_name=definition.name,
             session_id=agent_id,
             status=ForkStatus.FAILED,
@@ -204,7 +204,7 @@ def fork_subagent(
             "entrypoint": "fork",
             "agent_name": definition.name,
             "agent_id": agent_id,
-            "isolation": definition.isolation.value,
+            "workspace_mode": definition.workspace_mode.value,
             "worktree_path": _worktree.path if _worktree else "",
             "completion_requires": dict(contract.require_deliverables),
             "required_tools": sorted(definition.required_tools),
@@ -220,7 +220,7 @@ def fork_subagent(
     )
 
     # ── Result object fallback: never let a bare exception escape ──
-    # The parent MUST receive a structured ForkResult regardless of what
+    # The parent MUST receive a structured AgentRunResult regardless of what
     # happens inside the subagent. Initialize to a failed state so even
     # if the try block never executes, the contract is honored.
     result = RunResult(
@@ -355,7 +355,7 @@ def _build_fork_result(
     warning: str = "",
     worktree: "WorktreeEvidence | None" = None,
     worktree_disposition: WorktreeDisposition = WorktreeDisposition.NOT_APPLICABLE,
-) -> ForkResult:
+) -> AgentRunResult:
     status = ForkStatus.COMPLETED
     failure_diagnosis = ""
     if result.status == RunStatus.MAX_STEPS:
@@ -388,7 +388,7 @@ def _build_fork_result(
     if not summary:
         summary = "Subagent finished without a summary."
 
-    return ForkResult(
+    return AgentRunResult(
         agent_name=agent_name,
         session_id=agent_id,
         status=status,

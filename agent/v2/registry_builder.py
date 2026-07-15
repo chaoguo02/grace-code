@@ -65,9 +65,9 @@ def build_registry_for_session(
             circuit_breaker=circuit_breaker,
         ))
 
-        from agent.v2.models import AgentIsolation
+        from agent.v2.models import WorkspaceMode
         has_worktree_child = any(
-            child.isolation is AgentIsolation.WORKTREE
+            child.workspace_mode is WorkspaceMode.WORKTREE
             for child in delegatable_children
         )
         if has_worktree_child:

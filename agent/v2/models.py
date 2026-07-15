@@ -15,10 +15,41 @@ class SessionMode(str, Enum):
     SUBAGENT = "subagent"
 
 
-class AgentIsolation(str, Enum):
-    NONE = "none"
-    SHARED = "shared"
+class AgentKind(str, Enum):
+    """Identity of an agent session, independent of its workspace."""
+
+    PRIMARY = "primary"
+    NAMED_SUBAGENT = "named_subagent"
+    FORK = "fork"
+
+
+class ContextOrigin(str, Enum):
+    """Objective source of the conversation loaded for an agent run."""
+
+    FRESH = "fresh"
+    PARENT_SNAPSHOT = "parent_snapshot"
+    RESUMED = "resumed"
+
+
+class ExecutionPlacement(str, Enum):
+    """Where an agent run executes relative to its caller."""
+
+    AUTO = "auto"
+    FOREGROUND = "foreground"
+    BACKGROUND = "background"
+
+
+class WorkspaceMode(str, Enum):
+    """Filesystem placement, orthogonal to context inheritance."""
+
+    CURRENT = "current"
     WORKTREE = "worktree"
+
+
+# Temporary source-compatibility alias for callers that only used WORKTREE.
+# NONE/SHARED intentionally do not exist: identity and current-workspace use
+# now have their own strongly typed fields.
+AgentIsolation = WorkspaceMode
 
 
 class WorktreeChange(str, Enum):
@@ -151,11 +182,15 @@ class SessionStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-class ForkStatus(str, Enum):
+class AgentRunStatus(str, Enum):
     COMPLETED = "completed"
     PARTIAL = "partial"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+# Compatibility alias while execution APIs are migrated in Batch 3.
+ForkStatus = AgentRunStatus
 
 
 @dataclass
@@ -168,17 +203,48 @@ class SessionRecord:
     title: str
     status: SessionStatus
     repo_path: str
+    agent_kind: AgentKind = AgentKind.PRIMARY
+    context_origin: ContextOrigin = ContextOrigin.FRESH
+    execution_placement: ExecutionPlacement = ExecutionPlacement.FOREGROUND
+    workspace_mode: WorkspaceMode = WorkspaceMode.CURRENT
     summary: str = ""
     error: str = ""
     created_at: str = ""
     updated_at: str = ""
     completed_at: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    fork_result: ForkResult | None = None
+    agent_result: AgentRunResult | None = None
 
     def __post_init__(self) -> None:
         self.mode = SessionMode(self.mode)
         self.status = SessionStatus(self.status)
+        self.agent_kind = AgentKind(self.agent_kind)
+        self.context_origin = ContextOrigin(self.context_origin)
+        self.execution_placement = ExecutionPlacement(self.execution_placement)
+        self.workspace_mode = WorkspaceMode(self.workspace_mode)
+        if (self.mode is SessionMode.PRIMARY) != (
+            self.agent_kind is AgentKind.PRIMARY
+        ):
+            raise ValueError("Session mode and agent kind describe different roles")
+        if self.execution_placement is ExecutionPlacement.AUTO:
+            raise ValueError("Persisted sessions require a resolved execution placement")
+        if (
+            self.context_origin is ContextOrigin.PARENT_SNAPSHOT
+            and self.agent_kind is not AgentKind.FORK
+        ):
+            raise ValueError(
+                "Only fork sessions may originate from a parent snapshot"
+            )
+        if (
+            self.agent_kind is AgentKind.FORK
+            and self.context_origin is ContextOrigin.FRESH
+        ):
+            raise ValueError("Fork sessions require a parent snapshot or resume history")
+
+    @property
+    def fork_result(self) -> "AgentRunResult | None":
+        """Compatibility view for persisted records created before Batch 1."""
+        return self.agent_result
 
 
 @dataclass
@@ -207,7 +273,8 @@ class AgentDefinition:
     )
     delegation_scope: DelegationScope | None = None
     model: AgentModel = AgentModel.INHERIT
-    isolation: AgentIsolation = AgentIsolation.SHARED
+    agent_kind: AgentKind = AgentKind.NAMED_SUBAGENT
+    workspace_mode: WorkspaceMode = WorkspaceMode.CURRENT
     visibility: AgentVisibility = AgentVisibility.PUBLIC
     max_turns: int = 50
     max_tokens: int | None = None
@@ -225,8 +292,14 @@ class AgentDefinition:
     def __post_init__(self) -> None:
         if not isinstance(self.intent, TaskIntent):
             object.__setattr__(self, "intent", TaskIntent(self.intent))
-        if not isinstance(self.isolation, AgentIsolation):
-            object.__setattr__(self, "isolation", AgentIsolation(self.isolation))
+        if not isinstance(self.agent_kind, AgentKind):
+            object.__setattr__(self, "agent_kind", AgentKind(self.agent_kind))
+        if self.agent_kind is AgentKind.FORK:
+            raise ValueError("Fork is a spawn-time context choice, not an agent definition")
+        if not isinstance(self.workspace_mode, WorkspaceMode):
+            object.__setattr__(
+                self, "workspace_mode", WorkspaceMode(self.workspace_mode)
+            )
         if not isinstance(self.visibility, AgentVisibility):
             object.__setattr__(self, "visibility", AgentVisibility(self.visibility))
         if not isinstance(self.model, AgentModel):
@@ -248,7 +321,7 @@ class AgentDefinition:
     def mode(self) -> SessionMode:
         return (
             SessionMode.PRIMARY
-            if self.isolation is AgentIsolation.NONE
+            if self.agent_kind is AgentKind.PRIMARY
             else SessionMode.SUBAGENT
         )
 
@@ -271,12 +344,12 @@ class AgentDefinition:
 
 
 @dataclass(frozen=True)
-class ForkResult:
-    """Result from a forked subagent run."""
+class AgentRunResult:
+    """Typed result from any child-agent run."""
 
     agent_name: str
     session_id: str
-    status: ForkStatus
+    status: AgentRunStatus
     summary: str
     error: str = ""
     artifacts: tuple[str, ...] = ()
@@ -289,7 +362,7 @@ class ForkResult:
     worktree_disposition: WorktreeDisposition = WorktreeDisposition.NOT_APPLICABLE
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "status", ForkStatus(self.status))
+        object.__setattr__(self, "status", AgentRunStatus(self.status))
         object.__setattr__(
             self,
             "worktree_disposition",
@@ -331,7 +404,7 @@ class ForkResult:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ForkResult":
+    def from_dict(cls, data: dict[str, Any]) -> "AgentRunResult":
         raw_report = data.get("report")
         report = (
             SubagentReport.from_dict(raw_report)
@@ -348,7 +421,7 @@ class ForkResult:
         return cls(
             agent_name=str(data["agent_name"]),
             session_id=str(data["session_id"]),
-            status=ForkStatus(data["status"]),
+            status=AgentRunStatus(data["status"]),
             summary=str(data.get("summary", "")),
             error=str(data.get("error", "")),
             artifacts=tuple(str(item) for item in data.get("artifacts", [])),
@@ -363,6 +436,10 @@ class ForkResult:
             ),
             worktree_disposition=WorktreeDisposition(raw_disposition),
         )
+
+
+# Compatibility alias while execution APIs are migrated in Batch 3.
+ForkResult = AgentRunResult
 
 
 @dataclass(frozen=True)
@@ -462,7 +539,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         delegation_policy=DelegationPolicy.allowlist(
             frozenset({"explore", "general", "code-reviewer"})
         ),
-        isolation=AgentIsolation.NONE,
+        agent_kind=AgentKind.PRIMARY,
         visibility=AgentVisibility.PUBLIC,
         max_turns=100,
         system_prompt="",
@@ -475,7 +552,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         delegation_policy=DelegationPolicy.allowlist(
             frozenset({"explore", "code-reviewer"})
         ),
-        isolation=AgentIsolation.NONE,
+        agent_kind=AgentKind.PRIMARY,
         visibility=AgentVisibility.PUBLIC,
         max_turns=60,
         system_prompt="",
@@ -486,7 +563,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         "Use for: finding files, searching code, analyzing code for bugs, "
         "answering questions about the codebase. Uses file_read/search_text — NO shell.",
         intent=TaskIntent.ANALYSIS,
-        isolation=AgentIsolation.SHARED,
+        workspace_mode=WorkspaceMode.CURRENT,
         visibility=AgentVisibility.PUBLIC,
         tools=_DEFAULT_READONLY_TOOLS,
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task"}),
@@ -506,7 +583,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         "including shell. Use ONLY when Write, Edit, or Bash is required. "
         "For read-only analysis, code search, or bug-finding, use 'explore' instead.",
         intent=TaskIntent.EDIT,
-        isolation=AgentIsolation.SHARED,
+        workspace_mode=WorkspaceMode.CURRENT,
         visibility=AgentVisibility.PUBLIC,
         tools=_DEFAULT_GENERAL_TOOLS,
         disallowed_tools=frozenset({"Task"}),
@@ -524,7 +601,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         name="code-reviewer",
         description="Reviews code for correctness and quality.",
         intent=TaskIntent.ANALYSIS,
-        isolation=AgentIsolation.SHARED,
+        workspace_mode=WorkspaceMode.CURRENT,
         visibility=AgentVisibility.HIDDEN,
         tools=_DEFAULT_READONLY_TOOLS,
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task", "WebFetch", "WebSearch"}),

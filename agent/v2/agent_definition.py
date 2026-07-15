@@ -11,11 +11,12 @@ import yaml
 from agent.task import TaskIntent
 from agent.v2.models import (
     AgentDefinition,
-    AgentIsolation,
+    AgentKind,
     AgentModel,
     AgentVisibility,
     DelegationPolicy,
     DelegationScope,
+    WorkspaceMode,
 )
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -117,15 +118,35 @@ def _parse_definition(path: Path) -> AgentDefinition:
         intent = TaskIntent(intent_raw)
     except ValueError as exc:
         raise _invalid(path, f"field 'intent' has invalid value {intent_raw!r}") from exc
-    isolation_raw = frontmatter.get("isolation", AgentIsolation.SHARED.value)
+    kind_raw = frontmatter.get("kind", AgentKind.NAMED_SUBAGENT.value)
+    try:
+        agent_kind = AgentKind(kind_raw)
+    except ValueError as exc:
+        raise _invalid(path, f"field 'kind' has invalid value {kind_raw!r}") from exc
+    if agent_kind is AgentKind.FORK:
+        raise _invalid(
+            path,
+            "fork is a spawn-time context choice, not a reusable agent definition",
+        )
+    isolation_raw = frontmatter.get("isolation")
     if isolation_raw == "fork":
         raise _invalid(
             path,
-            "field 'isolation' value 'fork' was removed because it implied "
-            "inherited context; use 'shared' for fresh context in the parent workspace",
+            "field 'isolation' controls only the workspace; conversation forks "
+            "must be requested through the Agent spawn context",
+        )
+    if isolation_raw == "shared":
+        raise _invalid(
+            path,
+            "field 'isolation' value 'shared' is obsolete; omit 'isolation' "
+            "to use the current workspace",
         )
     try:
-        isolation = AgentIsolation(isolation_raw)
+        workspace_mode = (
+            WorkspaceMode.CURRENT
+            if isolation_raw is None
+            else WorkspaceMode(isolation_raw)
+        )
     except ValueError as exc:
         raise _invalid(
             path, f"field 'isolation' has invalid value {isolation_raw!r}"
@@ -183,12 +204,13 @@ def _parse_definition(path: Path) -> AgentDefinition:
         name=str(name),
         description=str(frontmatter.get("description", "")),
         intent=intent,
+        agent_kind=agent_kind,
         tools=_parse_tool_list(tools_raw),
         disallowed_tools=_parse_tool_list(disallowed_raw),
         delegation_policy=_parse_delegation_policy(path, allowed_subagents_raw),
         delegation_scope=delegation_scope,
         model=model,
-        isolation=isolation,
+        workspace_mode=workspace_mode,
         visibility=visibility,
         max_turns=max_turns,
         max_tokens=max_tokens,

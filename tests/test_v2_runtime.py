@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import json
+import sqlite3
 import subprocess
 
 import pytest
@@ -38,14 +40,18 @@ from agent.v2 import (
 )
 from agent.v2.models import (
     AgentDefinition,
-    AgentIsolation,
+    AgentKind,
+    AgentRunResult,
     AgentVisibility,
+    ContextOrigin,
+    ExecutionPlacement,
     ForkStatus,
     SessionMode,
     SessionStatus,
     WorktreeChange,
     WorktreeDisposition,
     WorktreeEvidence,
+    WorkspaceMode,
 )
 from agent.v2.task_tool import _format_fork_result
 from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
@@ -154,11 +160,66 @@ def test_v2_session_store_persists_parent_child_relationships(tmp_path):
     child = store.create_session(agent_name="explore", mode="subagent", repo_path=str(tmp_path),
                                  title="child", parent_id=root.id, root_id=root.root_id)
     assert root.mode is SessionMode.PRIMARY
+    assert root.agent_kind is AgentKind.PRIMARY
+    assert root.context_origin is ContextOrigin.FRESH
+    assert root.execution_placement is ExecutionPlacement.FOREGROUND
+    assert root.workspace_mode is WorkspaceMode.CURRENT
     assert root.status is SessionStatus.QUEUED
     assert child.mode is SessionMode.SUBAGENT
+    assert child.agent_kind is AgentKind.NAMED_SUBAGENT
     assert store.get_session(root.id).parent_id is None
     assert store.get_session(child.id).parent_id == root.id
     assert [item.id for item in store.list_child_sessions(root.id)] == [child.id]
+
+
+def test_v2_session_store_migrates_legacy_child_contract_and_result(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    legacy_result = ForkResult(
+        agent_name="explore", session_id="child", status=ForkStatus.COMPLETED,
+        summary="legacy facts",
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, parent_id TEXT NULL, root_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL, mode TEXT NOT NULL, title TEXT NOT NULL,
+                status TEXT NOT NULL, repo_path TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}', fork_result_json TEXT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                completed_at TEXT NULL
+            );
+            CREATE TABLE session_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL,
+                tool_call_id TEXT NULL, tool_name TEXT NULL,
+                tool_calls_json TEXT NULL, created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO sessions VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "child", "root", "root", "explore", "subagent", "legacy",
+                "completed", str(tmp_path), "legacy facts", "",
+                json.dumps({"isolation": "worktree"}),
+                json.dumps(legacy_result.to_dict()), "now", "now", "now",
+            ),
+        )
+
+    child = SessionStore(str(db_path)).get_session("child")
+
+    assert child is not None
+    assert child.agent_kind is AgentKind.NAMED_SUBAGENT
+    assert child.context_origin is ContextOrigin.FRESH
+    assert child.execution_placement is ExecutionPlacement.FOREGROUND
+    assert child.workspace_mode is WorkspaceMode.WORKTREE
+    assert child.agent_result == legacy_result
+    assert child.fork_result == legacy_result
 
 
 def test_v2_session_store_rejects_invalid_child_topology(tmp_path):
@@ -184,6 +245,18 @@ def test_v2_session_store_rejects_invalid_child_topology(tmp_path):
             repo_path=str(tmp_path), title="wrong root",
             parent_id=root.id, root_id="forged-root",
         )
+    with pytest.raises(ValueError, match="same role"):
+        store.create_session(
+            agent_name="explore", mode=SessionMode.SUBAGENT,
+            agent_kind=AgentKind.PRIMARY, repo_path=str(tmp_path),
+            title="conflicting role", parent_id=root.id,
+        )
+    with pytest.raises(ValueError, match="resolved execution placement"):
+        store.create_session(
+            agent_name="build", mode=SessionMode.PRIMARY,
+            execution_placement=ExecutionPlacement.AUTO,
+            repo_path=str(tmp_path), title="unresolved placement",
+        )
 
 
 def test_v2_session_store_rejects_messages_for_unknown_session(tmp_path):
@@ -207,7 +280,9 @@ def test_v2_agent_registry_loads_builtins():
     assert registry.get("explore").intent is TaskIntent.ANALYSIS
     assert registry.get("code-reviewer").intent is TaskIntent.ANALYSIS
     assert registry.get("general").intent is TaskIntent.EDIT
-    assert registry.get("general").isolation is AgentIsolation.SHARED
+    assert registry.get("build").agent_kind is AgentKind.PRIMARY
+    assert registry.get("general").agent_kind is AgentKind.NAMED_SUBAGENT
+    assert registry.get("general").workspace_mode is WorkspaceMode.CURRENT
     assert registry.has("coordinator") is False
 
 
@@ -291,7 +366,8 @@ def test_agent_definition_frontmatter_declares_intent(tmp_path):
 
     assert definition is not None
     assert definition.intent is TaskIntent.ANALYSIS
-    assert definition.isolation is AgentIsolation.SHARED
+    assert definition.agent_kind is AgentKind.NAMED_SUBAGENT
+    assert definition.workspace_mode is WorkspaceMode.CURRENT
     assert definition.visibility is AgentVisibility.PUBLIC
 
 
@@ -340,12 +416,12 @@ def test_agent_definition_rejects_removed_fork_isolation(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(AgentDefinitionError, match="use 'shared'"):
+    with pytest.raises(AgentDefinitionError, match="spawn context"):
         _parse_definition(path)
 
 
-def test_agent_definition_accepts_explicit_shared_workspace(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+def test_agent_definition_rejects_obsolete_shared_workspace(tmp_path):
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "shared-workspace.md"
     path.write_text(
@@ -353,10 +429,22 @@ def test_agent_definition_accepts_explicit_shared_workspace(tmp_path):
         encoding="utf-8",
     )
 
+    with pytest.raises(AgentDefinitionError, match="omit 'isolation'"):
+        _parse_definition(path)
+
+
+def test_agent_definition_accepts_worktree_workspace(tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    path = tmp_path / "worktree-agent.md"
+    path.write_text(
+        "---\nname: worker\nintent: edit\nisolation: worktree\n---\nEdit.",
+        encoding="utf-8",
+    )
+
     definition = _parse_definition(path)
 
-    assert definition is not None
-    assert definition.isolation is AgentIsolation.SHARED
+    assert definition.workspace_mode is WorkspaceMode.WORKTREE
 
 
 @pytest.mark.parametrize("configured", (None, "inherit", " INHERIT "))
@@ -436,7 +524,7 @@ def test_project_agent_definitions_declare_typed_intents():
     assert _parse_definition(project_agents / "explore.md").intent is TaskIntent.ANALYSIS
     general = _parse_definition(project_agents / "general.md")
     assert general.intent is TaskIntent.EDIT
-    assert general.isolation is AgentIsolation.SHARED
+    assert general.workspace_mode is WorkspaceMode.CURRENT
 
 
 @pytest.mark.parametrize(
@@ -587,7 +675,7 @@ def test_v2_agent_without_allowlist_has_delegation_disabled(tmp_path):
         name="standalone",
         description="no delegation",
         intent=TaskIntent.EDIT,
-        isolation=AgentIsolation.NONE,
+        agent_kind=AgentKind.PRIMARY,
     )
 
     assert definition.delegation_policy.mode is DelegationMode.DISABLED
@@ -602,7 +690,7 @@ def test_v2_disabled_delegation_hides_task_tool_and_prompt(tmp_path):
         "name: build\n"
         "description: standalone primary\n"
         "intent: edit\n"
-        "isolation: none\n"
+        "kind: primary\n"
         "tools: Read, Task\n"
         "allowedSubagents: []\n"
         "---\n"
@@ -631,7 +719,7 @@ def test_v2_empty_effective_delegation_hides_task_tool_and_prompt(tmp_path):
         "name: build\n"
         "description: read-only primary\n"
         "intent: analysis\n"
-        "isolation: none\n"
+        "kind: primary\n"
         "tools: Read, Task\n"
         "allowedSubagents: [general]\n"
         "---\n"
@@ -721,12 +809,12 @@ def test_v2_task_tool_declares_authority_from_parent_delegation_scope(tmp_path):
 
 
 def test_v2_analysis_delegation_defaults_to_read_only_scope():
-    from agent.v2.models import AgentDefinition, AgentIsolation
+    from agent.v2.models import AgentDefinition, AgentKind
 
     parent = AgentDefinition(
         name="audit", description="audit", intent=TaskIntent.ANALYSIS,
         delegation_policy=DelegationPolicy.allowlist(frozenset({"general"})),
-        isolation=AgentIsolation.NONE,
+        agent_kind=AgentKind.PRIMARY,
     )
     child = AgentDefinition(
         name="general", description="writer", intent=TaskIntent.EDIT,
@@ -2042,7 +2130,7 @@ def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, 
     )
     definition = replace(
         runtime.agent_registry.get("general"),
-        isolation=AgentIsolation.WORKTREE,
+        workspace_mode=WorkspaceMode.WORKTREE,
     )
 
     result = runtime.fork_session(
@@ -2106,7 +2194,7 @@ def test_v2_worktree_child_preserves_changes_without_mutating_parent(
     )
     definition = replace(
         runtime.agent_registry.get("general"),
-        isolation=AgentIsolation.WORKTREE,
+        workspace_mode=WorkspaceMode.WORKTREE,
     )
 
     result = runtime.fork_session(
@@ -2287,8 +2375,8 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "task" in text
     assert "explore" in text
     assert "general" in text
-    assert "isolation=shared" in text
-    assert "fresh context in the parent project working tree" in text
+    assert "workspace=current" in text
+    assert "workspace=current uses the parent project working tree" in text
     assert "Worktree Result Protocol" not in text
     assert "Subagent Output Review Protocol" in text
     assert "INSPECT before you relay" in text
@@ -2324,7 +2412,7 @@ def test_v2_runtime_injects_worktree_result_protocol_from_agent_metadata(tmp_pat
         for message in runtime._build_runtime_messages(build, "edit task")
     )
 
-    assert "**general** (isolation=worktree)" in text
+    assert "**general** (workspace=worktree)" in text
     assert "Worktree Result Protocol" in text
     assert "worktree-disposition=preserved" in text
     assert "subagent_worktree_inspect" in text
@@ -2474,7 +2562,7 @@ def test_list_subagents_excludes_primary_agents():
     assert registry.get("code-reviewer").visibility is AgentVisibility.HIDDEN
 
     for spec in subagents:
-        assert spec.isolation is not AgentIsolation.NONE, (
+        assert spec.agent_kind is not AgentKind.PRIMARY, (
             f"Primary agent {spec.name!r} leaked into list_subagents()"
         )
         assert spec.name not in primary_names

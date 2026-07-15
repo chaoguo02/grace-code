@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from agent.v2.models import AgentIsolation, DelegationMode, SessionMode
+from agent.v2.models import DelegationMode, SessionMode, WorkspaceMode
 
 if TYPE_CHECKING:
     from agent.v2.models import AgentDefinition
@@ -73,11 +73,11 @@ def build_runtime_messages(
     if not available_subagents:
         return messages
     subagent_descriptions = "\n".join(
-        f"- **{s.name}** (isolation={s.isolation.value}): {s.description}"
+        f"- **{s.name}** (workspace={s.workspace_mode.value}): {s.description}"
         for s in available_subagents
     )
     has_worktree_subagent = any(
-        child.isolation is AgentIsolation.WORKTREE
+        child.workspace_mode is WorkspaceMode.WORKTREE
         for child in available_subagents
     )
     worktree_review_protocol = (
@@ -107,7 +107,7 @@ def build_runtime_messages(
     content = (
         "[Available Subagents]\n"
         "You have a `task` tool to delegate subtasks to fresh-context subagents. "
-        "Each agent's declared isolation is shown below.\n"
+        "Each agent's declared workspace mode is shown below.\n"
         f"Available subagent types:\n{subagent_descriptions}\n\n"
         "Task routing guide (MUST follow — wrong agent type causes loops):\n"
         f"{delegation_boundary}"
@@ -115,9 +115,9 @@ def build_runtime_messages(
         "When in doubt, use 'explore'. It has no shell and cannot accidentally modify files.\n\n"
         "Delegation isolation rules:\n"
         "- Each subagent runs in a FRESH context — it sees NONE of your conversation history.\n"
-        "- isolation=shared uses a fresh context in the parent project working tree. "
-        "Only read-only shared-workspace tasks may fan out in parallel.\n"
-        "- isolation=worktree uses a separate Git worktree and requires explicit "
+        "- workspace=current uses the parent project working tree. Only read-only "
+        "current-workspace tasks may fan out in parallel.\n"
+        "- workspace=worktree uses a separate Git worktree and requires explicit "
         "parent-side result handling.\n"
         "- Put ALL necessary context in the prompt: constraints, key facts, file paths, expected output.\n"
         "- The Runtime returns the subagent's final message plus any validated structured report.\n"
