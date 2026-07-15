@@ -336,3 +336,80 @@ You said: $ARGUMENTS
         rendered = reg.load_and_render("echo", "fix bug #42 — urgent!")
         assert rendered is not None
         assert "fix bug #42 — urgent!" in rendered
+
+
+# ---------------------------------------------------------------------------
+# SK-02: Description auto-matching (when_to_use frontmatter field)
+# ---------------------------------------------------------------------------
+
+def test_skill_metadata_parses_when_to_use():
+    """SK-02: when_to_use is parsed from SKILL.md frontmatter."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "deploy"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: Deploy
+description: Deploy the project to production
+when_to_use: When asked to deploy, release, or ship the project
+---
+
+# Deploy Skill
+Run the deployment pipeline.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        meta = reg._metadata.get("deploy")
+        assert meta is not None
+        assert meta.when_to_use == "When asked to deploy, release, or ship the project"
+
+
+def test_format_for_prompt_includes_when_to_use():
+    """SK-02: format_for_prompt() includes when_to_use for LLM semantic matching."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "review"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: Review
+description: Review code changes
+when_to_use: For code review, PR check, or quality audit requests
+---
+
+Review the code.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        prompt = reg.format_for_prompt()
+        assert "when_to_use" not in prompt.lower()  # field name not shown verbatim
+        assert "For code review, PR check, or quality audit requests" in prompt
+        assert "(Use when:" in prompt  # CC-aligned format
+
+
+def test_skill_without_when_to_use_still_works():
+    """SK-02: Skills without when_to_use render correctly (backward compatible)."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "simple"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: Simple
+description: A simple skill without when_to_use
+---
+
+Just do the thing.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        meta = reg._metadata.get("simple")
+        assert meta is not None
+        assert meta.when_to_use == ""
+        prompt = reg.format_for_prompt()
+        assert "simple" in prompt
+        assert "(Use when:" not in prompt  # no when_to_use = no extra text

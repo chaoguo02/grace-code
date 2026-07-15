@@ -40,10 +40,11 @@ class SkillMetadata:
     Note: 'triggers' keyword matching has been removed per Claude Code alignment.
     Claude Code uses description-based semantic matching by the LLM, not substring matching.
     """
-    name: str           # 目录名，也是调用名（/name）
-    display_name: str   # frontmatter 中的 name 字段
-    description: str    # frontmatter 中的 description
-    dir_path: str       # 技能目录的绝对路径
+    name: str              # 目录名，也是调用名（/name）
+    display_name: str      # frontmatter 中的 name 字段
+    description: str       # frontmatter 中的 description
+    dir_path: str = ""     # 技能目录的绝对路径
+    when_to_use: str = ""  # frontmatter 中的 when_to_use（LLM 自主匹配）
 
 
 class SkillRegistry:
@@ -132,6 +133,7 @@ class SkillRegistry:
             name=dir_name,
             display_name=str(fm_dict.get("name", dir_name)),
             description=str(fm_dict.get("description", "")),
+            when_to_use=str(fm_dict.get("when_to_use", "")),
             dir_path=str(skill_file.parent),
         )
 
@@ -212,7 +214,9 @@ class SkillRegistry:
         ]
         for meta in self._metadata.values():
             desc = meta.description or "(no description)"
-            lines.append(f"- **{meta.name}**: {desc}")
+            if meta.when_to_use:
+                desc += f" (Use when: {meta.when_to_use})"
+            lines.append(f"- **/{meta.name}**: {desc}")
 
         return "\n".join(lines)
 
