@@ -114,14 +114,17 @@ def parse_selection_response(response_text: str) -> list[str]:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # Fallback: extract filenames from text (lines that look like filenames)
+    # Fallback: extract memory names from each line of text
     filenames: list[str] = []
     for line in response_text.splitlines():
-        line = line.strip().lstrip("- ").strip("`\"'")
-        if line and re.match(r"^[\w.-]+\.md$", line):
-            filenames.append(line[:-3])
-        elif line and re.match(r"^[\w.-]+$", line):
-            filenames.append(line)
+        name = line.strip().lstrip("- ").strip("`\"'")
+        if not name:
+            continue
+        # Strip .md extension if present
+        if name.endswith(".md"):
+            name = name[:-3]
+        if name:
+            filenames.append(name)
     return filenames[:_MAX_SELECTED]
 
 

@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import re
-from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,27 +24,6 @@ if TYPE_CHECKING:
     from memory.retriever import ProactiveRetriever
 
 logger = logging.getLogger(__name__)
-
-# 停用词（中英文常见词，不用于相关性匹配）
-_STOPWORDS = frozenset({
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "need", "to", "of", "in",
-    "for", "on", "with", "at", "by", "from", "as", "into", "through",
-    "and", "or", "but", "if", "not", "no", "this", "that", "it", "its",
-    "all", "each", "every", "both", "few", "more", "most", "other",
-    "的", "了", "是", "在", "有", "和", "就", "不", "人", "都", "一",
-    "我", "你", "他", "她", "它", "们", "这", "那", "个", "中",
-    "上", "下", "把", "让", "用", "到", "说", "也", "去", "能",
-})
-
-_WORD_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]*|[一-鿿]+")
-
-
-def _extract_keywords(text: str) -> set[str]:
-    """从文本中提取关键词（去除停用词，全部小写）。"""
-    words = _WORD_RE.findall(text.lower())
-    return {w for w in words if w not in _STOPWORDS and len(w) > 1}
 
 
 class MemoryContext:
@@ -360,69 +337,6 @@ class MemoryContext:
             logger.debug("RAG retrieval failed: %s", exc)
             return ""
 
-    def _build_filtered_section(self) -> str:
-        """按相关性过滤和排序记忆条目。"""
-        summaries = self._store.list_memories()
-        if not summaries:
-            return ""
-
-        task_keywords = _extract_keywords(self._task_context)
-        if not task_keywords:
-            # 无可提取的关键词，退回完整索引
-            index_content = self._store.get_index_content(max_lines=self._max_lines)
-            if not index_content.strip():
-                return ""
-            return "\n".join([
-                "## Available Memories",
-                index_content,
-                "",
-                "Use memory_read to read a specific memory, memory_write to",
-                "save new information you want to remember across sessions.",
-            ])
-
-        # 计算每条记忆的相关性得分
-        scored: list[tuple[float, object]] = []
-        for mem in summaries:
-            mem_keywords = _extract_keywords(f"{mem.name} {mem.description}")
-            overlap = task_keywords & mem_keywords
-            score = len(overlap)
-            # feedback 规则优先展示，避免任务约束被项目记忆淹没。
-            if mem.type == "feedback":
-                score += 0.5
-            scored.append((score, mem))
-
-        # 按得分降序排列
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        # 相关记忆（得分 > 0）放前面，无关记忆简要列出
-        relevant = [(s, m) for s, m in scored if s > 0]
-        other = [(s, m) for s, m in scored if s == 0]
-
-        lines = ["## Available Memories"]
-
-        if relevant:
-            lines.append("### Relevant to current task")
-            self._append_grouped_memories(lines, [mem for _score, mem in relevant])
-
-        if other:
-            lines.append("### Other memories")
-            other_memories = [mem for _score, mem in other]
-            shown_count = self._append_grouped_memories(lines, other_memories, limit=10)
-            if len(other_memories) > shown_count:
-                lines.append(f"  ... and {len(other_memories) - shown_count} more")
-
-        lines.append("")
-        lines.append("Use memory_read to read a specific memory, memory_write to")
-        lines.append("save new information you want to remember across sessions.")
-
-        # 按行数限制
-        result = "\n".join(lines)
-        result_lines = result.splitlines()
-        if len(result_lines) > self._max_lines:
-            result = "\n".join(result_lines[:self._max_lines])
-
-        return result
-
     def get_feedback_for_files(
         self, accessed_files: set[str], *, record_access: bool = False,
     ) -> str:
@@ -519,33 +433,3 @@ class MemoryContext:
         """Backward-compatible alias for get_feedback_for_files()."""
         return self.get_feedback_for_files(accessed_files, record_access=record_access)
 
-    @staticmethod
-    def _append_grouped_memories(lines: list[str], memories: list[object], limit: int | None = None) -> int:
-        """按类型优先级输出记忆摘要，feedback 始终在最前。"""
-        groups = [
-            ("Rules to follow", "feedback"),
-            ("Project knowledge", "project"),
-            ("About the user", "user"),
-            ("References", "reference"),
-        ]
-        shown = 0
-        known_types = {t for _, t in groups}
-        for title, mem_type in groups:
-            typed = [mem for mem in memories if getattr(mem, "type", "") == mem_type]
-            if limit is not None:
-                typed = typed[:max(0, limit - shown)]
-            if not typed:
-                continue
-            lines.append(f"#### {title}")
-            for mem in typed:
-                lines.append(f"- [{mem.name}]({mem.name}.md) — {mem.description} ({mem.type})")
-                shown += 1
-                if limit is not None and shown >= limit:
-                    return shown
-        remaining = [mem for mem in memories if getattr(mem, "type", "") not in known_types]
-        for mem in remaining:
-            if limit is not None and shown >= limit:
-                break
-            lines.append(f"- [{mem.name}]({mem.name}.md) — {mem.description} ({mem.type})")
-            shown += 1
-        return shown
