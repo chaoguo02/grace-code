@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import json
+from pathlib import Path
 from threading import Event, Lock
 from typing import TYPE_CHECKING
 
 from agent.task import TerminationReason
 from agent.v2.execution_budget import ExecutionBudget
+from context.history import ConversationSnapshot
+from llm.base import LLMMessage, LLMToolSchema
 
 if TYPE_CHECKING:
     from agent.policy import PhasePolicy
@@ -18,6 +22,90 @@ if TYPE_CHECKING:
 class CancellationState(str, Enum):
     ACTIVE = "active"
     CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class ToolSchemaSnapshot:
+    """Immutable copy of one tool contract visible to the parent model."""
+
+    name: str
+    description: str
+    parameters_json: str
+
+    @classmethod
+    def capture(cls, schema: LLMToolSchema) -> "ToolSchemaSnapshot":
+        return cls(
+            name=schema.name,
+            description=schema.description,
+            parameters_json=json.dumps(
+                schema.parameters,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
+
+    def materialize(self) -> LLMToolSchema:
+        return LLMToolSchema(
+            name=self.name,
+            description=self.description,
+            parameters=json.loads(self.parameters_json),
+        )
+
+
+@dataclass(frozen=True)
+class AgentSpawnContext:
+    """Runtime facts at the exact model-input boundary that requested a child."""
+
+    conversation: ConversationSnapshot
+    parent_session_id: str
+    parent_agent_name: str
+    repo_path: str
+    model_name: str
+    tool_schemas: tuple[ToolSchemaSnapshot, ...]
+    depth: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.parent_session_id:
+            raise ValueError("parent_session_id is required")
+        if not self.parent_agent_name:
+            raise ValueError("parent_agent_name is required")
+        if not self.model_name:
+            raise ValueError("model_name is required")
+        resolved_repo = str(Path(self.repo_path).resolve())
+        if not Path(resolved_repo).is_absolute():
+            raise ValueError("repo_path must resolve to an absolute path")
+        object.__setattr__(self, "repo_path", resolved_repo)
+        if self.depth < 0:
+            raise ValueError("depth cannot be negative")
+        names = [schema.name for schema in self.tool_schemas]
+        if len(names) != len(set(names)):
+            raise ValueError("tool schema names must be unique")
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        messages: list[LLMMessage],
+        parent_session_id: str,
+        parent_agent_name: str,
+        repo_path: str,
+        model_name: str,
+        tool_schemas: list[LLMToolSchema],
+        depth: int = 0,
+    ) -> "AgentSpawnContext":
+        return cls(
+            conversation=ConversationSnapshot.capture(messages),
+            parent_session_id=parent_session_id,
+            parent_agent_name=parent_agent_name,
+            repo_path=repo_path,
+            model_name=model_name,
+            tool_schemas=tuple(
+                ToolSchemaSnapshot.capture(schema) for schema in tool_schemas
+            ),
+            depth=depth,
+        )
 
 
 @dataclass
@@ -84,6 +172,7 @@ class RunContext:
     delegation_step_limit: int | None = None
     phase_policy: "PhasePolicy | None" = None
     delegation_effects: "frozenset[ToolEffect] | None" = None
+    spawn_context: AgentSpawnContext | None = None
 
     def __post_init__(self) -> None:
         if self.delegation_width < 1:

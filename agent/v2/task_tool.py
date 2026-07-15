@@ -375,6 +375,7 @@ class AgentTool(BaseTool):
                 parent_policy=run_context.phase_policy.with_allowed_effects(
                     run_context.delegation_effects
                 ),
+                spawn_context=run_context.spawn_context,
             )
             output = _format_fork_result(subagent_type, fork_result)
             if fork_result.status == ForkStatus.PARTIAL:

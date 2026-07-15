@@ -12,6 +12,78 @@ from __future__ import annotations
 import pytest
 
 
+class TestConversationSnapshot:
+    def test_capture_is_deeply_immutable_and_materializes_fresh_objects(self):
+        from agent.task import ToolCall
+        from context.history import ConversationSnapshot
+        from llm.base import LLMMessage
+
+        content = [{"type": "text", "text": "before"}]
+        params = {"path": "a.py", "options": ["one"]}
+        messages = [
+            LLMMessage(role="system", content=content),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(name="file_read", params=params, id="call-1")],
+            ),
+            LLMMessage(role="tool", content="result", tool_call_id="call-1"),
+        ]
+
+        snapshot = ConversationSnapshot.capture(messages)
+        fingerprint = snapshot.fingerprint
+        content[0]["text"] = "after"
+        params["options"].append("two")
+
+        first = snapshot.materialize()
+        second = snapshot.materialize()
+        assert first[0].content[0]["text"] == "before"
+        assert first[1].tool_calls[0].params == {
+            "options": ["one"], "path": "a.py",
+        }
+        assert first[0] is not second[0]
+        assert first[1].tool_calls[0] is not second[1].tool_calls[0]
+        assert snapshot.fingerprint == fingerprint
+
+    def test_rejects_orphan_tool_result(self):
+        from context.history import ConversationSnapshot, ConversationSnapshotError
+        from llm.base import LLMMessage
+
+        with pytest.raises(ConversationSnapshotError, match="not paired"):
+            ConversationSnapshot.capture([
+                LLMMessage(role="tool", content="orphan", tool_call_id="call-1"),
+            ])
+
+    def test_rejects_incomplete_tool_call_sequence(self):
+        from agent.task import ToolCall
+        from context.history import ConversationSnapshot, ConversationSnapshotError
+        from llm.base import LLMMessage
+
+        with pytest.raises(ConversationSnapshotError, match="ends before"):
+            ConversationSnapshot.capture([
+                LLMMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[ToolCall(name="file_read", params={}, id="call-1")],
+                ),
+            ])
+
+    def test_rejects_non_contiguous_tool_results(self):
+        from agent.task import ToolCall
+        from context.history import ConversationSnapshot, ConversationSnapshotError
+        from llm.base import LLMMessage
+
+        with pytest.raises(ConversationSnapshotError, match="contiguous"):
+            ConversationSnapshot.capture([
+                LLMMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[ToolCall(name="file_read", params={}, id="call-1")],
+                ),
+                LLMMessage(role="user", content="interruption"),
+            ])
+
+
 # ===========================================================================
 # ArtifactStore 测试
 # ===========================================================================

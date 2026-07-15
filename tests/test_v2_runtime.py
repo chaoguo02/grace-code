@@ -29,6 +29,7 @@ from agent.task import (
     ToolCall,
 )
 from agent.v2 import (
+    AgentSpawnContext,
     AgentRegistryV2,
     AgentTool,
     AgentModel,
@@ -56,7 +57,7 @@ from agent.v2.models import (
 from agent.v2.task_tool import _format_fork_result
 from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
 from agent.v2.run_context import CancellationToken, RunContext
-from llm.base import LLMBackend, LLMMessage, LLMResponse, MockBackend
+from llm.base import LLMBackend, LLMMessage, LLMResponse, LLMToolSchema, MockBackend
 from tools.artifact_tool import ArtifactReadTool, ArtifactStoreRef
 from tools.base import (
     NoopTool, PathAccess, ToolConcurrency, ToolEffect, ToolMetadata,
@@ -1026,6 +1027,37 @@ def test_v2_task_tool_passes_narrowed_parent_authority_to_fork():
     assert delegated_policy.strict_file_scope is True
 
 
+def test_v2_task_tool_passes_exact_live_spawn_context():
+    fork_result = ForkResult(
+        agent_name="general", session_id="child", status="completed",
+        summary="done",
+    )
+    runtime = _StubRuntime(fork_result)
+    context = _run_context()
+    spawn_context = AgentSpawnContext.capture(
+        messages=[LLMMessage(role="system", content="live parent prompt")],
+        parent_session_id="parent",
+        parent_agent_name="build",
+        repo_path=str(Path.cwd()),
+        model_name="test-model",
+        tool_schemas=[LLMToolSchema(
+            name="task", description="delegate", parameters={"type": "object"},
+        )],
+    )
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build"
+    ).with_run_context(replace(context, spawn_context=spawn_context))
+
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "inspect context",
+        "prompt": "Inspect the live boundary",
+    })
+
+    assert result.success is True
+    assert runtime.last_fork_kwargs["spawn_context"] is spawn_context
+
+
 def test_v2_task_tool_does_not_dispatch_after_cancellation():
     fork_result = ForkResult(
         agent_name="general", session_id="child", status="completed",
@@ -1732,6 +1764,7 @@ class _FanOutBackend(LLMBackend):
         self.fail_second = fail_second
         self.children_overlapped = False
         self.parent_resume_messages: list[LLMMessage] = []
+        self.first_parent_messages: list[LLMMessage] = []
 
     @property
     def model_name(self) -> str:
@@ -1744,6 +1777,7 @@ class _FanOutBackend(LLMBackend):
                 self._parent_calls += 1
                 parent_call = self._parent_calls
             if parent_call == 1:
+                self.first_parent_messages = list(messages)
                 action = Action(
                     action_type=ActionType.TOOL_CALL,
                     thought="fan out independent inspections",
@@ -1818,6 +1852,21 @@ def test_v2_plan_fans_out_read_only_children_then_synthesizes(
     assert backend.children_overlapped is True
     children = store.list_child_sessions(parent.id)
     assert len(children) == 2
+    from context.history import ConversationSnapshot
+    expected_snapshot = ConversationSnapshot.capture(backend.first_parent_messages)
+    fingerprints = {
+        child.metadata["parent_snapshot_fingerprint"] for child in children
+    }
+    assert fingerprints == {expected_snapshot.fingerprint}
+    assert {
+        int(child.metadata["parent_snapshot_message_count"])
+        for child in children
+    } == {len(backend.first_parent_messages)}
+    assert all("messages" not in child.metadata for child in children)
+    assert any(
+        "Available Subagents" in str(message.content)
+        for message in backend.first_parent_messages
+    )
     expected_statuses = (
         {SessionStatus.COMPLETED, SessionStatus.FAILED}
         if fail_second else {SessionStatus.COMPLETED}

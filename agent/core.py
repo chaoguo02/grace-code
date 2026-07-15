@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -383,13 +383,14 @@ class ReActAgent:
             ):
                 _delegation_effects.update(_tool_metadata.effects)
         _delegation_effects = frozenset(_delegation_effects)
-        self._registry = self._registry.with_run_context(RunContext(
+        _base_run_context = RunContext(
             budget=_execution_budget,
             cancellation=_cancellation,
             delegation_step_limit=task.max_steps,
             phase_policy=policy.execution,
             delegation_effects=_delegation_effects,
-        ))
+        )
+        self._registry = self._registry.with_run_context(_base_run_context)
         missing_test_target_followups: int | None = None
         missing_test_target_message: str | None = None
         missing_test_target_detected_step: int | None = None
@@ -628,6 +629,38 @@ class ReActAgent:
             )
 
             tools = [] if decision.strip_tools else self._registry.get_schemas()
+            _live_spawn_context = None
+            if any(
+                ToolRole.DELEGATE in self._registry.metadata_for(schema.name).roles
+                for schema in tools
+            ):
+                from agent.v2.run_context import AgentSpawnContext
+                from context.history import ConversationSnapshotError
+                try:
+                    # Capture before the provider call: this is the immutable
+                    # request boundary, and excludes the assistant action the
+                    # provider is about to produce.
+                    _live_spawn_context = AgentSpawnContext.capture(
+                        messages=messages,
+                        parent_session_id=str(
+                            task.metadata.get("session_id") or task.task_id
+                        ),
+                        parent_agent_name=str(
+                            task.metadata.get("agent_name") or "primary"
+                        ),
+                        repo_path=task.repo_path,
+                        model_name=self._backend.model_name,
+                        tool_schemas=tools,
+                        depth=int(task.metadata.get("agent_depth") or 0),
+                    )
+                except ConversationSnapshotError as exc:
+                    # Named subagents remain fresh-context in this batch.
+                    # A future inherited-context request must fail closed
+                    # when this typed boundary is unavailable.
+                    logger.warning(
+                        "Live conversation snapshot unavailable for delegation: %s",
+                        exc,
+                    )
 
             try:
                 response = self._call_with_retry(messages, tools)
@@ -659,6 +692,21 @@ class ReActAgent:
                 self._cfg.token_callback(total_tokens)
 
             action = response.action
+
+            # Provider adapters may omit native call ids (notably text/DSML
+            # fallbacks). Runtime owns protocol normalization so persisted
+            # assistant/tool pairs always remain provider-valid.
+            if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
+                import hashlib as _call_hash
+                for _call_index, _tool_call in enumerate(action.tool_calls):
+                    if not _tool_call.id:
+                        _identity = (
+                            f"{task.task_id}:{step}:{_call_index}:{_tool_call.name}"
+                        ).encode("utf-8")
+                        _tool_call.id = (
+                            "runtime_call_"
+                            + _call_hash.sha256(_identity).hexdigest()[:24]
+                        )
 
             # ── Control Plane: validate tool calls against registered schemas ──
             # The LLM is an "action generator" — its output MUST conform to the
@@ -929,19 +977,21 @@ class ReActAgent:
                         for tc in effective_tool_calls
                     )
                 )
-                execution_registry = self._registry
+                execution_context = _base_run_context
+                if any(
+                    ToolRole.DELEGATE in self._registry.metadata_for(tc.name).roles
+                    for tc in effective_tool_calls
+                ):
+                    execution_context = replace(
+                        execution_context,
+                        spawn_context=_live_spawn_context,
+                    )
                 if parallel_safe:
-                    # Every child receives an equal ceiling from the same
-                    # parent budget snapshot, so aggregate delegated spend
-                    # cannot exceed the remaining parent budget.
-                    execution_registry = self._registry.with_run_context(RunContext(
-                        budget=_execution_budget,
-                        cancellation=_cancellation,
+                    execution_context = replace(
+                        execution_context,
                         delegation_width=len(effective_tool_calls),
-                        delegation_step_limit=task.max_steps,
-                        phase_policy=policy.execution,
-                        delegation_effects=_delegation_effects,
-                    ))
+                    )
+                execution_registry = self._registry.with_run_context(execution_context)
 
                 def _execute_observed(tc: ToolCall):
                     with observer.start_tool(

@@ -33,7 +33,7 @@ from agent.v2.models import (
 )
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
-from agent.v2.run_context import CancellationToken
+from agent.v2.run_context import AgentSpawnContext, CancellationToken
 from context.history import ConversationHistory
 from hooks.events import HookContext, HookEvent
 from llm.base import LLMBackend, LLMMessage
@@ -706,6 +706,7 @@ class SessionRuntime:
         cancellation_token: CancellationToken,
         parent_policy: "PhasePolicy",
         origin: DelegationOrigin = DelegationOrigin.TOOL,
+        spawn_context: AgentSpawnContext | None = None,
     ) -> AgentRunResult:
         """Dispatch a fresh-context child subagent.
 
@@ -739,6 +740,15 @@ class SessionRuntime:
         if definition.agent_kind is not AgentKind.NAMED_SUBAGENT:
             raise ValueError("Child execution requires a named subagent definition")
         _repo = self._require_project_scope(parent.repo_path)
+        if spawn_context is not None:
+            if not isinstance(spawn_context, AgentSpawnContext):
+                raise TypeError("spawn_context must be an AgentSpawnContext")
+            if spawn_context.parent_session_id != parent.id:
+                raise ValueError("spawn context parent does not match the session")
+            if spawn_context.parent_agent_name != parent.agent_name:
+                raise ValueError("spawn context agent does not match the session")
+            if self._require_project_scope(spawn_context.repo_path) != _repo:
+                raise ValueError("spawn context repo does not match the session")
         child = self._store.create_session(
             agent_name=definition.name,
             mode=SessionMode.SUBAGENT,
@@ -757,6 +767,14 @@ class SessionRuntime:
                 "requested_budget_tokens": budget_tokens,
                 "budget_tokens": child_contract.budget_tokens,
                 "max_steps": child_contract.max_steps,
+                "parent_snapshot_fingerprint": (
+                    spawn_context.conversation.fingerprint
+                    if spawn_context is not None else None
+                ),
+                "parent_snapshot_message_count": (
+                    len(spawn_context.conversation.messages)
+                    if spawn_context is not None else 0
+                ),
             },
         )
         child_cancellation = cancellation_token.child()
