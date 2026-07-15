@@ -20,6 +20,7 @@ from agent.v2.models import (
     WorkspaceMode,
 )
 from context.history import ConversationHistory
+from hooks.events import HookEvent
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
 from agent.v2.result_contract import SubagentReport, SubagentReportStatus
@@ -187,6 +188,16 @@ def run_child_agent(
     cfg.stream_callback = None
     cfg.thought_callback = None
     cfg.compact_history = False
+    cfg.stop_hook_event = HookEvent.SUBAGENT_STOP
+    cfg.hook_session_id = (
+        session_record.parent_id
+        if session_record is not None and session_record.parent_id is not None
+        else agent_id
+    )
+    cfg.hook_agent_id = agent_id
+    cfg.hook_agent_type = result_agent_name
+    if session_runtime is not None:
+        cfg.hook_dispatcher = session_runtime.hook_dispatcher
 
     # ── P0-2: Per-subagent Circuit Breaker ──
     # Each subagent gets its OWN circuit breaker cloned from the parent's.
@@ -413,14 +424,9 @@ def _build_fork_result(
     worktree: "WorktreeEvidence | None" = None,
     worktree_disposition: WorktreeDisposition = WorktreeDisposition.NOT_APPLICABLE,
 ) -> AgentRunResult:
-    status = ForkStatus.COMPLETED
+    status = ForkStatus.from_run_status(result.status)
     failure_diagnosis = ""
-    if result.status == RunStatus.MAX_STEPS:
-        status = ForkStatus.PARTIAL
-    elif result.status == RunStatus.CANCELLED:
-        status = ForkStatus.CANCELLED
-    elif not result.is_success():
-        status = ForkStatus.FAILED
+    if status is ForkStatus.FAILED:
         diagnosis = _build_structured_diagnosis(result, recent_actions or [])
         failure_diagnosis = diagnosis
 

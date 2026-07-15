@@ -199,28 +199,14 @@ def _run_explicit_child(
 
 
 def _child_only_run_result(child_result) -> RunResult:
-    from agent.v2.models import ForkStatus
-
-    status_map = {
-        ForkStatus.COMPLETED: RunStatus.SUCCESS,
-        ForkStatus.PARTIAL: RunStatus.MAX_STEPS,
-        ForkStatus.FAILED: RunStatus.FAILED,
-        ForkStatus.CANCELLED: RunStatus.CANCELLED,
-    }
-    reason_map = {
-        ForkStatus.COMPLETED: TerminationReason.NONE,
-        ForkStatus.PARTIAL: TerminationReason.MAX_STEPS,
-        ForkStatus.FAILED: TerminationReason.INTERNAL_ERROR,
-        ForkStatus.CANCELLED: TerminationReason.USER_CANCELLED,
-    }
     return RunResult(
         task_id=child_result.session_id,
-        status=status_map[child_result.status],
+        status=child_result.status.run_status,
         summary=child_result.summary,
         steps_taken=child_result.turns_used,
         total_tokens=child_result.tokens_used,
         error=child_result.error or None,
-        termination_reason=reason_map[child_result.status],
+        termination_reason=child_result.status.termination_reason,
     )
 
 

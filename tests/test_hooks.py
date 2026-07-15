@@ -10,7 +10,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hooks.events import BLOCKABLE_EVENTS, HookContext, HookEvent
+from hooks.events import (
+    BLOCKABLE_EVENTS, HookContext, HookEvent, SessionStartSource,
+)
 from hooks.matcher import HookMatcher
 from hooks.protocol import (
     DispatchResult,
@@ -38,8 +40,9 @@ class TestHookEvent:
     def test_blockable_events(self):
         assert HookEvent.PRE_TOOL_USE in BLOCKABLE_EVENTS
         assert HookEvent.USER_PROMPT_SUBMIT in BLOCKABLE_EVENTS
+        assert HookEvent.STOP in BLOCKABLE_EVENTS
+        assert HookEvent.SUBAGENT_STOP in BLOCKABLE_EVENTS
         assert HookEvent.POST_TOOL_USE not in BLOCKABLE_EVENTS
-        assert HookEvent.STOP not in BLOCKABLE_EVENTS
 
 
 # ─── HookContext tests ────────────────────────────────────────────────────────
@@ -90,7 +93,16 @@ class TestHookContext:
             "agent_id": "child",
             "agent_type": "explore",
             "last_assistant_message": "done",
+            "stop_hook_active": False,
         }
+
+    def test_session_start_matches_typed_source(self):
+        ctx = HookContext(
+            event=HookEvent.SESSION_START,
+            session_start_source=SessionStartSource.RESUME,
+        )
+
+        assert ctx.matcher_subject == "resume"
 
 
 def test_dispatcher_matches_subagent_hooks_by_agent_type(tmp_path):
@@ -339,7 +351,7 @@ class TestHookDispatcher:
         assert "tests failed" in result.reason
 
     @patch("hooks.executor.LocalRuntime.exec")
-    def test_regular_stop_dispatch_remains_non_blockable(self, mock_run):
+    def test_regular_stop_dispatch_is_blockable(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=2, stdout="", stderr="tests failed"
         )
@@ -352,7 +364,7 @@ class TestHookDispatcher:
         ctx = HookContext(event=HookEvent.STOP)
         result = dispatcher.dispatch(HookEvent.STOP, ctx)
 
-        assert result.control is HookControl.CONTINUE
+        assert result.control is HookControl.BLOCK
 
     @patch("hooks.executor.LocalRuntime.exec")
     def test_non_blockable_event_ignores_exit_2(self, mock_run):

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar
 
-from agent.task import TaskIntent
+from agent.task import RunStatus, TaskIntent, TerminationReason
 from agent.v2.result_contract import Finding, SubagentReport
 
 
@@ -232,12 +232,75 @@ class SessionStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
 
+    @classmethod
+    def from_run_status(cls, status: RunStatus) -> "SessionStatus":
+        """Converge a primary run into its durable session lifecycle."""
+        typed = RunStatus(status)
+        if typed is RunStatus.SUCCESS:
+            return cls.COMPLETED
+        if typed is RunStatus.CANCELLED:
+            return cls.CANCELLED
+        return cls.FAILED
+
+    @classmethod
+    def from_agent_run_status(
+        cls, status: "AgentRunStatus",
+    ) -> "SessionStatus":
+        return {
+            AgentRunStatus.COMPLETED: cls.COMPLETED,
+            AgentRunStatus.PARTIAL: cls.PARTIAL,
+            AgentRunStatus.FAILED: cls.FAILED,
+            AgentRunStatus.CANCELLED: cls.CANCELLED,
+        }[AgentRunStatus(status)]
+
 
 class AgentRunStatus(str, Enum):
     COMPLETED = "completed"
     PARTIAL = "partial"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+    @classmethod
+    def from_run_status(cls, status: RunStatus) -> "AgentRunStatus":
+        return {
+            RunStatus.SUCCESS: cls.COMPLETED,
+            RunStatus.MAX_STEPS: cls.PARTIAL,
+            RunStatus.CANCELLED: cls.CANCELLED,
+        }.get(RunStatus(status), cls.FAILED)
+
+    @classmethod
+    def from_session_status(cls, status: SessionStatus) -> "AgentRunStatus":
+        typed = SessionStatus(status)
+        if typed in {SessionStatus.QUEUED, SessionStatus.RUNNING}:
+            raise ValueError("A running session has no terminal agent result")
+        return {
+            SessionStatus.COMPLETED: cls.COMPLETED,
+            SessionStatus.PARTIAL: cls.PARTIAL,
+            SessionStatus.FAILED: cls.FAILED,
+            SessionStatus.CANCELLED: cls.CANCELLED,
+        }[typed]
+
+    @property
+    def session_status(self) -> SessionStatus:
+        return SessionStatus.from_agent_run_status(self)
+
+    @property
+    def run_status(self) -> RunStatus:
+        return {
+            AgentRunStatus.COMPLETED: RunStatus.SUCCESS,
+            AgentRunStatus.PARTIAL: RunStatus.MAX_STEPS,
+            AgentRunStatus.FAILED: RunStatus.FAILED,
+            AgentRunStatus.CANCELLED: RunStatus.CANCELLED,
+        }[self]
+
+    @property
+    def termination_reason(self) -> TerminationReason:
+        return {
+            AgentRunStatus.COMPLETED: TerminationReason.NONE,
+            AgentRunStatus.PARTIAL: TerminationReason.MAX_STEPS,
+            AgentRunStatus.FAILED: TerminationReason.INTERNAL_ERROR,
+            AgentRunStatus.CANCELLED: TerminationReason.USER_CANCELLED,
+        }[self]
 
 
 # Compatibility alias while execution APIs are migrated in Batch 3.

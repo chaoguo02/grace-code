@@ -14,7 +14,6 @@ Flow:
 from __future__ import annotations
 
 import logging
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -24,11 +23,6 @@ from hooks.protocol import DispatchResult, ExitCode, HookControl
 from hooks.registry import HookRegistry
 
 logger = logging.getLogger(__name__)
-
-
-class HookBlockPolicy(str, Enum):
-    EVENT_DEFAULT = "event_default"
-    FORCE_BLOCKABLE = "force_blockable"
 
 
 class HookDispatcher:
@@ -60,18 +54,19 @@ class HookDispatcher:
         For blockable events (PreToolUse, UserPromptSubmit): exits 2 → block.
         For non-blockable events: exit codes are logged but don't block.
         """
-        return self._dispatch(event, context, HookBlockPolicy.EVENT_DEFAULT)
+        return self._dispatch(event, context)
 
     def dispatch_stop(self, context: HookContext) -> DispatchResult:
-        """Dispatch Stop hooks with Claude Code-style blocking semantics."""
-        return self._dispatch(HookEvent.STOP, context, HookBlockPolicy.FORCE_BLOCKABLE)
+        """Compatibility entrypoint; blockability belongs to HookEvent."""
+        return self.dispatch(HookEvent.STOP, context)
 
     def _dispatch(
         self,
         event: HookEvent,
         context: HookContext,
-        block_policy: HookBlockPolicy,
     ) -> DispatchResult:
+        if context.event is not event:
+            raise ValueError("Hook context event does not match dispatch event")
         matcher_subject = context.matcher_subject
         tool_input = context.tool_input
 
@@ -93,10 +88,7 @@ class HookDispatcher:
             return DispatchResult()
 
         collected_context: list[str] = []
-        is_blockable = (
-            block_policy is HookBlockPolicy.FORCE_BLOCKABLE
-            or event in BLOCKABLE_EVENTS
-        )
+        is_blockable = event in BLOCKABLE_EVENTS
 
         for hook_config in external_hooks:
             result = execute_hook(

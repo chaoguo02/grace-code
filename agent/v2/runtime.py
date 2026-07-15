@@ -48,7 +48,8 @@ from agent.v2.run_context import (
     AgentSpawnContext, CancellationToken, ToolSchemaSnapshot,
 )
 from context.history import ConversationHistory
-from hooks.events import HookContext, HookEvent
+from hooks.events import HookContext, HookEvent, SessionStartSource
+from hooks.protocol import DispatchResult
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
 
@@ -525,13 +526,7 @@ class SessionRuntime:
             raise ExplicitDelegationError(
                 f"Unknown parent session: {parent_session_id}"
             )
-        status_map = {
-            ForkStatus.COMPLETED: SessionStatus.COMPLETED,
-            ForkStatus.PARTIAL: SessionStatus.PARTIAL,
-            ForkStatus.FAILED: SessionStatus.FAILED,
-            ForkStatus.CANCELLED: SessionStatus.CANCELLED,
-        }
-        status = status_map[child_result.status]
+        status = child_result.status.session_status
         if status in {SessionStatus.FAILED, SessionStatus.CANCELLED}:
             self._store.update_status(
                 parent.id,
@@ -598,8 +593,14 @@ class SessionRuntime:
             agent_cfg.runtime_message_source = (
                 lambda: self._claim_completion_messages(session_id)
             )
+            agent_cfg.stop_hook_event = HookEvent.STOP
+            agent_cfg.hook_session_id = session_id
+            agent_cfg.hook_agent_id = ""
+            agent_cfg.hook_agent_type = spec.name
+            agent_cfg.hook_dispatcher = self._hook_dispatcher
 
             persisted_messages = self._store.list_messages(session_id)
+            had_persisted_messages = bool(persisted_messages)
             if messages:
                 for message in messages:
                     self._store.append_message(session_id, message)
@@ -634,10 +635,25 @@ class SessionRuntime:
                 },
             )
 
-            self._fire_hook(HookContext(
+            start_source = (
+                SessionStartSource.STARTUP
+                if session.status is SessionStatus.QUEUED and not had_persisted_messages
+                else SessionStartSource.RESUME
+            )
+            start_hook = self._fire_hook(HookContext(
                 event=HookEvent.SESSION_START,
                 session_id=session_id,
+                agent_type=spec.name,
+                session_start_source=start_source,
             ))
+            if start_hook.additional_context:
+                history.add(LLMMessage(
+                    role="user",
+                    content=(
+                        "[SESSION START HOOK CONTEXT]\n"
+                        f"{start_hook.additional_context}"
+                    ),
+                ))
 
             # Runtime-injected messages are also in history. Counting only DB
             # messages re-appends old history and can split native tool pairs.
@@ -710,10 +726,6 @@ class SessionRuntime:
                     status=SessionStatus.FAILED,
                 )
             self._cancellation_tokens.pop(session_key, None)
-            self._fire_hook(HookContext(
-                event=HookEvent.STOP,
-                session_id=session_id,
-            ))
 
     # ── Child subagent ──
 
@@ -1031,13 +1043,6 @@ class SessionRuntime:
                     status=completed_child.status,
                     fork_result=child_result,
                 )
-                self._fire_hook(HookContext(
-                    event=HookEvent.SUBAGENT_STOP,
-                    session_id=parent.id,
-                    agent_id=child.id,
-                    agent_type=child_agent_type,
-                    last_assistant_message=completed_child.summary,
-                ))
             self._cancellation_tokens.pop(
                 (child.id, child.generation), None,
             )
@@ -1068,16 +1073,12 @@ class SessionRuntime:
                     else:
                         notification_result = completed_child.agent_result
                         if notification_result is None:
-                            status_map = {
-                                SessionStatus.COMPLETED: AgentRunStatus.COMPLETED,
-                                SessionStatus.PARTIAL: AgentRunStatus.PARTIAL,
-                                SessionStatus.FAILED: AgentRunStatus.FAILED,
-                                SessionStatus.CANCELLED: AgentRunStatus.CANCELLED,
-                            }
                             notification_result = AgentRunResult(
                                 agent_name=completed_child.agent_name,
                                 session_id=completed_child.id,
-                                status=status_map[completed_child.status],
+                                status=AgentRunStatus.from_session_status(
+                                    completed_child.status
+                                ),
                                 summary=completed_child.summary,
                                 error=completed_child.error,
                             )
@@ -1399,16 +1400,22 @@ class SessionRuntime:
             spawn_context=spawn_context,
         )
 
-    def _fire_hook(self, context: HookContext) -> None:
+    def _fire_hook(self, context: HookContext) -> DispatchResult:
         if self._hook_dispatcher is None:
-            return
+            return DispatchResult()
         try:
-            self._hook_dispatcher.dispatch(context.event, context)
+            return self._hook_dispatcher.dispatch(context.event, context)
         except Exception:
             logger.debug(
                 "Hook %s failed for session %s",
                 context.event.value, context.session_id, exc_info=True,
             )
+            return DispatchResult()
+
+    @property
+    def hook_dispatcher(self):
+        """Lifecycle dispatcher shared by all sessions in this Runtime."""
+        return self._hook_dispatcher
 
     def _emit_subagent_event(
         self,

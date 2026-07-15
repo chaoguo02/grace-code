@@ -32,6 +32,8 @@ class PolicyAwareToolRegistry(ToolRegistry):
         super().__init__(
             hitl_manager=getattr(base, "_hitl_manager", None),
             permission_pipeline=getattr(base, "_permission_pipeline", None),
+            hook_dispatcher=getattr(base, "_hook_dispatcher", None),
+            capability_registry=getattr(base, "_capability_registry", None),
         )
         self._base = base
         self._phase_policy = phase_policy

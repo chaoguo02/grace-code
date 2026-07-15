@@ -33,9 +33,19 @@ class HookEvent(str, Enum):
     SUBAGENT_STOP = "SubagentStop"
 
 
+class SessionStartSource(str, Enum):
+    """Objective reason a session-start lifecycle event was emitted."""
+
+    STARTUP = "startup"
+    RESUME = "resume"
+    CLEAR = "clear"
+
+
 BLOCKABLE_EVENTS: frozenset[HookEvent] = frozenset({
     HookEvent.PRE_TOOL_USE,
     HookEvent.USER_PROMPT_SUBMIT,
+    HookEvent.STOP,
+    HookEvent.SUBAGENT_STOP,
 })
 
 
@@ -57,7 +67,21 @@ class HookContext:
     agent_id: str = ""
     agent_type: str = ""
     last_assistant_message: str = ""
+    stop_hook_active: bool = False
+    session_start_source: SessionStartSource | None = None
     timestamp: str = field(default_factory=_now)
+
+    def __post_init__(self) -> None:
+        self.event = HookEvent(self.event)
+        if self.session_start_source is not None:
+            self.session_start_source = SessionStartSource(
+                self.session_start_source
+            )
+        if (
+            self.event is HookEvent.SESSION_START
+            and self.session_start_source is None
+        ):
+            self.session_start_source = SessionStartSource.STARTUP
 
     @property
     def matcher_subject(self) -> str:
@@ -67,6 +91,9 @@ class HookContext:
             HookEvent.SUBAGENT_STOP,
         }:
             return self.agent_type
+        if self.event is HookEvent.SESSION_START:
+            assert self.session_start_source is not None
+            return self.session_start_source.value
         return self.tool_name
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,4 +119,6 @@ class HookContext:
             d["agent_type"] = self.agent_type
         if self.last_assistant_message:
             d["last_assistant_message"] = self.last_assistant_message
+        if self.event in {HookEvent.STOP, HookEvent.SUBAGENT_STOP}:
+            d["stop_hook_active"] = self.stop_hook_active
         return d

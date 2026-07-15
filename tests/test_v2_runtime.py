@@ -25,6 +25,7 @@ from agent.task import (
     ObservationStatus,
     RunResult,
     RunStatus,
+    TerminationReason,
     Task,
     TaskIntent,
     ToolCall,
@@ -117,6 +118,20 @@ def _run_context(tokens: int = 50_000) -> RunContext:
         phase_policy=PhasePolicy(),
         delegation_effects=frozenset(ToolEffect),
     )
+
+
+def test_agent_run_status_owns_cross_layer_terminal_mapping():
+    assert ForkStatus.from_run_status(RunStatus.SUCCESS) is ForkStatus.COMPLETED
+    assert ForkStatus.from_run_status(RunStatus.MAX_STEPS) is ForkStatus.PARTIAL
+    assert ForkStatus.from_run_status(RunStatus.GAVE_UP) is ForkStatus.FAILED
+    assert ForkStatus.CANCELLED.session_status is SessionStatus.CANCELLED
+    assert ForkStatus.PARTIAL.run_status is RunStatus.MAX_STEPS
+    assert (
+        ForkStatus.CANCELLED.termination_reason
+        is TerminationReason.USER_CANCELLED
+    )
+    with pytest.raises(ValueError, match="no terminal agent result"):
+        ForkStatus.from_session_status(SessionStatus.RUNNING)
 
 
 def _fork_resources(tokens: int = 50_000) -> dict[str, object]:
@@ -2191,7 +2206,8 @@ def test_v2_react_agent_stop_hook_blocks_then_continues(tmp_path):
         assert ctx.messages
 
     class BlockingDispatcher:
-        def dispatch_stop(self, ctx):
+        def dispatch(self, event, ctx):
+            assert event is HookEvent.STOP
             stop_callback(ctx)
             if calls == 1:
                 return DispatchResult(control=HookControl.BLOCK, reason="tests failed")
@@ -2218,7 +2234,8 @@ def test_v2_react_agent_stop_hook_retry_limit_gives_up(tmp_path):
     from hooks.protocol import DispatchResult
 
     class AlwaysBlockingDispatcher:
-        def dispatch_stop(self, ctx):
+        def dispatch(self, event, ctx):
+            assert event is HookEvent.STOP
             return DispatchResult(control=HookControl.BLOCK, reason="still failing")
 
     tool_registry = ToolRegistry(hook_dispatcher=AlwaysBlockingDispatcher())
@@ -2775,8 +2792,88 @@ def test_v2_subagent_lifecycle_events_carry_parent_child_facts(tmp_path):
     assert subagent_hooks[-1].last_assistant_message == "facts ready"
 
 
+def test_v2_subagent_stop_hook_blocks_before_terminal_state(tmp_path):
+    stop_contexts = []
+
+    class BlockingSubagentDispatcher:
+        def dispatch(self, event, context):
+            if event is HookEvent.SUBAGENT_STOP:
+                stop_contexts.append(context)
+                if len(stop_contexts) == 1:
+                    return DispatchResult(
+                        control=HookControl.BLOCK,
+                        reason="include exact evidence",
+                    )
+            return DispatchResult()
+
+    runtime, store = _make_runtime(
+        tmp_path,
+        MockBackend([
+            Action(ActionType.FINISH, "done", message="first answer"),
+            Action(ActionType.FINISH, "done", message="evidence included"),
+        ]),
+        hook_dispatcher=BlockingSubagentDispatcher(),
+    )
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+
+    result = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=runtime.agent_registry.get("explore"),
+        description="review with stop gate",
+        prompt="Inspect facts",
+        **_fork_resources(),
+    )
+
+    assert result.summary == "evidence included"
+    assert [ctx.stop_hook_active for ctx in stop_contexts] == [False, True]
+    assert store.get_session(result.session_id).status is SessionStatus.COMPLETED
+
+
+def test_v2_session_start_hook_context_enters_first_model_request(tmp_path):
+    class SessionContextDispatcher:
+        def dispatch(self, event, context):
+            if event is HookEvent.SESSION_START:
+                assert context.matcher_subject == "startup"
+                return DispatchResult(additional_context="project policy fact")
+            return DispatchResult()
+
+    backend = MockBackend([
+        Action(ActionType.FINISH, "done", message="review complete"),
+    ])
+    runtime, _ = _make_runtime(
+        tmp_path, backend, hook_dispatcher=SessionContextDispatcher(),
+    )
+    session = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="plan",
+    )
+
+    runtime.run_session(
+        session.id,
+        agent_name="plan",
+        task_description="review project",
+        intent="analysis",
+    )
+
+    first_request = "\n".join(
+        str(message.content) for message in backend.received_messages[0]
+    )
+    assert "[SESSION START HOOK CONTEXT]" in first_request
+    assert "project policy fact" in first_request
+
+
 def test_v2_cancelled_fork_converges_to_cancelled_session(tmp_path):
-    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    hook_events = []
+
+    class RecordingDispatcher:
+        def dispatch(self, event, context):
+            hook_events.append(event)
+            return DispatchResult()
+
+    runtime, store = _make_runtime(
+        tmp_path, MockBackend([]), hook_dispatcher=RecordingDispatcher(),
+    )
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
     )
@@ -2799,6 +2896,7 @@ def test_v2_cancelled_fork_converges_to_cancelled_session(tmp_path):
     assert child is not None
     assert child.status is SessionStatus.CANCELLED
     assert child.error == "operator cancelled"
+    assert HookEvent.SUBAGENT_STOP not in hook_events
 
 
 def test_react_agent_honors_pre_cancelled_runtime_token(tmp_path):

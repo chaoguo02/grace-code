@@ -50,6 +50,7 @@ from context.artifacts import ArtifactStore
 from context.compaction import ConversationCompactor
 from context.manager import ContextManager, ContextManagerConfig, RequestContext
 from llm.base import LLMBackend, LLMMessage, LLMToolSchema
+from hooks.events import HookEvent
 from observability.datasets import append_failure_dataset_item
 from observability.models import (
     build_analysis_run_metadata,
@@ -113,6 +114,13 @@ class AgentConfig:
     """Runtime-injected objective completion check; no LLM interpretation."""
     runtime_message_source: Callable[[], list[LLMMessage]] | None = None
     """Pulls typed Runtime events into history before each model request."""
+    stop_hook_event: HookEvent = HookEvent.STOP
+    """Typed terminal hook for this agent role (Stop or SubagentStop)."""
+    hook_session_id: str = ""
+    hook_agent_id: str = ""
+    hook_agent_type: str = ""
+    hook_dispatcher: object = None
+    """Runtime-owned lifecycle dispatcher; registry remains the fallback."""
     confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
     compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
@@ -807,7 +815,11 @@ class ReActAgent:
                         )
                         continue
 
-                stop_message = self._run_stop_hook(history)
+                stop_message = self._run_stop_hook(
+                    history,
+                    stop_hook_active=self._stop_hook_count > 0,
+                    last_assistant_message=action.message or "",
+                )
                 if stop_message is not None:
                     next_count = self._stop_hook_count + 1
                     if next_count > _MAX_STOP_HOOK_RETRIES:
@@ -1345,17 +1357,30 @@ class ReActAgent:
                 parts.append(f"[{role}] {content}")
         return "\n\n".join(parts)
 
-    def _run_stop_hook(self, history: ConversationHistory) -> str | None:
+    def _run_stop_hook(
+        self,
+        history: ConversationHistory,
+        *,
+        stop_hook_active: bool,
+        last_assistant_message: str,
+    ) -> str | None:
         messages = history.to_dicts()
-        dispatcher = getattr(self._full_registry, "_hook_dispatcher", None)
+        dispatcher = self._cfg.hook_dispatcher or getattr(
+            self._full_registry, "_hook_dispatcher", None
+        )
         if dispatcher is not None:
             try:
-                from hooks.events import HookContext, HookEvent
+                from hooks.events import HookContext
                 ctx = HookContext(
-                    event=HookEvent.STOP,
+                    event=self._cfg.stop_hook_event,
+                    session_id=self._cfg.hook_session_id,
                     messages=messages,
+                    agent_id=self._cfg.hook_agent_id,
+                    agent_type=self._cfg.hook_agent_type,
+                    last_assistant_message=last_assistant_message,
+                    stop_hook_active=stop_hook_active,
                 )
-                result = dispatcher.dispatch_stop(ctx)
+                result = dispatcher.dispatch(ctx.event, ctx)
             except Exception as exc:
                 logger.debug("Stop hook dispatch failed: %s", exc)
                 result = None
