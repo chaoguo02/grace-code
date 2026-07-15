@@ -123,44 +123,80 @@ class SkillRegistry:
 
     def __init__(self, skills_dir: str, extra_dirs: list[str] | None = None, include_builtin: bool = True) -> None:
         self._skills_dirs: list[str] = []
-        # 内置目录（可选，测试时可关闭）
         if include_builtin:
             self._skills_dirs.append(BUILTIN_SKILLS_DIR)
-        # 项目级目录
         if skills_dir:
             self._skills_dirs.append(skills_dir)
-        # 额外目录（如用户级 ~/.forge-agent/skills/）
         if extra_dirs:
             self._skills_dirs.extend(extra_dirs)
 
         self._metadata: dict[str, SkillMetadata] = {}
+        self._nested_metadata: dict[str, SkillMetadata] = {}  # SK-19: dir-prefixed skills
+        self._dir_mtimes: dict[str, float] = {}  # SK-18: mtime tracking
         self._discover()
 
     def _discover(self) -> None:
-        """扫描所有 skills 目录，解析每个 SKILL.md 的 frontmatter。"""
+        """扫描所有 skills 目录 + 嵌套目录（SK-19）。
+
+        SK-18: tracks directory mtimes for efficient refresh().
+        SK-19: scans nested .claude/skills/ up to 3 levels deep for monorepo support.
+        """
+        self._metadata.clear()
+        self._nested_metadata.clear()
+
         for skills_dir in self._skills_dirs:
             skills_path = Path(skills_dir)
             if not skills_path.is_dir():
                 logger.debug("Skills directory does not exist: %s", skills_dir)
                 continue
 
-            for entry in sorted(skills_path.iterdir()):
-                if not entry.is_dir():
-                    continue
-                skill_file = entry / "SKILL.md"
-                if not skill_file.is_file():
-                    continue
+            # SK-18: record mtime for this directory
+            try:
+                self._dir_mtimes[skills_dir] = skills_path.stat().st_mtime
+            except OSError:
+                pass
 
-                try:
-                    metadata = self._parse_frontmatter(skill_file, entry.name)
-                    if metadata:
-                        # 项目级覆盖内置（后扫描的目录覆盖先扫描的）
+            # Main skills directory
+            self._scan_skills_dir(skills_path, prefix="")
+
+            # SK-19: nested skills in subdirectories (up to 3 levels)
+            try:
+                for sub in skills_path.parent.rglob(".claude/skills"):
+                    if sub == skills_path:
+                        continue
+                    if sub.is_relative_to(skills_path) or skills_path in sub.parents:
+                        continue
+                    depth = len(sub.relative_to(skills_path.parent).parts)
+                    if depth <= 4:  # e.g. apps/web/.claude/skills = 3 parts
+                        rel_dir = str(sub.parent.relative_to(skills_path.parent)).replace("\\", "/")
+                        prefix = rel_dir + ":"
+                        self._scan_skills_dir(sub, prefix=prefix)
+            except (OSError, ValueError):
+                pass
+
+        total = len(self._metadata) + len(self._nested_metadata)
+        logger.info("Discovered %d skills total (%d root, %d nested)", total, len(self._metadata), len(self._nested_metadata))
+
+    def _scan_skills_dir(self, skills_path: Path, *, prefix: str = "") -> None:
+        """Scan one skills directory for SKILL.md files."""
+        for entry in sorted(skills_path.iterdir()):
+            if not entry.is_dir():
+                continue
+            skill_file = entry / "SKILL.md"
+            if not skill_file.is_file():
+                continue
+
+            try:
+                metadata = self._parse_frontmatter(skill_file, entry.name)
+                if metadata:
+                    if prefix:
+                        self._nested_metadata[f"{prefix}{metadata.name}"] = metadata
+                        logger.debug("Nested skill: %s%s (from %s)", prefix, metadata.name, skills_path)
+                    else:
                         self._metadata[metadata.name] = metadata
-                        logger.debug("Discovered skill: %s (from %s)", metadata.name, skills_dir)
-                except Exception as e:
-                    logger.warning("Failed to parse skill %s: %s", entry.name, e)
-
-        logger.info("Discovered %d skills total", len(self._metadata))
+                        logger.debug("Discovered skill: %s (from %s)", metadata.name, skills_path)
+            except Exception as e:
+                logger.warning("Failed to parse skill %s: %s", entry.name, e)
 
     def _parse_frontmatter(self, skill_file: Path, dir_name: str) -> SkillMetadata | None:
         """Parse SKILL.md YAML frontmatter.
@@ -243,19 +279,23 @@ class SkillRegistry:
         return split_frontmatter(content)
 
     def list_skills(self) -> list[SkillMetadata]:
-        """返回所有已发现的 skill metadata。"""
-        return list(self._metadata.values())
+        """返回所有已发现的 skill metadata（含嵌套 skills）。"""
+        return list(self._metadata.values()) + list(self._nested_metadata.values())
 
     def has_skill(self, name: str) -> bool:
-        """检查是否存在指定名称的 skill。"""
-        return name in self._metadata
+        """检查是否存在指定名称的 skill（含嵌套 skills）。"""
+        return name in self._metadata or name in self._nested_metadata
+
+    def _get_skill_meta(self, name: str) -> SkillMetadata | None:
+        """Get metadata for a skill, checking root then nested."""
+        return self._metadata.get(name) or self._nested_metadata.get(name)
 
     def get_skill_detail(self, name: str) -> str | None:
-        """返回 skill 的完整 body 内容（未做 $ARGUMENTS 替换）。供 /skill show 使用。"""
-        if name not in self._metadata:
+        """返回 skill 的完整 body 内容（未做 $ARGUMENTS 替换）。"""
+        meta = self._get_skill_meta(name)
+        if meta is None:
             return None
-        metadata = self._metadata[name]
-        skill_file = Path(metadata.dir_path) / "SKILL.md"
+        skill_file = Path(meta.dir_path) / "SKILL.md"
         if not skill_file.is_file():
             return None
         content = skill_file.read_text(encoding="utf-8")
@@ -279,14 +319,15 @@ class SkillRegistry:
           1. Read SKILL.md body
           2. SK-09: Expand `` !`cmd` `` and ```! blocks (run commands, inline output)
           3. SK-10~16: Apply string substitutions ($ARGUMENTS, $N, $name, ${...})
-          4. Return rendered content
+          4. SK-17: Append supporting files index if available
+          5. Return rendered content
 
         Reference: https://code.claude.com/docs/en/skills#available-string-substitutions
         """
-        if name not in self._metadata:
+        metadata = self._get_skill_meta(name)
+        if metadata is None:
             return None
 
-        metadata = self._metadata[name]
         skill_file = Path(metadata.dir_path) / "SKILL.md"
 
         if not skill_file.is_file():
@@ -311,7 +352,36 @@ class SkillRegistry:
             effort_level=effort_level,
         )
 
+        # Step 3 (SK-17): Append supporting files index
+        supporting = self._list_supporting_files(metadata.dir_path)
+        if supporting:
+            body += "\n\n## Supporting Files\n" + supporting
+
         return body
+
+    # ── SK-17: Supporting files ──────────────────────────────────────
+
+    @staticmethod
+    def _list_supporting_files(skill_dir: str) -> str:
+        """List supporting files in the skill directory (reference.md, scripts/, etc.).
+
+        CC reference: https://code.claude.com/docs/en/skills#add-supporting-files
+        """
+        lines: list[str] = []
+        try:
+            for entry in sorted(Path(skill_dir).iterdir()):
+                if entry.name == "SKILL.md":
+                    continue
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_file():
+                    lines.append(f"- `{entry.name}` — {entry.stat().st_size} bytes")
+                elif entry.is_dir():
+                    sub_files = list(entry.iterdir())
+                    lines.append(f"- `{entry.name}/` — {len(sub_files)} file(s)")
+        except OSError:
+            return ""
+        return "\n".join(lines) if lines else ""
 
     # ── SK-09: Dynamic context injection ────────────────────────────
 
@@ -322,9 +392,12 @@ class SkillRegistry:
         CC spec: !` at line start or after whitespace triggers execution.
         The command runs once during preprocessing; output is NOT re-scanned.
         """
-        import subprocess
+        # Fast path: skip if no injection markers present
+        if "!`" not in content and "```!" not in content:
+            return content
 
-        # ---- ```! fenced blocks (multi-line) ----
+        # Lazy import — subprocess is expensive on Windows
+        from subprocess import run as _subprocess_run
         _FENCED_BLOCK_RE = None  # compiled lazily at module level if needed
         result_parts: list[str] = []
         in_fence = False
@@ -346,7 +419,7 @@ class SkillRegistry:
                     cmd_text = "\n".join(fence_lines).strip()
                     if cmd_text:
                         try:
-                            output = subprocess.run(
+                            output = _subprocess_run(
                                 cmd_text, shell=True, capture_output=True, text=True,
                                 timeout=30, cwd=cwd,
                             ).stdout.strip()
@@ -363,7 +436,7 @@ class SkillRegistry:
             if m:
                 indent, cmd = m.group(1), m.group(2).strip()
                 try:
-                    output = subprocess.run(
+                    output = _subprocess_run(
                         cmd, shell=True, capture_output=True, text=True,
                         timeout=30, cwd=cwd,
                     ).stdout.strip()
@@ -467,8 +540,9 @@ class SkillRegistry:
         if not self._metadata:
             return ""
 
-        user_skills = [m for m in self._metadata.values() if m.user_can_invoke]
-        model_skills = [m for m in self._metadata.values() if m.model_invocable]
+        all_meta = list(self._metadata.values()) + list(self._nested_metadata.values())
+        user_skills = [m for m in all_meta if m.user_can_invoke]
+        model_skills = [m for m in all_meta if m.model_invocable]
 
         lines = [
             "## Available Skills",
@@ -493,6 +567,25 @@ class SkillRegistry:
         return "\n".join(lines)
 
     def refresh(self) -> None:
-        """重新扫描 skills 目录（用于运行时热加载）。"""
+        """SK-18: mtime-based live change detection.
+
+        Only rescans directories whose mtime has changed since last scan.
+        If no changes detected, returns immediately (no-op).
+        """
+        changed = False
+        for skills_dir in self._skills_dirs:
+            try:
+                current_mtime = Path(skills_dir).stat().st_mtime
+            except OSError:
+                continue
+            if self._dir_mtimes.get(skills_dir) != current_mtime:
+                changed = True
+                break
+
+        if not changed:
+            return  # Nothing changed, skip rescan
+
         self._metadata.clear()
+        self._nested_metadata.clear()
+        self._dir_mtimes.clear()
         self._discover()
