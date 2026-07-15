@@ -8,11 +8,13 @@ from pathlib import Path
 
 from agent.task import ToolCall
 from agent.v2.models import (
+    AgentCompletionNotification,
     AgentKind,
     AgentRunResult,
     ContextOrigin,
     ExecutionPlacement,
     ForkResult,
+    NotificationDeliveryState,
     SessionMode,
     SessionRecord,
     SessionStatus,
@@ -79,12 +81,24 @@ class SessionStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS agent_notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_session_id TEXT NOT NULL,
+                    child_session_id TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL,
+                    delivery_state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_sessions_parent_id
                     ON sessions(parent_id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_root_id
                     ON sessions(root_id);
                 CREATE INDEX IF NOT EXISTS idx_session_messages_session_id_id
                     ON session_messages(session_id, id);
+                CREATE INDEX IF NOT EXISTS idx_agent_notifications_parent_state_id
+                    ON agent_notifications(parent_session_id, delivery_state, id);
                 """
             )
             columns = {
@@ -342,6 +356,72 @@ class SessionStore:
                 tool_calls=tool_calls,
             ))
         return result
+
+    def append_agent_notification(
+        self, notification: AgentCompletionNotification,
+    ) -> None:
+        """Persist one terminal child result exactly once."""
+        if not isinstance(notification, AgentCompletionNotification):
+            raise TypeError("notification must be an AgentCompletionNotification")
+        parent = self.get_session(notification.parent_session_id)
+        child = self.get_session(notification.child_session_id)
+        if parent is None or child is None or child.parent_id != parent.id:
+            raise ValueError("Completion notification must identify a direct child")
+        payload = json.dumps(notification.to_dict(), ensure_ascii=True)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO agent_notifications (
+                    parent_session_id, child_session_id, payload_json,
+                    delivery_state, created_at, delivered_at
+                ) VALUES (?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    notification.parent_session_id,
+                    notification.child_session_id,
+                    payload,
+                    NotificationDeliveryState.PENDING.value,
+                    _utc_now(),
+                ),
+            )
+
+    def claim_pending_agent_notifications(
+        self, parent_session_id: str,
+    ) -> tuple[AgentCompletionNotification, ...]:
+        """Atomically claim pending child results for one parent session."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, payload_json
+                FROM agent_notifications
+                WHERE parent_session_id = ? AND delivery_state = ?
+                ORDER BY id
+                """,
+                (parent_session_id, NotificationDeliveryState.PENDING.value),
+            ).fetchall()
+            if rows:
+                now = _utc_now()
+                conn.executemany(
+                    """
+                    UPDATE agent_notifications
+                    SET delivery_state = ?, delivered_at = ?
+                    WHERE id = ? AND delivery_state = ?
+                    """,
+                    [
+                        (
+                            NotificationDeliveryState.DELIVERED.value,
+                            now,
+                            row["id"],
+                            NotificationDeliveryState.PENDING.value,
+                        )
+                        for row in rows
+                    ],
+                )
+        return tuple(
+            AgentCompletionNotification.from_dict(json.loads(row["payload_json"]))
+            for row in rows
+        )
 
     def update_status(
         self, session_id: str, status: SessionStatus, error: str = ""

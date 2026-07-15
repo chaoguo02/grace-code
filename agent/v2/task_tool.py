@@ -24,7 +24,8 @@ from xml.sax.saxutils import escape
 
 from agent.task import TaskIntent
 from agent.v2.models import (
-    AgentKind, AgentSpawnRequest, DelegationScope, ForkStatus, WorkspaceMode,
+    AgentKind, AgentSpawnRequest, BackgroundAgentHandle, DelegationScope,
+    ExecutionPlacement, ForkStatus, WorkspaceMode,
 )
 from tools.base import (
     ToolConcurrency, ToolEffect, ToolErrorType, ToolMetadata,
@@ -144,7 +145,8 @@ class AgentTool(BaseTool):
     """Dispatch a named subagent or fork through one Runtime spawn path.
 
     Named children use their definition and fresh context. Forks inherit the
-    parent request prefix, model, and tools. Both return only a final message.
+    parent request prefix, model, and tools. Foreground calls return the final
+    result; background calls return a session handle and deliver completion later.
 
     Usage:
         AgentTool(runtime, parent_session_id, caller_agent_name=agent_name)
@@ -246,6 +248,8 @@ class AgentTool(BaseTool):
             "- Named subagents start fresh; put all necessary context in their prompt.",
             "- fork inherits this conversation; use it when restating context would be wasteful.",
             "- The subagent's final summary is the only thing returned to you.",
+            "- Use foreground when you need the result before continuing.",
+            "- Use background only for independent work; completion arrives later.",
             "- Use for independent, clearly-scoped work. Do simple tasks directly.",
             "- Never hand off understanding — you can delegate execution, not comprehension.",
         ]
@@ -278,6 +282,17 @@ class AgentTool(BaseTool):
                     "type": "string",
                     "description": "The full task for the subagent. Include ALL context, constraints, and expected output format.",
                 },
+                "execution_placement": {
+                    "type": "string",
+                    "enum": [
+                        ExecutionPlacement.FOREGROUND.value,
+                        ExecutionPlacement.BACKGROUND.value,
+                    ],
+                    "description": (
+                        "Use foreground when this result is required before the "
+                        "next step; use background for independent concurrent work."
+                    ),
+                },
             },
             "required": ["subagent_type", "description", "prompt"],
         }
@@ -288,6 +303,9 @@ class AgentTool(BaseTool):
         raw_subagent_type = params.get("subagent_type")
         raw_description = params.get("description")
         raw_prompt = params.get("prompt")
+        raw_placement = params.get(
+            "execution_placement", ExecutionPlacement.FOREGROUND.value,
+        )
 
         # Validate
         if (
@@ -303,6 +321,20 @@ class AgentTool(BaseTool):
         subagent_type = raw_subagent_type.strip()
         description = raw_description.strip()
         user_prompt = raw_prompt.strip()
+        try:
+            execution_placement = ExecutionPlacement(raw_placement)
+        except (TypeError, ValueError):
+            return ToolResult(
+                success=False, output="",
+                error=(
+                    "execution_placement must be 'foreground' or 'background'"
+                ),
+            )
+        if execution_placement is ExecutionPlacement.AUTO:
+            return ToolResult(
+                success=False, output="",
+                error="execution_placement must resolve before dispatch",
+            )
         allowed = self._allowed_subagent_names()
         is_fork = subagent_type == AgentKind.FORK.value
         if not is_fork and not self._runtime.agent_registry.has(subagent_type):
@@ -394,15 +426,17 @@ class AgentTool(BaseTool):
                 AgentSpawnRequest.fork(
                     description=description,
                     prompt=prompt,
+                    execution_placement=execution_placement,
                 )
                 if is_fork
                 else AgentSpawnRequest.named(
                     definition=definition,
                     description=description,
                     prompt=prompt,
+                    execution_placement=execution_placement,
                 )
             )
-            fork_result = self._runtime.spawn_agent(
+            dispatch_result = self._runtime.spawn_agent(
                 parent_session_id=self._parent_session_id,
                 request=request,
                 budget_tokens=child_token_limit,
@@ -417,6 +451,15 @@ class AgentTool(BaseTool):
                 ),
                 spawn_context=run_context.spawn_context,
             )
+            if isinstance(dispatch_result, BackgroundAgentHandle):
+                return ToolResult(
+                    success=True,
+                    output=_format_background_handle(
+                        subagent_type, dispatch_result,
+                    ),
+                    subagent_tokens_used=0,
+                )
+            fork_result = dispatch_result
             output = _format_fork_result(subagent_type, fork_result)
             if fork_result.status == ForkStatus.PARTIAL:
                 output = (
@@ -541,6 +584,21 @@ def _format_fork_result(agent_type: str, result: "AgentRunResult") -> str:
         "</task-notification>",
     ])
     return "\n".join(lines)
+
+
+def _format_background_handle(
+    agent_type: str, handle: BackgroundAgentHandle,
+) -> str:
+    """Render an acknowledgement; it is not a completion result."""
+    return "\n".join([
+        "<task-notification>",
+        f"  <agent-type>{_xml_escape(agent_type)}</agent-type>",
+        f"  <session-id>{_xml_escape(handle.session_id)}</session-id>",
+        f"  <status>{handle.status.value}</status>",
+        f"  <execution-placement>{handle.execution_placement.value}</execution-placement>",
+        "  <message>Subagent started; completion will arrive separately.</message>",
+        "</task-notification>",
+    ])
 
 
 def _xml_escape(text: Any) -> str:

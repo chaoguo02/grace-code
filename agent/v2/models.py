@@ -39,6 +39,13 @@ class ExecutionPlacement(str, Enum):
     BACKGROUND = "background"
 
 
+class NotificationDeliveryState(str, Enum):
+    """Persistent delivery state for child completion notifications."""
+
+    PENDING = "pending"
+    DELIVERED = "delivered"
+
+
 class WorkspaceMode(str, Enum):
     """Filesystem placement, orthogonal to context inheritance."""
 
@@ -395,11 +402,12 @@ class AgentSpawnRequest:
         definition: AgentDefinition,
         description: str,
         prompt: str,
+        execution_placement: ExecutionPlacement = ExecutionPlacement.FOREGROUND,
     ) -> "AgentSpawnRequest":
         return cls(
             agent_kind=AgentKind.NAMED_SUBAGENT,
             context_origin=ContextOrigin.FRESH,
-            execution_placement=ExecutionPlacement.FOREGROUND,
+            execution_placement=execution_placement,
             workspace_mode=definition.workspace_mode,
             description=description,
             prompt=prompt,
@@ -413,11 +421,12 @@ class AgentSpawnRequest:
         description: str,
         prompt: str,
         workspace_mode: WorkspaceMode = WorkspaceMode.CURRENT,
+        execution_placement: ExecutionPlacement = ExecutionPlacement.FOREGROUND,
     ) -> "AgentSpawnRequest":
         return cls(
             agent_kind=AgentKind.FORK,
             context_origin=ContextOrigin.PARENT_SNAPSHOT,
-            execution_placement=ExecutionPlacement.FOREGROUND,
+            execution_placement=execution_placement,
             workspace_mode=workspace_mode,
             description=description,
             prompt=prompt,
@@ -516,6 +525,62 @@ class AgentRunResult:
                 if isinstance(raw_worktree, dict) else None
             ),
             worktree_disposition=WorktreeDisposition(raw_disposition),
+        )
+
+
+@dataclass(frozen=True)
+class BackgroundAgentHandle:
+    """Immediate acknowledgement for a child running independently."""
+
+    agent_name: str
+    session_id: str
+    status: SessionStatus = SessionStatus.RUNNING
+    execution_placement: ExecutionPlacement = ExecutionPlacement.BACKGROUND
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", SessionStatus(self.status))
+        object.__setattr__(
+            self,
+            "execution_placement",
+            ExecutionPlacement(self.execution_placement),
+        )
+        if self.status is not SessionStatus.RUNNING:
+            raise ValueError("A background handle must identify a running session")
+        if self.execution_placement is not ExecutionPlacement.BACKGROUND:
+            raise ValueError("A background handle requires background placement")
+
+
+@dataclass(frozen=True)
+class AgentCompletionNotification:
+    """Typed, durable child result awaiting delivery to its parent."""
+
+    parent_session_id: str
+    result: AgentRunResult
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.parent_session_id, str) or not self.parent_session_id:
+            raise ValueError("parent_session_id must be a non-empty string")
+        if not isinstance(self.result, AgentRunResult):
+            raise TypeError("result must be an AgentRunResult")
+
+    @property
+    def child_session_id(self) -> str:
+        return self.result.session_id
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "parent_session_id": self.parent_session_id,
+            "result": self.result.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AgentCompletionNotification":
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise ValueError("Completion notification requires a result object")
+        return cls(
+            parent_session_id=str(data["parent_session_id"]),
+            result=AgentRunResult.from_dict(result),
         )
 
 

@@ -5,10 +5,12 @@ from agent.v2.agent_registry import AgentRegistryV2, resolve_tool_name, resolve_
 from agent.v2.mcp_integration import MCPRuntimeToolProxy, MCPToolIntegration
 from agent.v2.models import (
     AgentDefinition,
+    AgentCompletionNotification,
     AgentKind,
     AgentRunResult,
     AgentRunStatus,
     AgentSpawnRequest,
+    BackgroundAgentHandle,
     AgentIsolation,
     AgentModel,
     AgentVisibility,
@@ -18,6 +20,7 @@ from agent.v2.models import (
     DelegationPolicy,
     ExplicitDelegationRequest,
     ExecutionPlacement,
+    NotificationDeliveryState,
     ForkResult,
     WorktreeChange,
     WorktreeDisposition,
@@ -41,11 +44,13 @@ from agent.v2.worktree_tool import (
 
 __all__ = [
     "AgentDefinition",
+    "AgentCompletionNotification",
     "AgentDefinitionError",
     "AgentKind",
     "AgentRunResult",
     "AgentRunStatus",
     "AgentSpawnRequest",
+    "BackgroundAgentHandle",
     "AgentIsolation",
     "AgentModel",
     "AgentVisibility",
@@ -55,6 +60,7 @@ __all__ = [
     "DelegationPolicy",
     "ExplicitDelegationRequest",
     "ExecutionPlacement",
+    "NotificationDeliveryState",
     "ExplicitDelegationError",
     "AgentRegistryV2",
     "AgentTool",

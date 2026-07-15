@@ -7,6 +7,7 @@ from pathlib import Path
 import json
 import sqlite3
 import subprocess
+import threading
 
 import pytest
 
@@ -29,10 +30,12 @@ from agent.task import (
     ToolCall,
 )
 from agent.v2 import (
+    AgentCompletionNotification,
     AgentSpawnContext,
     AgentSpawnRequest,
     AgentRegistryV2,
     AgentTool,
+    BackgroundAgentHandle,
     AgentModel,
     DelegationMode,
     DelegationPolicy,
@@ -175,6 +178,76 @@ def test_v2_session_store_persists_parent_child_relationships(tmp_path):
     assert store.get_session(root.id).parent_id is None
     assert store.get_session(child.id).parent_id == root.id
     assert [item.id for item in store.list_child_sessions(root.id)] == [child.id]
+
+
+def test_completion_notification_persists_and_is_claimed_once(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(str(db_path))
+    parent = store.create_session(
+        agent_name="build", mode=SessionMode.PRIMARY,
+        repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="explore", mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path), title="child",
+        parent_id=parent.id, root_id=parent.root_id,
+    )
+    notification = AgentCompletionNotification(
+        parent_session_id=parent.id,
+        result=AgentRunResult(
+            agent_name="explore", session_id=child.id,
+            status=ForkStatus.COMPLETED, summary="review complete",
+        ),
+    )
+    store.append_agent_notification(notification)
+    store.append_agent_notification(notification)
+
+    reopened = SessionStore(str(db_path))
+    claimed = reopened.claim_pending_agent_notifications(parent.id)
+
+    assert claimed == (notification,)
+    assert reopened.claim_pending_agent_notifications(parent.id) == ()
+
+
+def test_parent_model_receives_persisted_background_completion(tmp_path):
+    backend = MockBackend([
+        Action(ActionType.FINISH, "use completed review", message="done"),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="explore", mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path), title="background child",
+        parent_id=parent.id, root_id=parent.root_id,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+    result = AgentRunResult(
+        agent_name="explore", session_id=child.id,
+        status=ForkStatus.COMPLETED, summary="persisted background facts",
+    )
+    store.set_agent_result(child.id, result)
+    store.set_summary(
+        child.id, result.summary, status=SessionStatus.COMPLETED,
+    )
+    store.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id, result=result,
+    ))
+
+    runtime.run_session(
+        parent.id,
+        agent_name="build",
+        task_description="Use the background review",
+        intent=TaskIntent.EDIT,
+    )
+
+    first_request = backend.received_messages[0]
+    assert any(
+        "persisted background facts" in str(message.content)
+        for message in first_request
+    )
+    assert store.claim_pending_agent_notifications(parent.id) == ()
 
 
 def test_v2_session_store_migrates_legacy_child_contract_and_result(tmp_path):
@@ -1100,6 +1173,132 @@ def test_agent_spawn_request_keeps_context_and_workspace_orthogonal():
     assert fork.agent_kind is AgentKind.FORK
     assert fork.context_origin is ContextOrigin.PARENT_SNAPSHOT
     assert fork.workspace_mode is WorkspaceMode.CURRENT
+
+
+def test_agent_spawn_request_accepts_explicit_background_placement():
+    definition = AgentRegistryV2().get("explore")
+
+    request = AgentSpawnRequest.named(
+        definition=definition,
+        description="inspect concurrently",
+        prompt="Inspect files",
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+
+    assert request.execution_placement is ExecutionPlacement.BACKGROUND
+
+
+def test_v2_task_tool_returns_background_handle_without_final_result():
+    handle = BackgroundAgentHandle(agent_name="general", session_id="child-bg")
+    runtime = _StubRuntime(handle)
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build",
+    ).with_run_context(_run_context())
+
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "independent review",
+        "prompt": "Review the independent area",
+        "execution_placement": "background",
+    })
+
+    assert result.success is True
+    assert "<status>running</status>" in result.output
+    assert "completion will arrive separately" in result.output
+    assert (
+        runtime.last_fork_kwargs["request"].execution_placement
+        is ExecutionPlacement.BACKGROUND
+    )
+
+
+def test_background_child_runs_without_blocking_and_delivers_completion(
+    tmp_path, monkeypatch,
+):
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=ForkStatus.COMPLETED,
+            summary="background review complete",
+            turns_used=2,
+            tokens_used=120,
+        )
+
+    monkeypatch.setattr("agent.v2.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="review independently",
+            prompt="Review the independent area",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+
+    assert isinstance(handle, BackgroundAgentHandle)
+    assert started.wait(timeout=2)
+    assert store.get_session(handle.session_id).status is SessionStatus.RUNNING
+    thread = runtime._background_runs[handle.session_id]
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+    child = store.get_session(handle.session_id)
+    assert child.status is SessionStatus.COMPLETED
+    messages = runtime._claim_completion_messages(parent.id)
+    assert len(messages) == 1
+    assert "background review complete" in str(messages[0].content)
+    assert runtime._claim_completion_messages(parent.id) == []
+
+
+def test_background_child_failure_is_delivered_as_typed_terminal_result(
+    tmp_path, monkeypatch,
+):
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fail_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        raise RuntimeError("child backend unavailable")
+
+    monkeypatch.setattr("agent.v2.runtime.run_child_agent", _fail_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="failing review",
+            prompt="Try the review",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+    assert started.wait(timeout=2)
+    thread = runtime._background_runs[handle.session_id]
+    release.set()
+    thread.join(timeout=2)
+
+    child = store.get_session(handle.session_id)
+    assert child.status is SessionStatus.FAILED
+    assert child.error == "child backend unavailable"
+    notifications = store.claim_pending_agent_notifications(parent.id)
+    assert len(notifications) == 1
+    assert notifications[0].result.status is ForkStatus.FAILED
+    assert notifications[0].result.error == "child backend unavailable"
 
 
 def test_v2_task_tool_does_not_dispatch_after_cancellation():

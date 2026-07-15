@@ -111,6 +111,8 @@ class AgentConfig:
     """Runtime-owned cooperative cancellation shared with delegated runs."""
     completion_fact_check: "Callable[[], CompletionCheckResult] | None" = None
     """Runtime-injected objective completion check; no LLM interpretation."""
+    runtime_message_source: Callable[[], list[LLMMessage]] | None = None
+    """Pulls typed Runtime events into history before each model request."""
     confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
     compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
@@ -556,6 +558,12 @@ class ReActAgent:
             self._current_step = step  # 用于 compaction 日志
             self.compactor.tick_step()
             logger.debug("Step %d/%d", step, task.max_steps)
+
+            if self._cfg.runtime_message_source is not None:
+                try:
+                    history.add_many(self._cfg.runtime_message_source())
+                except Exception:
+                    logger.exception("Failed to load Runtime messages")
 
             # ── Runtime Controller: single pre-step enforcement gate ──
             # Replaces scattered inline checks. Returns StepDecision that the
