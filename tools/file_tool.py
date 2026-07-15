@@ -205,9 +205,11 @@ class FileReadTool(BaseTool):
         self._read_cache = read_cache or FileReadCache()
         self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
+    aliases = ("file_read",)
+
     @property
     def name(self) -> str:
-        return "file_read"
+        return "Read"
 
     aliases = ("read_file",)  # Claude Code naming convention
 
@@ -434,9 +436,11 @@ class FileWriteTool(BaseTool):
         self._read_cache = read_cache
         self._workspace_root = workspace_root
 
+    aliases = ("file_write",)
+
     @property
     def name(self) -> str:
-        return "file_write"
+        return "Write"
 
     @property
     def risk_level(self) -> str:

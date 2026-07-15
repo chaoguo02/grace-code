@@ -68,9 +68,11 @@ class SearchTextTool(BaseTool):
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
+    aliases = ("search_text",)
+
     @property
     def name(self) -> str:
-        return "search_text"
+        return "Grep"
 
     @property
     def description(self) -> str:
@@ -177,9 +179,11 @@ class FindFilesTool(BaseTool):
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
+    aliases = ("find_files",)
+
     @property
     def name(self) -> str:
-        return "find_files"
+        return "Glob"
 
     @property
     def description(self) -> str:

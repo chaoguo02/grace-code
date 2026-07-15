@@ -51,9 +51,11 @@ class FileEditTool(BaseTool):
         self._read_cache = read_cache
         self._workspace_root = workspace_root
 
+    aliases = ("file_edit",)
+
     @property
     def name(self) -> str:
-        return "file_edit"
+        return "Edit"
 
     @property
     def risk_level(self) -> str:

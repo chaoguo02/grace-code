@@ -76,9 +76,11 @@ class ShellTool(BaseTool):
         self._confirm_callback = confirm_callback
         self._runtime = runtime or LocalRuntime()
 
+    aliases = ("shell",)
+
     @property
     def name(self) -> str:
-        return "shell"
+        return "Bash"
 
     @property
     def description(self) -> str:

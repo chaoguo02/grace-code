@@ -73,7 +73,7 @@ class ScopedToolRule:
 
 # ── Specifier matchers (one per tool type) ──
 
-_COMMAND_TOOLS = frozenset({"shell", "bash"})
+_COMMAND_TOOLS = frozenset({"Bash", "shell", "bash"})
 
 
 def _match_command(tool_name: str, params: dict, pattern: str) -> bool:
@@ -89,7 +89,8 @@ def _match_command(tool_name: str, params: dict, pattern: str) -> bool:
 
 
 _PATH_TOOLS = frozenset({
-    "file_read", "file_view", "file_edit", "file_write",
+    "Read", "file_read", "file_view", "Edit", "file_edit",
+    "Write", "file_write", "Glob", "find_files", "Grep", "search_text",
     "read", "edit", "write", "glob", "grep",
 })
 
