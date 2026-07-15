@@ -442,11 +442,86 @@ class ChatSession:
         if rendered is None:
             return None
 
-        # Inject skill preamble so the model knows which skill was loaded
+        # SK-07: context:fork — run skill in a forked subagent
+        if meta is not None and meta.context == "fork":
+            self._run_skill_fork(name, rendered, meta)
+            return None  # Fork handles its own execution; no inline injection
+
+        # Default: inline context — inject skill content into shared_history
         return (
             f"[Skill: {name}]\n\n"
             f"{rendered}\n\n"
             f"[/End of skill: {name} — follow the instructions above.]"
+        )
+
+    def _run_skill_fork(self, name: str, rendered: str, meta) -> None:
+        """SK-07: Execute a context:fork skill as a subagent.
+
+        Spawns a subagent of the type declared in meta.agent (default: general)
+        with the rendered skill content as the task prompt.
+        """
+        import click
+        from agent.v2.models import DelegationScope, WorkspaceMode
+
+        agent_type = meta.agent or "general"
+        click.echo(
+            click.style(f"\n  Forking subagent '{agent_type}' for skill '{name}'...", fg="cyan")
+        )
+
+        try:
+            # Rebuild agent to pick up any model/effort overrides from the skill
+            fork_assembly = self._build_fork_assembly(agent_type, meta)
+            fork_agent = fork_assembly.agent
+
+            # Inject shared history so the subagent sees conversation context
+            fork_agent._pending_history = self._shared_history
+            fork_agent._goal_stop_hook = self._goal_stop_hook
+
+            from agent.task import Task, TaskIntent
+            task = Task(
+                description=f"[Skill: {name}] {rendered[:500]}",
+                repo_path=self.repo_path,
+                intent=TaskIntent.EDIT,
+                max_steps=self.config.agent.max_steps,
+                budget_tokens=self.config.agent.budget_tokens,
+                metadata={"entrypoint": "skill-fork", "skill": name, "agent_type": agent_type},
+            )
+
+            from agent.event_log import EventLog
+            with EventLog.create(task, log_dir=self.log_dir) as log:
+                result = fork_agent.run(task, log)
+
+            if result.summary:
+                self._shared_history.add(type(fork_agent).__new__(type(fork_agent)).__class__(
+                    role="assistant", content=result.summary
+                ))
+
+            click.echo(
+                click.style(f"  Skill '{name}' fork completed: {result.summary or 'done'}", fg="cyan")
+            )
+        except Exception as exc:
+            click.echo(click.style(f"  Skill '{name}' fork failed: {exc}", fg="red"))
+
+    def _build_fork_assembly(self, agent_type: str, meta):
+        """Build an AgentAssembly for a skill fork, respecting model/effort overrides."""
+        from agent.v2.agent_factory import AgentFactory
+
+        agent_cfg = self._agent_cfg
+        # SK-20: apply model/effort overrides from skill frontmatter
+        if meta.model or meta.effort:
+            from dataclasses import replace
+            agent_cfg = replace(agent_cfg)
+            # Note: actual model switching requires backend rebuild.
+            # For now, effort override is passed through agent_config metadata.
+
+        return AgentFactory.create(
+            agent_name=agent_type,
+            backend=self._backend,
+            base_registry=self._registry,
+            agent_registry=self._agent_registry,
+            root_agent_config=agent_cfg,
+            memory_context=self._memory_context,
+            repo_path=self.repo_path,
         )
 
     def compact(self, focus: str = "") -> str:

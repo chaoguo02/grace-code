@@ -66,6 +66,34 @@ class PolicyAwareToolRegistry(ToolRegistry):
             base_allowed_tools=allowed_tools,
         )
 
+    # ── SK-05 / SK-06: Skill tool restrictions ──────────────────────
+
+    def with_skill_restrictions(self, skill) -> "PolicyAwareToolRegistry":
+        """Apply a skill's allowed-tools and disallowed-tools to this registry.
+
+        SK-05: allowed-tools grants pre-approval (the listed tools don't prompt).
+        SK-06: disallowed-tools removes tools from the available pool while active.
+
+        Returns a new PolicyAwareToolRegistry with restrictions layered on.
+        """
+        result = self
+        if skill.allowed_tools:
+            result = result.with_allowed_tools(skill.allowed_tools)
+        if skill.disallowed_tools:
+            result = result._with_disallowed_tools(skill.disallowed_tools)
+        return result
+
+    def _with_disallowed_tools(self, disallowed: frozenset[str]) -> "PolicyAwareToolRegistry":
+        """Return a registry with additional denied tools (SK-06)."""
+        return PolicyAwareToolRegistry(
+            base=self._base,
+            phase_policy=self._phase_policy.with_denied_tools(disallowed),
+            repo_path=self._repo_path,
+            phase_name=self._phase_name,
+            base_allowed_tools=self._base_allowed_tools,
+            plan_mode_allowed=self._plan_mode_allowed,
+        )
+
     def with_phase_policy(self, phase_policy: PhasePolicy) -> "PolicyAwareToolRegistry":
         """Layer a per-task policy without mutating the reusable registry."""
         return PolicyAwareToolRegistry(

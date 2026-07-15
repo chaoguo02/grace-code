@@ -720,11 +720,14 @@ def chat(
                 click.echo(dim("\n".join(help_lines)))
             else:
                 # Try /skill-name dispatch (Claude Code alignment: direct injection)
-                rendered = session._handle_slash_skill(user_input)
-                if rendered is not None:
-                    skill_name = user_input[1:].split()[0]
-                    click.echo(dim(f"\n  Skill '{skill_name}' activated..."))
-                    session.run_round(rendered)
+                skill_name = user_input[1:].split()[0]
+                if skill_registry.has_skill(skill_name):
+                    rendered = session._handle_slash_skill(user_input)
+                    if rendered is not None:
+                        # Inline skill — inject and run agent
+                        click.echo(dim(f"\n  Skill '{skill_name}' activated..."))
+                        session.run_round(rendered)
+                    # else: context=fork — skill handled internally by _handle_slash_skill
                 else:
                     click.echo(dim(f"  Unknown command: {user_input}. Type /help for help."))
             continue

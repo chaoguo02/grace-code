@@ -269,6 +269,27 @@ class PhasePolicy:
             notes=self.notes,
         )
 
+    def with_denied_tools(self, denied_tools: set[str] | frozenset[str]) -> "PhasePolicy":
+        """Return a policy with additional denied tools (SK-06 disallowed-tools).
+
+        When a skill sets disallowed-tools, those tools are removed from the
+        available pool while the skill is active. The restriction layers on
+        top of any existing denied_tools.
+        """
+        denied = frozenset(denied_tools)
+        if self.denied_tools is not None:
+            denied = denied | self.denied_tools
+        return PhasePolicy(
+            allowed_tools=self.allowed_tools,
+            denied_tools=denied,
+            allowed_effects=self.allowed_effects,
+            denied_effects=self.denied_effects,
+            allowed_read_paths=self.allowed_read_paths,
+            allowed_write_paths=self.allowed_write_paths,
+            strict_file_scope=self.strict_file_scope,
+            notes=self.notes,
+        )
+
     def with_allowed_effects(
         self, allowed_effects: set[ToolEffect] | frozenset[ToolEffect],
     ) -> "PhasePolicy":

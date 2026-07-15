@@ -77,7 +77,15 @@ class MCPToolExhaustedError(RuntimeError):
 
 
 class SyncMCPToolManager:
-    """Manage MCP bridges on a persistent background event loop."""
+    """Manage MCP bridges on a persistent background event loop.
+
+    MCP-04: Automatic reconnection with exponential backoff.
+    When a bridge disconnects (ConnectionError during tool call), the manager
+    attempts up to MAX_RECONNECT_ATTEMPTS reconnections with exponential delay.
+    """
+
+    MAX_RECONNECT_ATTEMPTS = 5
+    RECONNECT_BASE_DELAY = 1.0  # seconds
 
     def __init__(self, *, default_policy: ExecutionPolicy | None = None) -> None:
         self._loop = asyncio.new_event_loop()
@@ -214,8 +222,22 @@ class SyncMCPToolManager:
 
         server_name, tool_name = parsed
         bridge = self._bridges.get(server_name)
-        if bridge is None or not bridge.is_connected:
+        if bridge is None:
             raise ConnectionError(f"MCP server '{server_name}' is not connected")
+
+        # MCP-04: attempt reconnection if bridge disconnected
+        if not bridge.is_connected:
+            logger.info("MCP server '%s' disconnected, attempting reconnect...", server_name)
+            if hasattr(self, "_loop") and self._loop is not None:
+                reconnected = self._run_coro(self._reconnect(server_name, bridge))
+                if not reconnected:
+                    raise ConnectionError(
+                        f"MCP server '{server_name}' is not connected and reconnection failed"
+                    )
+            else:
+                raise ConnectionError(
+                    f"MCP server '{server_name}' is not connected (no event loop for reconnect)"
+                )
 
         # Use idle_timeout from server config if available, else fall back to total timeout
         effective_timeout = idle_timeout if idle_timeout is not None else timeout
@@ -246,6 +268,45 @@ class SyncMCPToolManager:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("SyncMCPToolManager is closed")
+
+    # ── MCP-04: Automatic reconnection ──────────────────────────────
+
+    async def _reconnect(self, name: str, bridge: MCPToolBridge) -> bool:
+        """Attempt reconnection with exponential backoff. Returns True on success."""
+        for i in range(self.MAX_RECONNECT_ATTEMPTS):
+            delay = self.RECONNECT_BASE_DELAY * (2 ** i)
+            logger.info(
+                "MCP reconnect attempt %d/%d for '%s' in %.1fs",
+                i + 1, self.MAX_RECONNECT_ATTEMPTS, name, delay,
+            )
+            await asyncio.sleep(delay)
+            try:
+                tools = await bridge.connect()
+                self._refresh_tool_map(name, bridge, tools)
+                logger.info("MCP server '%s' reconnected successfully", name)
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "MCP reconnect attempt %d/%d for '%s' failed: %s",
+                    i + 1, self.MAX_RECONNECT_ATTEMPTS, name, exc,
+                )
+        logger.error(
+            "MCP server '%s' failed to reconnect after %d attempts", name, self.MAX_RECONNECT_ATTEMPTS,
+        )
+        return False
+
+    def _refresh_tool_map(
+        self, server_name: str, bridge: MCPToolBridge, tools: list[Any],
+    ) -> None:
+        """Update the tool map for a reconnected bridge."""
+        # Remove old entries for this server
+        stale = [k for k, v in self._tool_map.items() if v[0] == server_name]
+        for k in stale:
+            del self._tool_map[k]
+        # Register new tools
+        for tool_info in tools:
+            runtime_tool = mcp_tool_to_runtime_tool(bridge, tool_info)
+            self._tool_map[runtime_tool.name] = (server_name, tool_info.name)
 
 
 def _error_result(tool_name: str, message: str) -> MCPCallResult:
