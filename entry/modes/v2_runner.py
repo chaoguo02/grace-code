@@ -57,7 +57,7 @@ def magenta(t: str) -> str: return _c(t, "35")
 
 # ── Event rendering ──────────────────────────────────────────────────────
 
-def _render_v2_event(event, rend, proactive_memory=None, last_tool=None, last_tool_params=None):
+def _render_v2_event(event, rend, last_tool=None, last_tool_params=None):
     from agent.task import EventType
 
     payload = event.payload
@@ -83,13 +83,6 @@ def _render_v2_event(event, rend, proactive_memory=None, last_tool=None, last_to
         output = obs.get("output", "")
         status = obs.get("status", "")
         rend.on_observation(step, tool_name, status, output, obs.get("error"))
-        if proactive_memory is not None:
-            proactive_memory.check_tool_result(
-                tool_name=tool_name,
-                params=(last_tool_params[0] if last_tool_params else {}),
-                output=output,
-                success=(status == "success"),
-            )
     elif event.event_type == EventType.REFLECTION:
         rend.on_reflection(payload.get("reason", ""))
     elif event.event_type == EventType.SUBAGENT_START:
@@ -226,7 +219,6 @@ def run_v2_mode(
     approval_interaction=None,
     plan_file: str | None = None,
     hook_dispatcher=None,
-    proactive_memory=None,
     mcp_integration=None,
     renderer=None,
     explicit_agent: str | None = None,
@@ -259,7 +251,7 @@ def run_v2_mode(
         mcp_integration=mcp_integration,
         event_callback=(
             (lambda event: _render_v2_event(
-                event, rend, proactive_memory=proactive_memory,
+                event, rend,
                 last_tool=last_tool, last_tool_params=last_tool_params,
             )) if rend is not None else None
         ),
@@ -557,7 +549,7 @@ def run_v2_mode(
                     intent_override=_contract.execution_intent.value,
                     plan_file=plan_path,
                     hook_dispatcher=hook_dispatcher,
-                    proactive_memory=proactive_memory, renderer=renderer,
+                    renderer=renderer,
                 )
 
             elif action is PlanAction.COMPLETE_PLAN:
@@ -579,8 +571,6 @@ def run_v2_mode(
                 feedback = interaction.prompt_feedback()
                 if not feedback.strip():
                     continue
-                if proactive_memory:
-                    proactive_memory.check_plan_feedback(feedback)
                 interaction.show_message(
                     f"Re-planning ({service.revisions_remaining} revisions remaining)...",
                     style="info",

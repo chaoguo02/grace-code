@@ -92,10 +92,6 @@ class ChatSession:
         # ── 记忆系统 ──────────────────────────────────────────────────
         self._memory_store = memory_store
         self._memory_context = memory_context
-        self._proactive_memory = None
-        if memory_store:
-            from memory.proactive import ProactiveMemory
-            self._proactive_memory = ProactiveMemory(memory_store)
 
         # ── 流式回调（委托给 Renderer）────────────────────────────
         _stream_started = [False]
@@ -240,10 +236,6 @@ class ChatSession:
         if hasattr(self.agent, "compactor") and hasattr(self.agent.compactor, "reset_thrashing_counter"):
             self.agent.compactor.reset_thrashing_counter()
 
-        # 主动记忆：检测用户修正/偏好模式
-        if self._proactive_memory:
-            self._proactive_memory.check_user_message(user_input)
-
         task = Task(
             description=user_input,
             repo_path=self.repo_path,
@@ -360,14 +352,6 @@ class ChatSession:
                     error=obs.get("error"),
                 )
                 # 主动记忆：检测成功的构建/测试命令
-                if self._proactive_memory and obs.get("status") == "success":
-                    self._proactive_memory.check_tool_result(
-                        tool_name=tool_name,
-                        params=_last_tool_params[0],
-                        output=obs.get("output", ""),
-                        success=True,
-                    )
-
             elif etype == EventType.REFLECTION:
                 self._renderer.on_reflection(
                     reason=p.get("reason", ""),

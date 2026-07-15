@@ -329,16 +329,9 @@ def run(
         ),
     )
 
-    # ProactiveMemory（run 模式）
-    proactive_memory = None
-    if memory_store is not None:
-        from memory.proactive import ProactiveMemory
-        proactive_memory = ProactiveMemory(memory_store)
-        proactive_memory.check_user_message(description)
-
-    # Initialize HookDispatcher with ProactiveMemory as internal subscriber
+    # Initialize HookDispatcher
     hook_dispatcher = _init_hook_dispatcher(
-        repo_path, proactive_memory,
+        repo_path,
         memory_store=memory_store,
         log_dir=config.agent.log_dir,
         backend=backend,
@@ -404,7 +397,6 @@ def run(
                 approval_interaction=cli_plan_adapter(plan_action),
                 plan_file=plan_file,
                 hook_dispatcher=hook_dispatcher,
-                proactive_memory=proactive_memory,
                 mcp_integration=mcp_integration,
                 renderer=rend,
                 explicit_agent=delegate_to,

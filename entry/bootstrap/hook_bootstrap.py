@@ -1,8 +1,5 @@
 """Hook dispatcher bootstrap — assembles the HookDispatcher with all
-internal hooks (proactive memory, stop consolidation).
-
-Constitution: hook assembly belongs in entry/bootstrap/ — it's wiring logic,
-not CLI logic.
+internal hooks (stop consolidation).
 """
 
 from __future__ import annotations
@@ -16,39 +13,16 @@ logger = logging.getLogger(__name__)
 
 def init_hook_dispatcher(
     repo_path: Path,
-    proactive_memory: Any = None,
     memory_store: Any = None,
     log_dir: str | None = None,
     backend: Any = None,
 ) -> Any:
-    """Create HookDispatcher with ProactiveMemory + memory consolidation hooks."""
+    """Create HookDispatcher with memory consolidation hooks."""
     from hooks import HookDispatcher, HookEvent, HookMatcher, HookRegistry, InternalHook
 
     registry = HookRegistry()
     settings_path = repo_path / ".forge-agent" / "settings.json"
     registry.load_from_settings(settings_path)
-
-    if proactive_memory is not None:
-        registry.register_internal(HookEvent.POST_TOOL_USE, InternalHook(
-            callback=lambda ctx: proactive_memory.check_tool_result(
-                ctx.tool_name, ctx.tool_input,
-                (ctx.tool_output or {}).get("output", ""),
-                (ctx.tool_output or {}).get("success", False),
-            ),
-            matcher=HookMatcher(pattern="shell"),
-        ))
-        registry.register_internal(HookEvent.POST_TOOL_USE, InternalHook(
-            callback=lambda ctx: proactive_memory.notify_explicit_memory_write(),
-            matcher=HookMatcher(pattern="memory_write"),
-        ))
-
-        def _on_user_prompt(ctx):
-            proactive_memory.reset_turn()
-            proactive_memory.check_user_message(ctx.user_input)
-
-        registry.register_internal(HookEvent.USER_PROMPT_SUBMIT, InternalHook(
-            callback=_on_user_prompt,
-        ))
 
     if memory_store is not None:
         def _on_session_stop(ctx):

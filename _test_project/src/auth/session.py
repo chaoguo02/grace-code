@@ -35,19 +35,21 @@ class SessionManager:
 
     def revoke(self, token: str) -> None:
         """Remove a single token from the store."""
-        self._sessions.pop(token, None)
+        with self._lock:
+            self._sessions.pop(token, None)
         logger.debug("Revoked token %s...", token[:8])
 
     def cleanup_expired(self, token_expiry_hours: int) -> int:
         """Remove all expired tokens and return the count removed."""
-        now = time.time()
-        expired = [
-            token
-            for token, session in self._sessions.items()
-            if (now - session["created_at"]) / 3600 > token_expiry_hours
-        ]
-        for token in expired:
-            del self._sessions[token]
+        with self._lock:
+            now = time.time()
+            expired = [
+                token
+                for token, session in self._sessions.items()
+                if (now - session["created_at"]) / 3600 > token_expiry_hours
+            ]
+            for token in expired:
+                del self._sessions[token]
         if expired:
             logger.debug("Cleaned up %d expired session(s)", len(expired))
         return len(expired)
