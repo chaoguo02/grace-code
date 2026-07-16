@@ -128,6 +128,11 @@ class SkillRegistry:
             self._skills_dirs.append(BUILTIN_SKILLS_DIR)
         if skills_dir:
             self._skills_dirs.append(skills_dir)
+        # CC-aligned: also scan .claude/skills/ as a compatible fact source
+        if skills_dir and ".forge-agent" in skills_dir:
+            cc_dir = skills_dir.replace(".forge-agent", ".claude")
+            if Path(cc_dir).is_dir():
+                self._skills_dirs.append(cc_dir)
         if extra_dirs:
             self._skills_dirs.extend(extra_dirs)
 

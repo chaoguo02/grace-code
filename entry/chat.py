@@ -473,8 +473,7 @@ class ChatSession:
             fork_assembly = self._build_fork_assembly(agent_type, meta)
             fork_agent = fork_assembly.agent
 
-            # Inject shared history so the subagent sees conversation context
-            fork_agent._pending_history = self._shared_history
+            # CC-aligned: context=fork runs in FRESH context, not inheriting parent history
             fork_agent._goal_stop_hook = self._goal_stop_hook
 
             from agent.task import Task, TaskIntent
@@ -492,8 +491,9 @@ class ChatSession:
                 result = fork_agent.run(task, log)
 
             if result.summary:
-                self._shared_history.add(type(fork_agent).__new__(type(fork_agent)).__class__(
-                    role="assistant", content=result.summary
+                from llm.base import LLMMessage
+                self._shared_history.add(LLMMessage(
+                    role="assistant", content=f"[Skill fork: {name}]\n{result.summary}"
                 ))
 
             click.echo(
