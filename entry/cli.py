@@ -462,6 +462,8 @@ def run(
             ToolApprovalMode.AUTO if auto_approve else ToolApprovalMode.PROMPT
         ),
     )
+    if auto_approve and registry._permission_pipeline is not None:
+        registry._permission_pipeline.set_permission_mode("bypassPermissions")
 
     # Initialize HookDispatcher
     hook_dispatcher = _init_hook_dispatcher(
