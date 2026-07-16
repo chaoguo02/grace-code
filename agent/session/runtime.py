@@ -913,18 +913,23 @@ class SessionRuntime:
             child_agent_type=child_agent_type,
             spawn_context=spawn_context,
         )
+        _cleanup = lambda: (
+            self._unregister_agent_hooks(_agent_hooks),
+            self._mcp_integration.disconnect_agent_servers(definition)
+            if (_agent_mcp_tools and self._mcp_integration is not None) else None,
+        )
+
         if request.execution_placement is ExecutionPlacement.FOREGROUND:
             try:
                 return execute()
             finally:
-                self._unregister_agent_hooks(_agent_hooks)
-                if _agent_mcp_tools and self._mcp_integration is not None:
-                    self._mcp_integration.disconnect_agent_servers(definition)
+                _cleanup()
         return self._start_background_execution(
             parent=parent,
             child=child,
             agent_name=definition.name,
             execute=execute,
+            cleanup=_cleanup,
         )
 
     def _execute_child_session(
@@ -1076,6 +1081,7 @@ class SessionRuntime:
         child: "SessionRecord",
         agent_name: str,
         execute: Callable[[], AgentRunResult],
+        cleanup: Callable[[], None] | None = None,
     ) -> BackgroundAgentHandle:
         generation = child.generation
         execution_key = (child.id, generation)
@@ -1086,6 +1092,11 @@ class SessionRuntime:
             except BaseException:
                 logger.exception("Background subagent %s failed", child.id)
             finally:
+                if cleanup is not None:
+                    try:
+                        cleanup()
+                    except Exception:
+                        logger.exception("Background subagent cleanup failed for %s", child.id)
                 try:
                     completed_child = self._store.get_session(child.id)
                     if completed_child is None:
