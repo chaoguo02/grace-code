@@ -894,6 +894,11 @@ class SessionRuntime:
         # Register agent-scoped hooks from frontmatter (CC-aligned)
         _agent_hooks = self._register_agent_hooks(definition)
 
+        # Connect agent-scoped MCP servers (CC-aligned: inline mcpServers)
+        _agent_mcp_tools = []
+        if self._mcp_integration is not None and not is_fork:
+            _agent_mcp_tools = self._mcp_integration.connect_agent_servers(definition)
+
         execute = lambda: self._execute_child_session(
             parent=parent,
             child=child,
@@ -912,6 +917,8 @@ class SessionRuntime:
                 return execute()
             finally:
                 self._unregister_agent_hooks(_agent_hooks)
+                if _agent_mcp_tools and self._mcp_integration is not None:
+                    self._mcp_integration.disconnect_agent_servers(definition)
         return self._start_background_execution(
             parent=parent,
             child=child,

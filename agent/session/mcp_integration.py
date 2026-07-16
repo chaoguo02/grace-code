@@ -151,6 +151,61 @@ class MCPToolIntegration:
                 continue
             registry.register(tool)
 
+    def connect_agent_servers(self, spec) -> list[str]:
+        """Connect MCP servers declared in an agent's mcpServers frontmatter.
+        Returns list of newly registered tool names.
+        CC-aligned: inline definitions connect when agent starts.
+        """
+        if not spec.mcp_servers:
+            return []
+        if not self._initialized:
+            self.initialize()
+        new_tools: list[str] = []
+        for entry in spec.mcp_servers:
+            if isinstance(entry, dict):
+                for name, config in entry.items():
+                    if not isinstance(config, dict):
+                        continue
+                    server_config = _parse_server_config(name, config)
+                    if server_config is None:
+                        continue
+                    # Add to manager and discover tools
+                    if self._manager is not None:
+                        try:
+                            runtime_tools = self._manager.load_and_discover([server_config])
+                            for rt in runtime_tools:
+                                proxy = MCPRuntimeToolProxy(rt)
+                                proxy.server_name = name
+                                self._runtime_tools.append(rt)
+                                self._tools.append(proxy)
+                                new_tools.append(rt.name)
+                                logger.info("Connected agent-scoped MCP server '%s' (tool: %s)", name, rt.name)
+                        except Exception as exc:
+                            logger.warning("Failed to connect agent-scoped MCP server '%s': %s", name, exc)
+        return new_tools
+
+    def disconnect_agent_servers(self, spec) -> None:
+        """Disconnect agent-scoped MCP servers when agent finishes."""
+        if not spec.mcp_servers:
+            return
+        server_names: set[str] = set()
+        for entry in spec.mcp_servers:
+            if isinstance(entry, dict):
+                server_names.update(entry.keys())
+        if not server_names:
+            return
+        # Remove tools belonging to these servers
+        self._runtime_tools = [
+            rt for rt in self._runtime_tools
+            if not any(sn in getattr(rt, 'mcp_props', None) if hasattr(rt, 'mcp_props') else False
+                       for sn in server_names)
+        ]
+        count_before = len(self._tools)
+        self._tools = [t for t in self._tools if t.server_name not in server_names]
+        removed = count_before - len(self._tools)
+        if removed:
+            logger.info("Disconnected %d tool(s) from agent-scoped servers: %s", removed, server_names)
+
     def shutdown(self) -> None:
         if self._manager is not None:
             self._manager.close_all()
@@ -194,12 +249,19 @@ def _parse_server_config(name: str, raw: Any) -> MCPServerConfig | None:
     if not isinstance(raw, dict):
         return None
     transport = raw.get("transport", raw.get("type", "stdio"))
-    if transport != "stdio":
+    if transport not in ("stdio", "http", "sse", "ws"):
         logger.warning("Skipping MCP server %s: unsupported transport %s", name, transport)
         return None
-    command = raw.get("command")
-    if not isinstance(command, str) or not command.strip():
-        logger.warning("Skipping MCP server %s: missing command", name)
+    if transport == "stdio":
+        command = raw.get("command")
+        if not isinstance(command, str) or not command.strip():
+            logger.warning("Skipping MCP server %s: missing command for stdio", name)
+            return None
+    else:
+        command = raw.get("command") or ""
+    url = raw.get("url", "")
+    if transport in ("http", "sse", "ws") and not url:
+        logger.warning("Skipping MCP server %s: missing url for %s transport", name, transport)
         return None
     args = raw.get("args", [])
     if not isinstance(args, list):
@@ -217,10 +279,18 @@ def _parse_server_config(name: str, raw: Any) -> MCPServerConfig | None:
         timeout_seconds = float(raw.get("timeout_seconds", raw.get("timeout", 60.0)))
     except (TypeError, ValueError):
         timeout_seconds = 60.0
+    headers_raw = raw.get("headers", {})
+    if isinstance(headers_raw, dict):
+        headers = {str(k): str(v) for k, v in headers_raw.items()}
+    else:
+        headers = None
     return MCPServerConfig(
         name=name,
+        type=transport,
         command=command,
-        args=[str(arg) for arg in args],
+        args=[str(a) for a in args],
+        url=url,
+        headers=headers,
         env={str(key): str(value) for key, value in env.items()} if env else None,
         cwd=cwd,
         timeout_seconds=timeout_seconds,

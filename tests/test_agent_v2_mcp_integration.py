@@ -48,13 +48,18 @@ def test_raw_mcp_servers_config_parses_stdio_servers():
         }
     })
 
-    assert len(integration._server_configs) == 1
+    assert len(integration._server_configs) == 2
     config = integration._server_configs[0]
     assert isinstance(config, MCPServerConfig)
     assert config.name == "fs"
     assert config.command == "npx"
     assert config.args == ["-y", "server-fs"]
     assert config.timeout_seconds == 3.0
+    # SSE server now also parsed (CC-aligned: all 4 transports supported)
+    sse = integration._server_configs[1]
+    assert sse.name == "remote"
+    assert sse.type == "sse"
+    assert sse.url == "https://example.com/sse"
 
 
 def test_initialize_without_servers_is_noop():
