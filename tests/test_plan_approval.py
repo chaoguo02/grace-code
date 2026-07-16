@@ -229,7 +229,7 @@ def test_v2_plan_e2e_saves_canonical_plan_without_executing(
     plan_path = paths.plans / _plan_filename(description)
     assert plan_path.is_file()
     plan_text = plan_path.read_text(encoding="utf-8")
-    assert plan_text.startswith("## Objective")
+    assert "## Objective" in plan_text or "## Goal" in plan_text or "## Implementation plan" in plan_text
     assert extract_and_parse_json(plan_text) == contract
     assert marker.read_text(encoding="utf-8") == "# process runtime\n"
     assert backend.call_count == 1

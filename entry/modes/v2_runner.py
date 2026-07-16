@@ -392,8 +392,6 @@ def run_v2_mode(
         from entry.modes.plan_approval import PlanAction, PlanApprovalService
         interaction = approval_interaction or ClickAdapter()
         service = PlanApprovalService(max_revisions=5)
-        contract_repair_attempts = 0
-        max_contract_repairs = 2
         plan_override: str | None = None
 
         while True:
@@ -416,114 +414,40 @@ def run_v2_mode(
                 )
                 return _workflow_failure(result, detail)
 
-            # ── Plan Contract: extract JSON → validate → reject or approve ──
+            # ── Always save and display the Markdown plan first ──
+            # CC-aligned: the plan file IS the contract. JSON extraction is
+            # best-effort structured metadata, not a blocking gate.
+            Path(plan_path).write_text(plan_text, encoding="utf-8")
+            interaction.show_message(f"Plan saved: {plan_path}", style="info")
+
+            # ── Best-effort JSON contract extraction (non-blocking) ──
             from entry.modes.plan_contract import (
                 PlanContract, PlanValidator, extract_and_parse_json,
             )
+            _contract: PlanContract | None = None
             _data = extract_and_parse_json(plan_text)
-            if _data is None:
-                if contract_repair_attempts >= max_contract_repairs:
-                    detail = "Plan contract is still invalid after 2 repair attempts; aborting."
+            if _data is not None:
+                try:
+                    _contract = PlanContract.model_validate(_data)
+                    _valid, _err = PlanValidator.validate(_contract)
+                    if not _valid:
+                        interaction.show_message(
+                            f"Plan contract noted but has validation gaps: {_err}",
+                            style="warning",
+                        )
+                except Exception:
                     interaction.show_message(
-                        detail, style="error",
+                        "Plan has JSON block but failed contract validation; "
+                        "proceeding with Markdown plan only.",
+                        style="warning",
                     )
-                    return _workflow_failure(result, detail)
-                contract_repair_attempts += 1
-                interaction.show_message(
-                    "Plan has no valid JSON contract. Asking agent to add one...",
-                    style="warning",
-                )
-                result = runtime.run_session(
-                    session.id,
-                    agent_name="plan", task_description=description, intent=TaskIntent.ANALYSIS,
-                    messages=[LLMMessage(
-                        role="user",
-                        content=(
-                            '[SYSTEM] Your output must include a JSON contract block:\n'
-                            '```json\n'
-                            '{"objective": "...", "execution_intent": "analysis", '
-                            '"target_files": ["..."], '
-                            '"expected_behavior": "...", "verification_strategy": "...", '
-                            '"potential_conflicts": ["..."]}\n'
-                            '```\n'
-                            'All six fields are required. Re-read the files, '
-                            'then produce a revised plan with the JSON block.'
-                        ),
-                    )],
-                    contract=plan_contract,
-                )
-                continue
 
-            try:
-                _contract = PlanContract.model_validate(_data)
-            except Exception as exc:
-                if contract_repair_attempts >= max_contract_repairs:
-                    detail = "Plan contract is still invalid after 2 repair attempts; aborting."
-                    interaction.show_message(
-                        detail, style="error",
-                    )
-                    return _workflow_failure(result, detail)
-                contract_repair_attempts += 1
-                interaction.show_message(
-                    f"Plan contract validation failed: {exc}", style="warning",
-                )
-                result = runtime.run_session(
-                    session.id,
-                    agent_name="plan", task_description=description, intent=TaskIntent.ANALYSIS,
-                    messages=[LLMMessage(
-                        role="user",
-                        content=(
-                            f"[SYSTEM] Plan contract rejected: {exc}\n\n"
-                            f'Required fields: objective, execution_intent, target_files, expected_behavior, '
-                            f'verification_strategy, potential_conflicts (can be empty array). '
-                            f'Please fix the JSON and try again.'
-                        ),
-                    )],
-                    contract=plan_contract,
-                )
-                continue
-
-            _valid, _err = PlanValidator.validate(_contract)
-            if not _valid:
-                if contract_repair_attempts >= max_contract_repairs:
-                    detail = "Plan contract is still invalid after 2 repair attempts; aborting."
-                    interaction.show_message(
-                        detail, style="error",
-                    )
-                    return _workflow_failure(result, detail)
-                contract_repair_attempts += 1
-                interaction.show_message(
-                    f"Plan contract rejected: {_err}", style="warning",
-                )
-                result = runtime.run_session(
-                    session.id,
-                    agent_name="plan", task_description=description, intent=TaskIntent.ANALYSIS,
-                    messages=[LLMMessage(
-                        role="user",
-                        content=(
-                            f"[SYSTEM] Plan contract rejected: {_err}\n\n"
-                            f"Fix this issue and re-submit the JSON contract."
-                        ),
-                    )],
-                    contract=plan_contract,
-                )
-                continue
-
-            # An explicit CLI intent is an entry-boundary fact and takes
-            # precedence over the model's proposed execution classification.
-            if intent_override is not None:
+            if _contract is not None and intent_override is not None:
                 _contract = _contract.model_copy(update={
                     "execution_intent": TaskIntent(intent_override),
                 })
-
-            # Persist only a validated, canonical plan. Failed LLM responses
-            # must never overwrite a usable plan from an earlier attempt.
-            canonical_document = _contract.render_plan_document()
-            Path(plan_path).write_text(canonical_document, encoding="utf-8")
-            interaction.show_message(f"Plan saved: {plan_path}", style="info")
-
-            # Replace plan_text with human-readable rendering for display.
-            plan_text = _contract.render_for_approval()
+            if _contract is not None:
+                plan_text = _contract.render_for_approval()
 
             # ── UI → event → service → action → execute ──
             interaction.show_plan(plan_text, plan_path)
@@ -553,7 +477,8 @@ def run_v2_mode(
 
             elif action is PlanAction.CONTINUE_EDIT:
                 updated = _read_manual_plan_edit(plan_path, interaction)
-                if updated != canonical_document:
+                _current_text = Path(plan_path).read_text(encoding="utf-8")
+                if updated != _current_text:
                     plan_override = updated
                     interaction.show_message("Plan updated.", style="success")
                 else:
