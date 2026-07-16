@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult, ToolRole
 
 if TYPE_CHECKING:
     from memory.store import MemoryStore
@@ -27,12 +27,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # 可选类型字面量，帮助 LLM 决定用什么类型
-_TYPE_DESCRIPTIONS = {
+_TYPE_DESCRIPTIONS: dict[str, str] = {
     "user": "User role, goals, preferences, expertise level — private, always loaded",
     "feedback": "User corrections, confirmed approaches, rules to follow — private, always loaded",
     "project": "Ongoing work, decisions, architecture, build commands — project-scoped, on-demand",
     "reference": "Pointers to external resources (docs, dashboards, issue trackers) — project-scoped, on-demand",
 }
+_VALID_TYPES: frozenset[str] = frozenset(_TYPE_DESCRIPTIONS.keys())
 
 
 MEMORY_LIST_DEFAULT_LIMIT = 20
@@ -61,6 +62,7 @@ entries exist and how to retrieve them.
 # ---------------------------------------------------------------------------
 
 class MemoryReadTool(BaseTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.READ_AGENT_STATE}))
     """
     读取一条记忆。按 name（短横线 slug）查找并返回完整内容。
     常用于 memory_list 之后读取具体内容。
@@ -116,6 +118,10 @@ class MemoryReadTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class MemoryWriteTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.WRITE_AGENT_STATE}),
+        roles=frozenset({ToolRole.PERSIST_MEMORY}),
+    )
     """
     创建或更新一条记忆。自动更新 MEMORY.md 索引。
     当 agent 发现值得跨会话记住的信息时使用（构建命令、用户偏好、调试技巧等）。
@@ -187,7 +193,7 @@ class MemoryWriteTool(BaseTool):
     def execute(self, params: dict[str, Any]) -> ToolResult:
         name: str = (params.get("name") or "").strip()
         description: str = (params.get("description") or "").strip()
-        mem_type: str = (params.get("type") or "semantic").strip()
+        mem_type: str = (params.get("type") or "project").strip()
         content: str = (params.get("content") or "").strip()
         raw_anchors = params.get("anchors") or []
 
@@ -197,8 +203,8 @@ class MemoryWriteTool(BaseTool):
             return ToolResult(success=False, output="", error="description is required")
         if not content:
             return ToolResult(success=False, output="", error="content is required")
-        if mem_type not in _TYPE_DESCRIPTIONS:
-            valid = ", ".join(_TYPE_DESCRIPTIONS.keys())
+        if mem_type not in _VALID_TYPES:
+            valid = ", ".join(sorted(_VALID_TYPES))
             return ToolResult(
                 success=False, output="",
                 error=f"Invalid type '{mem_type}'. Valid types: {valid}",
@@ -222,12 +228,17 @@ class MemoryWriteTool(BaseTool):
                 value=(raw_anchor.get("value") or None),
             ))
 
-        from memory.models import _now
+        from memory.models import MemoryType, _now
+        try:
+            mem_type_enum = MemoryType(mem_type)
+        except ValueError:
+            mem_type_enum = MemoryType.PROJECT
+
         memory = Memory(
             name=name,
             description=description,
             content=content,
-            metadata=MemoryMetadata(type=mem_type, stale=False, validated_at=_now()),
+            metadata=MemoryMetadata(type=mem_type_enum, validated_at=_now()),
             anchors=anchors,
         )
 
@@ -248,6 +259,7 @@ class MemoryWriteTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class MemoryListTool(BaseTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.READ_AGENT_STATE}))
     """
     列出所有记忆的摘要（名称 + 一行描述 + 类型）。
     agent 在开始任务前应调用此工具检查是否有相关记忆。
@@ -390,6 +402,7 @@ def _format_paginated_list(
 # ---------------------------------------------------------------------------
 
 class MemoryDeleteTool(BaseTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.WRITE_AGENT_STATE}))
     """
     删除一条记忆。按 name 删除对应的记忆文件，并更新 MEMORY.md 索引。
     谨慎使用——删除不可恢复。
@@ -444,6 +457,7 @@ class MemoryDeleteTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class MemorySearchTool(BaseTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.READ_AGENT_STATE}))
     """
     语义搜索外部记忆。返回按相关性排序的结果。
     和 memory_list（精准列出）互补，适合"记得有但想不起来叫什么"的场景。

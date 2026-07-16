@@ -57,7 +57,7 @@ include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*", "observa
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "--tb=short -q"
+addopts = "--tb=short -q -m \"not e2e\""
 filterwarnings = [
     "ignore::requests.RequestsDependencyWarning",
     "ignore::requests.exceptions.RequestsDependencyWarning",

@@ -8,7 +8,9 @@ Core components:
 - HookRegistry: stores external (command) and internal (callable) hooks
 """
 
-from hooks.events import BLOCKABLE_EVENTS, HookContext, HookEvent
+from hooks.events import (
+    BLOCKABLE_EVENTS, HookContext, HookEvent, SessionStartSource,
+)
 from hooks.protocol import DispatchResult, ExitCode, HookOutput, HookResult
 from hooks.matcher import HookMatcher
 from hooks.registry import ExternalHookConfig, HookRegistry, InternalHook
@@ -17,6 +19,7 @@ from hooks.dispatcher import HookDispatcher
 __all__ = [
     "HookEvent",
     "HookContext",
+    "SessionStartSource",
     "BLOCKABLE_EVENTS",
     "ExitCode",
     "HookOutput",

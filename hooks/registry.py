@@ -93,22 +93,33 @@ class HookRegistry:
         """Register a Python callable hook."""
         self._internal[event].append(hook)
 
+    def register_external(self, event: HookEvent, config: ExternalHookConfig) -> None:
+        """Dynamically register an external hook (e.g. from agent frontmatter)."""
+        self._external[event].append(config)
+
+    def unregister_external(self, event: HookEvent, config: ExternalHookConfig) -> None:
+        """Remove a dynamically registered external hook."""
+        try:
+            self._external[event].remove(config)
+        except (KeyError, ValueError):
+            pass
+
     def find_external(
-        self, event: HookEvent, tool_name: str, tool_input: dict[str, Any]
+        self, event: HookEvent, matcher_subject: str, tool_input: dict[str, Any]
     ) -> list[ExternalHookConfig]:
-        """Find all external hooks matching the event + tool."""
+        """Find external hooks matching the event's declared subject."""
         return [
             h for h in self._external.get(event, [])
-            if h.matcher.matches(tool_name, tool_input)
+            if h.matcher.matches(matcher_subject, tool_input)
         ]
 
     def find_internal(
-        self, event: HookEvent, tool_name: str, tool_input: dict[str, Any]
+        self, event: HookEvent, matcher_subject: str, tool_input: dict[str, Any]
     ) -> list[InternalHook]:
-        """Find all internal hooks matching the event + tool."""
+        """Find internal hooks matching the event's declared subject."""
         return [
             h for h in self._internal.get(event, [])
-            if h.matcher.matches(tool_name, tool_input)
+            if h.matcher.matches(matcher_subject, tool_input)
         ]
 
     def _load_entry(self, event: HookEvent, entry: dict[str, Any]) -> None:

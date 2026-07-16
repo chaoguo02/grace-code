@@ -35,7 +35,6 @@ from dotenv import load_dotenv
 
 # Windows 终端强制 UTF-8 输出（避免 GBK 编码错误）
 if sys.platform == "win32":
-    os.system("")  # 启用 VT100 转义序列支持
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -61,16 +60,7 @@ from agent.prompt import reset_prompt_usage, set_project_dir, set_prompt_config 
 # 辅助：彩色输出
 # ---------------------------------------------------------------------------
 
-def _c(text: str, code: str) -> str:
-    return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
-
-def green(t: str) -> str:  return _c(t, "32")
-def yellow(t: str) -> str: return _c(t, "33")
-def red(t: str) -> str:    return _c(t, "31")
-def cyan(t: str) -> str:   return _c(t, "36")
-def bold(t: str) -> str:   return _c(t, "1")
-def dim(t: str) -> str:    return _c(t, "2")
-def magenta(t: str) -> str: return _c(t, "35")
+from entry._terminal import bold, cyan, dim, green, magenta, red, yellow
 
 
 # ---------------------------------------------------------------------------
@@ -78,222 +68,15 @@ def magenta(t: str) -> str: return _c(t, "35")
 # ---------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
-
-
-def _init_memory(repo_path: str, config) -> tuple:
-    """
-    初始化记忆系统，返回 (memory_store, memory_context, external_store)。
-    fastembed 不可用时优雅降级：禁用语义搜索，仅保留文件索引。
-    """
-    from memory.store import TwoTierMemoryStore
-    from memory.context import MemoryContext
-    from llm.router import create_selector_backend
-
-    retriever = None
-    external_store = None
-    indexer = None
-
-    try:
-        import fastembed as _  # noqa: F401
-        from memory.external_store import ExternalMemoryStore
-        from memory.indexer import MemoryIndexer
-        from memory.retriever import ProactiveRetriever
-
-        external_store = ExternalMemoryStore()
-        indexer = MemoryIndexer(external_store)
-        retriever = ProactiveRetriever(external_store, max_chunks=5, max_tokens=2000)
-    except ImportError:
-        logger.info(
-            "fastembed not installed — semantic memory search disabled. "
-            "Install: pip install 'coding-agent[rag]'"
-        )
-
-    memory_store = TwoTierMemoryStore(
-        repo_path=repo_path,
-        memory_dir=config.memory.directory or None,
-        max_index_lines=config.memory.max_index_lines,
-        indexer=indexer,
-    )
-    selector_backend = create_selector_backend({
-        "memory": {
-            "selector_enabled": config.memory.selector_enabled,
-            "selector_model": config.memory.selector_model,
-        },
-        "llm": {
-            "provider": config.llm.provider,
-            "model": config.llm.model,
-            "api_key": config.llm.api_key,
-            "base_url": config.llm.base_url,
-        },
-    })
-    memory_context = MemoryContext(
-        store=memory_store,
-        max_lines=config.memory.max_index_lines,
-        enabled=config.memory.enabled,
-        retriever=retriever,
-        selector_backend=selector_backend,
-    )
-    return memory_store, memory_context, external_store
-
-
-# ---------------------------------------------------------------------------
-# Hook Dispatcher 初始化
-# ---------------------------------------------------------------------------
-
-def _init_hook_dispatcher(repo_path: Path, proactive_memory=None, memory_store=None,
-                          log_dir: str | None = None, backend=None):
-    """Create HookDispatcher with optional ProactiveMemory as internal hooks."""
-    from hooks import HookDispatcher, HookEvent, HookMatcher, HookRegistry, InternalHook
-
-    registry = HookRegistry()
-
-    # Load external hooks from settings.json
-    settings_path = repo_path / ".forge-agent" / "settings.json"
-    registry.load_from_settings(settings_path)
-
-    # Register ProactiveMemory as internal PostToolUse/UserPromptSubmit subscriber
-    if proactive_memory is not None:
-        registry.register_internal(HookEvent.POST_TOOL_USE, InternalHook(
-            callback=lambda ctx: proactive_memory.check_tool_result(
-                ctx.tool_name,
-                ctx.tool_input,
-                (ctx.tool_output or {}).get("output", ""),
-                (ctx.tool_output or {}).get("success", False),
-            ),
-            matcher=HookMatcher(pattern="shell"),
-        ))
-        # Detect explicit memory_write → suppress auto-extraction this turn
-        registry.register_internal(HookEvent.POST_TOOL_USE, InternalHook(
-            callback=lambda ctx: proactive_memory.notify_explicit_memory_write(),
-            matcher=HookMatcher(pattern="memory_write"),
-        ))
-        def _on_user_prompt(ctx):
-            proactive_memory.reset_turn()
-            proactive_memory.check_user_message(ctx.user_input)
-
-        registry.register_internal(HookEvent.USER_PROMPT_SUBMIT, InternalHook(
-            callback=_on_user_prompt,
-        ))
-
-    # Register memory consolidation on SessionStop
-    if memory_store is not None:
-        def _on_session_stop(ctx):
-            from memory.consolidation import record_session_end, run_consolidation
-            try:
-                record_session_end(memory_store.store_dir)
-                run_consolidation(memory_store, log_dir=log_dir, backend=backend, async_run=True)
-            except Exception:
-                pass
-
-        registry.register_internal(HookEvent.STOP, InternalHook(
-            callback=_on_session_stop,
-        ))
-
-    return HookDispatcher(registry, cwd=str(repo_path))
-
-
-# ---------------------------------------------------------------------------
-# 构建 agent 各组件
-# ---------------------------------------------------------------------------
-
-def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
-                    external_store=None, repo_path=None, auto_approve=False):
-    """根据配置组装工具注册表。"""
-    from tools.base import ToolRegistry
-    from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
-    from tools.file_edit_tool import FileEditTool
-    from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
-    from tools.search_tool import FindFilesTool, FindSymbolTool, SearchTextTool
-    from tools.shell_tool import ShellTool
-    from tools.test_tool import PytestTool
-    from tools.web_tool import WebSearchTool, WebFetchTool
-    from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
-    from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
-    from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
-
-    # ── 构建 PermissionPipeline（5 层权限管道）──
-    from hitl.pipeline import PermissionPipeline
-    from hitl.settings_loader import load_permission_settings
-
-    project_root = str(repo_path) if repo_path else None
-    rules, _hook_configs = load_permission_settings(project_root or ".")
-
-    perm_confirm = None
-    if confirm_callback is not None:
-        from entry.renderer import permission_prompt
-        perm_confirm = permission_prompt
-
-    settings_path = None
-    if project_root:
-        from pathlib import Path
-        settings_path = str(Path(project_root) / ".forge-agent" / "settings.json")
-
-    pipeline = PermissionPipeline(
-        rules=rules,
-        confirm_callback=perm_confirm,
-        auto_approve=auto_approve,
-        settings_path=settings_path,
-        project_root=project_root,
-    )
-
-    web_cfg = cfg.tools.web
-    artifact_store_ref = ArtifactStoreRef()
-    evidence_ledger_ref = EvidenceLedgerRef()
-    submit_plan_ref = SubmitReadPlanRef()
-    registry = (
-        ToolRegistry(permission_pipeline=pipeline)
-        .register(ShellTool(runtime=runtime))
-        .register(FileReadTool())
-        .register(FileViewTool())
-        .register(FileWriteTool())
-        .register(FileEditTool())
-        .register(SearchTextTool())
-        .register(FindFilesTool())
-        .register(FindSymbolTool())
-        .register(PytestTool(runtime=runtime))
-        .register(GitStatusTool(runtime=runtime))
-        .register(GitDiffTool(runtime=runtime))
-        .register(GitAddTool(runtime=runtime))
-        .register(GitCommitTool(runtime=runtime))
-        .register(WebSearchTool(max_results=web_cfg.search_max_results))
-        .register(WebFetchTool(
-            max_chars=web_cfg.fetch_max_chars,
-            timeout=web_cfg.fetch_timeout,
-        ))
-        .register(ArtifactListTool(artifact_store_ref))
-        .register(ArtifactReadTool(artifact_store_ref))
-        .register(ArtifactSearchTool(artifact_store_ref))
-        .register(EvidenceListTool(evidence_ledger_ref))
-        .register(EvidenceGetTool(evidence_ledger_ref))
-        .register(SubmitReadPlanTool(submit_plan_ref))
-    )
-    registry._artifact_store_ref = artifact_store_ref
-    registry._evidence_ledger_ref = evidence_ledger_ref
-    registry._submit_plan_ref = submit_plan_ref
-
-    # 注册记忆工具（如果提供了 MemoryStore）
-    if memory_store is not None:
-        from tools.memory_tool import (
-            MemoryReadTool, MemoryWriteTool,
-            MemoryListTool, MemoryDeleteTool,
-        )
-        registry \
-            .register(MemoryReadTool(memory_store)) \
-            .register(MemoryWriteTool(memory_store)) \
-            .register(MemoryListTool(memory_store)) \
-            .register(MemoryDeleteTool(memory_store))
-
-    # 注册外部记忆搜索工具
-    if external_store is not None:
-        from tools.memory_tool import MemorySearchTool
-        registry.register(MemorySearchTool(external_store))
-
-    return registry
+from entry.bootstrap import init_memory as _init_memory
+from entry.bootstrap import init_hook_dispatcher as _init_hook_dispatcher
+from entry.bootstrap import build_registry as _build_registry
+from entry.modes.v2_runner import _render_v2_event, _print_v2_result, run_v2_mode as _run_v2_mode
 
 
 def _print_step(event) -> None:
     """实时打印单条 event。"""
-    from agent.task import EventType
+    from agent.task import EventType, ObservationStatus
     etype = event.event_type
     payload = event.payload
 
@@ -326,7 +109,7 @@ def _print_step(event) -> None:
         status = obs.get("status", "")
         tool = obs.get("tool_name", "")
         output = obs.get("output", "")
-        if status == "success":
+        if status == ObservationStatus.SUCCESS.value:
             click.echo(green(f"  ✓ [{tool}]"))
         else:
             click.echo(red(f"  ✗ [{tool}] {obs.get('error', '')}"))
@@ -364,6 +147,146 @@ def cli(ctx: click.Context, config: str | None) -> None:
     ctx.obj["config_path"] = config
 
 
+from entry.worktree_admin import worktree_admin  # noqa: E402
+cli.add_command(worktree_admin)
+
+
+# ---------------------------------------------------------------------------
+# MCP-06: MCP server management CLI
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def mcp():
+    """Manage MCP servers (add, list, get, remove)."""
+    pass
+
+
+@mcp.command("add")
+@click.argument("name")
+@click.argument("target")
+@click.option("--transport", "-t", default="stdio", type=click.Choice(["stdio", "http", "sse", "ws"]), help="Transport type")
+@click.option("--scope", "-s", default="project", type=click.Choice(["project", "user"]), help="Config scope")
+@click.option("--env", "-e", multiple=True, help="Environment variables (KEY=VALUE)")
+@click.option("--header", "-H", "headers", multiple=True, help="HTTP headers (Key: Value)")
+@click.option("--timeout", default=None, type=float, help="Timeout in seconds")
+@click.pass_context
+def mcp_add(ctx, name, target, transport, scope, env, headers, timeout):
+    """Add an MCP server.
+
+    NAME: server name
+    TARGET: command (stdio) or URL (http/sse/ws)
+
+    Examples:
+      forge-agent mcp add filesystem npx --transport stdio
+      forge-agent mcp add remote-api https://example.com --transport http --header "Authorization: Bearer xxx"
+    """
+    import json as _json
+    path = (
+        Path.home() / ".forge-agent.json"
+        if scope == "user"
+        else Path(".mcp.json")
+    )
+    data: dict = {}
+    if path.exists():
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+        except _json.JSONDecodeError:
+            click.echo(red(f"Error: {path} is not valid JSON"), err=True)
+            return
+
+    servers: dict = data.setdefault("mcpServers", {})
+    entry: dict = {"type": transport}
+    if transport == "stdio":
+        entry["command"] = target
+    else:
+        entry["url"] = target
+    if env:
+        env_dict = {}
+        for e in env:
+            if "=" in e:
+                k, v = e.split("=", 1)
+                env_dict[k] = v
+        entry["env"] = env_dict
+    if headers:
+        headers_dict = {}
+        for h in headers:
+            if ":" in h:
+                k, v = h.split(":", 1)
+                headers_dict[k.strip()] = v.strip()
+        entry["headers"] = headers_dict
+    if timeout is not None:
+        entry["timeout_seconds"] = timeout
+
+    servers[name] = entry
+    path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    click.echo(green(f"  MCP server '{name}' added to {path}"))
+
+
+@mcp.command("list")
+@click.option("--transport", "-t", default=None, type=click.Choice(["stdio", "http", "sse", "ws"]), help="Filter by transport")
+@click.pass_context
+def mcp_list(ctx, transport):
+    """List configured MCP servers."""
+    from runtime.mcp.config import load_mcp_config
+    result = load_mcp_config(project_dir=".")
+    servers = result.servers
+    if transport:
+        servers = [s for s in servers if s.type == transport]
+    if not servers:
+        click.echo(dim("  No MCP servers configured."))
+        return
+    click.echo(dim(f"  MCP servers ({len(servers)}):"))
+    for s in servers:
+        target = s.command or s.url
+        click.echo(dim(f"    {s.name}: {s.type} → {target}"))
+
+
+@mcp.command("get")
+@click.argument("name")
+@click.pass_context
+def mcp_get(ctx, name):
+    """Show details for one MCP server."""
+    from runtime.mcp.config import load_mcp_config
+    result = load_mcp_config(project_dir=".")
+    for s in result.servers:
+        if s.name == name:
+            click.echo(f"  Name: {s.name}")
+            click.echo(f"  Type: {s.type}")
+            click.echo(f"  Command/URL: {s.command or s.url}")
+            click.echo(f"  Args: {s.args}")
+            click.echo(f"  Env: {s.env}")
+            click.echo(f"  Headers: {s.headers}")
+            click.echo(f"  Timeout: {s.timeout_seconds}s")
+            click.echo(f"  Idle timeout: {s.idle_timeout_seconds}s")
+            return
+    click.echo(dim(f"  MCP server '{name}' not found."))
+
+
+@mcp.command("remove")
+@click.argument("name")
+@click.option("--scope", "-s", default="project", type=click.Choice(["project", "user"]), help="Config scope")
+@click.pass_context
+def mcp_remove(ctx, name, scope):
+    """Remove an MCP server."""
+    import json as _json
+    path = (
+        Path.home() / ".forge-agent.json"
+        if scope == "user"
+        else Path(".mcp.json")
+    )
+    if not path.exists():
+        click.echo(dim(f"  No config at {path}"))
+        return
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    servers: dict = data.get("mcpServers", {})
+    if name not in servers:
+        click.echo(dim(f"  MCP server '{name}' not found in {path}."))
+        return
+    del servers[name]
+    path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    click.echo(green(f"  MCP server '{name}' removed from {path}."))
+
+
 # ---------------------------------------------------------------------------
 # Multi-Agent config helper
 # ---------------------------------------------------------------------------
@@ -388,328 +311,6 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
         return False
     return resp in ("y", "yes", "")
 
-
-def _render_v2_event(event, rend, proactive_memory=None, last_tool=None, last_tool_params=None):
-    from agent.task import EventType
-
-    payload = event.payload
-    if event.event_type == EventType.ACTION:
-        step = payload.get("step", 0)
-        action = payload.get("action", {})
-        tool_calls = action.get("tool_calls") or []
-        if tool_calls:
-            for tool_call in tool_calls:
-                if last_tool is not None:
-                    last_tool[0] = tool_call.get("name", "")
-                if last_tool_params is not None:
-                    last_tool_params[0] = tool_call.get("params", {})
-                rend.on_tool_call(step, tool_call.get("name", ""), tool_call.get("params", {}))
-        elif action.get("action_type") == "finish":
-            rend.on_finish(step, action.get("message", ""))
-        elif action.get("action_type") == "give_up":
-            rend.on_give_up(step, action.get("message", ""))
-    elif event.event_type == EventType.OBSERVATION:
-        step = payload.get("step", 0)
-        obs = payload.get("observation", {})
-        tool_name = obs.get("tool_name") or (last_tool[0] if last_tool else "")
-        output = obs.get("output", "")
-        status = obs.get("status", "")
-        rend.on_observation(step, tool_name, status, output, obs.get("error"))
-        if proactive_memory is not None:
-            proactive_memory.check_tool_result(
-                tool_name=tool_name,
-                params=(last_tool_params[0] if last_tool_params else {}),
-                output=output,
-                success=(status == "success"),
-            )
-    elif event.event_type == EventType.REFLECTION:
-        rend.on_reflection(payload.get("reason", ""))
-
-
-def _run_v2_mode(
-    *,
-    mode: str,
-    description: str,
-    repo_path: Path,
-    backend,
-    registry,
-    agent_config,
-    memory_context,
-    log_dir: str,
-    intent_override: str,
-    plan_approval_callback=None,
-    auto_approve: bool = False,
-    plan_file: str | None = None,
-    hook_dispatcher=None,
-    proactive_memory=None,
-    mcp_integration=None,
-    renderer=None,
-) -> None:
-    import os
-    import subprocess
-    from datetime import datetime
-    from agent.task import RunStatus
-    from agent.factory import classify_task_intent
-    from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
-    from llm.base import LLMMessage
-
-    db_path = default_session_db_path(str(repo_path))
-    store = SessionStore(db_path)
-    rend = renderer
-    last_tool = [""]
-    last_tool_params = [{}]
-    runtime = SessionRuntime(
-        store=store,
-        backend=backend,
-        base_registry=registry,
-        agent_registry=AgentRegistryV2(),
-        root_agent_config=agent_config,
-        log_dir=log_dir,
-        memory_context=memory_context,
-        hook_dispatcher=hook_dispatcher,
-        mcp_integration=mcp_integration,
-        event_callback=(
-            (lambda event: _render_v2_event(
-                event, rend, proactive_memory=proactive_memory,
-                last_tool=last_tool, last_tool_params=last_tool_params,
-            )) if rend is not None else None
-        ),
-    )
-    intent = classify_task_intent(description, intent_override, backend)
-
-    if mode == "v2-build":
-        # ── 上下文连续：如果提供了 --plan-file，将计划文件内容注入 build session ──
-        build_messages: list[LLMMessage] = []
-        if plan_file and os.path.isfile(plan_file):
-            with open(plan_file, encoding="utf-8") as f:
-                plan_content = f.read()
-            click.echo(dim(f"  Plan file: {plan_file}"))
-            build_messages.append(LLMMessage(
-                role="user",
-                content=(
-                    f"[PLAN CONTEXT] The following implementation plan has been reviewed and approved. "
-                    f"Execute it now.\n\n{plan_content}"
-                ),
-            ))
-        build_messages.append(LLMMessage(role="user", content=description))
-
-        session = runtime.create_root_session(
-            agent_name="build",
-            repo_path=str(repo_path),
-            title=description[:80] or "v2-build",
-            metadata={"entrypoint": "cli_run_v2", "mode": mode},
-        )
-        result = runtime.run_session(
-            session.id,
-            agent_name="build",
-            task_description=description,
-            intent=intent,
-            messages=build_messages,
-        )
-        _print_v2_result(mode, db_path, session.id, result, show_summary=False)
-        return
-
-    # --- plan / v2-plan: 权限过滤器 ---
-    # plan agent = 只读工具（模型看到写工具但调用被拦截），用户审查后手动切 build。
-    # 封闭循环：模型提交计划 → 用户审批 → 拒绝时反馈注入 → 模型重新规划 → 再审批
-    # 计划文件 = single source of truth，原地覆盖（对齐 Claude Code .claude/plans/[name].md）
-    if mode in ("plan", "v2-plan"):
-        session = runtime.create_root_session(
-            agent_name="plan",
-            repo_path=str(repo_path),
-            title=description[:80] or "plan",
-            metadata={"entrypoint": "cli_run_v2", "mode": mode},
-        )
-        plan_steps = max(5, agent_config.max_steps // 3)
-        plan_budget = max(5000, agent_config.budget_tokens // 3)
-
-        # 固定计划文件路径（single file, 原地覆盖）
-        plans_dir = os.path.join(str(repo_path), ".forge-agent", "plans")
-        os.makedirs(plans_dir, exist_ok=True)
-        task_slug = description[:40].replace(" ", "_").replace("/", "_").replace("\\", "_")
-        plan_path = os.path.join(plans_dir, f"{task_slug}.md")
-
-        # 首次 plan session
-        result = runtime.run_session(
-            session.id,
-            agent_name="plan",
-            task_description=description,
-            intent="analysis",
-            messages=[LLMMessage(role="user", content=description)],
-            max_steps_override=plan_steps,
-            budget_tokens_override=plan_budget,
-        )
-
-        # ── Plan 审批循环（封闭循环直到批准或用户退出）────
-        max_revisions = 5
-        revision_count = 0
-        while True:
-            plan_text = result.summary or ""
-
-            # 原地覆盖同一个计划文件
-            if plan_text.strip():
-                with open(plan_path, "w", encoding="utf-8") as f:
-                    f.write(plan_text)
-
-            _print_v2_result(mode, db_path, session.id, result, show_summary=False)
-            if plan_text.strip():
-                click.echo(dim(f"  Plan    : {plan_path}"))
-
-            # auto_approve → 跳过审核
-            if auto_approve:
-                if plan_text.strip():
-                    click.echo(green("  Auto-approved."))
-                return
-
-            if not plan_text.strip():
-                click.echo(yellow("  Plan session produced no output. Nothing to review."))
-                return
-
-            # ── 交互式审批菜单（对齐 Claude Code 5 选项）────
-            click.echo("\n" + "─" * 60)
-            click.echo(bold("  Plan ready for review"))
-            click.echo(f"  File: {plan_path}")
-            click.echo("─" * 60)
-            click.echo(f"  [1] Yes, and auto-accept edits")
-            click.echo(f"  [2] Yes, and manually approve edits")
-            click.echo(f"  [3] Edit plan file (opens editor)")
-            click.echo(f"  [4] Tell Claude what to change (re-plan)")
-            click.echo(f"  [5] Abort")
-            click.echo("─" * 60)
-            try:
-                choice = click.prompt("  Choice", type=str, default="1").strip()
-            except (EOFError, KeyboardInterrupt):
-                click.echo("\n  Aborted.")
-                return
-
-            if choice == "1":
-                # 批准 + 自动执行（bypass edit permissions）
-                # 审批通过后重新读取文件（用户可能通过选项3编辑过）
-                with open(plan_path, encoding="utf-8") as f:
-                    _ = f.read()
-                click.echo(green("  Plan approved (auto-accept). Executing...\n"))
-                _run_v2_mode(
-                    mode="v2-build",
-                    description=description,
-                    repo_path=repo_path,
-                    backend=backend,
-                    registry=registry,
-                    agent_config=agent_config,
-                    memory_context=memory_context,
-                    log_dir=log_dir,
-                    intent_override=intent_override,
-                    plan_approval_callback=plan_approval_callback,
-                    auto_approve=True,
-                    plan_file=plan_path,
-                    hook_dispatcher=hook_dispatcher,
-                    proactive_memory=proactive_memory,
-                    renderer=renderer,
-                )
-                return
-
-            elif choice == "2":
-                # 批准 + 逐步确认写操作
-                with open(plan_path, encoding="utf-8") as f:
-                    _ = f.read()
-                click.echo(green("  Plan approved (manual review). Executing...\n"))
-                _run_v2_mode(
-                    mode="v2-build",
-                    description=description,
-                    repo_path=repo_path,
-                    backend=backend,
-                    registry=registry,
-                    agent_config=agent_config,
-                    memory_context=memory_context,
-                    log_dir=log_dir,
-                    intent_override=intent_override,
-                    plan_approval_callback=plan_approval_callback,
-                    auto_approve=False,
-                    plan_file=plan_path,
-                    hook_dispatcher=hook_dispatcher,
-                    proactive_memory=proactive_memory,
-                    renderer=renderer,
-                )
-                return
-
-            elif choice == "3":
-                # 在编辑器中打开计划文件，原地编辑
-                editor = os.environ.get("EDITOR", "notepad")
-                try:
-                    subprocess.call([editor, plan_path])
-                except Exception:
-                    click.echo(red(f"  Failed to open editor: {editor}"))
-                    click.echo(dim(f"  Edit manually: {plan_path}"))
-                # 读回并显示差异提示
-                with open(plan_path, encoding="utf-8") as f:
-                    updated = f.read()
-                if updated != plan_text:
-                    plan_text = updated
-                    click.echo(green("  Plan updated."))
-                else:
-                    click.echo(dim("  No changes detected."))
-                # 回到菜单，用户可以选择批准或继续改
-                continue
-
-            elif choice == "4":
-                # 反馈 → 留在 plan 模式，模型重新规划
-                revision_count += 1
-                if revision_count >= max_revisions:
-                    click.echo(yellow(f"  Max revisions ({max_revisions}) reached. Aborting."))
-                    return
-                try:
-                    feedback = click.prompt(
-                        "  What would you like to change?", type=str
-                    )
-                except (EOFError, KeyboardInterrupt):
-                    click.echo("\n  Aborted.")
-                    return
-                if not feedback.strip():
-                    continue
-                if proactive_memory:
-                    proactive_memory.check_plan_feedback(feedback)
-                click.echo(dim(f"  Re-planning (revision {revision_count}/{max_revisions})...\n"))
-                result = runtime.run_session(
-                    session.id,
-                    agent_name="plan",
-                    task_description=description,
-                    intent="analysis",
-                    messages=[LLMMessage(
-                        role="user",
-                        content=(
-                            f"[USER FEEDBACK ON PLAN]\n{feedback}\n\n"
-                            f"Please revise the plan accordingly and output "
-                            f"an updated structured plan."
-                        ),
-                    )],
-                    max_steps_override=plan_steps,
-                    budget_tokens_override=plan_budget,
-                )
-                # 回到循环顶部：新 plan 覆盖文件，再次展示审批菜单
-                continue
-
-            elif choice == "5":
-                click.echo(dim("  Aborted. Plan saved at: ") + click.style(plan_path, fg="yellow"))
-                return
-
-            else:
-                click.echo(red(f"  Invalid choice: {choice}"))
-                continue
-        return
-
-
-def _print_v2_result(mode: str, db_path: str, session_id: str, result, *, show_summary: bool = True) -> None:
-    from agent.task import RunStatus
-    click.echo(dim(f"  Mode    : {mode}"))
-    click.echo(dim(f"  V2 DB   : {db_path}"))
-    click.echo(dim(f"  Session : {session_id}\n"))
-    if show_summary and result.summary:
-        click.echo(result.summary)
-    if result.status == RunStatus.SUCCESS:
-        click.echo(green("\n  V2 run completed successfully."))
-    else:
-        click.echo(yellow(f"\n  V2 run finished with status: {result.status.value}"))
-
-
 # ---------------------------------------------------------------------------
 # run 子命令
 # ---------------------------------------------------------------------------
@@ -726,14 +327,33 @@ def _print_v2_result(mode: str, db_path: str, session_id: str, result, *, show_s
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
-@click.option("--mode", default="v2-build", show_default=True, type=click.Choice(["v2-build", "v2-plan"]), help="Agent mode: v2-build or v2-plan")
-@click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
+@click.option("--agent", "agent_name", default="build", show_default=True, help="Agent type (e.g. build, plan, or any custom agent name)")
+@click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve tool permission prompts; does not execute a generated plan")
+@click.option(
+    "--plan-action",
+    type=click.Choice(["review", "save", "execute"]),
+    default="review",
+    show_default=True,
+    help="After v2-plan succeeds: review interactively, save only, or execute",
+)
 @click.option("--replan", is_flag=True, default=False, help="Enable one or more DAG replans after subtask failure")
 @click.option("--max-replans", default=None, type=int, help="Maximum DAG replan attempts")
 @click.option("--read", "read_paths", multiple=True, default=None, help="Explicitly allowed read path (repeatable)")
 @click.option("--write", "write_paths", multiple=True, default=None, help="Explicitly allowed write path (repeatable)")
-@click.option("--intent", "intent_override", default="auto", show_default=True, type=click.Choice(["analysis", "edit", "auto"]), help="Task intent: analysis (read-only), edit, or auto (detect)")
+@click.option("--intent", "intent_override", default=None, type=click.Choice(["analysis", "edit"]), help="Override the task intent declared by the selected mode")
 @click.option("--plan-file", default=None, help="Inject an approved plan file into v2-build session")
+@click.option(
+    "--delegate-to",
+    default=None,
+    metavar="AGENT",
+    help="Guarantee one named subagent runs before the primary agent synthesizes the result",
+)
+@click.option(
+    "--agents", "agents_json",
+    default=None,
+    metavar="JSON",
+    help="JSON string with session-only agent definitions (CC-aligned)",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -749,14 +369,17 @@ def run(
     stream: bool,
     confirm: bool,
     sandbox: bool,
-    mode: str,
+    agent_name: str,
     auto_approve: bool,
+    plan_action: str,
     replan: bool,
     max_replans: int | None,
     read_paths: tuple[str, ...] | None,
     write_paths: tuple[str, ...] | None,
-    intent_override: str,
+    intent_override: str | None,
     plan_file: str | None,
+    delegate_to: str | None,
+    agents_json: str | None,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -827,6 +450,7 @@ def run(
     if config.memory.enabled:
         memory_store, memory_context, external_store = _init_memory(str(repo_path), config)
 
+    from hitl.pipeline import ToolApprovalMode
     registry = _build_registry(
         config,
         confirm_callback=confirm_cb,
@@ -834,19 +458,16 @@ def run(
         memory_store=memory_store,
         external_store=external_store,
         repo_path=repo_path,
-        auto_approve=auto_approve,
+        approval_mode=(
+            ToolApprovalMode.AUTO if auto_approve else ToolApprovalMode.PROMPT
+        ),
     )
+    if auto_approve and registry._permission_pipeline is not None:
+        registry._permission_pipeline.set_permission_mode("bypassPermissions")
 
-    # ProactiveMemory（run 模式）
-    proactive_memory = None
-    if memory_store is not None:
-        from memory.proactive import ProactiveMemory
-        proactive_memory = ProactiveMemory(memory_store)
-        proactive_memory.check_user_message(description)
-
-    # Initialize HookDispatcher with ProactiveMemory as internal subscriber
+    # Initialize HookDispatcher
     hook_dispatcher = _init_hook_dispatcher(
-        repo_path, proactive_memory,
+        repo_path,
         memory_store=memory_store,
         log_dir=config.agent.log_dir,
         backend=backend,
@@ -865,8 +486,6 @@ def run(
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
     from agent.policy import normalize_repo_path
-    from agent.factory import classify_task_intent
-    from dataclasses import dataclass
     from entry.renderer import create_renderer
     try:
         from context.token_budget import is_tiktoken_available
@@ -874,7 +493,7 @@ def run(
         is_tiktoken_available = lambda: False
 
     # 创建渲染器
-    rend = create_renderer(model=config.llm.model, mode=mode)
+    rend = create_renderer(model=config.llm.model, mode=agent_name)
 
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
@@ -882,63 +501,71 @@ def run(
         request_budget_tokens=config.context.request_budget_tokens,
         artifact_threshold_tokens=config.context.artifact_threshold_tokens,
         artifact_storage_dir=config.context.artifact_storage_dir,
-        analysis_inspect_read_limit=config.agent.analysis_inspect_read_limit,
-        analysis_verify_read_limit=config.agent.analysis_verify_read_limit,
         history_max_messages=config.context.history_window * 2,
         stream=stream,
         stream_callback=rend.stream_text if stream else None,
         thought_callback=rend.stream_thought if stream else None,
+        token_callback=rend.update_tokens,
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
     )
-    # Plan 审批回调（V1 plan mode 和 V2 v2-plan 共用）
-
-    @dataclass
-    class _PlanApproval:
-        approved: bool
-        action: str = "execute"
-        feedback: str = ""
-
-    def _plan_approval_cb(plan_text: str):
-        if auto_approve:
-            rend.on_plan_generated(plan_text)
-            rend.on_plan_approved()
-            return _PlanApproval(approved=True)
-        rend.on_plan_generated(plan_text)
-        while True:
-            try:
-                resp = input("  [approve(y)/reject(n)/revise(e)] > ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                rend.on_plan_rejected()
-                return _PlanApproval(approved=False, feedback="Plan approval interrupted")
-            if resp in ("y", "yes", "approve", "a", ""):
-                rend.on_plan_approved()
-                return _PlanApproval(approved=True)
-            if resp in ("n", "no", "reject", "r"):
-                rend.on_plan_rejected()
-                return _PlanApproval(approved=False, feedback="Plan rejected by user")
-            if resp in ("e", "edit", "revise", "feedback", "f"):
-                try:
-                    feedback = input("  Revision feedback > ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    feedback = "Plan revision requested by user"
-                rend.on_plan_rejected()
-                if proactive_memory and feedback:
-                    proactive_memory.check_plan_feedback(feedback)
-                return _PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
-            click.echo("  Please enter y to approve, n to reject, or e to request revision.")
-
     mcp_integration = None
-    if mode in ("v2-build", "plan", "v2-plan") and getattr(config, "mcp_servers", None):
-        from agent.v2 import MCPToolIntegration
-        mcp_integration = MCPToolIntegration({"mcp_servers": config.mcp_servers})
-        mcp_integration.initialize()
-        mcp_integration.register_into(registry)
-
-    if mode in ("v2-build", "plan", "v2-plan"):
+    from agent.v2 import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration
+    try:
+        _agent_registry = AgentRegistryV2(project_dir=repo_path)
+    except AgentDefinitionError as _ade:
+        click.echo(red(f"Error: {_ade}"), err=True)
+        sys.exit(1)
+        return
+    
+    # Inject session-only agent definitions from --agents (CC-aligned)
+    if agents_json:
+        import json
         try:
-            _run_v2_mode(
-                mode=mode,
+            session_agents = json.loads(agents_json)
+            if isinstance(session_agents, dict):
+                for name, config in session_agents.items():
+                    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+                    from agent.v2.agent_definition import _parse_tool_list
+                    agent = AgentDefinition(
+                        name=str(name),
+                        description=str(config.get("description", "")),
+                        intent=TaskIntent(config.get("intent", "edit")),
+                        tools=_parse_tool_list(config.get("tools", "")),
+                        disallowed_tools=_parse_tool_list(config.get("disallowedTools", "")),
+                        model=str(config.get("model", "inherit")),
+                        agent_kind=AgentKind.NAMED_SUBAGENT,
+                        system_prompt=str(config.get("prompt", config.get("instructions", ""))),
+                    )
+                    _agent_registry._agents[name] = agent
+        except (json.JSONDecodeError, Exception) as _jde:
+            click.echo(yellow(f"Warning: --agents JSON parse failed: {_jde}"), err=True)
+        sys.exit(1)
+        return
+    if _agent_registry.has(agent_name):
+        # Inject initial_prompt from agent definition (CC-aligned)
+        _spec = _agent_registry.get(agent_name)
+        if _spec.initial_prompt and description:
+            description = f"{_spec.initial_prompt}\n\n{description}"
+        elif _spec.initial_prompt:
+            description = _spec.initial_prompt
+
+        if getattr(config, "mcp_servers", None):
+            mcp_integration = MCPToolIntegration({"mcp_servers": config.mcp_servers})
+            mcp_integration.initialize()
+            mcp_integration.register_into(registry)
+
+            # Wire MCP context into ToolSearch + WaitForMcpServers tools
+            from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool
+            for _name, _tool in registry._tools.items():
+                if isinstance(_tool, (ToolSearchTool, WaitForMcpServersTool)):
+                    _tool.set_mcp_context(registry, mcp_integration)
+
+        from agent.v2 import AgentDefinitionError, ExplicitDelegationError
+        try:
+            from entry.modes.interaction import cli_plan_adapter
+            mode_result = _run_v2_mode(
+                agent_name=agent_name,
                 description=description,
                 repo_path=repo_path,
                 backend=backend,
@@ -947,21 +574,31 @@ def run(
                 memory_context=memory_context,
                 log_dir=config.agent.log_dir,
                 intent_override=intent_override,
-                plan_approval_callback=_plan_approval_cb,
-                auto_approve=auto_approve,
+                approval_interaction=cli_plan_adapter(plan_action),
                 plan_file=plan_file,
                 hook_dispatcher=hook_dispatcher,
-                proactive_memory=proactive_memory,
                 mcp_integration=mcp_integration,
                 renderer=rend,
+                explicit_agent=delegate_to,
             )
+        except (AgentDefinitionError, ExplicitDelegationError) as exc:
+            raise click.ClickException(str(exc)) from exc
         finally:
             if mcp_integration is not None:
                 mcp_integration.shutdown()
         flush_observability()
+        if not mode_result.is_success():
+            raise click.exceptions.Exit(1)
         return
 
-    click.echo(red(f"Error: mode '{mode}' has been removed. Use --mode v2-build or --mode v2-plan."), err=True)
+    available = sorted(_agent_registry.list_all(), key=lambda a: a.name)
+    click.echo(
+        red(
+            f"Error: unknown agent '{agent_name}'. "
+            f"Available agents: {', '.join(a.name for a in available)}"
+        ),
+        err=True,
+    )
     sys.exit(1)
 
 
@@ -974,7 +611,7 @@ def run(
 @click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
-@click.option("--mode", default="v2-build", show_default=True, type=click.Choice(["v2-build", "v2-plan"]), help="Agent mode")
+@click.option("--agent", "agent_name", default="build", show_default=True, help="Agent type (e.g. build, plan, or any custom agent name)")
 @click.option("--max-steps", default=None, type=int, help="Max steps per round")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
@@ -984,7 +621,7 @@ def chat(
     repo: str,
     model: str | None,
     provider: str | None,
-    mode: str,
+    agent_name: str,
     max_steps: int | None,
     sandbox: bool,
     verbose: bool,
@@ -1055,7 +692,7 @@ def chat(
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
     from entry.renderer import create_renderer
-    rend = create_renderer(model=config.llm.model, mode="react")
+    rend = create_renderer(model=config.llm.model, mode=agent_name)
     session = ChatSession(
         backend=backend,
         registry=registry,
@@ -1070,14 +707,14 @@ def chat(
     )
 
     # 设置初始模式
-    if mode != "react":
-        session.switch_mode(mode)
+    if agent_name != session._agent_name:
+        session.switch_mode(agent_name)
 
     # 欢迎信息
     click.echo(bold(f"\nCoding Agent — Chat Mode"))
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
-    click.echo(f"  Mode     : {mode}")
+    click.echo(f"  Mode     : {agent_name}")
     click.echo(f"  Repo     : {repo_path}")
     click.echo(dim(f"  Type your task. Commands: /exit /stats /clear /help\n"))
 
@@ -1161,9 +798,7 @@ def chat(
                     else:
                         click.echo(dim(f"  Available skills ({len(skills)}):"))
                         for s in skills:
-                            triggers = ", ".join(s.triggers[:3]) if s.triggers else ""
-                            trigger_info = f" [triggers: {triggers}]" if triggers else ""
-                            click.echo(dim(f"    /{s.name:<14} — {s.description or '(no description)'}{trigger_info}"))
+                            click.echo(dim(f"    /{s.name:<14} — {s.description or '(no description)'}"))
                 elif subcmd == "show":
                     skill_name = parts[2] if len(parts) > 2 else ""
                     if not skill_name:
@@ -1280,16 +915,15 @@ def chat(
                 help_lines.append("  Anything else is sent to the agent.")
                 click.echo(dim("\n".join(help_lines)))
             else:
-                # 检查是否是 skill 调用
-                skill_cmd = user_input[1:].split()[0] if user_input[1:].strip() else ""
-                if skill_registry.has_skill(skill_cmd):
-                    args = user_input[1 + len(skill_cmd):].strip()
-                    rendered = skill_registry.load_and_render(skill_cmd, args)
-                    if rendered:
-                        click.echo(dim(f"\n  Skill '{skill_cmd}' activated..."))
+                # Try /skill-name dispatch (Claude Code alignment: direct injection)
+                skill_name = user_input[1:].split()[0]
+                if skill_registry.has_skill(skill_name):
+                    rendered = session._handle_slash_skill(user_input)
+                    if rendered is not None:
+                        # Inline skill — inject and run agent
+                        click.echo(dim(f"\n  Skill '{skill_name}' activated..."))
                         session.run_round(rendered)
-                    else:
-                        click.echo(dim(f"  Skill '{skill_cmd}' failed to render."))
+                    # else: context=fork — skill handled internally by _handle_slash_skill
                 else:
                     click.echo(dim(f"  Unknown command: {user_input}. Type /help for help."))
             continue
@@ -1518,9 +1152,9 @@ def log() -> None:
 @click.option(
     "--dir",
     "log_dir",
-    default="./logs",
+    default="",
     show_default=True,
-    help="Load all log files from a directory when no explicit log files are provided",
+    help="Load logs from a directory; empty uses isolated state for the current project",
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON output")
 def log_filters(log_files: tuple[str, ...], log_dir: str, as_json: bool) -> None:
@@ -1530,7 +1164,11 @@ def log_filters(log_files: tuple[str, ...], log_dir: str, as_json: bool) -> None
     if log_files:
         paths = [Path(log_file) for log_file in log_files]
     else:
-        log_path = Path(log_dir)
+        if log_dir:
+            log_path = Path(log_dir)
+        else:
+            from runtime.state_paths import ProjectStatePaths
+            log_path = ProjectStatePaths.for_project(Path.cwd()).logs
         if not log_path.exists():
             click.echo(red(f"Log directory not found: {log_path}"), err=True)
             sys.exit(1)
@@ -1614,20 +1252,24 @@ def log_show(log_file: str) -> None:
         ts = event.timestamp[11:19]   # HH:MM:SS
         etype = event.event_type.value
         detail = ""
-        if event.event_type.value == "action":
+        if event.event_type is EventType.ACTION:
             tcs = event.payload.get("action", {}).get("tool_calls") or []
             detail = f"  tools={[tc['name'] for tc in tcs]}" if tcs else ""
-        elif event.event_type.value == "observation":
+        elif event.event_type is EventType.OBSERVATION:
             obs = event.payload.get("observation", {})
             detail = f"  status={obs.get('status')}"
         click.echo(f"  {ts}  {etype:<16}{detail}")
 
 
 @log.command("list")
-@click.option("--dir", "log_dir", default="./logs", help="Log directory")
+@click.option("--dir", "log_dir", default="", help="Log directory; empty uses isolated project state")
 def log_list(log_dir: str) -> None:
     """List all event log files."""
-    log_path = Path(log_dir)
+    if log_dir:
+        log_path = Path(log_dir)
+    else:
+        from runtime.state_paths import ProjectStatePaths
+        log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(f"Log directory not found: {log_path}")
         return
@@ -1716,12 +1358,16 @@ def history_search(query: str, limit: int) -> None:
 
 
 @history.command("archive")
-@click.option("--dir", "log_dir", default="./logs", help="Log directory to archive from")
+@click.option("--dir", "log_dir", default="", help="Log directory; empty uses isolated project state")
 def history_archive(log_dir: str) -> None:
     """Archive all log files from the logs directory to ~/.forge-agent/history/."""
     from entry.history_viewer import archive_log
 
-    log_path = Path(log_dir)
+    if log_dir:
+        log_path = Path(log_dir)
+    else:
+        from runtime.state_paths import ProjectStatePaths
+        log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(red(f"  Log directory not found: {log_path}"), err=True)
         return

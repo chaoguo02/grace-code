@@ -12,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, TypeVar
 
 from runtime.tool import PermissionDecision, ToolCall, ToolExecutionResult, ToolUseContext
 
@@ -22,6 +23,27 @@ if TYPE_CHECKING:
     from runtime.tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+ItemT = TypeVar("ItemT")
+ResultT = TypeVar("ResultT")
+
+
+def execute_parallel_sync(
+    items: list[ItemT],
+    execute: Callable[[ItemT], ResultT],
+    *,
+    max_workers: int,
+) -> list[ResultT]:
+    """Execute a Runtime-approved synchronous batch and preserve input order."""
+    if max_workers < 1:
+        raise ValueError("max_workers must be positive")
+    if len(items) < 2:
+        return [execute(item) for item in items]
+    with ThreadPoolExecutor(
+        max_workers=min(len(items), max_workers),
+        thread_name_prefix="forge-tool",
+    ) as executor:
+        return list(executor.map(execute, items))
 
 
 async def execute_single_tool(

@@ -11,9 +11,7 @@ memory/extractor.py
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -30,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_ANCHOR_KINDS = {"file", "symbol", "task"}
 _ALLOWED_CONFIDENCE = {"high", "medium", "low"}
-_FILE_RE = re.compile(r"[A-Za-z0-9_.\-/\\]+\.[A-Za-z0-9_]+")
 
 
 @dataclass
@@ -143,12 +140,13 @@ class MemoryExtractor:
         tool_calls: list[str] = []
         observations: list[str] = []
         for event in log.replay():
-            if event.event_type.value == "action":
+            from agent.task import EventType
+            if event.event_type is EventType.ACTION:
                 for tool_call in event.payload.get("action", {}).get("tool_calls") or []:
                     name = tool_call.get("name", "")
                     params = tool_call.get("params", {})
                     tool_calls.append(f"- {name}: {params}")
-            elif event.event_type.value == "observation":
+            elif event.event_type is EventType.OBSERVATION:
                 observation = event.payload.get("observation", {})
                 status = observation.get("status", "")
                 tool_name = observation.get("tool_name", "")
@@ -203,17 +201,18 @@ class MemoryExtractor:
 
     @staticmethod
     def _load_json(raw: str) -> Any:
+        """Parse structured LLM output.  Requires a backend that provides structured
+        responses (native tool_use or structured_output); the caller must pass
+        tools=[] for text-only backends.
+
+        Claude Code pattern: native tool_use blocks exclusively, zero regex.
+        """
+        import json
         text = raw.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
-            if not match:
-                return {"memories": []}
-            return json.loads(match.group(1))
+            return {"memories": []}
 
     @staticmethod
     def _parse_anchors(raw_anchors: list[Any]) -> list[Anchor]:
@@ -237,35 +236,22 @@ class MemoryExtractor:
             return []
         return [MemoryCandidate(
             type="project",
-            name=self._slug("episode", f"{task.description} {summary}"),
+            name=self._slug(f"{task.description} {summary}"),
             description=f"Completed task: {task.description[:80]}",
             content=f"Task completed successfully.\n\n**Task:** {task.description}\n\n**Outcome:** {summary}",
-            anchors=self._anchors_from_text(f"{task.description} {summary}"),
+            anchors=[],
             confidence="medium",
         )]
 
-    @staticmethod
-    def _anchors_from_text(text: str) -> list[Anchor]:
-        anchors: list[Anchor] = []
-        seen: set[str] = set()
-        for match in _FILE_RE.findall(text):
-            path = match.replace("\\", "/").strip(".,:;()[]{}<>`'\"")
-            if not path or path in seen:
-                continue
-            anchors.append(Anchor(kind="file", path=path))
-            seen.add(path)
-        return anchors
-
     @classmethod
     def _normalize_name(cls, raw_name: str, description: str, content: str) -> str:
-        if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", raw_name):
-            return raw_name[:80]
-        return cls._slug("memory", f"{description} {content}")
+        # Validate kebab-case: lowercase letters, digits, hyphens
+        cleaned = raw_name.strip().lower()
+        if cleaned and all(c.isalnum() or c == "-" for c in cleaned) and not cleaned.startswith("-") and not cleaned.endswith("-") and "--" not in cleaned:
+            return cleaned[:80]
+        return cls._slug(f"{description} {content}")
 
     @staticmethod
-    def _slug(prefix: str, text: str) -> str:
-        words = re.findall(r"[a-zA-Z0-9]+|[一-鿿]+", text.lower())
-        slug_words = [word for word in words[:5] if len(word) > 1]
-        slug = "-".join(slug_words)[:48] if slug_words else hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
-        digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
-        return f"{prefix}-{slug}-{digest}"
+    def _slug(text: str) -> str:
+        digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+        return f"memory-{digest}"

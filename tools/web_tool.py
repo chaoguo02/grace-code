@@ -22,7 +22,7 @@ import logging
 import time
 from typing import Any
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 from tools.utils import truncate_output
 from tools.web_utils import (
     DEFAULT_FETCH_TIMEOUT,
@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class WebSearchTool(BaseTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.NETWORK}))
     """
     用 DuckDuckGo 搜索网页。
 
@@ -58,7 +59,9 @@ class WebSearchTool(BaseTool):
 
     @property
     def name(self) -> str:
-        return "web_search"
+        return "WebSearch"
+
+    aliases = ("web_search",)
 
     @property
     def description(self) -> str:
@@ -83,6 +86,16 @@ class WebSearchTool(BaseTool):
                     "type": "integer",
                     "description": f"Number of results (default 5, max {self._max_results})",
                 },
+                "allowed_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Only include results from these domains (e.g. ['docs.python.org', 'github.com'])",
+                },
+                "blocked_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Exclude results from these domains",
+                },
             },
             "required": ["query"],
         }
@@ -90,6 +103,8 @@ class WebSearchTool(BaseTool):
     def execute(self, params: dict[str, Any]) -> ToolResult:
         query: str = params.get("query", "").strip()
         count: int = min(int(params.get("count", 5)), self._max_results)
+        allowed_domains: list[str] | None = params.get("allowed_domains")
+        blocked_domains: list[str] | None = params.get("blocked_domains")
 
         if not query:
             return ToolResult(success=False, output="", error="query is required")
@@ -102,7 +117,7 @@ class WebSearchTool(BaseTool):
                 error="ddgs not installed. Run: pip install ddgs",
             )
 
-        # 带重试的搜索
+        # Retry loop
         last_exc: Exception | None = None
         for attempt in range(1, DEFAULT_MAX_RETRIES + 1):
             try:
@@ -121,6 +136,26 @@ class WebSearchTool(BaseTool):
                 success=False, output="",
                 error=f"Search failed after {DEFAULT_MAX_RETRIES} attempts: {last_exc}",
             )
+
+        # Post-filter by domain
+        if allowed_domains or blocked_domains:
+            from urllib.parse import urlparse
+
+            def _domain_of(href: str) -> str:
+                try:
+                    return urlparse(href).netloc.lower()
+                except Exception:
+                    return ""
+
+            filtered: list[dict] = []
+            for r in results:
+                dom = _domain_of(r.get("href", ""))
+                if blocked_domains and any(b.lower() in dom for b in blocked_domains):
+                    continue
+                if allowed_domains and not any(a.lower() in dom for a in allowed_domains):
+                    continue
+                filtered.append(r)
+            results = filtered
 
         if not results:
             return ToolResult(
@@ -147,6 +182,7 @@ class WebSearchTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class WebFetchTool(BaseTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.NETWORK}))
     """
     抓取指定 URL 并提取正文。
 
@@ -166,16 +202,18 @@ class WebFetchTool(BaseTool):
 
     @property
     def name(self) -> str:
-        return "web_fetch"
+        return "WebFetch"
+
+    aliases = ("web_fetch",)
 
     @property
     def description(self) -> str:
         return (
-            "Fetch the content of a web page and extract the main text "
-            "(using Mozilla's readability algorithm). Use this after "
-            "web_search to read a specific page in detail, e.g. official "
-            "documentation, blog posts, or API references. "
-            f"Timeout is {self._timeout}s, max output is ~{self._max_chars // 1000}KB."
+            "Fetch a URL and extract content. HTTP auto-upgrades to HTTPS. "
+            "Use after WebSearch to read result pages. "
+            "The 'prompt' parameter describes what to extract — it's used "
+            "for keyword relevance filtering of the extracted text. "
+            f"Timeout {self._timeout}s, max output ~{self._max_chars // 1000}KB."
         )
 
     @property
@@ -185,7 +223,11 @@ class WebFetchTool(BaseTool):
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "The URL to fetch (must be http or https)",
+                    "description": "The URL to fetch (must be http or https). HTTP is auto-upgraded to HTTPS.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "What to extract from the page. Used for keyword filtering of the extracted text. (In CC, this is run against a small model; here it does simple relevance scoring.)",
                 },
             },
             "required": ["url"],
@@ -193,6 +235,7 @@ class WebFetchTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         url: str = params.get("url", "").strip()
+        prompt: str = params.get("prompt", "").strip()
 
         if not url:
             return ToolResult(success=False, output="", error="url is required")

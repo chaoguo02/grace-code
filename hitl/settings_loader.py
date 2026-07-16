@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from hitl.permission_rule import PermissionRule
+from hitl.permission_rule import PermissionRule, PermissionRuleTier
 
 
 DEFAULT_SETTINGS_FILE = ".forge-agent/settings.json"
@@ -40,17 +40,17 @@ def load_permission_settings(
 
     for raw in perms.get("deny", []):
         try:
-            rules.append(PermissionRule.parse(raw, tier="deny", source="settings"))
+            rules.append(PermissionRule.parse(raw, tier=PermissionRuleTier.DENY, source="settings"))
         except ValueError:
             continue
     for raw in perms.get("ask", []):
         try:
-            rules.append(PermissionRule.parse(raw, tier="ask", source="settings"))
+            rules.append(PermissionRule.parse(raw, tier=PermissionRuleTier.ASK, source="settings"))
         except ValueError:
             continue
     for raw in perms.get("allow", []):
         try:
-            rules.append(PermissionRule.parse(raw, tier="allow", source="settings"))
+            rules.append(PermissionRule.parse(raw, tier=PermissionRuleTier.ALLOW, source="settings"))
         except ValueError:
             continue
 
@@ -84,10 +84,12 @@ def _builtin_defaults() -> list[PermissionRule]:
     Sensible defaults when no settings.json exists.
     Equivalent to "acceptEdits" mode: reads auto-allow, writes ask, destructive deny.
 
-    Derives from shell_tool.py's _READONLY_PREFIXES / _CONFIRM_KEYWORDS / _BLOCKED_PATTERNS
-    as the single source of truth for command classification.
+    Command classification is now declarative — the constants _READONLY_PREFIXES
+    and _CONFIRM_KEYWORDS were removed from shell_tool.py in favor of
+    PhasePolicy.allowed_effects. The allow/ask lists below are inline defaults
+    that match Claude Code's acceptEdits permission model.
     """
-    from tools.shell_tool import _BLOCKED_PATTERNS, _READONLY_PREFIXES, _CONFIRM_KEYWORDS
+    from tools.shell_tool import _BLOCKED_PATTERNS
 
     rules: list[PermissionRule] = []
 
@@ -96,43 +98,52 @@ def _builtin_defaults() -> list[PermissionRule]:
     # Layer 3 deny rules are defense-in-depth with prefix matching.
     for pattern in _BLOCKED_PATTERNS:
         safe_pattern = pattern.rstrip()
-        # For patterns that end with space or special chars (like "dd if="),
-        # use prefix match to catch any suffix
-        rules.append(PermissionRule.parse(f"shell({safe_pattern} *)", tier="deny", source="builtin"))
+        rules.append(PermissionRule.parse(f"shell({safe_pattern} *)", tier=PermissionRuleTier.DENY, source="builtin"))
 
-    # ── allow: read-only tools (non-shell) ──
+    # ── allow: read-only tools (non-shell) — aligned with Claude Code ──
+    # Must match canonical tool names (not aliases) — the permission pipeline
+    # checks tool.name, and aliases are only resolved at execute_tool() time.
     allow_tools = [
-        "file_read",
-        "file_view",
-        "search_text",
-        "find_files",
-        "find_symbol",
-        "git_status",
-        "git_diff",
-        "web_search",
-        "web_fetch",
+        "Read",         # was "file_read"
+        "file_view",    # unchanged
+        "Grep",         # was "search_text"
+        "Glob",         # was "find_files"
+        "find_symbol",  # unchanged
+        "WebSearch",    # unchanged (already PascalCase)
+        "WebFetch",     # unchanged (already PascalCase)
+        "git_status",   # read-only git inspection
+        "git_diff",     # read-only git diff
     ]
     for t in allow_tools:
-        rules.append(PermissionRule.parse(t, tier="allow", source="builtin"))
+        rules.append(PermissionRule.parse(t, tier=PermissionRuleTier.ALLOW, source="builtin"))
 
-    # ── allow: derived from _READONLY_PREFIXES ──
-    for prefix in _READONLY_PREFIXES:
-        # Trailing * = prefix match: matches "ls" alone and "ls -la" etc.
-        rules.append(PermissionRule.parse(f"shell({prefix} *)", tier="allow", source="builtin"))
+    # ── allow: read-only shell commands (safe commands with no side effects) ──
+    _READONLY_COMMANDS = (
+        "ls", "dir", "pwd", "echo", "cat", "head", "tail",
+        "wc", "sort", "uniq", "cut", "tr",
+        "date", "env", "printenv", "which", "type",
+        "du", "df", "free", "uptime",
+        "find", "locate", "xargs", "tee",
+        "grep", "rg", "awk", "sed",
+    )
+    for cmd in _READONLY_COMMANDS:
+        rules.append(PermissionRule.parse(f"shell({cmd} *)", tier=PermissionRuleTier.ALLOW, source="builtin"))
 
     # ── ask: file write operations ──
-    rules.append(PermissionRule.parse("file_write", tier="ask", source="builtin"))
-    rules.append(PermissionRule.parse("file_edit", tier="ask", source="builtin"))
+    rules.append(PermissionRule.parse("Write", tier=PermissionRuleTier.ASK, source="builtin"))
+    rules.append(PermissionRule.parse("file_write", tier=PermissionRuleTier.ASK, source="builtin"))
+    rules.append(PermissionRule.parse("Edit", tier=PermissionRuleTier.ASK, source="builtin"))
+    rules.append(PermissionRule.parse("file_edit", tier=PermissionRuleTier.ASK, source="builtin"))
 
-    # ── ask: derived from _CONFIRM_KEYWORDS ──
-    for keyword in _CONFIRM_KEYWORDS:
-        keyword = keyword.rstrip()
-        if not keyword:
-            continue
-        # Special cases: "> " and "| tee " are output redirection patterns
-        if keyword.startswith(">") or keyword.startswith("|"):
-            continue
-        # Trailing * = prefix match: "git push *" matches "git push" and "git push origin"
-        rules.append(PermissionRule.parse(f"shell({keyword} *)", tier="ask", source="builtin"))
+    # ── ask: potentially destructive or network-exposed commands ──
+    _CONFIRM_COMMANDS = (
+        "git push", "git commit", "npm publish", "npm install -g",
+        "pip install", "docker", "docker-compose", "kubectl", "helm",
+        "terraform", "ansible", "systemctl", "service",
+        "chmod", "chown", "rm", "mv", "cp -r",
+        "scp", "rsync", "curl", "wget",
+    )
+    for cmd in _CONFIRM_COMMANDS:
+        rules.append(PermissionRule.parse(f"shell({cmd} *)", tier=PermissionRuleTier.ASK, source="builtin"))
 
     return rules

@@ -1,17 +1,15 @@
 """
 tools/shell_tool.py
 
-Shell 命令执行工具。四层防护：
-1. 黑名单：拒绝明显破坏性命令（硬拦截，不可绕过）
-2. 白名单：只读命令免确认直接执行
-3. 权限确认：写操作等待用户 y/n（可通过 confirm_callback 注入）
-4. Timeout + 输出截断：防挂起、防上下文爆炸
+Shell 命令执行工具。
 
-权限确认设计：
-- confirm_callback 是一个 Callable[[str], bool]，返回 True 表示允许
-- 默认 None（不确认，直接执行）——用于 run 模式
-- chat 模式 / 交互模式传入真实的终端确认函数
-- 测试时传入 mock，不需要真实终端
+安全模型：
+- L0 安全底线：拒绝明显破坏性命令（硬拦截，防御纵深）
+- 读写权限判断：不再使用工具内部字符串白名单/黑名单。
+  改为框架层通过 PhasePolicy.allowed_effects 声明式控制——
+  PolicyAwareToolRegistry._is_tool_visible() 在注册时过滤。
+- 用户确认：PermissionPipeline 统一处理，工具层不自行判断。
+- Timeout + 输出截断：防挂起、防上下文爆炸。
 """
 
 from __future__ import annotations
@@ -21,7 +19,7 @@ import re
 import subprocess
 from typing import Any, Callable
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 from tools.runtime import LocalRuntime, Runtime
 from tools.utils import truncate_output
 
@@ -32,7 +30,7 @@ from tools.utils import truncate_output
 
 MAX_OUTPUT_CHARS = 50_000
 
-# 硬拦截黑名单（永不执行，不问用户）
+# L0 安全底线 — 硬拦截破坏性命令（永不执行，防御纵深最后一层）
 _BLOCKED_PATTERNS: tuple[str, ...] = (
     "rm -rf /",
     "rm -rf ~",
@@ -44,52 +42,6 @@ _BLOCKED_PATTERNS: tuple[str, ...] = (
     "> /dev/sda",
 )
 
-# 只读命令前缀白名单（直接执行，不询问）
-_READONLY_PREFIXES: tuple[str, ...] = (
-    "ls", "ll", "la",
-    "cat", "head", "tail", "less", "more",
-    "echo", "printf",
-    "pwd", "whoami", "which", "type",
-    "find", "locate",
-    "grep", "egrep", "fgrep", "rg", "ag",
-    "wc", "sort", "uniq", "cut", "awk", "sed -n",
-    "diff", "diff3",
-    "file", "stat",
-    "python -c", "python3 -c",
-    "python -m pytest", "python3 -m pytest", "pytest",
-    "git status", "git diff", "git log", "git show",
-    "git branch", "git tag", "git remote",
-    "git stash list",
-    "tree",
-    "env", "printenv",
-    "ps", "top", "htop",
-    "df", "du",
-    "uname", "hostname",
-    "date", "cal",
-    "man", "help",
-)
-
-# 需要确认的危险命令关键词（白名单之外且包含这些词时必须确认）
-_CONFIRM_KEYWORDS: tuple[str, ...] = (
-    "rm ", "rmdir",
-    "mv ",
-    "cp -r", "cp -f",
-    "chmod", "chown",
-    "pip install", "pip uninstall",
-    "npm install", "npm uninstall",
-    "git commit", "git push", "git reset",
-    "git checkout", "git merge", "git rebase",
-    "git clean",
-    "sudo",
-    "curl", "wget",            # 网络请求
-    "kill", "pkill", "killall",
-    "shutdown", "reboot",
-    "docker", "kubectl",
-    "make", "make install",
-    "> ",                      # 重定向覆盖（>> 追加不拦截）
-    "| tee ",
-)
-
 # 确认回调类型：接收命令字符串，返回 True=允许 / False=拒绝
 ConfirmCallback = Callable[[str], bool]
 
@@ -99,18 +51,21 @@ ConfirmCallback = Callable[[str], bool]
 # ---------------------------------------------------------------------------
 
 class ShellTool(BaseTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.EXECUTE}))
     """
     执行 shell 命令，返回 stdout + stderr。
 
     params:
-        cmd (str):     shell 命令字符串
+        command (str): 可执行程序名（推荐，shell=False，参数隔离）
+        args (list):   参数列表
+        cmd (str):     shell 命令字符串（legacy，shell=True）
         timeout (int): 超时秒数（默认 30）
         cwd (str):     工作目录（默认使用当前目录）
 
     安全模型：
-        - L0 黑名单硬拦截：execute() 内 _check_blocked()，defense-in-depth
-        - 权限管道 Layer 1 也调用 _check_blocked()，双重保障
-        - 其他权限决策由 PermissionPipeline 统一处理
+        - L0 安全底线硬拦截：execute() 内 _check_blocked()
+        - 读写权限由框架层 PhasePolicy.allowed_effects 声明式控制
+        - 用户确认由 PermissionPipeline 统一处理
     """
 
     def __init__(
@@ -121,16 +76,23 @@ class ShellTool(BaseTool):
         self._confirm_callback = confirm_callback
         self._runtime = runtime or LocalRuntime()
 
+    aliases = ("shell",)
+
     @property
     def name(self) -> str:
-        return "shell"
+        return "Bash"
 
     @property
     def description(self) -> str:
         return (
             "Execute a shell command and return its output (stdout + stderr combined). "
-            "Timeout is 30s by default. Avoid long-running commands; "
-            "prefer targeted commands like 'grep', 'pytest tests/foo.py', 'git diff'."
+            "Timeout is 30s by default. "
+            "CRITICAL: Use the 'cwd' parameter to set the working directory. "
+            "Never write 'cd /some/path' in the command string — use cwd instead. "
+            "RESTRICTION: Do NOT use this tool to read files (use file_read instead) "
+            "or modify files (use file_edit / file_write instead). "
+            "Use shell ONLY for operations that have no dedicated tool: "
+            "running tests, git commands, builds, package managers, etc."
         )
 
     @property
@@ -138,20 +100,42 @@ class ShellTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The program to run (e.g., 'pytest', 'git', 'ls'). PREFERRED over 'cmd' — uses parameterized execution with shell=False.",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Arguments as separate items. Each item is ONE argument, never parsed by shell.",
+                },
                 "cmd": {
                     "type": "string",
-                    "description": "Shell command to execute",
+                    "description": "DEPRECATED. Use 'command' + 'args' instead. Shell command string (legacy).",
+                    "deprecated": True,
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Human-readable description of what this command does (shown in permission prompts)",
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default 30)",
+                    "description": "Timeout in seconds (default 120, max 600)",
                 },
                 "cwd": {
                     "type": "string",
                     "description": "Working directory (optional)",
                 },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Set to true to run this command in the background. For long-running processes like dev servers.",
+                },
+                "dangerouslyDisableSandbox": {
+                    "type": "boolean",
+                    "description": "Set to true to override sandbox mode and run without sandboxing. Requires explicit user confirmation.",
+                },
             },
-            "required": ["cmd"],
+            "required": [],
         }
 
     @property
@@ -160,44 +144,73 @@ class ShellTool(BaseTool):
         return RiskLevel.HIGH
 
     def classify_risk(self, params: dict[str, Any]) -> str:
-        """动态风险分类：根据命令内容决定实际风险等级。"""
+        """Dynamic risk classification: shell is always HIGH by default.
+
+        PermissionPipeline refines this with per-command rules.
+        """
         from tools.base import RiskLevel
-        cmd = params.get("cmd", "").strip()
-        if not cmd:
-            return RiskLevel.NONE
-        if _is_readonly(cmd):
-            return RiskLevel.NONE
-        if _needs_confirm(cmd):
-            return RiskLevel.HIGH
-        return RiskLevel.LOW
+        return RiskLevel.HIGH
+
+    def _build_cmd_repr(self, params: dict[str, Any]) -> str:
+        """Build a string representation for safety checks (L0/L1/L2)."""
+        command = params.get("command", "")
+        args = params.get("args", [])
+        if command:
+            return f"{command} {' '.join(args)}" if args else command
+        return params.get("cmd", "")
+
+    def permission_denial_reason(self, params: dict[str, Any]) -> str | None:
+        cmd = self._build_cmd_repr(params)
+        blocked = _check_blocked(cmd)
+        if blocked:
+            return f"Blocked by safety floor: matched '{blocked}'"
+        if "\x00" in cmd or len(cmd) > 10_000:
+            return "Blocked: malicious input detected"
+        return None
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         cmd: str = params.get("cmd", "").strip()
+        command: str = params.get("command", "").strip()
+        args: list[str] = params.get("args", [])
         timeout: int = int(params.get("timeout", 30))
         cwd: str | None = params.get("cwd", None)
 
-        if not cmd:
-            return ToolResult(success=False, output="", error="cmd is required")
+        # Prefer parameterized execution (command+args) over legacy (cmd)
+        if command:
+            return self._execute_parameterized(command, args, timeout, cwd)
+        if cmd:
+            return self._execute_legacy(cmd, timeout, cwd)
 
-        # L0 黑名单硬拦截（永远在 execute 内，不可被 policy 覆盖）
-        blocked = _check_blocked(cmd)
+        return ToolResult(success=False, output="", error="Either 'command' or 'cmd' is required")
+
+    def _execute_parameterized(self, command: str, args: list[str], timeout: int, cwd: str | None) -> ToolResult:
+        """Execute via Runtime.execute() — shell=False, physically isolated parameters."""
+        cmd_repr = f"{command} {' '.join(args)}" if args else command
+
+        # L0 safety floor
+        blocked = _check_blocked(cmd_repr)
         if blocked:
             return ToolResult(
-                success=False,
-                output="",
+                success=False, output="",
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
 
-        # 如果有 HitlManager（通过 ToolRegistry 接入），确认已在 execute 前完成。
-        # 降级路径：无 HitlManager 时使用内部 confirm_callback（兼容旧代码/测试）
-        if self._confirm_callback is not None and _needs_confirm(cmd):
-            allowed = self._confirm_callback(cmd)
-            if not allowed:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=f"Command rejected by user: {cmd!r}",
-                )
+        from tools.runtime import RunResult
+        run_result: RunResult = self._runtime.execute(
+            command, args=args, cwd=cwd, timeout=timeout,
+        )
+
+        return self._build_result(run_result, cmd_repr)
+
+    def _execute_legacy(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
+        """Execute via Runtime.exec() — shell=True, backward compatible."""
+        # L0 safety floor
+        blocked = _check_blocked(cmd)
+        if blocked:
+            return ToolResult(
+                success=False, output="",
+                error=f"Command blocked for safety: matched '{blocked}'",
+            )
 
         return self._run(cmd, timeout, cwd)
 
@@ -206,31 +219,22 @@ class ShellTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _run(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
-        """通过 runtime 执行命令（本地或 Docker 沙箱）。"""
+        """Execute via Runtime.exec() — legacy path with shell=True."""
         result = self._runtime.exec(cmd, cwd=cwd, timeout=timeout)
-        output = truncate_output(result.output, MAX_OUTPUT_CHARS)
-        if not result.success:
-            # 区分 timeout 和普通错误，error 字段包含可读原因
-            if "timed out" in result.stderr.lower():
-                error = result.stderr.strip()
-            else:
-                error = f"Exit code: {result.returncode}"
-                # cwd 诊断：ModuleNotFoundError / FileNotFoundError 通常是 cwd 问题
-                combined = f"{result.stdout}{result.stderr}".lower()
-                if any(sig in combined for sig in (
-                    "modulenotfounderror", "no module named",
-                    "filenotfounderror", "no such file or directory",
-                    "cannot find", "not recognized",
-                )):
-                    effective_cwd = cwd or os.getcwd()
-                    error += (
-                        f"\n[HINT] Working directory was: {effective_cwd}\n"
-                        f"If the target file/module is in a subdirectory, use "
-                        f"the cwd parameter or prefix with 'cd <project_root> && '."
-                    )
-        else:
-            error = None
-        return ToolResult(success=result.success, output=output, error=error)
+        return self._build_result(result, cmd)
+
+    def _build_result(self, run_result: "Any", cmd_repr: str) -> ToolResult:
+        """Convert RunResult to ToolResult with proper error classification."""
+        from tools.base import classify_runtime_error
+        output = truncate_output(run_result.output, MAX_OUTPUT_CHARS)
+        if not run_result.success:
+            _tool_err = classify_runtime_error(run_result, cmd_repr)
+            return ToolResult(
+                success=False, output=output,
+                error=_tool_err.to_message() if _tool_err else f"Exit code: {run_result.returncode}",
+                tool_error=_tool_err,
+            )
+        return ToolResult(success=True, output=output)
 
 
 # ---------------------------------------------------------------------------
@@ -238,38 +242,12 @@ class ShellTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 def _check_blocked(cmd: str) -> str | None:
-    """返回匹配到的黑名单 pattern，没有匹配返回 None。"""
+    """返回匹配到的 L0 安全底线 pattern，没有匹配返回 None。"""
     cmd_lower = cmd.lower()
     for pattern in _BLOCKED_PATTERNS:
         if pattern.lower() in cmd_lower:
             return pattern
     return None
-
-
-def _is_readonly(cmd: str) -> bool:
-    """
-    判断命令是否在只读白名单里。
-    包含 > 写重定向的命令不算只读（即使命令名在白名单里）。
-    """
-    # 包含写重定向（> 但不是 >>）时不算只读
-    if re.search(r'(?<![>])>(?![>])', cmd):
-        return False
-    stripped = cmd.strip().lower()
-    for prefix in _READONLY_PREFIXES:
-        if stripped == prefix or stripped.startswith(prefix + " "):
-            return True
-    return False
-
-
-def _needs_confirm(cmd: str) -> bool:
-    """
-    判断命令是否需要用户确认。
-    不在白名单 且 包含危险关键词 → 需要确认。
-    """
-    if _is_readonly(cmd):
-        return False
-    cmd_lower = cmd.lower()
-    return any(kw in cmd_lower for kw in _CONFIRM_KEYWORDS)
 
 
 # ---------------------------------------------------------------------------

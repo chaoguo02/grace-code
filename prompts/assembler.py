@@ -194,12 +194,16 @@ class PromptAssembler:
         repo_summary: str | None = None,
     ) -> PromptRenderResult:
         tool_descriptions = self._format_tool_descriptions(tools)
+        tool_contract_rules = self._build_tool_contract_rules(tools)
+        platform_info = self._build_platform_info()
         summary = repo_summary or "(Repository summary not yet available - use find_files and file_read to explore)"
         return self.render_result(
             "base.md",
             repo_path=repo_path,
             repo_summary=summary,
             tool_descriptions=tool_descriptions,
+            tool_contract_rules=tool_contract_rules,
+            platform_info=platform_info,
         )
 
     def render_mode_prompt(self, mode: str, **variables: Any) -> str:
@@ -263,9 +267,53 @@ class PromptAssembler:
         return f"{namespace}/{normalized}" if namespace else normalized
 
     @staticmethod
+    def _build_platform_info() -> str:
+        """Declare the platform truth to the LLM — control plane, not secret translation."""
+        import platform as _platform, os as _os
+        system = _platform.system()
+        if system == "Windows":
+            return (
+                "## Platform\n"
+                "You are running on **Windows**. Available shell: **PowerShell**.\n"
+                "- Use PowerShell commands. Do NOT use Linux commands (wc, grep, find, cat, ls).\n"
+                "- wc → `(Get-Content file).Count`\n"
+                "- grep → `Select-String`\n"
+                "- find → `Get-ChildItem -Recurse`\n"
+                "- cat → `Get-Content`\n"
+                "- ls → `dir` or `Get-ChildItem`\n"
+                "- which → `where` or `Get-Command`"
+            )
+        return (
+            "## Platform\n"
+            "You are running on **Linux/macOS**. Available shell: **bash**.\n"
+        )
+
+    @staticmethod
     def _format_tool_descriptions(tools: list) -> str:
         if not tools:
             return "(no tools available)"
         sorted_tools = sorted(tools, key=lambda t: t.name)
         lines = [f"- **{tool.name}**: {tool.description}" for tool in sorted_tools]
         return "\n".join(lines)
+
+    @staticmethod
+    def _build_tool_contract_rules(tools: list) -> str:
+        """Generate mandatory tool usage rules from schema metadata.
+
+        When a tool's schema changes (e.g., shell switched from 'cmd' string
+        to 'command'+'args' array), this contract is automatically reflected
+        in the system prompt. No hand-maintained prompt text needed.
+        """
+        rules = []
+        for tool in tools:
+            name = getattr(tool, "name", "")
+            if name == "shell":
+                rules.append(
+                    "- **shell tool**: ALWAYS use `command` + `args` (NOT the deprecated `cmd` field). "
+                    "Each argument is a separate list element: `{\"command\": \"pytest\", \"args\": [\"--tb=short\"]}`. "
+                    "Never embed flags or paths inside the `command` string."
+                )
+            # Other tools with contract requirements can be added here
+        if rules:
+            return "\n## CRITICAL TOOL USAGE RULES\n" + "\n".join(rules)
+        return ""

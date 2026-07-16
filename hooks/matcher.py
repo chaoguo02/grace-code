@@ -1,9 +1,10 @@
 """
 hooks/matcher.py
 
-Hook matcher: filters which hooks fire for a given tool call.
+Hook matcher: filters hooks by their event-specific subject.
 
 Matcher syntax (aligned with Claude Code):
+Tool events use the tool name; subagent events use the agent type.
 - "*"                   → match all tools
 - "shell"              → exact match on tool name
 - "file_write|file_edit" → alternation (pipe-separated)
@@ -22,19 +23,19 @@ class HookMatcher:
     pattern: str = "*"
     if_condition: str | None = None
 
-    def matches(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
-        if not self._match_tool_name(tool_name):
+    def matches(self, matcher_subject: str, tool_input: dict[str, Any]) -> bool:
+        if not self._match_subject(matcher_subject):
             return False
         if self.if_condition:
             return self._evaluate_if(tool_input)
         return True
 
-    def _match_tool_name(self, tool_name: str) -> bool:
+    def _match_subject(self, matcher_subject: str) -> bool:
         if self.pattern == "*":
             return True
         # Pipe-separated alternation: "file_write|file_edit"
         alternatives = [p.strip() for p in self.pattern.split("|")]
-        return tool_name in alternatives
+        return matcher_subject in alternatives
 
     def _evaluate_if(self, tool_input: dict[str, Any]) -> bool:
         """

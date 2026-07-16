@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from context.artifacts import ArtifactStore
-from tools.base import BaseTool, ToolResult
+from tools.base import (
+    BaseTool, ToolDependency, ToolEffect, ToolMetadata, ToolResult,
+)
 
 
 @dataclass
@@ -17,6 +19,10 @@ class ArtifactStoreRef:
 
 
 class ArtifactListTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_AGENT_STATE}),
+        dependency=ToolDependency.ARTIFACT_STORE,
+    )
     def __init__(self, store_ref: ArtifactStoreRef) -> None:
         self._store_ref = store_ref
 
@@ -46,6 +52,10 @@ class ArtifactListTool(BaseTool):
 
 
 class ArtifactReadTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_AGENT_STATE}),
+        dependency=ToolDependency.ARTIFACT_STORE,
+    )
     def __init__(self, store_ref: ArtifactStoreRef) -> None:
         self._store_ref = store_ref
 

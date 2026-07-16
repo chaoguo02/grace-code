@@ -20,14 +20,23 @@ if TYPE_CHECKING:
 
 class SkillTool(BaseTool):
     """
-    Agent 可调用的 Skill 工具。
+    LLM-initiated skill invocation tool (fallback — aligned with Claude Code).
 
-    LLM 通过此工具触发 skill：
-    1. 调用 use_skill(skill_name="code-review", arguments="...")
-    2. SkillTool 从 SkillRegistry 加载并渲染 skill
-    3. 通过 SkillContextBuffer 管理上下文用量
-    4. 返回 ToolResult，渲染后的 skill 内容作为 output
-    5. Agent 在下一轮看到 skill 内容，按照指示执行
+    PRIMARY PATH (Claude Code alignment): users type /skill-name directly
+    in the chat REPL → content is injected into shared_history without a
+    tool_use round-trip (see entry/chat.py:_handle_slash_skill).
+
+    THIS TOOL (fallback): the LLM can also invoke Skill(skill_name=...)
+    to load a skill mid-turn. This is the path used when:
+    - The LLM semantically matches a skill from the system prompt listing
+    - The model chooses to load a skill autonomously (not user-triggered)
+
+    Flow:
+    1. LLM calls Skill(skill_name="code-review", arguments="...")
+    2. SkillTool loads and renders the skill from SkillRegistry
+    3. SkillContextBuffer manages context budget
+    4. Returns ToolResult with rendered skill content as output
+    5. Agent sees the skill content in the next turn's observation
     """
 
     def __init__(
@@ -38,29 +47,28 @@ class SkillTool(BaseTool):
         self._registry = skill_registry
         self._buffer = buffer
 
+    aliases = ("use_skill",)
+
     @property
     def name(self) -> str:
-        return "use_skill"
+        return "Skill"
 
     @property
     def description(self) -> str:
-        available = [m.name for m in self._registry.list_skills()]
-        skills_list = ", ".join(available) if available else "(none)"
         return (
-            f"Invoke a predefined skill to get specialized instructions. "
-            f"Available skills: {skills_list}"
+            "Invoke a skill by name. Skills provide specialized, reusable instructions. "
+            "Use the skill name as listed in Available Skills in the system prompt. "
+            "Users can also invoke skills directly with /skill-name."
         )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
-        skill_names = [m.name for m in self._registry.list_skills()]
         return {
             "type": "object",
             "properties": {
                 "skill_name": {
                     "type": "string",
-                    "enum": skill_names if skill_names else ["(none)"],
-                    "description": "Name of the skill to invoke",
+                    "description": "Name of the skill to invoke (as listed in Available Skills)",
                 },
                 "arguments": {
                     "type": "string",

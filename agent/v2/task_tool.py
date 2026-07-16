@@ -1,11 +1,15 @@
-"""AgentTool — spawn a fork subagent to handle a delegated subtask.
+"""AgentTool — dispatch a typed named child or inherited-context fork.
 
 Architecture: three-layer defense for subagent output quality.
 
-  Layer 1 (prompt, ~80%): _SUBAGENT_PROTOCOL wraps every subagent prompt with
-    mandatory analysis constraints, a 4-phase verification flow, anti-laziness
-    rules, and a structured output format.
-  Layer 2 (code, 100%): _validate_subagent_report() checks that the subagent
+  Layer 0 (JSON Schema, ~95%): submit_findings tool with structured JSON Schema.
+    Subagent calls this tool → Runtime validates → parent receives typed data.
+    Replaces fragile regex parsing with deterministic schema enforcement.
+  Layer 1 (prompt, ~5%): _SUBAGENT_PROTOCOL wraps code-reviewer prompts with
+    mandatory analysis constraints, a 4-phase verification flow, and
+    anti-laziness rules. Text-only output still accepted as fallback.
+  Layer 2: Removed — replaced by Layer 0 (submit_findings JSON Schema).
+    No more regex parsing. No more format guessing.
     followed the format protocol before the result reaches the parent.
   Layer 3 (parent prompt): runtime._build_runtime_messages() injects review
     instructions so the parent doesn't rubber-stamp subagent output.
@@ -14,14 +18,23 @@ Architecture: three-layer defense for subagent output quality.
 from __future__ import annotations
 
 import logging
-import re
+import copy
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
+from agent.task import TaskIntent
+from agent.v2.models import (
+    AgentKind, AgentSpawnRequest, BackgroundAgentHandle, DelegationScope,
+    ExecutionPlacement, ForkStatus, WorkspaceMode,
+)
+from tools.base import (
+    ToolConcurrency, ToolEffect, ToolErrorType, ToolMetadata,
+    ToolRetryDirective, ToolRole,
+)
 from tools.base import BaseTool, ToolResult
 
 if TYPE_CHECKING:
-    from agent.v2.models import ForkResult
+    from agent.v2.models import AgentRunResult
     from agent.v2.runtime import SessionRuntime
 
 logger = logging.getLogger(__name__)
@@ -107,25 +120,16 @@ If you find yourself writing any of these, STOP — you are skipping verificatio
 | "我没有权限读取 X 文件"                 | Then DON'T report Confirmed findings about X. |
 | "从命名来看..."                        | Read the actual implementation.      |
 
-## Output Format (MANDATORY — three sections, in this exact order)
+## How to Submit Your Findings (REQUIRED)
 
-### Confirmed Bugs
-Each entry MUST contain:
-- **File and line**: e.g. `agent/task_tool.py:142`
-- **Actual code**: the exact lines you read (use ``` fence)
-- **Problem**: what's wrong
-- **Verification**: how you confirmed this (which file you cross-referenced)
+**You MUST call the `submit_findings` tool before finishing.** This is NOT optional.
+The tool accepts a structured JSON report. Calling it means:
+- Your findings are validated at the Runtime level (no format guessing)
+- The parent agent receives typed data (no regex parsing)
+- File paths, line numbers, and severities are machine-readable
 
-If you can't provide ALL four fields, move to Unverified Hypotheses.
-
-### Improvement Suggestions
-Style, clarity, robustness suggestions. NOT bugs.
-Each must still include a file:line reference.
-
-### Unverified Hypotheses
-Claims you suspect but could NOT verify.
-Each MUST explain: "Why unverified: <blocked by what>"
-If you have no unverified claims, write "None." — do NOT omit this section.
+You can call `submit_findings` multiple times (e.g., once per investigation phase).
+Call it with status='no_findings' and empty findings if you found nothing.
 
 ---
 
@@ -134,49 +138,128 @@ If you have no unverified claims, write "None." — do NOT omit this section.
 
 
 class AgentTool(BaseTool):
-    """Dispatch a fork subagent. Claude Code `task` tool equivalent.
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.DELEGATE_WRITE}),
+        roles=frozenset({ToolRole.DELEGATE}),
+    )
+    """Dispatch a named subagent or fork through one Runtime spawn path.
 
-    The subagent runs in a fresh context (Fork model):
-    - No parent conversation history.
-    - Tools restricted to the agent definition's allowlist.
-    - Its final message is the return value.
+    Named children use their definition and fresh context. Forks inherit the
+    parent request prefix, model, and tools. Foreground calls return the final
+    result; background calls return a session handle and deliver completion later.
 
     Usage:
-        AgentTool(runtime, parent_session_id)
+        AgentTool(runtime, parent_session_id, caller_agent_name=agent_name)
     """
 
-    def __init__(self, runtime: "SessionRuntime", parent_session_id: str, caller_agent_name: str | None = None) -> None:
+    def __init__(
+        self,
+        runtime: "SessionRuntime",
+        parent_session_id: str,
+        *,
+        caller_agent_name: str,
+        circuit_breaker: Any = None,
+    ) -> None:
         self._runtime = runtime
         self._parent_session_id = parent_session_id
         self._caller_agent_name = caller_agent_name
+        self._circuit_breaker = circuit_breaker
+        self._run_context = None
+        delegation_scope = (
+            runtime.agent_registry.get(caller_agent_name)
+            .effective_delegation_scope
+        )
+        delegation_effect = (
+            ToolEffect.DELEGATE_READ_ONLY
+            if delegation_scope is DelegationScope.READ_ONLY
+            else ToolEffect.DELEGATE_WRITE
+        )
+        self.metadata = ToolMetadata(
+            effects=frozenset({delegation_effect}),
+            roles=frozenset({ToolRole.DELEGATE}),
+        )
+
+    def with_run_context(self, context: Any) -> "AgentTool":
+        """Bind the parent run's live budget and cancellation facts."""
+        from agent.v2.run_context import RunContext
+        if not isinstance(context, RunContext):
+            raise TypeError("AgentTool requires a RunContext")
+        bound = copy.copy(self)
+        bound._run_context = context
+        return bound
+
+    def concurrency_mode(self, params: dict[str, Any]) -> ToolConcurrency:
+        """Only shared-workspace read-only children are safe to fan out."""
+        subagent_type = params.get("subagent_type")
+        if not isinstance(subagent_type, str):
+            return ToolConcurrency.SERIAL
+        subagent_type = subagent_type.strip()
+        allowed = self._allowed_subagent_names()
+        if not subagent_type or subagent_type not in allowed:
+            return ToolConcurrency.SERIAL
+        if subagent_type == AgentKind.FORK.value:
+            try:
+                workspace_mode = WorkspaceMode(
+                    params.get("isolation", WorkspaceMode.CURRENT.value)
+                )
+            except (TypeError, ValueError):
+                return ToolConcurrency.SERIAL
+            if workspace_mode is WorkspaceMode.WORKTREE:
+                return ToolConcurrency.PARALLEL_SAFE
+            caller = self._runtime.agent_registry.get(self._caller_agent_name)
+            return (
+                ToolConcurrency.PARALLEL_SAFE
+                if caller.intent is TaskIntent.ANALYSIS
+                else ToolConcurrency.SERIAL
+            )
+        if not self._runtime.agent_registry.has(subagent_type):
+            return ToolConcurrency.SERIAL
+        definition = self._runtime.agent_registry.get(subagent_type)
+        if (
+            definition.intent is TaskIntent.ANALYSIS
+            and definition.workspace_mode is WorkspaceMode.CURRENT
+        ):
+            return ToolConcurrency.PARALLEL_SAFE
+        return ToolConcurrency.SERIAL
 
     # ── BaseTool interface ──
 
+    aliases = ("task",)
+
     @property
     def name(self) -> str:
-        return "task"
+        return "Agent"
+
+    def _get_available_subagent_specs(self) -> list[Any]:
+        """Return subagent specs allowed by the declarative agent definition."""
+        registry = self._runtime.agent_registry
+        caller = registry.get(self._caller_agent_name)
+        return registry.delegatable_by(caller)
 
     @property
     def description(self) -> str:
-        registry = self._runtime.agent_registry
-        allowed = self._allowed_subagent_names()
-        specs = registry.list_subagents()
-        if allowed is not None:
-            specs = [spec for spec in specs if spec.name in allowed]
+        specs = self._get_available_subagent_specs()
         subagents = [
             f"- {spec.name}: {spec.description}"
             for spec in specs
         ]
+        subagents.append(
+            f"- {AgentKind.FORK.value}: inherit this conversation, tools, and model"
+        )
         lines = [
             "Launch a subagent to handle a complex, multi-step task autonomously.",
-            "The subagent runs in an isolated context and returns one final message.",
+            "The child keeps its own tool history and returns one final message.",
             "",
             "Available subagent types:",
             *subagents,
             "",
             "Guidelines:",
-            "- Put ALL necessary context in the prompt — the subagent has no access to this conversation.",
+            "- Select only from the Runtime-derived subagent list above.",
+            "- Named subagents start fresh; put all necessary context in their prompt.",
+            "- fork inherits this conversation; use it when restating context would be wasteful.",
             "- The subagent's final summary is the only thing returned to you.",
+            "- Use foreground when you need the result before continuing.",
+            "- Use background only for independent work; completion arrives later.",
             "- Use for independent, clearly-scoped work. Do simple tasks directly.",
             "- Never hand off understanding — you can delegate execution, not comprehension.",
         ]
@@ -184,12 +267,22 @@ class AgentTool(BaseTool):
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
+        # P2: dynamic subagent_type description — only lists available types
+        available_specs = self._get_available_subagent_specs()
+        available_names = [s.name for s in available_specs]
+        available_names.append(AgentKind.FORK.value)
+        type_desc = (
+            "Which subagent to spawn. CHOOSE CAREFULLY — wrong type causes loops. "
+            "Currently available: " + ", ".join(
+                f"'{n}'" for n in available_names
+            ) + ". Select only from this Runtime-derived list."
+        )
         return {
             "type": "object",
             "properties": {
                 "subagent_type": {
                     "type": "string",
-                    "description": "The type of subagent to spawn (e.g. 'explore', 'general', 'code-reviewer')",
+                    "description": type_desc,
                 },
                 "description": {
                     "type": "string",
@@ -198,6 +291,28 @@ class AgentTool(BaseTool):
                 "prompt": {
                     "type": "string",
                     "description": "The full task for the subagent. Include ALL context, constraints, and expected output format.",
+                },
+                "execution_placement": {
+                    "type": "string",
+                    "enum": [
+                        ExecutionPlacement.FOREGROUND.value,
+                        ExecutionPlacement.BACKGROUND.value,
+                    ],
+                    "description": (
+                        "Use foreground when this result is required before the "
+                        "next step; use background for independent concurrent work."
+                    ),
+                },
+                "isolation": {
+                    "type": "string",
+                    "enum": [
+                        WorkspaceMode.CURRENT.value,
+                        WorkspaceMode.WORKTREE.value,
+                    ],
+                    "description": (
+                        "Fork-only workspace placement. Use worktree for "
+                        "parallel edits that must not touch the parent checkout."
+                    ),
                 },
             },
             "required": ["subagent_type", "description", "prompt"],
@@ -209,6 +324,10 @@ class AgentTool(BaseTool):
         raw_subagent_type = params.get("subagent_type")
         raw_description = params.get("description")
         raw_prompt = params.get("prompt")
+        raw_placement = params.get(
+            "execution_placement", ExecutionPlacement.FOREGROUND.value,
+        )
+        raw_isolation = params.get("isolation", WorkspaceMode.CURRENT.value)
 
         # Validate
         if (
@@ -224,99 +343,290 @@ class AgentTool(BaseTool):
         subagent_type = raw_subagent_type.strip()
         description = raw_description.strip()
         user_prompt = raw_prompt.strip()
+        try:
+            execution_placement = ExecutionPlacement(raw_placement)
+        except (TypeError, ValueError):
+            return ToolResult(
+                success=False, output="",
+                error=(
+                    "execution_placement must be 'foreground' or 'background'"
+                ),
+            )
+        if execution_placement is ExecutionPlacement.AUTO:
+            return ToolResult(
+                success=False, output="",
+                error="execution_placement must resolve before dispatch",
+            )
+        try:
+            workspace_mode = WorkspaceMode(raw_isolation)
+        except (TypeError, ValueError):
+            return ToolResult(
+                success=False, output="",
+                error="isolation must be 'current' or 'worktree'",
+            )
         allowed = self._allowed_subagent_names()
-        if allowed is not None and subagent_type not in allowed:
+        is_fork = subagent_type == AgentKind.FORK.value
+        if not is_fork and not self._runtime.agent_registry.has(subagent_type):
+            return ToolResult(
+                success=False, output="",
+                error=f"Unknown subagent_type: {subagent_type!r}. "
+                      f"Available: {sorted(allowed)}",
+            )
+        if subagent_type not in allowed:
             return ToolResult(
                 success=False, output="",
                 error=f"subagent_type {subagent_type!r} is not allowed for this agent. "
                       f"Available: {sorted(allowed)}",
             )
-        if not self._runtime.agent_registry.has(subagent_type):
-            available = allowed if allowed is not None else {s.name for s in self._runtime.agent_registry.list_subagents()}
-            return ToolResult(
-                success=False, output="",
-                error=f"Unknown subagent_type: {subagent_type!r}. "
-                      f"Available: {sorted(available)}",
+
+        definition = (
+            None if is_fork
+            else self._runtime.agent_registry.get(subagent_type)
+        )
+        if not is_fork and "isolation" in params:
+            raw_isolation = params["isolation"]
+            try:
+                workspace_mode = WorkspaceMode(raw_isolation)
+            except (TypeError, ValueError):
+                return ToolResult(
+                    success=False, output="",
+                    error=f"Invalid isolation value: {raw_isolation!r}. Must be 'current' or 'worktree'.",
+                )
+            # CC-aligned: per-invocation isolation overrides the definition's workspace_mode
+            import dataclasses
+            new_definition = dataclasses.replace(definition, workspace_mode=workspace_mode)
+            definition = new_definition
+
+        run_context = getattr(self, "_run_context", None)
+        if run_context is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires a Runtime-bound run context",
+            )
+        if run_context.phase_policy is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires the parent's effective phase policy",
+            )
+        if run_context.delegation_effects is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires the parent's effective tool effects",
+            )
+        if run_context.delegation_step_limit is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires the parent's effective step limit",
+            )
+        if is_fork and run_context.spawn_context is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.UNAVAILABLE,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Fork requires a valid live parent conversation snapshot",
+            )
+        if run_context.cancellation.is_cancelled:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERRUPTED,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail=run_context.cancellation.detail,
+            )
+        child_token_limit = run_context.delegation_token_limit
+        if child_token_limit <= 0:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.UNAVAILABLE,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Parent execution budget has no tokens available for delegation",
             )
 
-        definition = self._runtime.agent_registry.get(subagent_type)
-
-        # Wrap user prompt with mandatory analysis protocol (Layer 1)
-        prompt = _build_subagent_prompt(user_prompt)
-        logger.debug(
-            "Injecting subagent protocol (%d chars) into prompt for agent %s",
-            len(_SUBAGENT_PROTOCOL), subagent_type,
+        # Wrap user prompt with agent-type-appropriate protocol (Layer 1)
+        prompt = (
+            user_prompt
+            if is_fork
+            else _build_subagent_prompt(user_prompt, definition)
         )
+        if definition is not None and definition.required_tools:
+            logger.debug(
+                "Injecting subagent protocol (%d chars) into prompt for agent %s",
+                len(_SUBAGENT_PROTOCOL), subagent_type,
+            )
+        else:
+            logger.debug(
+                "Skipping subagent protocol for agent %s (no required_tools or fork)",
+                subagent_type,
+            )
         logger.info(
             "Dispatching subagent '%s' for task: %s",
             subagent_type, description,
         )
 
         try:
-            fork_result = self._runtime.fork_session(
-                definition=definition,
-                description=description,
-                prompt=prompt,
+            request = (
+                AgentSpawnRequest.fork(
+                    description=description,
+                    prompt=prompt,
+                    workspace_mode=workspace_mode,
+                    execution_placement=execution_placement,
+                )
+                if is_fork
+                else AgentSpawnRequest.named(
+                    definition=definition,
+                    description=description,
+                    prompt=prompt,
+                    execution_placement=execution_placement,
+                )
             )
+            dispatch_result = self._runtime.spawn_agent(
+                parent_session_id=self._parent_session_id,
+                request=request,
+                budget_tokens=child_token_limit,
+                parent_max_steps=run_context.delegation_step_limit,
+                cancellation_token=run_context.cancellation,
+                parent_policy=(
+                    run_context.phase_policy
+                    if is_fork
+                    else run_context.phase_policy.with_allowed_effects(
+                        run_context.delegation_effects
+                    )
+                ),
+                spawn_context=run_context.spawn_context,
+            )
+            if isinstance(dispatch_result, BackgroundAgentHandle):
+                return ToolResult(
+                    success=True,
+                    output=_format_background_handle(
+                        subagent_type, dispatch_result,
+                    ),
+                    subagent_tokens_used=0,
+                )
+            fork_result = dispatch_result
             output = _format_fork_result(subagent_type, fork_result)
-            if fork_result.status == "partial":
+            if fork_result.status == ForkStatus.PARTIAL:
                 output = (
                     f"WARNING: Subagent reached max steps ({fork_result.turns_used} turns). "
                     "Result may be INCOMPLETE. Verify findings independently before relying on them.\n\n"
                     f"{output}"
                 )
         except Exception as exc:
-            logger.exception("Fork subagent '%s' crashed", subagent_type)
+            logger.exception("Subagent '%s' crashed", subagent_type)
+            if self._circuit_breaker is not None:
+                self._circuit_breaker.record_subagent_failure()
             return ToolResult(
                 success=False, output="",
                 error=f"Subagent '{subagent_type}' failed: {exc}",
             )
 
-        is_failure = fork_result.status == "failed"
+        # ── Circuit breaker: track subagent success/failure rhythm ──
+        if self._circuit_breaker is not None:
+            if fork_result.status == ForkStatus.FAILED:
+                self._circuit_breaker.record_subagent_failure()
+            elif fork_result.status != ForkStatus.CANCELLED:
+                self._circuit_breaker.record_subagent_success()
 
-        # Layer 2: deterministic format validation (code layer, 100% execution)
-        violations = _validate_subagent_report(fork_result.summary or "")
-        if violations:
-            violation_text = "\n".join(f"  • {v}" for v in violations)
-            logger.warning(
-                "Subagent '%s' report format violations: %s",
-                subagent_type, violations,
-            )
-            output = (
-                f"{output}\n\n"
-                f"{VIOLATION_MARKER}:\n{violation_text}\n"
-                f"Treat all findings as [UNVERIFIED] until independently confirmed."
-            )
+        is_failure = fork_result.status in {
+            ForkStatus.FAILED, ForkStatus.CANCELLED,
+        }
 
         return ToolResult(
             success=not is_failure,
             output=output,
             error=fork_result.error if is_failure else "",
+            subagent_tokens_used=fork_result.tokens_used,
+            structured_findings=tuple(
+                finding.to_dict() for finding in fork_result.structured_findings
+            ),
         )
 
-    def _allowed_subagent_names(self) -> frozenset[str] | None:
-        if self._caller_agent_name is None:
-            return None
-        try:
-            caller = self._runtime.agent_registry.get(self._caller_agent_name)
-        except KeyError:
-            return None
-        return caller.allowed_subagents
+    def _allowed_subagent_names(self) -> frozenset[str]:
+        caller = self._runtime.agent_registry.get(self._caller_agent_name)
+        return frozenset({AgentKind.FORK.value}).union(
+            child.name
+            for child in self._runtime.agent_registry.delegatable_by(caller)
+        )
 
 
-def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
-    """Format ForkResult as an XML <task-notification> block."""
+def _format_fork_result(
+    agent_type: str,
+    result: "AgentRunResult",
+    *,
+    generation: int | None = None,
+) -> str:
+    """Render AgentRunResult as an XML <task-notification> block.
+
+    When structured_findings are present (from submit_findings tool),
+    they are displayed FIRST as the primary, reliable output. The text
+    summary follows as supplementary context.
+    """
     lines = [
         "<task-notification>",
         f"  <agent-type>{agent_type}</agent-type>",
         f"  <session-id>{result.session_id}</session-id>",
-        f"  <status>{result.status}</status>",
+        f"  <status>{result.status.value}</status>",
         f"  <turns-used>{result.turns_used}</turns-used>",
+        f"  <worktree-disposition>{result.worktree_disposition.value}</worktree-disposition>",
     ]
+    if generation is not None:
+        lines.insert(3, f"  <generation>{generation}</generation>")
     if result.error:
         lines.append(f"  <error>{_xml_escape(result.error)}</error>")
+    if result.warning:
+        lines.append(f"  <warning>{_xml_escape(result.warning)}</warning>")
+    if result.worktree is not None:
+        evidence = result.worktree
+        lines.append(f"  <worktree change='{evidence.change.value}'>")
+        lines.append(f"    <path>{_xml_escape(evidence.path)}</path>")
+        lines.append(f"    <branch>{_xml_escape(evidence.branch)}</branch>")
+        lines.append(f"    <base-branch>{_xml_escape(evidence.base_branch)}</base-branch>")
+        lines.append(f"    <base-commit>{_xml_escape(evidence.base_commit)}</base-commit>")
+        lines.append(f"    <revision>{_xml_escape(evidence.revision)}</revision>")
+        for changed_file in evidence.changed_files:
+            lines.append(f"    <changed-file>{_xml_escape(changed_file)}</changed-file>")
+        if evidence.error:
+            lines.append(f"    <inspection-error>{_xml_escape(evidence.error)}</inspection-error>")
+        lines.append("  </worktree>")
     if result.failure_diagnosis:
         lines.append(f"  <failure-diagnosis>{_xml_escape(result.failure_diagnosis)}</failure-diagnosis>")
+
+    # ── P1-5: Structured findings (primary output) ──
+    if result.report is not None:
+        lines.append(
+            f"  <subagent-report status='{result.report.status.value}' "
+            f"count='{len(result.report.findings)}'>"
+        )
+        if result.report.summary:
+            lines.append(
+                f"    <report-summary>{_xml_escape(result.report.summary)}</report-summary>"
+            )
+        for finding in result.report.findings:
+            lines.append(
+                f"    <finding severity='{finding.severity.value}' "
+                f"category='{finding.category.value}'>"
+            )
+            lines.append(f"      <title>{_xml_escape(finding.title)}</title>")
+            lines.append(f"      <description>{_xml_escape(finding.description)}</description>")
+            if finding.file_path:
+                lines.append(
+                    f"      <location path='{_xml_escape(finding.file_path)}' "
+                    f"line-start='{finding.line_start}' line-end='{finding.line_end}' />"
+                )
+            if finding.code_snippet:
+                lines.append(
+                    f"      <code-snippet>{_xml_escape(finding.code_snippet)}</code-snippet>"
+                )
+            if finding.verification:
+                lines.append(
+                    f"      <verification>{_xml_escape(finding.verification)}</verification>"
+                )
+            if finding.recommendation:
+                lines.append(
+                    f"      <recommendation>{_xml_escape(finding.recommendation)}</recommendation>"
+                )
+            lines.append("    </finding>")
+        lines.append("  </subagent-report>")
+
     lines.extend([
         "  <summary>",
         _xml_escape(str(result.summary or "").strip()),
@@ -326,79 +636,33 @@ def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
     return "\n".join(lines)
 
 
+def _format_background_handle(
+    agent_type: str, handle: BackgroundAgentHandle,
+) -> str:
+    """Render an acknowledgement; it is not a completion result."""
+    return "\n".join([
+        "<task-notification>",
+        f"  <agent-type>{_xml_escape(agent_type)}</agent-type>",
+        f"  <session-id>{_xml_escape(handle.session_id)}</session-id>",
+        f"  <generation>{handle.generation}</generation>",
+        f"  <status>{handle.status.value}</status>",
+        f"  <execution-placement>{handle.execution_placement.value}</execution-placement>",
+        "  <message>Subagent started; completion will arrive separately.</message>",
+        "</task-notification>",
+    ])
+
+
 def _xml_escape(text: Any) -> str:
     return escape(str(text or ""))
 
 
-def _build_subagent_prompt(user_prompt: str) -> str:
-    """Wrap the user's task prompt with the mandatory subagent analysis protocol.
+def _build_subagent_prompt(user_prompt: str, definition: "AgentDefinition | None") -> str:
+    """Wrap the user's task prompt with the subagent analysis protocol.
 
-    The protocol is hardcoded in the tool, not in memory — tool behavior
-    constraints belong to the tool, while memory is for project knowledge.
+    Subagents with required_tools (structured-report agents like code-reviewer)
+    get the full verification protocol. Others pass through cleanly — their
+    system prompt already has tool selection rules from _SUBAGENT_SUMMARY_RULE.
     """
-    return f"{_SUBAGENT_PROTOCOL}\n{user_prompt}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Layer 2: Format validation (code layer — deterministic, 100% execution)
-# ═══════════════════════════════════════════════════════════════════════════
-
-_BUG_CLAIM_PATTERN = re.compile(
-    r"\b(Confirmed Bugs?|Bug\s*[#\d]|🐞|bug:|issue:|error:)\b",
-    re.IGNORECASE,
-)
-_FILE_LINE_PATTERN = re.compile(r"\S+\.(?:py|ts|js|rs|go|java|rb):\d+")
-_SECTION_MARKERS = re.compile(
-    r"(Confirmed Bugs?|Improvement Suggestions?|Unverified Hypothes)",
-    re.IGNORECASE,
-)
-_CODE_FENCE_PATTERN = re.compile(r"```")
-
-VIOLATION_MARKER = "⚠️ SUBAGENT REPORT FORMAT VIOLATIONS"
-
-
-def _validate_subagent_report(summary: str) -> list[str]:
-    """Validate subagent report format — metadata-level, NOT semantic.
-
-    Checks whether the subagent followed the output format protocol:
-    - Each Confirmed entry has file:line references + code snippets.
-    - Report uses the three-section structure.
-
-    NOTE: [UNVERIFIED] markers are NOT mandatory. Their presence depends
-    on whether the subagent actually had unverifiable findings. A report
-    where everything was confirmed should not have them.
-
-    Returns a list of violation strings (empty = report format is clean).
-    """
-    text = summary.strip()
-    if not text:
-        return []
-
-    # Only inspect reports that claim to have found bugs/issues
-    if not _BUG_CLAIM_PATTERN.search(text):
-        return []
-
-    violations: list[str] = []
-    has_file_lines = bool(_FILE_LINE_PATTERN.search(text))
-    has_sections = len(_SECTION_MARKERS.findall(text)) >= 2
-    has_code_fences = bool(_CODE_FENCE_PATTERN.search(text))
-
-    # Confirmed section present → must provide evidence
-    if not has_file_lines:
-        violations.append(
-            "Missing file:line references — Confirmed Bugs must cite "
-            "specific code locations (e.g. agent/task_tool.py:142)"
-        )
-    if not has_code_fences:
-        violations.append(
-            "Missing code snippets (``` fences) — Confirmed Bugs "
-            "must include the actual code read"
-        )
-    # Three-section structure (at least 2 of the 3 required markers)
-    if not has_sections:
-        violations.append(
-            "Missing report structure — expected at least 2 of: "
-            "Confirmed Bugs / Improvement Suggestions / Unverified Hypotheses"
-        )
-
-    return violations
+    if definition is not None and definition.required_tools:
+        return f"{_SUBAGENT_PROTOCOL}\n{user_prompt}"
+    return user_prompt

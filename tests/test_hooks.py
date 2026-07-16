@@ -5,14 +5,23 @@ Tests for the hooks/ package: events, matcher, executor, registry, dispatcher.
 """
 
 import json
-import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hooks.events import BLOCKABLE_EVENTS, HookContext, HookEvent
+from hooks.events import (
+    BLOCKABLE_EVENTS, HookContext, HookEvent, SessionStartSource,
+)
 from hooks.matcher import HookMatcher
-from hooks.protocol import DispatchResult, ExitCode, HookOutput, HookResult
+from hooks.protocol import (
+    DispatchResult,
+    ExitCode,
+    HookControl,
+    HookDecision,
+    HookOutput,
+    HookResult,
+)
 from hooks.registry import ExternalHookConfig, HookRegistry, InternalHook
 from hooks.dispatcher import HookDispatcher
 
@@ -25,12 +34,15 @@ class TestHookEvent:
         assert HookEvent.POST_TOOL_USE == "PostToolUse"
         assert HookEvent.STOP == "Stop"
         assert HookEvent.SESSION_START == "SessionStart"
+        assert HookEvent.SUBAGENT_START == "SubagentStart"
+        assert HookEvent.SUBAGENT_STOP == "SubagentStop"
 
     def test_blockable_events(self):
         assert HookEvent.PRE_TOOL_USE in BLOCKABLE_EVENTS
         assert HookEvent.USER_PROMPT_SUBMIT in BLOCKABLE_EVENTS
+        assert HookEvent.STOP in BLOCKABLE_EVENTS
+        assert HookEvent.SUBAGENT_STOP in BLOCKABLE_EVENTS
         assert HookEvent.POST_TOOL_USE not in BLOCKABLE_EVENTS
-        assert HookEvent.STOP not in BLOCKABLE_EVENTS
 
 
 # ─── HookContext tests ────────────────────────────────────────────────────────
@@ -45,6 +57,7 @@ class TestHookContext:
         )
         d = ctx.to_dict()
         assert d["event"] == "PreToolUse"
+        assert d["hook_event_name"] == "PreToolUse"
         assert d["session_id"] == "sess1"
         assert d["tool_name"] == "shell"
         assert d["tool_input"] == {"cmd": "ls"}
@@ -61,6 +74,61 @@ class TestHookContext:
         messages = [{"role": "user", "content": "hi"}]
         ctx = HookContext(event=HookEvent.STOP, messages=messages)
         assert ctx.to_dict()["messages"] == messages
+
+    def test_subagent_fields_and_matcher_subject_are_typed(self):
+        ctx = HookContext(
+            event=HookEvent.SUBAGENT_STOP,
+            session_id="parent",
+            agent_id="child",
+            agent_type="explore",
+            last_assistant_message="done",
+        )
+
+        assert ctx.matcher_subject == "explore"
+        assert ctx.to_dict() == {
+            "event": "SubagentStop",
+            "hook_event_name": "SubagentStop",
+            "session_id": "parent",
+            "timestamp": ctx.timestamp,
+            "agent_id": "child",
+            "agent_type": "explore",
+            "last_assistant_message": "done",
+            "stop_hook_active": False,
+        }
+
+    def test_session_start_matches_typed_source(self):
+        ctx = HookContext(
+            event=HookEvent.SESSION_START,
+            session_start_source=SessionStartSource.RESUME,
+        )
+
+        assert ctx.matcher_subject == "resume"
+
+
+def test_dispatcher_matches_subagent_hooks_by_agent_type(tmp_path):
+    calls = []
+    registry = HookRegistry()
+    registry.register_internal(
+        HookEvent.SUBAGENT_START,
+        InternalHook(
+            callback=calls.append,
+            matcher=HookMatcher(pattern="explore"),
+        ),
+    )
+    dispatcher = HookDispatcher(registry, cwd=str(tmp_path))
+
+    dispatcher.dispatch(
+        HookEvent.SUBAGENT_START,
+        HookContext(
+            event=HookEvent.SUBAGENT_START,
+            session_id="parent",
+            agent_id="child",
+            agent_type="explore",
+        ),
+    )
+
+    assert len(calls) == 1
+    assert calls[0].agent_id == "child"
 
 
 # ─── HookMatcher tests ───────────────────────────────────────────────────────
@@ -102,25 +170,37 @@ class TestHookMatcher:
 class TestHookResult:
     def test_blocks_exit_2(self):
         r = HookResult(exit_code=2, stderr="denied")
-        assert r.blocks is True
+        assert r.control is HookControl.BLOCK
 
     def test_no_block_exit_0(self):
         r = HookResult(exit_code=0, stdout="ok")
-        assert r.blocks is False
+        assert r.control is HookControl.CONTINUE
 
     def test_approves_explicitly(self):
-        output = HookOutput(decision="allow")
+        output = HookOutput(decision=HookDecision.ALLOW)
         r = HookResult(exit_code=0, parsed=output)
-        assert r.approves_explicitly is True
+        assert r.control is HookControl.APPROVE
 
     def test_no_approve_without_decision(self):
         r = HookResult(exit_code=0, stdout="some text")
-        assert r.approves_explicitly is False
+        assert r.control is HookControl.CONTINUE
+
+    def test_structured_block_is_typed_at_protocol_boundary(self):
+        output = HookOutput.from_dict({"decision": "block", "reason": "policy"})
+        r = HookResult(exit_code=0, parsed=output)
+
+        assert output.decision is HookDecision.BLOCK
+        assert r.control is HookControl.BLOCK
+
+    def test_unknown_decision_does_not_create_a_control_state(self):
+        output = HookOutput.from_dict({"decision": "maybe"})
+
+        assert output.decision is None
 
     def test_has_context(self):
         output = HookOutput(additional_context="extra info")
         r = HookResult(exit_code=0, parsed=output)
-        assert r.has_context is True
+        assert r.context == "extra info"
 
 
 # ─── HookRegistry tests ─────────────────────────────────────────────────────
@@ -196,7 +276,7 @@ class TestHookDispatcher:
         result = dispatcher.dispatch(HookEvent.POST_TOOL_USE, ctx)
 
         callback.assert_called_once_with(ctx)
-        assert result.blocked is False
+        assert result.control is HookControl.CONTINUE
 
     def test_internal_hook_exception_does_not_crash(self):
         def bad_hook(ctx):
@@ -211,9 +291,9 @@ class TestHookDispatcher:
 
         ctx = HookContext(event=HookEvent.POST_TOOL_USE, tool_name="shell")
         result = dispatcher.dispatch(HookEvent.POST_TOOL_USE, ctx)
-        assert result.blocked is False
+        assert result.control is HookControl.CONTINUE
 
-    @patch("hooks.executor.subprocess.run")
+    @patch("hooks.executor.LocalRuntime.exec")
     def test_external_hook_blocks_on_exit_2(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=2, stdout="", stderr="Blocked: dangerous"
@@ -227,10 +307,15 @@ class TestHookDispatcher:
         ctx = HookContext(event=HookEvent.PRE_TOOL_USE, tool_name="shell", tool_input={"cmd": "rm -rf /"})
         result = dispatcher.dispatch(HookEvent.PRE_TOOL_USE, ctx)
 
-        assert result.blocked is True
+        assert result.control is HookControl.BLOCK
         assert "Blocked" in result.reason
+        call = mock_run.call_args
+        assert call.kwargs["cwd"] == str(Path.cwd().resolve())
+        stdin_payload = json.loads(call.kwargs["stdin_data"])
+        assert stdin_payload["event"] == HookEvent.PRE_TOOL_USE.value
+        assert stdin_payload["tool_input"] == {"cmd": "rm -rf /"}
 
-    @patch("hooks.executor.subprocess.run")
+    @patch("hooks.executor.LocalRuntime.exec")
     def test_external_hook_approves_explicitly(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
@@ -246,10 +331,9 @@ class TestHookDispatcher:
         ctx = HookContext(event=HookEvent.PRE_TOOL_USE, tool_name="shell", tool_input={"cmd": "ls"})
         result = dispatcher.dispatch(HookEvent.PRE_TOOL_USE, ctx)
 
-        assert result.approved_explicitly is True
-        assert result.blocked is False
+        assert result.control is HookControl.APPROVE
 
-    @patch("hooks.executor.subprocess.run")
+    @patch("hooks.executor.LocalRuntime.exec")
     def test_dispatch_stop_blocks_on_exit_2(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=2, stdout="", stderr="tests failed"
@@ -263,11 +347,11 @@ class TestHookDispatcher:
         ctx = HookContext(event=HookEvent.STOP, messages=[{"role": "assistant", "content": "done"}])
         result = dispatcher.dispatch_stop(ctx)
 
-        assert result.blocked is True
+        assert result.control is HookControl.BLOCK
         assert "tests failed" in result.reason
 
-    @patch("hooks.executor.subprocess.run")
-    def test_regular_stop_dispatch_remains_non_blockable(self, mock_run):
+    @patch("hooks.executor.LocalRuntime.exec")
+    def test_regular_stop_dispatch_is_blockable(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=2, stdout="", stderr="tests failed"
         )
@@ -280,9 +364,9 @@ class TestHookDispatcher:
         ctx = HookContext(event=HookEvent.STOP)
         result = dispatcher.dispatch(HookEvent.STOP, ctx)
 
-        assert result.blocked is False
+        assert result.control is HookControl.BLOCK
 
-    @patch("hooks.executor.subprocess.run")
+    @patch("hooks.executor.LocalRuntime.exec")
     def test_non_blockable_event_ignores_exit_2(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=2, stdout="", stderr="Blocked"
@@ -297,7 +381,7 @@ class TestHookDispatcher:
         result = dispatcher.dispatch(HookEvent.POST_TOOL_USE, ctx)
 
         # POST_TOOL_USE is not blockable, so exit 2 is logged but doesn't block
-        assert result.blocked is False
+        assert result.control is HookControl.CONTINUE
 
     def test_no_hooks_returns_empty_result(self):
         registry = HookRegistry()
@@ -306,8 +390,7 @@ class TestHookDispatcher:
         ctx = HookContext(event=HookEvent.PRE_TOOL_USE, tool_name="shell")
         result = dispatcher.dispatch(HookEvent.PRE_TOOL_USE, ctx)
 
-        assert result.blocked is False
-        assert result.approved_explicitly is False
+        assert result.control is HookControl.CONTINUE
         assert result.additional_context == ""
 
 
@@ -359,9 +442,9 @@ class TestToolRegistryHookIntegration:
 # ─── Integration: PermissionPipeline + HookDispatcher (Layer 2) ──────────────
 
 class TestPipelineHookIntegration:
-    @patch("hooks.executor.subprocess.run")
+    @patch("hooks.executor.LocalRuntime.exec")
     def test_layer2_blocks_via_dispatcher(self, mock_run):
-        from hitl.pipeline import PermissionPipeline
+        from hitl.pipeline import PermissionDecision, PermissionLayer, PermissionPipeline
 
         mock_run.return_value = MagicMock(
             returncode=2, stdout="", stderr="Hook denied"
@@ -379,14 +462,16 @@ class TestPipelineHookIntegration:
             risk_level = "high"
             def classify_risk(self, params):
                 return self.risk_level
+            def permission_denial_reason(self, params):
+                return None
 
         result = pipeline.check(FakeShell(), {"cmd": "git push origin main"})
-        assert result.approved is False
-        assert result.layer == 2
+        assert result.decision is PermissionDecision.DENY
+        assert result.layer is PermissionLayer.PRE_TOOL_HOOK
 
-    @patch("hooks.executor.subprocess.run")
+    @patch("hooks.executor.LocalRuntime.exec")
     def test_layer2_approves_via_dispatcher(self, mock_run):
-        from hitl.pipeline import PermissionPipeline
+        from hitl.pipeline import PermissionDecision, PermissionLayer, PermissionPipeline
 
         mock_run.return_value = MagicMock(
             returncode=0,
@@ -406,52 +491,169 @@ class TestPipelineHookIntegration:
             risk_level = "high"
             def classify_risk(self, params):
                 return self.risk_level
+            def permission_denial_reason(self, params):
+                return None
 
         result = pipeline.check(FakeShell(), {"cmd": "ls"})
-        assert result.approved is True
-        assert result.layer == 2
+        assert result.decision is PermissionDecision.ALLOW
+        assert result.layer is PermissionLayer.PRE_TOOL_HOOK
 
 
-# ─── P1-2: ProactiveMemory.check_plan_feedback ───────────────────────────────
+class TestTypedPermissionPipeline:
+    def test_string_boundaries_coerce_to_enums(self):
+        from hitl.permission_rule import PermissionRule, PermissionRuleTier
+        from hitl.pipeline import PromptAction, PromptDecision
 
-class TestProactiveMemoryPlanFeedback:
-    def test_captures_actionable_feedback(self, tmp_path):
-        from memory.store import MemoryStore
-        from memory.proactive import ProactiveMemory
+        rule = PermissionRule.parse("file_read", tier="allow")
+        prompt = PromptDecision(action="allow_once")
 
-        store = MemoryStore(repo_path=str(tmp_path), memory_dir=str(tmp_path / "mem"))
-        pm = ProactiveMemory(store)
+        assert rule.tier is PermissionRuleTier.ALLOW
+        assert prompt.action is PromptAction.ALLOW_ONCE
 
-        pm.check_plan_feedback("Don't use raw SQL queries, use the ORM instead")
+    def test_background_policy_surfaces_prompt_with_agent_identity(self):
+        from hitl.pipeline import (
+            PermissionDecision,
+            PermissionLayer,
+            PermissionPipeline,
+            PromptAction,
+            PromptDecision,
+        )
+        from tools.base import NoopTool
 
-        # Should have saved a memory
-        memories = store.list_memories()
-        assert len(memories) >= 1
-        assert any("plan feedback" in m.description.lower() for m in memories)
+        prompt_calls = []
 
-    def test_ignores_generic_feedback(self, tmp_path):
-        from memory.store import MemoryStore
-        from memory.proactive import ProactiveMemory
+        def confirm(request):
+            prompt_calls.append(request)
+            return PromptDecision(action=PromptAction.ALLOW_ONCE)
 
-        store = MemoryStore(repo_path=str(tmp_path), memory_dir=str(tmp_path / "mem"))
-        pm = ProactiveMemory(store)
+        pipeline = PermissionPipeline(confirm_callback=confirm)
+        background = pipeline.for_agent("general")
+        result = background.check(NoopTool("writer"), {})
 
-        pm.check_plan_feedback("Plan rejected by user")
-        pm.check_plan_feedback("")
-        pm.check_plan_feedback("short")
+        assert result.decision is PermissionDecision.ALLOW
+        assert result.layer is PermissionLayer.INTERACTIVE
+        assert len(prompt_calls) == 1
+        assert prompt_calls[0].agent_name == "general"
 
-        memories = store.list_memories()
-        assert len(memories) == 0
+    def test_background_policy_preserves_explicit_auto_approval(self):
+        from hitl.pipeline import (
+            PermissionDecision,
+            PermissionPipeline,
+            ToolApprovalMode,
+        )
+        from tools.base import NoopTool
 
-    def test_deduplicates_same_feedback(self, tmp_path):
-        from memory.store import MemoryStore
-        from memory.proactive import ProactiveMemory
+        background = PermissionPipeline(
+            approval_mode=ToolApprovalMode.AUTO,
+        ).for_agent("general")
 
-        store = MemoryStore(repo_path=str(tmp_path), memory_dir=str(tmp_path / "mem"))
-        pm = ProactiveMemory(store)
+        assert background.check(
+            NoopTool("writer"), {}
+        ).decision is PermissionDecision.ALLOW
 
-        pm.check_plan_feedback("Always use TypeScript interfaces, never raw objects")
-        pm.check_plan_feedback("Always use TypeScript interfaces, never raw objects")
+    def test_prompt_mode_fails_closed_without_callback(self):
+        from hitl.pipeline import PermissionDecision, PermissionPipeline
+        from tools.base import NoopTool
 
-        memories = store.list_memories()
-        assert len(memories) == 1
+        result = PermissionPipeline().check(NoopTool("writer"), {})
+
+        assert result.decision is PermissionDecision.DENY
+
+    def test_tool_owned_validator_blocks_parameterized_shell(self):
+        from hitl.pipeline import PermissionDecision, PermissionLayer, PermissionPipeline
+        from tools.shell_tool import ShellTool
+
+        from hitl.pipeline import ToolApprovalMode
+        result = PermissionPipeline(approval_mode=ToolApprovalMode.AUTO).check(
+            ShellTool(),
+            {"command": "rm", "args": ["-rf", "/"]},
+        )
+
+        assert result.decision is PermissionDecision.DENY
+        assert result.layer is PermissionLayer.INPUT_VALIDATION
+
+    def test_path_check_uses_metadata_not_tool_name(self, tmp_path):
+        from hitl.pipeline import (
+            PermissionDecision,
+            PermissionLayer,
+            PermissionPipeline,
+            ToolApprovalMode,
+        )
+        from tools.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
+
+        tool = NoopTool("arbitrary_writer")
+        tool.metadata = ToolMetadata(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            path_access=PathAccess.WRITE,
+            path_parameter="target",
+        )
+        outside = tmp_path.parent / "outside.txt"
+
+        result = PermissionPipeline(
+            approval_mode=ToolApprovalMode.AUTO,
+            project_root=str(tmp_path),
+        ).check(tool, {"target": str(outside)})
+
+        assert result.decision is PermissionDecision.DENY
+        assert result.layer is PermissionLayer.TOOL_CHECK
+
+    def test_path_check_resolves_relative_path_from_declared_project_root(
+        self, tmp_path, monkeypatch,
+    ):
+        from hitl.pipeline import PermissionDecision, PermissionPipeline, ToolApprovalMode
+        from tools.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
+
+        project = tmp_path / "project"
+        elsewhere = tmp_path / "elsewhere"
+        project.mkdir()
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        tool = NoopTool("writer")
+        tool.metadata = ToolMetadata(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            path_access=PathAccess.WRITE,
+            path_parameter="path",
+        )
+
+        result = PermissionPipeline(
+            approval_mode=ToolApprovalMode.AUTO,
+            project_root=str(project),
+        ).check(tool, {"path": "child.txt"})
+
+        assert result.decision is PermissionDecision.ALLOW
+
+    def test_registry_scope_rebinds_permission_project_root(self, tmp_path):
+        from hitl.pipeline import PermissionDecision, PermissionPipeline, ToolApprovalMode
+        from tools.base import (
+            ExecutionContext,
+            NoopTool,
+            PathAccess,
+            ToolEffect,
+            ToolMetadata,
+            ToolRegistry,
+        )
+
+        parent = tmp_path / "parent"
+        child = tmp_path / "child"
+        parent.mkdir()
+        child.mkdir()
+        pipeline = PermissionPipeline(
+            approval_mode=ToolApprovalMode.AUTO,
+            project_root=str(parent),
+        )
+        tool = NoopTool("writer")
+        tool.metadata = ToolMetadata(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            path_access=PathAccess.WRITE,
+            path_parameter="path",
+        )
+        registry = ToolRegistry(permission_pipeline=pipeline)
+        registry.register(tool)
+
+        original = pipeline.check(tool, {"path": str(child / "child.txt")})
+        scoped = registry.scoped(ExecutionContext(
+            workspace_root=str(child), repo_path=str(child),
+        )).execute_tool("writer", {"path": str(child / "child.txt")})
+
+        assert original.decision is PermissionDecision.DENY
+        assert scoped.success is True

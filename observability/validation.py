@@ -7,9 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from config.schema import load_config
-from observability.datasets import DEFAULT_FAILURE_DATASET_PATH
-
-
 @dataclass(frozen=True)
 class ValidationScenario:
     name: str
@@ -106,7 +103,8 @@ def selected_validation_scenarios(selection: str) -> list[ValidationScenario]:
 
 
 def failure_dataset_path_for(repo_path: str) -> Path:
-    return Path(repo_path) / DEFAULT_FAILURE_DATASET_PATH
+    from runtime.state_paths import ProjectStatePaths
+    return ProjectStatePaths.for_project(repo_path).datasets
 
 
 def failure_dataset_line_count(repo_path: str) -> tuple[Path, int]:
@@ -147,9 +145,10 @@ def write_validation_results(results: list[ValidationResult], output_path: str |
 
 
 def default_baseline_output_path(repo_path: str, baseline_name: str) -> Path:
+    from runtime.state_paths import ProjectStatePaths
     safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in baseline_name).strip("-_")
     safe_name = safe_name or "langfuse-baseline"
-    return Path(repo_path) / ".forge-agent" / "experiments" / "langfuse-baselines" / f"{safe_name}.json"
+    return ProjectStatePaths.for_project(repo_path).experiments / "langfuse-baselines" / f"{safe_name}.json"
 
 
 def build_baseline_snapshot(

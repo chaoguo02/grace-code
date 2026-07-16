@@ -29,7 +29,6 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from agent.factory import create_agent  # noqa: E402
 from agent.prompt import reset_prompt_usage, set_project_dir  # noqa: E402
 from entry.renderer import InlineRenderer, create_renderer  # noqa: E402
 from observability import flush_observability  # noqa: E402
@@ -37,13 +36,6 @@ from observability import flush_observability  # noqa: E402
 # 兼容别名
 Renderer = InlineRenderer
 RendererBase = InlineRenderer
-
-
-def _cyan_prompt(text: str) -> str:
-    """为 prompt 文本加 cyan 颜色（仅 TTY）。"""
-    if sys.stdout.isatty():
-        return f"\033[36m{text}\033[0m"
-    return text
 
 
 # ---------------------------------------------------------------------------
@@ -81,14 +73,16 @@ class ChatSession:
         self.config = config
         self._session_id = uuid.uuid4().hex[:12]
         self._confirm_callback = confirm_callback
-        self._mode = "react"
+        self._agent_name = "build"
         self._model = getattr(backend, "model_name", "?")
         self._provider = getattr(config.llm, "provider", "?")
 
         self._backend = backend
         self._registry = registry
+        from agent.v2.agent_registry import AgentRegistryV2
+        self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
         self._renderer = renderer or create_renderer(
-            model=self._model, mode=self._mode,
+            model=self._model, mode=self._agent_name,
         )
 
         # ── Skill 系统 ─────────────────────────────────────────────────
@@ -97,10 +91,6 @@ class ChatSession:
         # ── 记忆系统 ──────────────────────────────────────────────────
         self._memory_store = memory_store
         self._memory_context = memory_context
-        self._proactive_memory = None
-        if memory_store:
-            from memory.proactive import ProactiveMemory
-            self._proactive_memory = ProactiveMemory(memory_store)
 
         # ── 流式回调（委托给 Renderer）────────────────────────────
         _stream_started = [False]
@@ -141,13 +131,17 @@ class ChatSession:
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
         )
-        multi_cfg = self._build_multi_config() if self._mode == "multi-agent" else None
-        self.agent = create_agent(
-            self._mode, self._backend, self._registry, self._agent_cfg,
-            plan_approval_callback=self._plan_approval,
+        from agent.v2.agent_factory import AgentFactory
+        self._agent_assembly = AgentFactory.create(
+            agent_name=self._agent_name,
+            backend=self._backend,
+            base_registry=self._registry,
+            agent_registry=self._agent_registry,
+            root_agent_config=self._agent_cfg,
             memory_context=self._memory_context,
-            multi_config=multi_cfg,
+            repo_path=self.repo_path,
         )
+        self.agent = self._agent_assembly.agent
         self._shared_history = ConversationHistory(
             max_messages=config.context.history_window * 2,
         )
@@ -158,7 +152,8 @@ class ChatSession:
 
         # ── Goal Stop Hook（Claude Code /goal-style session goal）────
         from runtime.goal import GoalStore
-        self.goal_store = GoalStore(Path(self.repo_path) / ".forge-agent" / "goal.json")
+        from runtime.state_paths import ProjectStatePaths
+        self.goal_store = GoalStore(ProjectStatePaths.for_project(self.repo_path).goals)
         self.goal_store.restore()
 
         # ── 跨 session 上下文恢复（从持久化的 compaction 摘要）─────
@@ -175,12 +170,13 @@ class ChatSession:
         self.total_steps = 0
         self.round_count = 0
 
-    def switch_mode(self, mode: str) -> None:
-        """运行时切换 agent 模式（仅保留 v2 兼容）。"""
-        if mode not in ("v2-build", "v2-plan"):
-            raise ValueError(f"Unknown mode: {mode!r}. Use v2-build or v2-plan.")
-        self._mode = mode
-        self._renderer.mode = mode
+    def switch_mode(self, agent_name: str) -> None:
+        """Switch to a different agent by name."""
+        from agent.v2.models import _BUILTIN_AGENTS
+        if agent_name not in _BUILTIN_AGENTS:
+            raise ValueError(f"Unknown agent: {agent_name!r}. Available: {sorted(_BUILTIN_AGENTS)}")
+        self._agent_name = agent_name
+        self._renderer.mode = agent_name
         self._rebuild_agent()
 
     def switch_model(
@@ -189,82 +185,35 @@ class ChatSession:
         api_key: str | None = None,
         base_url: str | None = None,
     ) -> None:
-        """运行时切换 LLM 模型（保持对话历史）。"""
-        from llm.router import create_backend
-
-        provider = provider or self._provider or "openai"
-        resolved_key = api_key or os.environ.get(
-            {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY",
-             "deepseek": "DEEPSEEK_API_KEY", "groq": "GROQ_API_KEY",
-             "ollama": "OLLAMA_API_KEY", "openai-compat": "OPENAI_API_KEY"}.get(provider, ""), "",
+        """运行时切换 LLM 模型（保持对话历史）。委托给 agent_session_factory。"""
+        from entry.chat_services.agent_session_factory import rebuild_backend_for_model
+        self._backend, self._model, self._provider = rebuild_backend_for_model(
+            model, provider=provider, api_key=api_key, base_url=base_url,
+            current_provider=self._provider,
         )
-        self._backend = create_backend(
-            provider=provider, model=model,
-            api_key=resolved_key or None,
-            base_url=base_url,
-        )
-        self._model = model
-        self._provider = provider
         self._renderer.model = model
         self._rebuild_agent()
 
     def _rebuild_agent(self) -> None:
-        """用当前的 backend 重建 agent 实例。"""
-        self.agent = create_agent(
-            self._mode, self._backend, self._registry, self._agent_cfg,
-            plan_approval_callback=self._plan_approval,
+        """用当前的 backend 重建 agent 实例。委托给 AgentFactory。"""
+        from agent.v2.agent_factory import AgentFactory
+        self._agent_assembly = AgentFactory.create(
+            agent_name=self._agent_name,
+            backend=self._backend,
+            base_registry=self._registry,
+            agent_registry=self._agent_registry,
+            root_agent_config=self._agent_cfg,
             memory_context=self._memory_context,
+            repo_path=self.repo_path,
         )
-
-    def _plan_approval(self, plan_text: str):
-        """
-        交互式 Plan 审批。展示 plan，等待用户 approve/reject/revise。
-        返回 PlanApproval，避免把未知输入或 edit(e) 误当成批准。
-        """
-        from dataclasses import dataclass
-
-        @dataclass
-        class _PlanApproval:
-            approved: bool
-            action: str = "execute"
-            feedback: str = ""
-
-        self._renderer.on_plan_generated(plan_text)
-        while True:
-            try:
-                response = input(
-                    _cyan_prompt("  [approve(y)/reject(n)/revise(e)] > ")
-                ).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                self._renderer.on_plan_rejected()
-                return _PlanApproval(approved=False, feedback="Plan approval interrupted")
-
-            if response in ("y", "yes", "approve", "a", ""):
-                self._renderer.on_plan_approved()
-                return _PlanApproval(approved=True)
-            if response in ("n", "no", "reject", "r"):
-                self._renderer.on_plan_rejected()
-                return _PlanApproval(approved=False, feedback="Plan rejected by user")
-            if response in ("e", "edit", "revise", "feedback", "f"):
-                try:
-                    feedback = input(_cyan_prompt("  Revision feedback > ")).strip()
-                except (EOFError, KeyboardInterrupt):
-                    feedback = "Plan revision requested by user"
-                self._renderer.on_plan_rejected()
-                return _PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
-
-            print("  Please enter y to approve, n to reject, or e to request revision.")
-
-    # ------------------------------------------------------------------
-    # 核心循环
-    # ------------------------------------------------------------------
+        self.agent = self._agent_assembly.agent
 
     def run_round(self, user_input: str) -> bool:
         """
         执行一轮对话。返回 True 表示正常结束（含 gave_up）。
         """
         from agent.event_log import EventLog
-        from agent.task import Task
+        from agent.task import Task, TaskIntent
         from context.session import TaskSummary
         from llm.base import LLMMessage
 
@@ -274,35 +223,20 @@ class ChatSession:
         self._shared_history.add(LLMMessage(role="user", content=user_input))
 
         # Phase 3: 开始一个结构化 task context
-        from agent.factory import classify_task_intent
-        intent = classify_task_intent(user_input, "auto", self._backend)
+        from agent.v2.models import _BUILTIN_AGENTS
+        definition = _BUILTIN_AGENTS.get(self._agent_name)
+        intent = definition.intent if definition else TaskIntent.EDIT
 
         # Phase 7: 分类任务关系
-        from context.task_router import classify_task_relationship, get_compaction_strategy
-        relationship = classify_task_relationship(user_input, self._session_state)
-
         task_ctx = self._session_state.start_task(
             user_goal=user_input,
             intent=intent,
-            relationship=relationship,
         )
 
         # Phase 7: 基于任务关系的预压缩
-        strategy = get_compaction_strategy(relationship)
-        if strategy["should_compact"] and len(self._shared_history.to_dicts()) >= 6:
-            import logging
-            logging.getLogger(__name__).info(
-                "Pre-round compaction triggered: relationship=%s", relationship
-            )
-            self.compact(focus=user_input[:200])
-
         # 用户新一轮输入，重置 compaction thrashing 计数器
         if hasattr(self.agent, "compactor") and hasattr(self.agent.compactor, "reset_thrashing_counter"):
             self.agent.compactor.reset_thrashing_counter()
-
-        # 主动记忆：检测用户修正/偏好模式
-        if self._proactive_memory:
-            self._proactive_memory.check_user_message(user_input)
 
         task = Task(
             description=user_input,
@@ -312,7 +246,7 @@ class ChatSession:
             budget_tokens=self.config.agent.budget_tokens,
             metadata={
                 "entrypoint": "chat",
-                "mode": self._mode,
+                "agent": self._agent_name,
                 "session_id": self._session_id,
                 "round": self.round_count,
                 "provider": self._provider,
@@ -369,14 +303,8 @@ class ChatSession:
             cache_stats=result.cache_stats,
         )
 
-        # Plan/DAG 模式执行完成后自动切回 react（一次性规划任务）
-        # Multi-Agent 不切回：用户显式选择的持久对话模式
-        if self._mode in ("plan", "dag"):
-            self._mode = "react"
-            self._renderer.mode = "react"
-            self._rebuild_agent()
-
-        return result.is_success() or result.status.value == "gave_up"
+        from agent.task import RunStatus
+        return result.is_success() or result.status is RunStatus.GAVE_UP
 
     def _run_with_renderer(self, task, log):
         """运行 agent，通过 monkey-patch EventLog 实现事件实时输出。"""
@@ -427,14 +355,6 @@ class ChatSession:
                     error=obs.get("error"),
                 )
                 # 主动记忆：检测成功的构建/测试命令
-                if self._proactive_memory and obs.get("status") == "success":
-                    self._proactive_memory.check_tool_result(
-                        tool_name=tool_name,
-                        params=_last_tool_params[0],
-                        output=obs.get("output", ""),
-                        success=True,
-                    )
-
             elif etype == EventType.REFLECTION:
                 self._renderer.on_reflection(
                     reason=p.get("reason", ""),
@@ -486,8 +406,123 @@ class ChatSession:
         )
 
     # ------------------------------------------------------------------
-    # 统计 & 工具方法
+    # Skill 系统
     # ------------------------------------------------------------------
+
+    def _handle_slash_skill(self, user_input: str) -> str | None:
+        """Handle /skill-name [arguments] input from the chat REPL.
+
+        Aligned with Claude Code: skills are invoked via /skill-name directly
+        by the user, injecting the rendered skill content into context without
+        a tool_use round-trip. The SkillTool (use_skill fallback) remains
+        available for LLM-initiated invocations.
+
+        Returns the rendered skill content if a matching skill is found,
+        or None if the input does not match any registered skill name.
+        """
+        if not user_input.startswith("/"):
+            return None
+        if not self._skill_registry:
+            return None
+
+        # Strip leading / and split name from arguments
+        inner = user_input[1:]
+        parts = inner.split(maxsplit=1)
+        name, args = parts[0], (parts[1] if len(parts) > 1 else "")
+
+        if not self._skill_registry.has_skill(name):
+            return None
+
+        # SK-04: respect user-invocable — only user-invocable skills can be /-invoked
+        meta = self._skill_registry._get_skill_meta(name)
+        if meta is not None and not meta.user_can_invoke:
+            return None  # Silently ignore; skill is for LLM-only invocation
+
+        rendered = self._skill_registry.load_and_render(name, args)
+        if rendered is None:
+            return None
+
+        # SK-07: context:fork — run skill in a forked subagent
+        if meta is not None and meta.context == "fork":
+            self._run_skill_fork(name, rendered, meta)
+            return None  # Fork handles its own execution; no inline injection
+
+        # Default: inline context — inject skill content into shared_history
+        return (
+            f"[Skill: {name}]\n\n"
+            f"{rendered}\n\n"
+            f"[/End of skill: {name} — follow the instructions above.]"
+        )
+
+    def _run_skill_fork(self, name: str, rendered: str, meta) -> None:
+        """SK-07: Execute a context:fork skill as a subagent.
+
+        Spawns a subagent of the type declared in meta.agent (default: general)
+        with the rendered skill content as the task prompt.
+        """
+        import click
+        from agent.v2.models import DelegationScope, WorkspaceMode
+
+        agent_type = meta.agent or "general"
+        click.echo(
+            click.style(f"\n  Forking subagent '{agent_type}' for skill '{name}'...", fg="cyan")
+        )
+
+        try:
+            # Rebuild agent to pick up any model/effort overrides from the skill
+            fork_assembly = self._build_fork_assembly(agent_type, meta)
+            fork_agent = fork_assembly.agent
+
+            # Inject shared history so the subagent sees conversation context
+            fork_agent._pending_history = self._shared_history
+            fork_agent._goal_stop_hook = self._goal_stop_hook
+
+            from agent.task import Task, TaskIntent
+            task = Task(
+                description=f"[Skill: {name}] {rendered[:500]}",
+                repo_path=self.repo_path,
+                intent=TaskIntent.EDIT,
+                max_steps=self.config.agent.max_steps,
+                budget_tokens=self.config.agent.budget_tokens,
+                metadata={"entrypoint": "skill-fork", "skill": name, "agent_type": agent_type},
+            )
+
+            from agent.event_log import EventLog
+            with EventLog.create(task, log_dir=self.log_dir) as log:
+                result = fork_agent.run(task, log)
+
+            if result.summary:
+                self._shared_history.add(type(fork_agent).__new__(type(fork_agent)).__class__(
+                    role="assistant", content=result.summary
+                ))
+
+            click.echo(
+                click.style(f"  Skill '{name}' fork completed: {result.summary or 'done'}", fg="cyan")
+            )
+        except Exception as exc:
+            click.echo(click.style(f"  Skill '{name}' fork failed: {exc}", fg="red"))
+
+    def _build_fork_assembly(self, agent_type: str, meta):
+        """Build an AgentAssembly for a skill fork, respecting model/effort overrides."""
+        from agent.v2.agent_factory import AgentFactory
+
+        agent_cfg = self._agent_cfg
+        # SK-20: apply model/effort overrides from skill frontmatter
+        if meta.model or meta.effort:
+            from dataclasses import replace
+            agent_cfg = replace(agent_cfg)
+            # Note: actual model switching requires backend rebuild.
+            # For now, effort override is passed through agent_config metadata.
+
+        return AgentFactory.create(
+            agent_name=agent_type,
+            backend=self._backend,
+            base_registry=self._registry,
+            agent_registry=self._agent_registry,
+            root_agent_config=agent_cfg,
+            memory_context=self._memory_context,
+            repo_path=self.repo_path,
+        )
 
     def compact(self, focus: str = "") -> str:
         """

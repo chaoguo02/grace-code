@@ -16,6 +16,7 @@ from contextvars import ContextVar
 from typing import Any
 
 from config.schema import PromptConfig
+from agent.task import TaskIntent
 from llm.base import LLMToolSchema
 from prompts.assembler import PromptAssembler, PromptRenderResult
 
@@ -180,13 +181,14 @@ def build_task_prompt(
     description: str,
     repo_path: str,
     issue_url: str | None = None,
-    intent: str = "edit",
+    intent: TaskIntent | str = TaskIntent.EDIT,
 ) -> str:
     issue_section = ""
     if issue_url:
         issue_section = _ISSUE_SECTION_TEMPLATE.format(issue_url=issue_url)
 
-    template = "task-analysis.md" if intent == "analysis" else "task.md"
+    typed_intent = TaskIntent(intent)
+    template = "task-analysis.md" if typed_intent is TaskIntent.ANALYSIS else "task.md"
     return _render_prompt(
         template,
         repo_path=repo_path,
@@ -291,6 +293,20 @@ def build_coordinator_prompt(
         repo_path=repo_path or ".",
         sub_agent_budget=sub_agent_budget or "(auto)",
         max_retries=max_retries,
+    )
+
+
+def build_long_term_context(
+    memory_context=None,
+    skills_prompt: str = "",
+    repo_path: str = ".",
+) -> str | None:
+    """Build long-term memory context. Delegates to memory/injection_service."""
+    from memory.injection_service import build_injection_context
+    return build_injection_context(
+        memory_context=memory_context,
+        skills_prompt=skills_prompt,
+        repo_path=repo_path,
     )
 
 

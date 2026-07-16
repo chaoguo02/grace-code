@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(python -m pytest test_plan_mode.py --tb=short -q 2>&1)"
+      "PowerShell(python -m pytest test_plan_mode.py --tb=short -q 2>&1)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'Batch 5: MCP-01 HTTP transport + SK-02 description auto-matching *)"
     ]
   }
 }

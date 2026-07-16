@@ -1,12 +1,6 @@
 ---
 name: Refactor
 description: 重构手册，提取方法、消除重复、SOLID 原则应用指南
-triggers:
-  - refactor
-  - 重构
-  - clean up
-  - simplify
-  - extract
 ---
 
 ## Refactoring Principles

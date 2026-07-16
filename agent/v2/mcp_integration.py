@@ -19,9 +19,15 @@ class MCPRuntimeToolProxy(BaseTool):
 
     def __init__(self, runtime_tool: Any) -> None:
         self._runtime_tool = runtime_tool
-        self.is_mcp = bool(getattr(runtime_tool, "is_mcp", True))
-        self.always_load = bool(getattr(runtime_tool, "always_load", False))
-        self.should_defer = bool(getattr(runtime_tool, "should_defer", False))
+        mcp_props = getattr(runtime_tool, "mcp_props", None)
+        if mcp_props is not None:
+            self.is_mcp = True
+            self.always_load = mcp_props.always_load
+            self.should_defer = mcp_props.is_deferred
+        else:
+            self.is_mcp = bool(getattr(runtime_tool, "is_mcp", True))
+            self.always_load = bool(getattr(runtime_tool, "always_load", False))
+            self.should_defer = bool(getattr(runtime_tool, "should_defer", False))
         self.metadata = dict(getattr(runtime_tool, "metadata", {}) or {})
 
     @property
@@ -92,6 +98,20 @@ class MCPToolIntegration:
     @property
     def is_initialized(self) -> bool:
         return self._initialized
+
+    @property
+    def server_tools(self) -> dict[str, list[str]]:
+        """Map server name → tool names for resolving agent-scoped mcpServers."""
+        result: dict[str, list[str]] = {}
+        if self._manager is not None:
+            for name in getattr(self._manager, '_server_names', []):
+                result[name] = []
+        for tool in self._tools:
+            for server_name in list(result.keys()):
+                prefix = server_name.rstrip("/").replace("-", "_").replace(".", "_")
+                if tool.name.startswith(prefix + "__") or tool.name == prefix:
+                    result[server_name].append(tool.name)
+        return result
 
     @property
     def manager(self) -> SyncMCPToolManager | None:

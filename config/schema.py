@@ -38,9 +38,7 @@ class LLMConfig:
 class AgentCfg:
     max_steps: int = 40
     budget_tokens: int = 80_000
-    log_dir: str = "./logs"
-    analysis_inspect_read_limit: int = 5
-    analysis_verify_read_limit: int = 2
+    log_dir: str = ""
 
 
 @dataclass
@@ -116,7 +114,7 @@ class ContextConfig:
     auto_compact_after_round: bool = True    # 是否在每轮结束后检查自动压缩
     compact_every_rounds: int = 3            # 每 N 轮强制检查压缩
     artifact_threshold_tokens: int = 2_000   # 工具输出超过此值时 artifact 化
-    artifact_storage_dir: str = ".forge-agent/artifacts"
+    artifact_storage_dir: str = ""
 
 
 @dataclass
@@ -248,9 +246,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     agent = AgentCfg(
         max_steps=int(agent_raw.get("max_steps", 40)),
         budget_tokens=int(agent_raw.get("budget_tokens", 80_000)),
-        log_dir=agent_raw.get("log_dir", "./logs"),
-        analysis_inspect_read_limit=int(agent_raw.get("analysis_inspect_read_limit", 5)),
-        analysis_verify_read_limit=int(agent_raw.get("analysis_verify_read_limit", 2)),
+        log_dir=agent_raw.get("log_dir", ""),
     )
 
     shell_raw = tools_raw.get("shell", {})
@@ -313,7 +309,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         auto_compact_after_round=bool(context_raw.get("auto_compact_after_round", True)),
         compact_every_rounds=int(context_raw.get("compact_every_rounds", 3)),
         artifact_threshold_tokens=int(context_raw.get("artifact_threshold_tokens", 2_000)),
-        artifact_storage_dir=context_raw.get("artifact_storage_dir", ".forge-agent/artifacts"),
+        artifact_storage_dir=context_raw.get("artifact_storage_dir", ""),
     )
 
     hitl = HitlConfig(

@@ -9,9 +9,6 @@ from agent.event_log import EventLog, summarize_run
 from agent.task import RunResult, RunStatus, Task
 
 
-DEFAULT_FAILURE_DATASET_PATH = Path(".forge-agent") / "datasets" / "forge-agent-failures.jsonl"
-
-
 @dataclass(frozen=True)
 class FailureDatasetItem:
     id: str
@@ -106,8 +103,13 @@ def append_failure_dataset_item(
 
 def _resolve_dataset_path(repo_path: str, dataset_path: str | Path | None) -> Path:
     if dataset_path is None:
-        return Path(repo_path) / DEFAULT_FAILURE_DATASET_PATH
-    return Path(dataset_path)
+        from runtime.state_paths import ProjectStatePaths
+        return ProjectStatePaths.for_project(repo_path).datasets
+    configured = Path(dataset_path).expanduser()
+    if configured.is_absolute():
+        return configured.resolve()
+    from runtime.state_paths import ProjectStatePaths
+    return ProjectStatePaths.for_project(repo_path).root / configured
 
 
 def _load_log_stats(log_path: str | Path | None) -> dict[str, Any]:

@@ -8,10 +8,8 @@ llm:
 
 agent:
   max_steps: 40
-  budget_tokens: 80000
-  log_dir: ./logs
-  analysis_inspect_read_limit: 5 # broad analysis inspect 阶段最多 distinct file reads
-  analysis_verify_read_limit: 2 # broad analysis verify 阶段最多额外 file reads
+  budget_tokens: 160000
+  log_dir: "" # empty = isolated per-project runtime state
 
 tools:
   shell:
@@ -87,7 +85,7 @@ context:
   auto_compact_after_round: true # 每轮结束后检查是否需要自动压缩
   compact_every_rounds: 3 # 每 N 轮强制检查压缩
   artifact_threshold_tokens: 2000 # 工具输出超过此值时 artifact 化（Phase 4）
-  artifact_storage_dir: .forge-agent/artifacts # durable artifact storage, repo-relative
+  artifact_storage_dir: "" # empty = isolated per-project runtime state
 
 # ---------------------------------------------------------------------------
 # MCP Servers — 外部 MCP 工具服务器
@@ -120,7 +118,4 @@ context:
 #     args: ["-y", "@anthropic/mcp-server-brave-search"]
 #     env:
 #       BRAVE_API_KEY: "${BRAVE_API_KEY}"
-mcp_servers:
-  demo:
-    command: python
-    args: ["-m", "mcp_servers.demo_server"]
+mcp_servers: {}

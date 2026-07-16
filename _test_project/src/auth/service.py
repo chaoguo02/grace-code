@@ -1,8 +1,8 @@
 """Auth orchestration — wires token creation, session storage, and login."""
 import logging
 from config import SECRET_KEY, TOKEN_EXPIRY_HOURS
-from src.user_service import UserService
-from src.auth.token import generate_token as _generate_token
+from src.user_service import UserService, _verify_password
+from src.auth.token import generate_token as _generate_token, verify_token as _verify_token
 from src.auth.session import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -44,11 +44,16 @@ class AuthService:
         if not user:
             logger.debug("Login failed: user '%s' not found", username)
             return None
-        if user.get("password") != password:
+        if not _verify_password(password, user["password"]):
             logger.debug("Login failed: wrong password for '%s'", username)
             return None
         logger.debug("Login successful for '%s'", username)
-        return self.generate_token(user["id"])
+        token = self.generate_token(user["id"])
+        # Sanity-check that the generated token passes HMAC verification.
+        if not _verify_token(token, self._secret_key):
+            logger.error("Generated token failed HMAC self-check for user '%s'", username)
+            return None
+        return token
 
     def revoke_token(self, token: str) -> None:
         """Remove a token from active sessions (logout support)."""

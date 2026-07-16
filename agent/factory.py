@@ -1,15 +1,9 @@
-"""
-agent/factory.py
-
-Agent 工厂。根据 mode 创建对应的 Agent 实例。
-V1 模式已移除 —— 所有入口统一走 V2 SessionRuntime。
-"""
+"""Agent construction and explicit mode-to-intent declarations."""
 
 from __future__ import annotations
 
-import re
-
 from agent.core import AgentConfig, ReActAgent
+from agent.task import TaskIntent
 from llm.base import LLMBackend
 from tools.base import ToolRegistry
 
@@ -21,41 +15,49 @@ def create_agent(
     agent_config: AgentConfig | None = None,
     plan_config: object | None = None,
     task_description: str | None = None,
-    plan_approval_callback=None,
     memory_context=None,
     multi_config: object | None = None,
+    repo_path: str | None = None,
 ) -> ReActAgent:
-    """Create a ReActAgent instance.
-
-    All V1 modes (plan / dag / multi-agent / auto) have been removed.
-    Every caller now routes through V2 SessionRuntime.
-    """
+    """Create a ReActAgent through the V2 declarative agent factory."""
+    del plan_config, task_description, multi_config
     if agent_config is None:
         agent_config = AgentConfig()
-    return ReActAgent(backend, registry, agent_config, memory_context=memory_context)
+
+    from agent.v2.agent_factory import AgentFactory
+
+    assembly = AgentFactory.create(
+        agent_name=mode,
+        backend=backend,
+        base_registry=registry,
+        root_agent_config=agent_config,
+        memory_context=memory_context,
+        repo_path=repo_path,
+    )
+    return assembly.agent
 
 
-# ---------------------------------------------------------------------------
-# 任务意图分类
-# ---------------------------------------------------------------------------
-
-_EDIT_INDICATORS = re.compile(
-    r"\b(fix|write|create|modify|change|update|add|remove|delete|"
-    r"refactor|implement|rename|move|replace|install|upgrade|patch|"
-    r"rewrite|migrate|编辑|修改|创建|删除|重构|添加|修复|写入)\b",
-    re.IGNORECASE,
-)
+# Deprecated: prefer AgentDefinition.intent directly.
+# The caller should look up the agent definition by name and read definition.intent.
+_DEFAULT_INTENT_BY_MODE = {
+    "v2-build": TaskIntent.EDIT,
+    "build": TaskIntent.EDIT,
+    "v2-plan": TaskIntent.ANALYSIS,
+    "plan": TaskIntent.ANALYSIS,
+}
 
 
-def classify_task_intent(
-    description: str,
-    intent_override: str = "auto",
-    backend: object = None,
-) -> str:
-    """Determine task intent: "edit" or "analysis"."""
-    if intent_override != "auto":
-        return intent_override
+def resolve_task_intent(
+    mode: str,
+    intent_override: TaskIntent | str | None = None,
+) -> TaskIntent:
+    """Deprecated: look up AgentDefinition.intent instead.
 
-    if _EDIT_INDICATORS.search(description):
-        return "edit"
-    return "analysis"
+    Kept for backward compat with tests and callers that haven't migrated yet.
+    """
+    if intent_override is not None:
+        return TaskIntent(intent_override)
+    try:
+        return _DEFAULT_INTENT_BY_MODE[mode]
+    except KeyError as exc:
+        raise ValueError(f"No default task intent declared for mode {mode!r}") from exc

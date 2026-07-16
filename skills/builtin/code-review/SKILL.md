@@ -1,11 +1,6 @@
 ---
 name: Code Review
 description: 代码审查清单与最佳实践，帮助识别 bug、性能问题和可维护性问题
-triggers:
-  - review
-  - 审查
-  - check code
-  - code review
 ---
 
 ## Code Review Checklist

@@ -11,8 +11,15 @@ from agent.v2.runtime import SessionRuntime
 from agent.v2.session_store import SessionStore
 from llm.base import MockBackend
 from runtime.mcp import MCPServerConfig
+from runtime.mcp.types import MCPToolProps
 from runtime.tool import ToolResult as RuntimeToolResult, ToolUseContext, build_tool
-from tools.base import NoopTool, ToolRegistry
+from tools.base import (
+    NoopTool,
+    ToolEffect,
+    ToolMetadata,
+    ToolRegistry,
+    ToolRole,
+)
 
 
 def _runtime_tool(name: str, output: str = "ok", *, is_error: bool = False):
@@ -27,8 +34,8 @@ def _runtime_tool(name: str, output: str = "ok", *, is_error: bool = False):
         input_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         call_fn=call_fn,
         description_text=f"{name} description",
+        mcp_props=MCPToolProps(server_name="test"),
     )
-    tool.is_mcp = True
     tool.metadata = {"is_mcp": True}
     return tool
 
@@ -110,11 +117,16 @@ def test_register_into_skips_duplicate_tools():
 
 
 def test_session_runtime_exposes_mcp_tools_to_build_and_general_only(tmp_path):
-    agent_registry = AgentRegistryV2()
+    agent_registry = AgentRegistryV2(project_dir=tmp_path)
     base_registry = ToolRegistry()
-    from agent.v2.agent_registry import _BUILD_ALLOWED
-    for tool_name in sorted(_BUILD_ALLOWED):
-        base_registry.register(NoopTool(tool_name))
+    for tool_name in sorted(agent_registry.tool_names_for("build")):
+        tool = NoopTool(tool_name)
+        if tool_name == "task":
+            tool.metadata = ToolMetadata(
+                effects=frozenset({ToolEffect.DELEGATE_WRITE}),
+                roles=frozenset({ToolRole.DELEGATE}),
+            )
+        base_registry.register(tool)
     mcp_tool = MCPRuntimeToolProxy(_runtime_tool("mcp__server__echo"))
     base_registry.register(mcp_tool)
 

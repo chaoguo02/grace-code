@@ -17,7 +17,15 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from tools.base import BaseTool, ToolResult
+from tools.base import (
+    BaseTool,
+    PathAccess,
+    ToolEffect,
+    ToolMetadata,
+    ToolResult,
+    ToolRetryDirective,
+)
+from agent.task import ToolOutcome
 from tools.runtime import LocalRuntime, Runtime
 
 
@@ -36,6 +44,11 @@ PYTEST_EXIT_MEANINGS = {
 
 
 class PytestTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.TEST}),
+        path_access=PathAccess.READ,
+        path_parameter="path",
+    )
     """
     运行 pytest 并返回结构化结果。
 
@@ -45,8 +58,13 @@ class PytestTool(BaseTool):
         cwd (str):   工作目录（默认当前目录）
     """
 
-    def __init__(self, runtime: Runtime | None = None) -> None:
-        self._runtime = runtime or LocalRuntime()
+    def __init__(
+        self,
+        runtime: Runtime | None = None,
+        workspace_root: str | Path | None = None,
+    ) -> None:
+        self._workspace_root = Path(workspace_root or Path.cwd()).resolve()
+        self._runtime = runtime or LocalRuntime(workspace_root=self._workspace_root)
 
     @property
     def name(self) -> str:
@@ -83,7 +101,24 @@ class PytestTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         cwd = params.get("cwd", None)
-        cwd_path = Path(cwd) if cwd else Path.cwd()
+        requested_cwd = Path(cwd) if cwd else self._workspace_root
+        cwd_path = (
+            requested_cwd.resolve()
+            if requested_cwd.is_absolute()
+            else (self._workspace_root / requested_cwd).resolve()
+        )
+        try:
+            cwd_path.relative_to(self._workspace_root)
+        except ValueError:
+            from tools.base import ToolError as _ToolError, ToolErrorType
+            return ToolResult(
+                success=False, output="",
+                error=f"test cwd is outside workspace: {cwd_path}",
+                tool_error=_ToolError(
+                    error_type=ToolErrorType.PERMISSION_DENIED,
+                    detail=f"test cwd is outside workspace: {cwd_path}",
+                ),
+            )
 
         # 决定测试路径
         test_path = params.get("path", "")
@@ -95,34 +130,65 @@ class PytestTool(BaseTool):
 
         extra_args = params.get("args", "")
 
+        # Runtime metadata is the only executable fact source. Never probe PATH.
+        from runtime.project_environment import ExecutableKind
+        python_executable = self._runtime.resolve_executable(ExecutableKind.PYTHON)
+        if python_executable is None:
+            from tools.base import ToolError as _ToolError, ToolErrorType
+            return ToolResult(
+                success=False, output="",
+                error="pytest is not available in this environment.",
+                tool_error=_ToolError(
+                    error_type=ToolErrorType.UNAVAILABLE,
+                    detail="No project-local or Runtime-injected Python executable is available.",
+                ),
+            )
+
         # 组装命令：--tb=short 足够 agent 理解，--no-header 减少噪音
-        cmd_parts = [
-            "python", "-m", "pytest",
+        args = [
+            "-m", "pytest",
             test_path,
             "--tb=short",
             "--no-header",
             "-q",               # 安静模式：只输出失败详情和最终统计
         ]
         if extra_args:
-            cmd_parts.extend(extra_args.split())
+            args.extend(extra_args.split())
 
-        cmd_str = " ".join(cmd_parts)
-        run_result = self._runtime.exec(cmd_str, cwd=cwd, timeout=PYTEST_TIMEOUT)
-        if "timed out" in run_result.stderr.lower():
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"pytest timed out after {PYTEST_TIMEOUT}s",
-            )
+        # Use parameterized execute() — shell=False, no string joining
+        run_result = self._runtime.execute(
+            python_executable,
+            args=args,
+            cwd=str(cwd_path),
+            timeout=PYTEST_TIMEOUT,
+        )
+
+        # Use unified error classification for runtime-level failures
+        if not run_result.success:
+            from tools.base import classify_runtime_error
+            cmd_repr = f"{python_executable} -m pytest {test_path}"
+            _runtime_err = classify_runtime_error(run_result, cmd_repr)
+            if _runtime_err and _runtime_err.retry is ToolRetryDirective.DO_NOT_RETRY:
+                # Unavailable / permission denied → don't retry
+                return ToolResult(
+                    success=False, output="",
+                    error=_runtime_err.to_message(), tool_error=_runtime_err,
+                )
         raw = run_result.output
         success = run_result.returncode == 0
 
         output, error = _classify_pytest_result(run_result.returncode, raw, test_path, success)
+        outcome = (
+            ToolOutcome.TEST_TARGET_MISSING
+            if run_result.returncode == 4 and _looks_like_missing_pytest_target(raw)
+            else ToolOutcome.NONE
+        )
 
         return ToolResult(
             success=success,
             output=output,
             error=error,
+            outcome=outcome,
         )
 
 

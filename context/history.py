@@ -17,8 +17,202 @@ context/history.py
 
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
 from agent.task import ToolCall
 from llm.base import LLMMessage
+
+
+class ConversationSnapshotError(ValueError):
+    """The live model-input prefix cannot be frozen without changing meaning."""
+
+
+class SnapshotBoundary(str, Enum):
+    """Exact point in the parent loop represented by a snapshot."""
+
+    MODEL_INPUT = "model_input"
+
+
+class SnapshotMessageRole(str, Enum):
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+@dataclass(frozen=True)
+class ToolCallSnapshot:
+    name: str
+    params_json: str
+    call_id: str
+
+    @classmethod
+    def capture(cls, call: ToolCall) -> "ToolCallSnapshot":
+        if not call.id:
+            raise ConversationSnapshotError(
+                f"Native tool call {call.name!r} has no call id"
+            )
+        try:
+            params_json = json.dumps(
+                call.params, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConversationSnapshotError(
+                f"Tool call {call.name!r} parameters are not JSON-safe"
+            ) from exc
+        return cls(name=call.name, params_json=params_json, call_id=call.id)
+
+    def materialize(self) -> ToolCall:
+        return ToolCall(
+            name=self.name,
+            params=json.loads(self.params_json),
+            id=self.call_id,
+        )
+
+
+@dataclass(frozen=True)
+class MessageSnapshot:
+    role: SnapshotMessageRole
+    content_json: str
+    tool_call_id: str | None = None
+    tool_calls: tuple[ToolCallSnapshot, ...] = ()
+
+    @classmethod
+    def capture(cls, message: LLMMessage) -> "MessageSnapshot":
+        try:
+            role = SnapshotMessageRole(message.role)
+        except ValueError as exc:
+            raise ConversationSnapshotError(
+                f"Unsupported message role {message.role!r}"
+            ) from exc
+        try:
+            content_json = json.dumps(
+                message.content,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConversationSnapshotError(
+                f"Message content for role {role.value!r} is not JSON-safe"
+            ) from exc
+        return cls(
+            role=role,
+            content_json=content_json,
+            tool_call_id=message.tool_call_id,
+            tool_calls=tuple(
+                ToolCallSnapshot.capture(call)
+                for call in (message.tool_calls or ())
+            ),
+        )
+
+    def materialize(self) -> LLMMessage:
+        return LLMMessage(
+            role=self.role.value,
+            content=json.loads(self.content_json),
+            tool_call_id=self.tool_call_id,
+            tool_calls=(
+                [call.materialize() for call in self.tool_calls]
+                if self.tool_calls else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ConversationSnapshot:
+    """Immutable, provider-valid copy of one parent model-input prefix."""
+
+    messages: tuple[MessageSnapshot, ...]
+    boundary: SnapshotBoundary = SnapshotBoundary.MODEL_INPUT
+
+    @classmethod
+    def capture(cls, messages: list[LLMMessage]) -> "ConversationSnapshot":
+        snapshot = cls(messages=tuple(MessageSnapshot.capture(m) for m in messages))
+        snapshot._validate_native_tool_pairs()
+        return snapshot
+
+    def materialize(self) -> list[LLMMessage]:
+        """Return new mutable message objects; never expose snapshot internals."""
+        return [message.materialize() for message in self.messages]
+
+    @property
+    def fingerprint(self) -> str:
+        payload = {
+            "boundary": self.boundary.value,
+            "messages": [
+                {
+                    "role": message.role.value,
+                    "content": message.content_json,
+                    "tool_call_id": message.tool_call_id,
+                    "tool_calls": [
+                        {
+                            "name": call.name,
+                            "params": call.params_json,
+                            "id": call.call_id,
+                        }
+                        for call in message.tool_calls
+                    ],
+                }
+                for message in self.messages
+            ],
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _validate_native_tool_pairs(self) -> None:
+        pending: set[str] | None = None
+        seen_call_ids: set[str] = set()
+        for message in self.messages:
+            if (
+                message.role is not SnapshotMessageRole.ASSISTANT
+                and message.tool_calls
+            ):
+                raise ConversationSnapshotError(
+                    "Only assistant messages may contain tool calls"
+                )
+            if (
+                message.role is not SnapshotMessageRole.TOOL
+                and message.tool_call_id is not None
+            ):
+                raise ConversationSnapshotError(
+                    "Only tool messages may contain a tool_call_id"
+                )
+            if message.role is SnapshotMessageRole.TOOL:
+                if not message.tool_call_id:
+                    raise ConversationSnapshotError(
+                        "Tool result has no tool_call_id"
+                    )
+                if pending is None or message.tool_call_id not in pending:
+                    raise ConversationSnapshotError(
+                        "Tool result is not paired with the preceding assistant call"
+                    )
+                pending.remove(message.tool_call_id)
+                continue
+            if pending:
+                raise ConversationSnapshotError(
+                    "Assistant tool calls are missing contiguous tool results"
+                )
+            pending = None
+            if message.role is SnapshotMessageRole.ASSISTANT and message.tool_calls:
+                ids = [call.call_id for call in message.tool_calls]
+                if len(ids) != len(set(ids)) or seen_call_ids.intersection(ids):
+                    raise ConversationSnapshotError(
+                        "Assistant tool call ids must be unique in the snapshot"
+                    )
+                seen_call_ids.update(ids)
+                pending = set(ids)
+        if pending:
+            raise ConversationSnapshotError(
+                "Snapshot ends before all assistant tool calls have results"
+            )
 
 
 class ConversationHistory:

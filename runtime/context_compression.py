@@ -31,6 +31,7 @@ TOOL_RESULT_BUDGETS: dict[str, float] = {
     "grep": 20_000,
     "find_files": 100_000,
     "glob": 100_000,
+    "WebFetch": 100_000,
     "web_fetch": 100_000,
     "file_edit": 100_000,
     "file_write": 100_000,
@@ -517,7 +518,7 @@ def _get_message_content(msg: Any) -> Any:
 
 
 def _is_readonly_tool_result(msg: Any) -> bool:
-    readonly_tools = {"read_file", "grep", "glob", "list_dir", "web_search", "read", "search"}
+    readonly_tools = {"Read", "Grep", "Glob", "WebSearch", "file_read", "grep", "glob", "list_dir", "web_search", "read", "search"}
     if isinstance(msg, dict):
         content = msg.get("content", [])
         if isinstance(content, list):

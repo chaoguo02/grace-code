@@ -28,30 +28,13 @@ from typing import Any
 # ANSI 工具函数
 # ---------------------------------------------------------------------------
 
-_IS_TTY = sys.stdout.isatty()
-
-
-def _c(text: str, code: str) -> str:
-    return f"\033[{code}m{text}\033[0m" if _IS_TTY else text
-
-
-def _green(t: str) -> str:  return _c(t, "32")
-def _yellow(t: str) -> str: return _c(t, "33")
-def _red(t: str) -> str:    return _c(t, "31")
-def _cyan(t: str) -> str:   return _c(t, "36")
-def _bold(t: str) -> str:   return _c(t, "1")
-def _dim(t: str) -> str:    return _c(t, "2")
-def _magenta(t: str) -> str: return _c(t, "35")
-def _bg_yellow(t: str) -> str: return _c(t, "43;30")
-def _bg_red(t: str) -> str: return _c(t, "41;37")
-
-
-def _move_up(n: int) -> str:
-    return f"\033[{n}A" if n > 0 else ""
-
-
-def _clear_line() -> str:
-    return "\033[2K"
+from entry._terminal import (
+    _IS_TTY,
+    _c, _clear_line, _move_up,
+    bg_red as _bg_red, bg_yellow as _bg_yellow,
+    bold as _bold, cyan as _cyan, dim as _dim,
+    green as _green, magenta as _magenta, red as _red, yellow as _yellow,
+)
 
 
 def _hide_cursor() -> str:
@@ -531,17 +514,13 @@ class InlineRenderer(RendererBase):
         with self._lock:
             self._clear_status_bar()
 
-            silent = tool_name in {
-                "file_read", "file_view", "file_write",
-                "find_files", "find_symbol",
-            }
-
             if tool_name == "task":
                 sys.stdout.write(f"{self._format_task_observation(output, error)}\n")
             elif status == "success":
                 if tool_name in {"file_read", "file_view"}:
                     sys.stdout.write(f"{self._format_file_read_summary(tool_name, output)}\n")
-                elif silent:
+                elif tool_name in {"file_write", "find_files", "find_symbol"}:
+                    sys.stdout.write(_dim(f"  [{tool_name}] ok\n"))
                     sys.stdout.write(_green("    ╰─ ✓\n"))
                 else:
                     formatted = self._format_tool_output(status, output, error)
@@ -554,8 +533,8 @@ class InlineRenderer(RendererBase):
                     _red(f"    ╰─ ✗ {error or output[:200]}\n")
                 )
 
-            # 诊断着色：error / warning 行
-            if output and not silent:
+            # 诊断着色：error / warning 行 (only when output is present)
+            if output:
                 for line in output.splitlines()[:30]:
                     lower = line.lower()
                     if "error" in lower or "traceback" in lower:
@@ -747,10 +726,8 @@ class InlineRenderer(RendererBase):
         self._panels_collapsed = not self._panels_collapsed
 
     def update_tokens(self, tokens: int) -> None:
-        """外部更新 token 计数（供状态栏刷新）。"""
+        """Update token facts; the next action event redraws with its step."""
         self._round_tokens = tokens
-        if _IS_TTY and not self._streaming:
-            self._refresh_status()
 
 
 # ---------------------------------------------------------------------------
@@ -851,11 +828,11 @@ def permission_prompt(request: "Any") -> "Any":
     Returns PromptDecision(action, note, inferred_rule).
     """
     import sys
-    from hitl.pipeline import PromptDecision
+    from hitl.pipeline import PromptAction, PromptDecision
     from hitl.pattern_inference import infer_permission_pattern
 
     if not sys.stdin.isatty():
-        return PromptDecision(action="deny", note="Non-interactive terminal")
+        return PromptDecision(action=PromptAction.DENY, note="Non-interactive terminal")
 
     params = request.params
     if "cmd" in params:
@@ -870,6 +847,10 @@ def permission_prompt(request: "Any") -> "Any":
 
     sys.stdout.write("\n")
     sys.stdout.write(_yellow("  ┌─ Permission Required ") + _yellow("─" * 36) + "\n")
+    if getattr(request, "agent_name", ""):
+        sys.stdout.write(
+            _yellow("  │  ") + f"Agent:  {_bold(request.agent_name)}\n"
+        )
     sys.stdout.write(_yellow("  │  ") + f"Tool:   {_bold(request.tool_name)}\n")
     sys.stdout.write(_yellow("  │  ") + f"Params: {params_display}\n")
     thought = getattr(request, "thought", "")
@@ -886,43 +867,46 @@ def permission_prompt(request: "Any") -> "Any":
             ans = input(_cyan("  [a]llow once / always [A]llow / [d]eny > ")).strip()
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\n")
-            return PromptDecision(action="deny")
+            return PromptDecision(action=PromptAction.DENY)
 
         if ans.lower() in ("a", "y", "yes", "allow", ""):
             sys.stdout.write(_green("  ✓ Allowed (once)\n\n"))
             sys.stdout.flush()
-            return PromptDecision(action="allow_once")
+            return PromptDecision(action=PromptAction.ALLOW_ONCE)
 
         elif ans in ("A",) or ans.lower() in ("always", "aa"):
             rule = infer_permission_pattern(request.tool_name, request.params)
             sys.stdout.write(_green(f"  ✓ Always allow: ") + _dim(rule.raw) + "\n\n")
             sys.stdout.flush()
-            return PromptDecision(action="always_allow", inferred_rule=rule)
+            return PromptDecision(action=PromptAction.ALWAYS_ALLOW, inferred_rule=rule)
 
         elif ans.lower() in ("d", "n", "no", "deny"):
             sys.stdout.write(_red("  ✗ Denied\n\n"))
             sys.stdout.flush()
-            return PromptDecision(action="deny")
+            return PromptDecision(action=PromptAction.DENY)
 
         elif ans.lower().startswith("d:") or ans.lower().startswith("n:"):
             note = ans[2:].strip()
             sys.stdout.write(_red(f"  ✗ Denied") + _dim(f" ({note})\n\n"))
             sys.stdout.flush()
-            return PromptDecision(action="deny", note=note)
+            return PromptDecision(action=PromptAction.DENY, note=note)
 
         else:
             sys.stdout.write(_dim("  (enter a, A, d, or d: <reason>)\n"))
 
 
 def _risk_color(risk: str) -> str:
-    """根据风险等级返回带颜色的标签。"""
-    if risk == "high":
-        return _red(_bold("HIGH"))
-    elif risk == "medium":
-        return _yellow("MEDIUM")
-    elif risk == "low":
-        return _dim("low")
-    return _dim("none")
+    """Return ANSI-colored risk label.
+
+    Accepts str for caller convenience (RiskLevel str Enum, raw strings from config).
+    Uses declarative mapping instead of if/elif chain.
+    """
+    _RISK_DISPLAY: dict[str, str] = {
+        "high": _red(_bold("HIGH")),
+        "medium": _yellow("MEDIUM"),
+        "low": _dim("low"),
+    }
+    return _RISK_DISPLAY.get(risk.lower(), _dim("none"))
 
 
 # ---------------------------------------------------------------------------

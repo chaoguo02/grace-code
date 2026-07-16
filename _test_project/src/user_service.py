@@ -1,12 +1,34 @@
 """User business logic and data access."""
+import base64
+import hashlib
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
+
+def _hash_password(password: str) -> str:
+    """Hash a password with PBKDF2-SHA256 and a random 16-byte salt.
+
+    Returns a ``salt$hash`` string where both components are base64-encoded.
+    """
+    salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000)
+    return base64.b64encode(salt).decode() + "$" + base64.b64encode(key).decode()
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    """Verify a plaintext password against a ``salt$hash`` string."""
+    salt_b64, hash_b64 = stored.split("$")
+    salt = base64.b64decode(salt_b64)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000)
+    return base64.b64encode(key).decode() == hash_b64
+
+
 FAKE_DB = [
-    {"id": 1, "name": "alice", "email": "alice@example.com", "password": "pass123"},
-    {"id": 2, "name": "bob", "email": "bob@example.com", "password": "secret456"},
-    {"id": 3, "name": "charlie", "email": "charlie@example.com", "password": "qwerty"},
+    {"id": 1, "name": "alice", "email": "alice@example.com", "password": _hash_password("pass123")},
+    {"id": 2, "name": "bob", "email": "bob@example.com", "password": _hash_password("secret456")},
+    {"id": 3, "name": "charlie", "email": "charlie@example.com", "password": _hash_password("qwerty")},
 ]
 
 _next_id = 4
@@ -32,10 +54,10 @@ class UserService:
         return None
 
     def create(self, name: str, email: str, password: str):
-        """Create a new user."""
+        """Create a new user. Password is hashed before storage."""
         global _next_id
         logger.debug("UserService.create(%s, %s)", name, email)
-        user = {"id": _next_id, "name": name, "email": email, "password": password}
+        user = {"id": _next_id, "name": name, "email": email, "password": _hash_password(password)}
         FAKE_DB.append(user)
         _next_id += 1
         return {"id": user["id"], "name": user["name"], "email": user["email"]}

@@ -3,7 +3,6 @@ tests/test_context.py
 
 context 管理模块单元测试：
 - ArtifactStore (context/artifacts.py)
-- TaskRouter (context/task_router.py)
 - ContextManager (context/manager.py)
 - SessionState (context/session.py)
 """
@@ -11,6 +10,78 @@ context 管理模块单元测试：
 from __future__ import annotations
 
 import pytest
+
+
+class TestConversationSnapshot:
+    def test_capture_is_deeply_immutable_and_materializes_fresh_objects(self):
+        from agent.task import ToolCall
+        from context.history import ConversationSnapshot
+        from llm.base import LLMMessage
+
+        content = [{"type": "text", "text": "before"}]
+        params = {"path": "a.py", "options": ["one"]}
+        messages = [
+            LLMMessage(role="system", content=content),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(name="file_read", params=params, id="call-1")],
+            ),
+            LLMMessage(role="tool", content="result", tool_call_id="call-1"),
+        ]
+
+        snapshot = ConversationSnapshot.capture(messages)
+        fingerprint = snapshot.fingerprint
+        content[0]["text"] = "after"
+        params["options"].append("two")
+
+        first = snapshot.materialize()
+        second = snapshot.materialize()
+        assert first[0].content[0]["text"] == "before"
+        assert first[1].tool_calls[0].params == {
+            "options": ["one"], "path": "a.py",
+        }
+        assert first[0] is not second[0]
+        assert first[1].tool_calls[0] is not second[1].tool_calls[0]
+        assert snapshot.fingerprint == fingerprint
+
+    def test_rejects_orphan_tool_result(self):
+        from context.history import ConversationSnapshot, ConversationSnapshotError
+        from llm.base import LLMMessage
+
+        with pytest.raises(ConversationSnapshotError, match="not paired"):
+            ConversationSnapshot.capture([
+                LLMMessage(role="tool", content="orphan", tool_call_id="call-1"),
+            ])
+
+    def test_rejects_incomplete_tool_call_sequence(self):
+        from agent.task import ToolCall
+        from context.history import ConversationSnapshot, ConversationSnapshotError
+        from llm.base import LLMMessage
+
+        with pytest.raises(ConversationSnapshotError, match="ends before"):
+            ConversationSnapshot.capture([
+                LLMMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[ToolCall(name="file_read", params={}, id="call-1")],
+                ),
+            ])
+
+    def test_rejects_non_contiguous_tool_results(self):
+        from agent.task import ToolCall
+        from context.history import ConversationSnapshot, ConversationSnapshotError
+        from llm.base import LLMMessage
+
+        with pytest.raises(ConversationSnapshotError, match="contiguous"):
+            ConversationSnapshot.capture([
+                LLMMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[ToolCall(name="file_read", params={}, id="call-1")],
+                ),
+                LLMMessage(role="user", content="interruption"),
+            ])
 
 
 # ===========================================================================
@@ -145,120 +216,6 @@ class TestArtifactStore:
 # ===========================================================================
 
 
-class TestTaskRouter:
-    """task_router.py 的分类逻辑测试。"""
-
-    def _make_session_state(self, user_goal="fix the login bug", changed_files=None, read_files=None):
-        from context.session import SessionState, TaskSummary
-        state = SessionState()
-        summary = TaskSummary(
-            task_id="t1",
-            user_goal=user_goal,
-            outcome="success",
-            changed_files=changed_files or ["src/auth.py"],
-            read_files=read_files or ["src/config.py"],
-        )
-        state.completed_tasks.append(summary)
-        return state
-
-    def test_first_message_is_unrelated(self):
-        """首轮消息（无已完成任务）→ unrelated_task。"""
-        from context.task_router import classify_task_relationship
-        from context.session import SessionState
-        state = SessionState()
-        result = classify_task_relationship("fix a bug in auth", state)
-        assert result == "unrelated_task"
-
-    def test_continuation_signal(self):
-        """短消息 + 继续信号 → same_task。"""
-        from context.task_router import classify_task_relationship
-        state = self._make_session_state()
-        result = classify_task_relationship("also fix the typo", state)
-        assert result == "same_task"
-
-    def test_explicit_switch_signal(self):
-        """显式切换信号 → unrelated_task。"""
-        from context.task_router import classify_task_relationship
-        state = self._make_session_state()
-        result = classify_task_relationship("switch to working on the database module", state)
-        assert result == "unrelated_task"
-
-    def test_quick_question_no_file_overlap(self):
-        """简单问题模式（无文件重叠）→ quick_question。"""
-        from context.task_router import classify_task_relationship
-        state = self._make_session_state()
-        result = classify_task_relationship("what is a decorator in Python?", state)
-        assert result == "quick_question"
-
-    def test_quick_question_with_file_overlap_is_same_task(self):
-        """简单问题但引用了当前任务文件 → same_task。"""
-        from context.task_router import classify_task_relationship
-        state = self._make_session_state(changed_files=["src/auth.py"])
-        result = classify_task_relationship("what is the purpose of src/auth.py?", state)
-        assert result == "same_task"
-
-    def test_file_overlap_is_related(self):
-        """新消息提到之前任务涉及的文件 → related_task。"""
-        from context.task_router import classify_task_relationship
-        state = self._make_session_state(
-            changed_files=["src/auth.py"],
-            read_files=["src/config.py"],
-        )
-        result = classify_task_relationship("refactor the validation logic in src/config.py", state)
-        assert result == "related_task"
-
-    def test_long_message_no_overlap_is_unrelated(self):
-        """长消息无关键词/文件重叠 → unrelated_task。"""
-        from context.task_router import classify_task_relationship
-        state = self._make_session_state()
-        long_msg = "I need you to implement a completely new feature for the payment processing system. " * 5
-        result = classify_task_relationship(long_msg, state)
-        assert result == "unrelated_task"
-
-    def test_keyword_overlap_is_related(self):
-        """关键词重叠 → related_task。"""
-        from context.task_router import classify_task_relationship
-        state = self._make_session_state(user_goal="implement authentication middleware")
-        result = classify_task_relationship("add rate limiting to the authentication middleware", state)
-        assert result == "related_task"
-
-    def test_compaction_strategy_same_task(self):
-        """same_task 策略：不压缩。"""
-        from context.task_router import get_compaction_strategy, SAME_TASK
-        strategy = get_compaction_strategy(SAME_TASK)
-        assert strategy["should_compact"] is False
-        assert strategy["keep_recent_rounds"] == 99
-
-    def test_compaction_strategy_unrelated_task(self):
-        """unrelated_task 策略：压缩 + 注入 summary。"""
-        from context.task_router import get_compaction_strategy, UNRELATED_TASK
-        strategy = get_compaction_strategy(UNRELATED_TASK)
-        assert strategy["should_compact"] is True
-        assert strategy["inject_session_summary"] is True
-
-    def test_compaction_strategy_quick_question(self):
-        """quick_question 策略：不压缩，极少保留。"""
-        from context.task_router import get_compaction_strategy, QUICK_QUESTION
-        strategy = get_compaction_strategy(QUICK_QUESTION)
-        assert strategy["should_compact"] is False
-        assert strategy["keep_recent_rounds"] == 2
-        assert strategy["inject_session_summary"] is False
-
-    def test_chinese_continuation(self):
-        """中文继续信号识别。"""
-        from context.task_router import classify_task_relationship
-        state = self._make_session_state()
-        result = classify_task_relationship("继续修复那个问题", state)
-        assert result == "same_task"
-
-    def test_chinese_switch(self):
-        """中文切换信号识别。"""
-        from context.task_router import classify_task_relationship
-        state = self._make_session_state()
-        result = classify_task_relationship("换个话题，帮我看看数据库连接", state)
-        assert result == "unrelated_task"
-
-
 # ===========================================================================
 # SessionState 测试
 # ===========================================================================
@@ -271,8 +228,9 @@ class TestSessionState:
         """正常的任务开始→结束流程。"""
         from context.session import SessionState, TaskSummary
         state = SessionState()
-        ctx = state.start_task("fix auth bug", intent="edit", relationship="unrelated_task")
+        ctx = state.start_task("fix auth bug", intent="edit")
         assert state.active_task is ctx
+        assert not hasattr(ctx, "relationship")
         assert state.round_count == 1
 
         summary = TaskSummary(

@@ -37,7 +37,7 @@ def test_load_and_discover_returns_adapted_runtime_tools():
 
         assert {"mcp__fake_test__echo", "mcp__fake_test__add", "mcp__fake_test__slow_echo"}.issubset(by_name)
         echo = by_name["mcp__fake_test__echo"]
-        assert echo.is_mcp is True
+        assert echo.mcp_props is not None
         assert echo.input_schema["type"] == "object"
         assert "message" in echo.input_schema.get("properties", {})
     finally:

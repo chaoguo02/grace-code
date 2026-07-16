@@ -1,12 +1,6 @@
 ---
 name: Debug Guide
 description: 系统化调试方法论，帮助定位 bug 根因（二分法、日志注入、最小复现）
-triggers:
-  - debug
-  - 调试
-  - bug
-  - troubleshoot
-  - 排查
 ---
 
 ## Systematic Debugging Methodology

@@ -13,27 +13,44 @@ Aligned with Claude Code's hook system:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum, IntEnum
 from typing import Any
 
 
-class ExitCode:
+class ExitCode(IntEnum):
     SUCCESS = 0
     BLOCKING_ERROR = 2
+
+
+class HookDecision(str, Enum):
+    ALLOW = "allow"
+    BLOCK = "block"
+
+
+class HookControl(str, Enum):
+    CONTINUE = "continue"
+    BLOCK = "block"
+    APPROVE = "approve"
 
 
 @dataclass
 class HookOutput:
     """Parsed from hook script's stdout JSON."""
 
-    decision: str | None = None
+    decision: HookDecision | None = None
     reason: str | None = None
     additional_context: str | None = None
     updated_input: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "HookOutput":
+        raw_decision = data.get("decision")
+        try:
+            decision = HookDecision(raw_decision) if raw_decision is not None else None
+        except ValueError:
+            decision = None
         return cls(
-            decision=data.get("decision"),
+            decision=decision,
             reason=data.get("reason"),
             additional_context=data.get("additional_context") or data.get("additionalContext"),
             updated_input=data.get("updated_input") or data.get("updatedInput"),
@@ -50,30 +67,31 @@ class HookResult:
     parsed: HookOutput | None = None
 
     @property
-    def blocks(self) -> bool:
-        """Exit code 2 = blocking error."""
-        return self.exit_code == ExitCode.BLOCKING_ERROR
+    def control(self) -> HookControl:
+        """Typed control instruction derived at the external protocol boundary."""
+        if self.exit_code == ExitCode.BLOCKING_ERROR:
+            return HookControl.BLOCK
+        if self.exit_code == ExitCode.SUCCESS and self.parsed is not None:
+            if self.parsed.decision is HookDecision.BLOCK:
+                return HookControl.BLOCK
+            if self.parsed.decision is HookDecision.ALLOW:
+                return HookControl.APPROVE
+        return HookControl.CONTINUE
 
     @property
-    def approves_explicitly(self) -> bool:
-        """Exit 0 with decision=allow, or legacy exit 0 (approve)."""
-        if self.parsed and self.parsed.decision == "allow":
-            return True
-        return False
-
-    @property
-    def has_context(self) -> bool:
-        """Has additional context to inject into conversation."""
+    def context(self) -> str:
+        """Additional context emitted by a successful hook, if any."""
         if self.parsed and self.parsed.additional_context:
-            return True
-        return self.exit_code == ExitCode.SUCCESS and bool(self.stdout) and self.parsed is None
+            return self.parsed.additional_context
+        if self.exit_code == ExitCode.SUCCESS and self.parsed is None:
+            return self.stdout
+        return ""
 
 
 @dataclass
 class DispatchResult:
     """Aggregated result from dispatching an event to all matching hooks."""
 
-    blocked: bool = False
+    control: HookControl = HookControl.CONTINUE
     reason: str = ""
-    approved_explicitly: bool = False
     additional_context: str = ""

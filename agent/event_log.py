@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from agent.task import Event, EventType, Task, Action, Observation, RunResult
+from agent.task import Event, EventType, ObservationStatus, Task, Action, Observation, RunResult
 
 
 # ---------------------------------------------------------------------------
@@ -53,12 +53,23 @@ class EventLog:
     # ------------------------------------------------------------------
 
     @classmethod
-    def create(cls, task: Task, log_dir: str = "./logs") -> "EventLog":
+    def create(cls, task: Task, log_dir: str = "") -> "EventLog":
         """
         为一次新运行创建 EventLog。
         目录不存在时自动创建。
         """
-        log_path = Path(log_dir)
+        configured = Path(log_dir).expanduser() if log_dir else None
+        if configured is not None and configured.is_absolute():
+            # An absolute path is an explicit caller-owned export location.
+            # Only defaults and relative paths are framework-private state.
+            log_path = configured.resolve()
+        else:
+            from runtime.state_paths import ProjectStatePaths
+            state_paths = ProjectStatePaths.for_project(task.repo_path)
+            if not log_dir or log_dir in {"logs", "./logs", ".\\logs"}:
+                log_path = state_paths.logs
+            else:
+                log_path = state_paths.root / configured
         log_path.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -429,7 +440,7 @@ def summarize_run(log: EventLog) -> dict:
 
         elif event.event_type == EventType.OBSERVATION:
             obs = event.payload["observation"]
-            if obs["status"] == "success":
+            if obs["status"] == ObservationStatus.SUCCESS.value:
                 stats["observations_ok"] += 1
             else:
                 stats["observations_err"] += 1

@@ -8,7 +8,7 @@ import threading
 from typing import Any, Callable
 
 from runtime.mcp.client import MCPToolBridge, MCPToolCallError
-from runtime.mcp.types import MCPToolInfo
+from runtime.mcp.types import MCPToolInfo, MCPToolProps
 from runtime.tool import ToolResult, ToolUseContext, build_tool
 
 
@@ -46,19 +46,14 @@ def mcp_tool_to_runtime_tool(bridge: MCPToolBridge, tool_info: MCPToolInfo, alwa
         is_concurrency_safe=lambda _input: False,
         is_read_only=lambda _input: False,
         is_destructive=lambda _input: False,
+        mcp_props=MCPToolProps(
+            server_name=tool_info.server_name,
+            original_tool_name=tool_info.name,
+            always_load=always_load,
+            is_deferred=not always_load,  # MCP tools are deferred unless always_load
+        ),
     )
-    metadata = dict(tool_info.metadata)
-    metadata.update({
-        "is_mcp": True,
-        "mcp_server": tool_info.server_name,
-        "mcp_tool_name": tool_info.name,
-        "always_load": always_load,
-        "should_defer": False,
-    })
-    tool.is_mcp = True
-    tool.always_load = always_load
-    tool.should_defer = False
-    tool.metadata = metadata
+    tool.metadata = dict(tool_info.metadata)  # keep for backward compat
     return tool
 
 
@@ -119,23 +114,15 @@ def deferred_mcp_tool(
         is_concurrency_safe=lambda _input: False,
         is_read_only=lambda _input: False,
         is_destructive=lambda _input: False,
+        mcp_props=MCPToolProps(
+            server_name=server_name,
+            original_tool_name=original_tool_name or name,
+            is_deferred=True,
+            always_load=False,
+        ),
     )
 
-    tool_metadata = dict(metadata or {})
-    tool_metadata.update({
-        "is_mcp": True,
-        "is_deferred": True,
-        "mcp_server": server_name,
-        "mcp_tool_name": original_tool_name,
-        "always_load": False,
-        "should_defer": True,
-    })
-    tool.is_mcp = True
-    tool.always_load = False
-    tool.should_defer = True
-    tool.metadata = tool_metadata
-    tool.server_name = server_name
-    tool.original_tool_name = original_tool_name
+    tool.metadata = dict(metadata or {})
     tool.ensure_connected = ensure_connected
     tool.execute = lambda arguments: _sync_execute(tool, arguments)
     tool.is_connected = lambda: bool(state["connected"])
@@ -190,6 +177,67 @@ def adapt_mcp_tools(tool_infos: list[MCPToolInfo], *, manager: Any, defer: bool 
 
 def _sync_execute(tool: Any, arguments: dict[str, Any]) -> Any:
     result = asyncio.run(tool.call(arguments, ToolUseContext()))
+    if result.metadata.get("mcp_error"):
+        raise RuntimeError(result.metadata["mcp_error"])
+    return result.output
+
+
+# ── MCP Resource tools (ListMcpResourcesTool, ReadMcpResourceTool) ──
+
+def create_resource_list_tool(bridge: MCPToolBridge):
+    """Create a ListMcpResourcesTool wrapper for a connected MCP bridge."""
+    server_name = bridge.config.name
+
+    async def call_fn(input: dict, _context: ToolUseContext) -> ToolResult[str]:
+        try:
+            resources = await bridge.list_resources()
+        except Exception as exc:
+            return ToolResult(output="", metadata={"mcp_error": str(exc)})
+        if not resources:
+            return ToolResult(output=f"No resources from MCP server '{server_name}'")
+        lines = [f"MCP resources from '{server_name}':"]
+        for r in resources:
+            lines.append(f"  {r['uri']} — {r['name']} ({r.get('mimeType', '')})")
+        return ToolResult(output="\n".join(lines))
+
+    return build_tool(
+        name=f"mcp__{server_name}__list_resources",
+        description=f"List resources from MCP server '{server_name}'",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        call_fn=call_fn,
+        metadata={"mcp_server": server_name, "is_resource": True},
+    )
+
+
+def create_resource_read_tool(bridge: MCPToolBridge):
+    """Create a ReadMcpResourceTool wrapper for a connected MCP bridge."""
+    server_name = bridge.config.name
+
+    async def call_fn(input: dict, _context: ToolUseContext) -> ToolResult[str]:
+        uri = input.get("uri", "")
+        if not uri:
+            return ToolResult(output="", metadata={"mcp_error": "uri is required"})
+        try:
+            result = await bridge.read_resource(uri)
+        except Exception as exc:
+            return ToolResult(output="", metadata={"mcp_error": str(exc)})
+        contents = result.get("contents", [])
+        if not contents:
+            return ToolResult(output=f"Resource '{uri}' returned empty content")
+        text = "\n".join(c.get("text", "") for c in contents)
+        return ToolResult(output=text)
+
+    return build_tool(
+        name=f"mcp__{server_name}__read_resource",
+        description=f"Read an MCP resource from '{server_name}' by URI",
+        input_schema={
+            "type": "object",
+            "properties": {"uri": {"type": "string", "description": "Resource URI to read"}},
+            "required": ["uri"],
+        },
+        call_fn=call_fn,
+        metadata={"mcp_server": server_name, "is_resource": True},
+    )
     if result.metadata.get("mcp_error"):
         raise RuntimeError(result.metadata["mcp_error"])
     return result.output

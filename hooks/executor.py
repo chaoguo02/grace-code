@@ -1,7 +1,7 @@
 """
 hooks/executor.py
 
-Hook executor: runs external command hooks via subprocess.
+Hook executor: runs external command hooks through Runtime.
 
 Communication protocol:
 - stdin: JSON context (HookContext.to_dict())
@@ -14,11 +14,10 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
-from typing import Any
 
 from hooks.events import HookContext
 from hooks.protocol import HookOutput, HookResult
+from tools.runtime import LocalRuntime, ProcessTermination, Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +29,10 @@ def execute_hook(
     context: HookContext,
     timeout: int = DEFAULT_TIMEOUT,
     cwd: str | None = None,
+    runtime: Runtime | None = None,
 ) -> HookResult:
     """
-    Execute a command-type hook via subprocess.
+    Execute a command-type hook through the injected Runtime.
 
     The context is passed as JSON on stdin.
     stdout is parsed as JSON (HookOutput) if possible, else treated as plain text.
@@ -40,29 +40,32 @@ def execute_hook(
     stdin_data = json.dumps(context.to_dict(), ensure_ascii=False)
 
     try:
-        proc = subprocess.run(
+        if runtime is None:
+            from pathlib import Path
+
+            root = Path(cwd or Path.cwd()).resolve()
+            runtime = LocalRuntime(workspace_root=root)
+        result = runtime.exec(
             command,
-            shell=True,
-            input=stdin_data,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
             cwd=cwd,
+            timeout=timeout,
+            stdin_data=stdin_data,
         )
-    except subprocess.TimeoutExpired:
-        logger.warning("Hook timed out after %ds: %s", timeout, command)
-        return HookResult(exit_code=1, stderr=f"Hook timed out after {timeout}s")
     except Exception as exc:
         logger.warning("Hook execution failed: %s — %s", command, exc)
         return HookResult(exit_code=1, stderr=str(exc))
 
-    stdout = proc.stdout.strip()
-    stderr = proc.stderr.strip()
+    if result.termination is ProcessTermination.TIMED_OUT:
+        logger.warning("Hook timed out after %ds: %s", timeout, command)
+        return HookResult(exit_code=1, stderr=f"Hook timed out after {timeout}s")
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
 
     parsed = _try_parse_output(stdout)
 
     return HookResult(
-        exit_code=proc.returncode,
+        exit_code=result.returncode,
         stdout=stdout,
         stderr=stderr,
         parsed=parsed,

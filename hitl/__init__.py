@@ -14,15 +14,27 @@ Legacy 组件（保留向后兼容）：
 from hitl.request import HitlDecision, HitlRequest, HitlResult, HitlStats
 from hitl.manager import HitlManager
 from hitl.policy import PolicyEngine
-from hitl.pipeline import PermissionPipeline, PermissionResult, PermissionRequest, PromptDecision
-from hitl.permission_rule import PermissionRule
+from hitl.pipeline import (
+    PermissionDecision,
+    PermissionLayer,
+    PermissionPipeline,
+    PermissionRequest,
+    PermissionResult,
+    PromptAction,
+    PromptDecision,
+)
+from hitl.permission_rule import PermissionRule, PermissionRuleTier
 
 __all__ = [
     # New (primary)
     "PermissionPipeline",
+    "PermissionDecision",
+    "PermissionLayer",
     "PermissionResult",
     "PermissionRequest",
     "PermissionRule",
+    "PermissionRuleTier",
+    "PromptAction",
     "PromptDecision",
     # Legacy (backward compat)
     "HitlDecision",

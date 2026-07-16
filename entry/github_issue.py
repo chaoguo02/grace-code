@@ -23,16 +23,19 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import click
+
+if TYPE_CHECKING:
+    from tools.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -109,27 +112,24 @@ def create_pull_request(
 # Git 操作
 # ---------------------------------------------------------------------------
 
-def _run_git(args: list[str], cwd: str) -> tuple[bool, str]:
-    """运行 git 命令，返回 (success, output)。"""
-    try:
-        proc = subprocess.run(
-            ["git"] + args,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            cwd=cwd,
-            encoding="utf-8",
-            errors="replace",
-        )
-        output = (proc.stdout + proc.stderr).strip()
-        return proc.returncode == 0, output
-    except Exception as e:
-        return False, str(e)
+def _run_git(
+    runtime: "Runtime",
+    args: list[str],
+    cwd: str | Path,
+) -> tuple[bool, str]:
+    """Run parameterized Git through the injected Runtime."""
+    result = runtime.execute(
+        "git",
+        args=args,
+        cwd=str(Path(cwd).expanduser().resolve()),
+        timeout=60,
+    )
+    return result.success, result.output.strip()
 
 
-def clone_repo(repo_name: str, local_path: str) -> None:
+def clone_repo(repo_name: str, local_path: str, runtime: "Runtime") -> None:
     """Clone repo 到本地路径（如果已存在则跳过）。"""
-    path = Path(local_path)
+    path = Path(local_path).expanduser().resolve()
     if path.exists() and (path / ".git").exists():
         logger.info("Repo already exists at %s, skipping clone", local_path)
         return
@@ -141,22 +141,25 @@ def clone_repo(repo_name: str, local_path: str) -> None:
         url = f"https://github.com/{repo_name}.git"
 
     click.echo(f"Cloning {repo_name} → {local_path} ...")
-    ok, out = _run_git(["clone", url, local_path], cwd="/tmp")
+    ok, out = _run_git(runtime, ["clone", url, path.name], cwd=path.parent)
     if not ok:
         raise RuntimeError(f"git clone failed: {out}")
 
 
-def create_branch(local_path: str, branch: str) -> None:
+def create_branch(local_path: str, branch: str, runtime: "Runtime") -> None:
     """创建并切换到新分支。"""
-    ok, out = _run_git(["checkout", "-b", branch], cwd=local_path)
+    ok, out = _run_git(runtime, ["checkout", "-b", branch], cwd=local_path)
     if not ok:
         # 分支已存在，切换过去
-        _run_git(["checkout", branch], cwd=local_path)
+        ok, out = _run_git(runtime, ["checkout", branch], cwd=local_path)
+        if not ok:
+            raise RuntimeError(f"git checkout failed: {out}")
 
 
-def push_branch(local_path: str, branch: str) -> None:
+def push_branch(local_path: str, branch: str, runtime: "Runtime") -> None:
     """推送分支到远端。"""
     ok, out = _run_git(
+        runtime,
         ["push", "--set-upstream", "origin", branch],
         cwd=local_path,
     )
@@ -175,6 +178,7 @@ def run_on_issue(
     config_path: str | None = None,
     create_pr: bool = True,
     base_branch: str = "main",
+    runtime: "Runtime | None" = None,
 ) -> int:
     """
     拉取 Issue，运行 agent，创建 PR。
@@ -190,6 +194,11 @@ def run_on_issue(
     from agent.factory import create_agent
     from llm.router import create_backend_from_config
     from observability import configure_observability, flush_observability
+    from tools.runtime import LocalRuntime
+
+    project_path = Path(local_path).expanduser().resolve()
+    runtime_root = project_path if project_path.is_dir() else project_path.parent
+    bootstrap_runtime = runtime or LocalRuntime(workspace_root=runtime_root)
 
     config = load_config(config_path)
     configure_observability(config)
@@ -208,16 +217,18 @@ def run_on_issue(
 
     # 2. Clone（如果需要）
     try:
-        clone_repo(repo_name, local_path)
+        clone_repo(repo_name, str(project_path), bootstrap_runtime)
     except RuntimeError as e:
         click.echo(f"Error: {e}", err=True)
         return 1
+    local_path = str(project_path)
+    runtime = runtime or LocalRuntime(workspace_root=project_path)
     set_project_dir(local_path)
     reset_prompt_usage()
 
     # 3. 创建工作分支
     branch = f"agent/fix-issue-{issue_number}-{int(time.time())}"
-    create_branch(local_path, branch)
+    create_branch(local_path, branch, runtime)
     click.echo(f"  Branch: {branch}")
 
     # 4. 构建 agent
@@ -252,7 +263,7 @@ def run_on_issue(
             enabled=config.memory.enabled,
         )
 
-    registry = _build_registry(config, memory_store=memory_store)
+    registry = _build_registry(config, memory_store=memory_store, runtime=runtime)
 
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
@@ -299,7 +310,7 @@ def run_on_issue(
     if create_pr:
         click.echo("\nPushing branch ...")
         try:
-            push_branch(local_path, branch)
+            push_branch(local_path, branch, runtime)
         except RuntimeError as e:
             click.echo(f"Warning: push failed: {e}", err=True)
             click.echo("Changes are committed locally. Push manually to create a PR.")

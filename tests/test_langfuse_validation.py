@@ -9,6 +9,7 @@ from observability.validation import (
     default_baseline_output_path,
     ValidationResult,
     evaluate_validation_result,
+    failure_dataset_path_for,
     failure_dataset_line_count,
     get_langfuse_validation_scenarios,
     selected_validation_scenarios,
@@ -54,7 +55,7 @@ def test_evaluate_validation_result_checks_dataset_behavior() -> None:
 def test_failure_dataset_line_count_and_json_report() -> None:
     with tempfile.TemporaryDirectory(dir=".") as tmp_dir:
         repo_path = Path(tmp_dir)
-        dataset_path = repo_path / ".forge-agent" / "datasets" / "forge-agent-failures.jsonl"
+        dataset_path = failure_dataset_path_for(str(repo_path))
         dataset_path.parent.mkdir(parents=True, exist_ok=True)
         dataset_path.write_text('{"id":"x"}\n{"id":"y"}\n', encoding="utf-8")
 

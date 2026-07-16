@@ -89,6 +89,18 @@ class RecordingDreamRunner:
         return True
 
 
+def test_dream_agent_exposes_no_shell_tool(tmp_path):
+    from memory.dream_agent import DreamAgent
+
+    agent = DreamAgent(memory_dir=tmp_path, backend=object())
+
+    assert {schema["name"] for schema in agent._tool_schemas()} == {
+        "read_file",
+        "grep",
+        "write_file",
+    }
+
+
 class TestAutoDreamConsolidation:
     def test_record_session_end_only_increments_counter(self, tmp_path):
         from memory.consolidation import _read_session_counter, record_session_end
@@ -193,59 +205,6 @@ class TestConsolidationLock:
 
         result = _acquire_lock(lock_path, now_ms=now_ms)
         assert result is False
-
-
-# ─── Write-protection / anti-overwrite (改动 5) ───────────────────────────────
-
-@pytest.mark.skip(reason="Intermittent KeyboardInterrupt in this environment; covered by memory write discipline tests separately.")
-class TestProactiveMemoryWriteProtection:
-    def test_explicit_write_suppresses_auto_extraction(self, tmp_path):
-        """After notify_explicit_memory_write(), check_user_message() should be skipped."""
-        from memory.store import MemoryStore
-        from memory.proactive import ProactiveMemory
-
-        store = MemoryStore(repo_path=str(tmp_path), memory_dir=str(tmp_path / "mem"))
-        pm = ProactiveMemory(store)
-
-        # Simulate: user explicitly wrote a memory
-        pm.notify_explicit_memory_write()
-
-        # This correction pattern would normally trigger a save
-        pm.check_user_message("don't use raw SQL queries, use the ORM instead")
-
-        # No memory should be saved (suppressed)
-        memories = store.list_memories()
-        assert len(memories) == 0
-
-    def test_reset_turn_clears_suppression(self, tmp_path):
-        """After reset_turn(), auto-extraction should work again."""
-        from memory.store import MemoryStore
-        from memory.proactive import ProactiveMemory
-
-        store = MemoryStore(repo_path=str(tmp_path), memory_dir=str(tmp_path / "mem"))
-        pm = ProactiveMemory(store)
-
-        pm.notify_explicit_memory_write()
-        pm.reset_turn()
-
-        # Now it should work
-        pm.check_user_message("don't use raw SQL queries, use the ORM instead")
-
-        memories = store.list_memories()
-        assert len(memories) >= 1
-
-    def test_without_explicit_write_extraction_works(self, tmp_path):
-        """Without explicit write, auto-extraction should work normally."""
-        from memory.store import MemoryStore
-        from memory.proactive import ProactiveMemory
-
-        store = MemoryStore(repo_path=str(tmp_path), memory_dir=str(tmp_path / "mem"))
-        pm = ProactiveMemory(store)
-
-        pm.check_user_message("stop using console.log for debugging, use the logger")
-
-        memories = store.list_memories()
-        assert len(memories) >= 1
 
 
 # ─── Memory list pagination/filtering ─────────────────────────────────────────

@@ -14,13 +14,14 @@ tools/base.py
 
 from __future__ import annotations
 
+import copy
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
-from agent.task import Observation, ObservationStatus
+from agent.task import Observation, ObservationStatus, ToolOutcome
 from llm.base import LLMToolSchema
 
 
@@ -36,6 +37,118 @@ class RiskLevel(str, Enum):
     HIGH = "high"       # shell(dangerous), git_commit — 不可逆，总是提示
 
 
+class ToolEffect(str, Enum):
+    """Observable effect of a successful tool call."""
+
+    UNKNOWN = "unknown"
+    READ_WORKSPACE = "read_workspace"
+    WRITE_WORKSPACE = "write_workspace"
+    DISCOVER_WORKSPACE = "discover_workspace"
+    READ_VCS = "read_vcs"
+    WRITE_VCS = "write_vcs"
+    NETWORK = "network"
+    READ_AGENT_STATE = "read_agent_state"
+    WRITE_AGENT_STATE = "write_agent_state"
+    PRODUCE_DELIVERABLE = "produce_deliverable"
+    EXECUTE = "execute"
+    TEST = "test"
+    DELEGATE_READ_ONLY = "delegate_read_only"
+    DELEGATE_WRITE = "delegate_write"
+
+
+class PathAccess(str, Enum):
+    NONE = "none"
+    READ = "read"
+    WRITE = "write"
+    DISCOVER = "discover"
+    DIFF = "diff"
+    WORKSPACE_WIDE = "workspace_wide"
+
+
+class ToolDependency(str, Enum):
+    NONE = "none"
+    ARTIFACT_STORE = "artifact_store"
+    EVIDENCE_LEDGER = "evidence_ledger"
+
+
+class ToolRole(str, Enum):
+    """Runtime protocol roles that cannot be inferred from a tool's name."""
+
+    PERSIST_MEMORY = "persist_memory"
+    DELEGATE = "delegate"
+
+
+class ToolConcurrency(str, Enum):
+    """Runtime scheduling contract declared by each tool call."""
+
+    SERIAL = "serial"
+    PARALLEL_SAFE = "parallel_safe"
+
+
+@dataclass(frozen=True)
+class ToolMetadata:
+    """Declarative Runtime contract owned by the tool implementation."""
+
+    effects: frozenset[ToolEffect] = frozenset({ToolEffect.UNKNOWN})
+    path_access: PathAccess = PathAccess.NONE
+    path_parameter: str = ""
+    dependency: ToolDependency = ToolDependency.NONE
+    roles: frozenset[ToolRole] = frozenset()
+
+
+# ---------------------------------------------------------------------------
+# ToolError — structured tool error information
+# ---------------------------------------------------------------------------
+
+class ToolErrorType(str, Enum):
+    """Stable machine-readable categories for tool failures."""
+
+    TIMEOUT = "timeout"
+    INTERRUPTED = "interrupted"
+    ENVIRONMENT_UNAVAILABLE = "environment_unavailable"
+    PROCESS_FAILED = "process_failed"
+    PERMISSION_DENIED = "permission_denied"
+    NOT_FOUND = "not_found"
+    INTERNAL = "internal"
+    INVALID_PARAMS = "invalid_params"
+    UNAVAILABLE = "unavailable"
+
+
+class ToolRetryDirective(str, Enum):
+    """Explicit Runtime guidance; never inferred from diagnostic prose."""
+
+    RETRY = "retry"
+    DO_NOT_RETRY = "do_not_retry"
+
+
+@dataclass(frozen=True)
+class ToolError:
+    """Structured error from tool execution.
+
+    Unlike raw string errors, this gives the Runtime and LLM enough
+    information to decide: should I retry? Is there an alternative tool?
+
+    The Runtime owns both the typed category and retry directive. Human-readable
+    detail is presentation only and must never drive state transitions.
+    """
+
+    error_type: ToolErrorType
+    retry: ToolRetryDirective = ToolRetryDirective.DO_NOT_RETRY
+    alternative: str = "" # suggested alternative tool name, e.g. "shell" for "bash"
+    detail: str = ""      # human-readable detail for the LLM
+
+    def to_message(self) -> str:
+        """Format as a single line for LLM context injection."""
+        parts = [f"[{self.error_type.value}]"]
+        if self.detail:
+            parts.append(f" {self.detail}")
+        if self.retry is ToolRetryDirective.RETRY:
+            parts.append(" (retryable)")
+        if self.alternative:
+            parts.append(f" (try '{self.alternative}' instead)")
+        return "".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # ToolResult
 # ---------------------------------------------------------------------------
@@ -48,21 +161,173 @@ class ToolResult:
     """
     success: bool
     output: str                         # 工具的文本输出，已做截断处理
-    error: str | None = None            # 失败时的错误信息
+    error: str | None = None            # 失败时的错误信息（向后兼容，建议使用 tool_error）
+    tool_error: ToolError | None = None # 结构化错误信息（新增，Runtime可据此决策）
     duration_ms: float = 0.0            # 工具执行耗时（毫秒），由 ToolRegistry 填充
+    cached: bool = False                # True = 结果来自缓存命中（无实际 I/O）
+    subagent_tokens_used: int = 0       # 子代理消耗的 token 数，父代理预算需计入
+    structured_findings: tuple = ()     # 子代理的结构化发现（Finding dicts），用于自动记忆沉淀
+    outcome: ToolOutcome = ToolOutcome.NONE
 
     def to_observation(self, tool_name: str) -> Observation:
         """转换为 Observation，供 core.py 写入 EventLog 和注入上下文。"""
+        metadata: dict[str, Any] = {}
+        if self.tool_error is not None:
+            metadata["tool_error"] = {
+                "error_type": self.tool_error.error_type.value,
+                "retry": self.tool_error.retry.value,
+                "alternative": self.tool_error.alternative,
+            }
         return Observation(
             status=ObservationStatus.SUCCESS if self.success else ObservationStatus.ERROR,
             output=self.output,
             tool_name=tool_name,
-            error=self.error,
+            error=self._format_error_for_observation(),
+            metadata=metadata,
+            outcome=self.outcome,
+        )
+
+    def _format_error_for_observation(self) -> str | None:
+        """Build error message, preferring structured tool_error over raw string."""
+        if self.tool_error is not None:
+            return self.tool_error.to_message()
+        return self.error
+
+    @classmethod
+    def from_error(
+        cls,
+        error_type: ToolErrorType,
+        detail: str = "",
+        *,
+        retry: ToolRetryDirective = ToolRetryDirective.DO_NOT_RETRY,
+        alternative: str = "",
+    ) -> "ToolResult":
+        """Factory: create a failed ToolResult with structured error."""
+        return cls(
+            success=False,
+            output="",
+            error=detail,
+            tool_error=ToolError(
+                error_type=error_type,
+                retry=retry,
+                alternative=alternative,
+                detail=detail,
+            ),
         )
 
 
 # ---------------------------------------------------------------------------
+# Runtime error classification — framework-level, not tool-specific
+# ---------------------------------------------------------------------------
+
+def classify_runtime_error(run_result: Any, cmd: str = "") -> ToolError | None:
+    """Map Runtime-owned process facts to a typed tool failure.
+
+    stderr/stdout remain presentation data. They are deliberately excluded
+    from classification so diagnostic wording cannot change control flow.
+    """
+    from tools.runtime import ProcessTermination
+
+    if run_result.success:
+        return None
+
+    cmd_name = cmd.split()[0] if cmd.strip() else "command"
+
+    if run_result.termination is ProcessTermination.TIMED_OUT:
+        return ToolError(
+            error_type=ToolErrorType.TIMEOUT,
+            retry=ToolRetryDirective.RETRY,
+            detail=f"Command timed out: {cmd[:80]!r}",
+        )
+
+    if run_result.termination is ProcessTermination.INTERRUPTED:
+        return ToolError(
+            error_type=ToolErrorType.INTERRUPTED,
+            detail=f"Command interrupted: {cmd[:80]!r}",
+        )
+
+    if (
+        run_result.termination is ProcessTermination.START_FAILED
+        or run_result.returncode in (127, 9009)
+    ):
+        return ToolError(
+            error_type=ToolErrorType.ENVIRONMENT_UNAVAILABLE,
+            detail=f"Runtime could not start {cmd_name!r}. {run_result.stderr.strip()[:200]}",
+            alternative=f"Provide a project-local or Runtime-injected {cmd_name!r} executable.",
+        )
+
+    return ToolError(
+        error_type=ToolErrorType.PROCESS_FAILED,
+        retry=ToolRetryDirective.RETRY,
+        detail=(
+            f"Exit code {run_result.returncode}: "
+            f"{run_result.stderr.strip()[:200] or run_result.stdout.strip()[:200]}"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # BaseTool
+# ---------------------------------------------------------------------------
+# ExecutionContext — unified environment passed to every tool invocation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExecutionContext:
+    """Environment context available to every tool at execution time.
+
+    Tools destructure what they need from this object. No more
+    requires_workspace / requires_git_root flags on BaseTool.
+    """
+    workspace_root: str = ""
+    repo_path: str = ""
+
+
+@runtime_checkable
+class WorkspaceAware(Protocol):
+    """Protocol: tools that accept a workspace_root for path resolution.
+
+    Use isinstance(tool, WorkspaceAware) instead of hasattr(tool, '_workspace_root').
+    This is type-safe — static checkers verify the attribute exists.
+    """
+    _workspace_root: str
+
+
+@runtime_checkable
+class ScopableRuntime(Protocol):
+    def scoped(self, workspace_root: str) -> Any:
+        ...
+
+
+@runtime_checkable
+class ProjectScopablePermissionPipeline(Protocol):
+    """Permission pipeline that can bind its path sandbox to a child project root."""
+
+    def scoped(self, project_root: str) -> Any:
+        ...
+
+
+@runtime_checkable
+class AgentScopablePermissionPipeline(Protocol):
+    """Permission pipeline that can identify a requesting child agent."""
+
+    def for_agent(self, agent_name: str) -> Any:
+        ...
+
+
+@runtime_checkable
+class RuntimeBoundTool(Protocol):
+    _runtime: Any
+
+
+@runtime_checkable
+class RunContextAware(Protocol):
+    """Protocol for tools that consume typed, per-run Runtime resources."""
+
+    def with_run_context(self, context: Any) -> "BaseTool":
+        ...
+
+
 # ---------------------------------------------------------------------------
 
 class BaseTool(ABC):
@@ -74,6 +339,30 @@ class BaseTool(ABC):
     - schema:   JSON Schema 描述，告诉 LLM 这个工具怎么用
     - execute(): 实际执行逻辑
     """
+
+    aliases: tuple[str, ...] = ()
+    """Alternative names the LLM might use (Claude Code conventions)."""
+
+    _registry: Any = None
+    """Injected by ToolRegistry.register() — enables signal tools to set
+    mode-switch flags on the registry for the main loop to pick up."""
+
+    metadata = ToolMetadata()
+
+    def bind_context(self, context: ExecutionContext) -> "BaseTool":
+        """Clone this tool and inject one session's immutable project scope."""
+        bound = copy.copy(self)
+        if isinstance(bound, WorkspaceAware):
+            bound._workspace_root = context.workspace_root
+        if isinstance(bound, RuntimeBoundTool):
+            if ToolRole.DELEGATE in bound.metadata.roles:
+                return bound
+            if not isinstance(bound._runtime, ScopableRuntime):
+                raise ValueError(
+                    f"Tool {bound.name!r} runtime cannot bind workspace context"
+                )
+            bound._runtime = bound._runtime.scoped(context.workspace_root)
+        return bound
 
     @property
     @abstractmethod
@@ -114,6 +403,14 @@ class BaseTool(ABC):
         """
         return self.risk_level
 
+    def permission_denial_reason(self, params: dict[str, Any]) -> str | None:
+        """Return a Runtime safety denial reason, or ``None`` when valid."""
+        return None
+
+    def concurrency_mode(self, params: dict[str, Any]) -> ToolConcurrency:
+        """Declare whether this specific call may run beside sibling calls."""
+        return ToolConcurrency.SERIAL
+
     @abstractmethod
     def execute(self, params: dict[str, Any]) -> ToolResult:
         """执行工具，返回 ToolResult。不抛异常——所有异常已在内部处理。"""
@@ -129,6 +426,153 @@ class BaseTool(ABC):
 
 
 # ---------------------------------------------------------------------------
+# Path safety — hard security boundary for file tools
+# ---------------------------------------------------------------------------
+# Defense in Depth (three layers):
+#   1. sanitize_path()  — string-level ../ removal (Sanitizer)
+#   2. is_path_safe()   — parent directory resolution check
+#   3. safe_open_for_write() — platform-adaptive atomic open (TOCTOU protection)
+#
+# On POSIX: uses O_NOFOLLOW to atomically reject symlinks
+# On Windows: checks is_symlink() before open (no kernel-level symlink TOCTOU on Win)
+
+import errno as _errno
+import os as _os
+import sys as _sys
+from pathlib import Path as _Path
+
+# Platform-adaptive: O_NOFOLLOW is POSIX-only
+_O_NOFOLLOW = getattr(_os, "O_NOFOLLOW", 0)
+
+
+def sanitize_path(user_path: str, workspace_root: str) -> str:
+    """Clean user-supplied path: resolve ../, ensure within workspace.
+
+    Layer 1 (Sanitizer): string-level path normalization. Runs BEFORE
+    any file operation. Strips ../ traversal attempts without touching
+    the filesystem.
+    """
+    if _os.path.isabs(user_path):
+        clean = _os.path.normpath(user_path)
+    else:
+        clean = _os.path.normpath(_os.path.join(workspace_root, user_path))
+
+    ws = _os.path.normpath(workspace_root)
+    if not clean.startswith(ws):
+        raise ValueError(
+            f"Path '{user_path}' resolves to '{clean}' which escapes "
+            f"workspace '{workspace_root}'"
+        )
+    return clean
+
+
+def is_path_safe(target: str, workspace_root: str) -> bool:
+    """Check that target path (resolved, symlinks followed) is within workspace.
+
+    Layer 2: filesystem-level boundary check. Resolves symlinks on the
+    full path. Use this for reading existing files. For writing, use
+    resolve_safe_parent() + O_NOFOLLOW to prevent TOCTOU.
+    """
+    try:
+        target_path = _Path(target).resolve()
+        root_path = _Path(workspace_root).resolve()
+        target_path.relative_to(root_path)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def resolve_safe_parent(target: str, workspace_root: str) -> tuple[str, str] | tuple[None, str]:
+    """Resolve parent directory and return (safe_full_path, error).
+
+    Layer 3 preparation for TOCTOU-safe writes:
+      1. Sanitize the path string
+      2. Resolve the PARENT directory (follows symlinks on dirs)
+      3. Check resolved parent is within workspace
+      4. Return (parent/target_name, "") — caller opens with O_NOFOLLOW
+
+    Does NOT follow symlinks on the final path component — that's the
+    caller's job via O_NOFOLLOW.
+    """
+    # 1. Sanitize
+    try:
+        clean = sanitize_path(target, workspace_root)
+    except ValueError as e:
+        return None, str(e)
+
+    p = _Path(clean)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return None, f"Cannot create parent directory: {e}"
+
+    # 2. Resolve parent (follows symlinks on directory components)
+    try:
+        parent_resolved = p.parent.resolve()
+    except OSError as e:
+        return None, f"Cannot resolve parent directory: {e}"
+
+    # 3. Check parent within workspace
+    try:
+        ws = _Path(workspace_root).resolve()
+        parent_resolved.relative_to(ws)
+    except ValueError:
+        return None, (
+            f"Parent directory '{parent_resolved}' is outside "
+            f"workspace '{ws}'"
+        )
+
+    full = str(parent_resolved / p.name)
+    return full, ""
+
+
+def safe_open_for_write(full_path: str) -> tuple[int | None, str]:
+    """Open a file for writing with TOCTOU protection. Returns (fd, error).
+
+    On POSIX: uses O_NOFOLLOW — kernel rejects symlinks atomically.
+    On Windows: checks is_symlink() before open (no kernel symlink TOCTOU).
+    """
+    p = _Path(full_path)
+    # Windows: explicit symlink check (O_NOFOLLOW is not available)
+    if _sys.platform == "win32" and p.exists() and p.is_symlink():
+        return None, f"Cannot write to symlink: {full_path}"
+    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC
+    if _O_NOFOLLOW:
+        flags |= _O_NOFOLLOW
+    try:
+        fd = _os.open(full_path, flags)
+        return fd, ""
+    except OSError as e:
+        return None, f"Cannot open for write '{full_path}': {e}"
+
+
+def safe_create_file(full_path: str) -> tuple[int | None, str]:
+    """Create a NEW file with TOCTOU protection. Returns (fd, error).
+    Fails if the file already exists (O_EXCL)."""
+    p = _Path(full_path)
+    if _sys.platform == "win32" and p.exists():
+        return None, f"File already exists: {full_path}"
+    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL
+    if _O_NOFOLLOW:
+        flags |= _O_NOFOLLOW
+    try:
+        fd = _os.open(full_path, flags)
+        return fd, ""
+    except OSError as e:
+        return None, f"Cannot create '{full_path}': {e}"
+
+
+def safe_read_text(target: str, workspace_root: str) -> tuple[str | None, str]:
+    """Read file content with path safety check. Returns (content, error)."""
+    if not is_path_safe(target, workspace_root):
+        return None, f"Path '{target}' is outside workspace"
+    try:
+        return _Path(target).read_text(encoding="utf-8", errors="replace"), ""
+    except OSError as e:
+        return None, str(e)
+
+
+# ---------------------------------------------------------------------------
 # ToolRegistry
 # ---------------------------------------------------------------------------
 
@@ -140,12 +584,25 @@ class ToolRegistry:
     3. 记录每个工具的执行耗时统计（get_timing_stats）
     """
 
-    def __init__(self, hitl_manager: Any = None, permission_pipeline: Any = None, hook_dispatcher: Any = None) -> None:
+    def __init__(
+        self,
+        hitl_manager: Any = None,
+        permission_pipeline: Any = None,
+        hook_dispatcher: Any = None,
+        capability_registry: Any = None,
+    ) -> None:
+        """Create a tool registry with optional Runtime-owned intercept layers.
+
+        All parameters are Protocol-typed in the type stubs; ``Any`` at runtime
+        avoids circular imports from hitl/hooks packages.
+        """
         self._tools: dict[str, BaseTool] = {}
+        self._tool_aliases: dict[str, str] = {}  # alias → canonical name
         self._permission_pipeline = permission_pipeline
         # Backward compat: hitl_manager still accepted, pipeline takes precedence
         self._hitl_manager = hitl_manager
         self._hook_dispatcher = hook_dispatcher
+        self._capability_registry = capability_registry  # dynamic capability check
         self._timing_stats: dict[str, dict[str, float | int]] = {}
 
     def register(self, tool: BaseTool) -> "ToolRegistry":
@@ -156,7 +613,42 @@ class ToolRegistry:
         if tool.name in self._tools:
             raise ValueError(f"Tool '{tool.name}' is already registered.")
         self._tools[tool.name] = tool
+        # Inject registry reference so signal tools can set mode-switch flags
+        tool._registry = self
+        # Register aliases (tool naming aligned with LLM prior knowledge)
+        for alias in getattr(tool, "aliases", ()):
+            if alias in self._tool_aliases:
+                logger.warning("Tool alias '%s' → '%s' shadowed by existing alias → '%s'",
+                               alias, tool.name, self._tool_aliases[alias])
+            self._tool_aliases[alias] = tool.name
         return self
+
+    def resolve_name(self, name: str) -> str | None:
+        """Resolve a possibly-aliased tool name to its canonical name.
+
+        Returns the canonical name if the tool exists (directly or via alias),
+        or None if the tool is completely unknown.
+        """
+        if name in self._tools:
+            return name
+        return self._tool_aliases.get(name)
+
+    def metadata_for(self, name: str) -> ToolMetadata | None:
+        """Return metadata for a canonical or aliased registered tool."""
+        canonical = self.resolve_name(name)
+        if canonical is None:
+            return None
+        metadata = getattr(self._tools[canonical], "metadata", None)
+        return metadata if isinstance(metadata, ToolMetadata) else ToolMetadata()
+
+    def concurrency_for(
+        self, name: str, params: dict[str, Any],
+    ) -> ToolConcurrency:
+        """Return a call-specific scheduling fact; unknown calls fail closed."""
+        canonical = self.resolve_name(name)
+        if canonical is None:
+            return ToolConcurrency.SERIAL
+        return self._tools[canonical].concurrency_mode(params)
 
     def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
         """
@@ -167,27 +659,48 @@ class ToolRegistry:
         start = time.perf_counter()
         result: ToolResult
 
-        if name not in self._tools:
+        # Resolve aliases — LLM may use Claude Code naming conventions
+        canonical = self.resolve_name(name)
+        if canonical is None:
             available = ", ".join(self._tools.keys()) or "none"
-            result = ToolResult(
-                success=False,
-                output="",
-                error=f"Unknown tool '{name}'. Available tools: {available}",
+            result = ToolResult.from_error(
+                error_type=ToolErrorType.NOT_FOUND,
+                detail=f"Unknown tool '{name}'. Available tools: {available}",
             )
             self._record_timing(name, start, result)
             return result
 
-        tool = self._tools[name]
+        tool = self._tools[canonical]
+
+        # Runtime-owned capability facts physically remove unavailable tools.
+        if self._capability_registry is not None:
+            import json as _json
+            from agent.capability_registry import InterceptDecision
+            intercept = self._capability_registry.intercept(
+                canonical, session_id=getattr(self, "_session_id", ""),
+            )
+            if intercept.decision is InterceptDecision.BLOCK:
+                feedback_json = _json.dumps(intercept.feedback, ensure_ascii=False)
+                result = ToolResult.from_error(
+                    error_type=ToolErrorType.UNAVAILABLE,
+                    detail=f"Tool '{name}' blocked: {feedback_json}",
+                )
+                self._record_timing(name, start, result)
+                return result
 
         # Permission Pipeline gate (5-layer evaluation)
         if self._permission_pipeline is not None:
             perm_result = self._permission_pipeline.check(tool, params, thought=thought)
-            if not perm_result.approved:
+            from hitl.pipeline import PermissionDecision
+            if perm_result.decision is PermissionDecision.DENY:
                 feedback = getattr(perm_result, "feedback", "")
                 error_msg = f"Tool '{name}' denied: {perm_result.reason}"
                 if feedback:
                     error_msg += f" Feedback: {feedback}"
-                result = ToolResult(success=False, output="", error=error_msg)
+                result = ToolResult.from_error(
+                    error_type=ToolErrorType.PERMISSION_DENIED,
+                    detail=error_msg,
+                )
                 self._record_timing(name, start, result)
                 return result
         # Legacy HITL gate (backward compat when no pipeline)
@@ -198,7 +711,10 @@ class ToolRegistry:
                 error_msg = f"Tool '{name}' denied by user."
                 if note:
                     error_msg += f" Feedback: {note}"
-                result = ToolResult(success=False, output="", error=error_msg)
+                result = ToolResult.from_error(
+                    error_type=ToolErrorType.PERMISSION_DENIED,
+                    detail=error_msg,
+                )
                 self._record_timing(name, start, result)
                 return result
 
@@ -206,10 +722,9 @@ class ToolRegistry:
             result = tool.execute(params)
         except Exception as exc:
             # 工具内部未捕获的异常，降级为 error 结果
-            result = ToolResult(
-                success=False,
-                output="",
-                error=f"Tool '{name}' raised an unexpected error: {exc}",
+            result = ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                detail=f"Tool '{name}' raised an unexpected error: {exc}",
             )
 
         # Fire PostToolUse / PostToolUseFailure hook
@@ -230,12 +745,72 @@ class ToolRegistry:
         return list(self._tools.keys())
 
     def filtered(self, allowed_tools: set[str] | frozenset[str]) -> "ToolRegistry":
-        """返回只包含指定工具的新注册表，保留 HITL 管理器但不共享统计数据。"""
-        filtered = ToolRegistry(hitl_manager=self._hitl_manager)
+        """返回只包含指定工具的新注册表，保留所有拦截层（pipeline, HITL, hooks, capability）。"""
+        filtered = ToolRegistry(
+            hitl_manager=self._hitl_manager,
+            permission_pipeline=self._permission_pipeline,
+            hook_dispatcher=self._hook_dispatcher,
+            capability_registry=self._capability_registry,
+        )
         for tool_name in self.tool_names:
             if tool_name in allowed_tools:
                 filtered._tools[tool_name] = self._tools[tool_name]
+        # Preserve aliases for filtered tools — critical for LLM tool name
+        # compatibility (e.g. "file_read" → "Read", "search_text" → "Grep")
+        for alias, canonical in self._tool_aliases.items():
+            if canonical in filtered._tools:
+                filtered._tool_aliases[alias] = canonical
         return filtered
+
+    def excluding_roles(self, roles: frozenset[ToolRole]) -> "ToolRegistry":
+        """Return a registry without tools owning any prohibited protocol role."""
+        return self.filtered(frozenset(
+            name
+            for name in self.tool_names
+            if not (self.metadata_for(name).roles & roles)
+        ))
+
+    def with_permission_request_origin(self, agent_name: str) -> "ToolRegistry":
+        """Clone registry policy and identify its child permission requester."""
+        derived = copy.copy(self)
+        derived._timing_stats = {}
+        pipeline = self._permission_pipeline
+        if isinstance(pipeline, AgentScopablePermissionPipeline):
+            derived._permission_pipeline = pipeline.for_agent(agent_name)
+        return derived
+
+    def scoped(self, context: ExecutionContext) -> "ToolRegistry":
+        """Clone registered tools into an isolated per-session context."""
+        permission_pipeline = self._permission_pipeline
+        if isinstance(permission_pipeline, ProjectScopablePermissionPipeline):
+            permission_pipeline = permission_pipeline.scoped(
+                context.repo_path or context.workspace_root
+            )
+        scoped = ToolRegistry(
+            hitl_manager=self._hitl_manager,
+            permission_pipeline=permission_pipeline,
+            hook_dispatcher=self._hook_dispatcher,
+            capability_registry=self._capability_registry,
+        )
+        for tool in self._tools.values():
+            scoped.register(tool.bind_context(context))
+        return scoped
+
+    def with_run_context(self, context: Any) -> "ToolRegistry":
+        """Clone only tools that declaratively consume per-run resources."""
+        # Preserve registry-level dependency references and session metadata;
+        # only tool instances and per-run counters belong to the new binding.
+        bound = copy.copy(self)
+        bound._tools = {}
+        bound._tool_aliases = {}
+        bound._timing_stats = {}
+        for tool in self._tools.values():
+            bound.register(
+                tool.with_run_context(context)
+                if isinstance(tool, RunContextAware)
+                else tool
+            )
+        return bound
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools

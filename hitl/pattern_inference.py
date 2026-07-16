@@ -13,7 +13,7 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Any
 
-from hitl.permission_rule import PermissionRule
+from hitl.permission_rule import PermissionRule, PermissionRuleTier
 
 
 def infer_permission_pattern(tool_name: str, params: dict[str, Any]) -> PermissionRule:
@@ -31,20 +31,20 @@ def infer_permission_pattern(tool_name: str, params: dict[str, Any]) -> Permissi
     if name == "shell":
         cmd = params.get("cmd", "")
         pattern = _infer_shell_pattern(cmd)
-        return PermissionRule.parse(f"shell({pattern})", tier="allow", source="session")
+        return PermissionRule.parse(f"shell({pattern})", tier=PermissionRuleTier.ALLOW, source="session")
 
     if name in ("file_write", "file_edit"):
         path = params.get("path", "")
         dir_pattern = _infer_path_pattern(path)
-        return PermissionRule.parse(f"{name}({dir_pattern})", tier="allow", source="session")
+        return PermissionRule.parse(f"{name}({dir_pattern})", tier=PermissionRuleTier.ALLOW, source="session")
 
     if name in ("file_read", "file_view"):
         path = params.get("path", "")
         dir_pattern = _infer_path_pattern(path)
-        return PermissionRule.parse(f"{name}({dir_pattern})", tier="allow", source="session")
+        return PermissionRule.parse(f"{name}({dir_pattern})", tier=PermissionRuleTier.ALLOW, source="session")
 
     # Generic: allow all calls to this tool
-    return PermissionRule.parse(name, tier="allow", source="session")
+    return PermissionRule.parse(name, tier=PermissionRuleTier.ALLOW, source="session")
 
 
 def _infer_shell_pattern(cmd: str) -> str:

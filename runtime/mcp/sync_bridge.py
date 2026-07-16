@@ -11,18 +11,33 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any
 
-from runtime.mcp.client import MCPCallResult, MCPToolBridge
+from runtime.mcp.client import MCPCallResult, MCPToolBridge, create_mcp_bridge
 from runtime.mcp.tool_adapter import mcp_tool_to_runtime_tool
 from runtime.mcp.types import MCPServerConfig
 
 logger = logging.getLogger(__name__)
 
 
+# ── Per-transport defaults (Claude Code alignment) ──
+# These are used when the server config does not specify explicit values.
+DEFAULT_EXECUTION_TIMEOUT = 30.0       # total timeout per attempt
+DEFAULT_IDLE_TIMEOUT_STDIO = 1800.0    # 30 min idle for local processes
+DEFAULT_IDLE_TIMEOUT_HTTP = 300.0      #  5 min idle for remote servers
+
+
 @dataclass(frozen=True)
 class ExecutionPolicy:
-    """Synchronous MCP tool execution policy."""
+    """Synchronous MCP tool execution policy.
 
-    timeout: float = 30.0
+    timeout:     total wall-clock timeout per attempt (including retries).
+    idle_timeout: max idle time waiting for a single future result.
+                  None means no idle check (backward compatible).
+                  For stdio servers this should be very long (30 min);
+                  for HTTP servers this should be shorter (5 min).
+    """
+
+    timeout: float = DEFAULT_EXECUTION_TIMEOUT
+    idle_timeout: float | None = None
     max_retries: int = 2
     backoff_base: float = 0.5
     backoff_factor: float = 2.0
@@ -62,7 +77,15 @@ class MCPToolExhaustedError(RuntimeError):
 
 
 class SyncMCPToolManager:
-    """Manage MCP bridges on a persistent background event loop."""
+    """Manage MCP bridges on a persistent background event loop.
+
+    MCP-04: Automatic reconnection with exponential backoff.
+    When a bridge disconnects (ConnectionError during tool call), the manager
+    attempts up to MAX_RECONNECT_ATTEMPTS reconnections with exponential delay.
+    """
+
+    MAX_RECONNECT_ATTEMPTS = 5
+    RECONNECT_BASE_DELAY = 1.0  # seconds
 
     def __init__(self, *, default_policy: ExecutionPolicy | None = None) -> None:
         self._loop = asyncio.new_event_loop()
@@ -88,7 +111,7 @@ class SyncMCPToolManager:
         self._ensure_open()
         runtime_tools: list[Any] = []
         for config in server_configs:
-            bridge = MCPToolBridge(config)
+            bridge = create_mcp_bridge(config)
             try:
                 tools = self._run_coro(bridge.connect())
             except Exception as exc:  # pragma: no cover - exact SDK failures vary
@@ -104,6 +127,12 @@ class SyncMCPToolManager:
                 runtime_tool = mcp_tool_to_runtime_tool(bridge, tool_info)
                 runtime_tools.append(runtime_tool)
                 self._tool_map[runtime_tool.name] = (config.name, tool_info.name)
+            # MCP Resources: also register resource list/read tools
+            from runtime.mcp.tool_adapter import create_resource_list_tool, create_resource_read_tool
+            resource_list_tool = create_resource_list_tool(bridge)
+            runtime_tools.append(resource_list_tool)
+            resource_read_tool = create_resource_read_tool(bridge)
+            runtime_tools.append(resource_read_tool)
         return runtime_tools
 
     def execute_tool(
@@ -133,7 +162,12 @@ class SyncMCPToolManager:
                 time.sleep(backoff)
 
             try:
-                return self._execute_once(runtime_tool_name, arguments, timeout=active_policy.timeout, attempt=attempt)
+                return self._execute_once(
+                    runtime_tool_name, arguments,
+                    timeout=active_policy.timeout,
+                    idle_timeout=active_policy.idle_timeout,
+                    attempt=attempt,
+                )
             except active_policy.retryable_exceptions as exc:
                 last_error = exc
                 logger.warning(
@@ -183,6 +217,7 @@ class SyncMCPToolManager:
         arguments: dict[str, Any],
         *,
         timeout: float,
+        idle_timeout: float | None = None,
         attempt: int = 0,
     ) -> MCPCallResult:
         parsed = self._tool_map.get(runtime_tool_name)
@@ -193,17 +228,34 @@ class SyncMCPToolManager:
 
         server_name, tool_name = parsed
         bridge = self._bridges.get(server_name)
-        if bridge is None or not bridge.is_connected:
+        if bridge is None:
             raise ConnectionError(f"MCP server '{server_name}' is not connected")
+
+        # MCP-04: attempt reconnection if bridge disconnected
+        if not bridge.is_connected:
+            logger.info("MCP server '%s' disconnected, attempting reconnect...", server_name)
+            if hasattr(self, "_loop") and self._loop is not None:
+                reconnected = self._run_coro(self._reconnect(server_name, bridge))
+                if not reconnected:
+                    raise ConnectionError(
+                        f"MCP server '{server_name}' is not connected and reconnection failed"
+                    )
+            else:
+                raise ConnectionError(
+                    f"MCP server '{server_name}' is not connected (no event loop for reconnect)"
+                )
+
+        # Use idle_timeout from server config if available, else fall back to total timeout
+        effective_timeout = idle_timeout if idle_timeout is not None else timeout
 
         future = asyncio.run_coroutine_threadsafe(bridge.call_tool(tool_name, arguments), self._loop)
         try:
-            return future.result(timeout=timeout)
+            return future.result(timeout=effective_timeout)
         except (FutureTimeoutError, asyncio.TimeoutError) as exc:
             future.cancel()
-            raise MCPToolTimeoutError(runtime_tool_name, timeout, attempt) from exc
+            raise MCPToolTimeoutError(runtime_tool_name, effective_timeout, attempt) from exc
         except asyncio.CancelledError as exc:
-            raise MCPToolTimeoutError(runtime_tool_name, timeout, attempt) from exc
+            raise MCPToolTimeoutError(runtime_tool_name, effective_timeout, attempt) from exc
 
     def _parse_namespaced_name(self, namespaced_name: str) -> tuple[str, str] | None:
         parts = namespaced_name.split("__", 2)
@@ -222,6 +274,45 @@ class SyncMCPToolManager:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("SyncMCPToolManager is closed")
+
+    # ── MCP-04: Automatic reconnection ──────────────────────────────
+
+    async def _reconnect(self, name: str, bridge: MCPToolBridge) -> bool:
+        """Attempt reconnection with exponential backoff. Returns True on success."""
+        for i in range(self.MAX_RECONNECT_ATTEMPTS):
+            delay = self.RECONNECT_BASE_DELAY * (2 ** i)
+            logger.info(
+                "MCP reconnect attempt %d/%d for '%s' in %.1fs",
+                i + 1, self.MAX_RECONNECT_ATTEMPTS, name, delay,
+            )
+            await asyncio.sleep(delay)
+            try:
+                tools = await bridge.connect()
+                self._refresh_tool_map(name, bridge, tools)
+                logger.info("MCP server '%s' reconnected successfully", name)
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "MCP reconnect attempt %d/%d for '%s' failed: %s",
+                    i + 1, self.MAX_RECONNECT_ATTEMPTS, name, exc,
+                )
+        logger.error(
+            "MCP server '%s' failed to reconnect after %d attempts", name, self.MAX_RECONNECT_ATTEMPTS,
+        )
+        return False
+
+    def _refresh_tool_map(
+        self, server_name: str, bridge: MCPToolBridge, tools: list[Any],
+    ) -> None:
+        """Update the tool map for a reconnected bridge."""
+        # Remove old entries for this server
+        stale = [k for k, v in self._tool_map.items() if v[0] == server_name]
+        for k in stale:
+            del self._tool_map[k]
+        # Register new tools
+        for tool_info in tools:
+            runtime_tool = mcp_tool_to_runtime_tool(bridge, tool_info)
+            self._tool_map[runtime_tool.name] = (server_name, tool_info.name)
 
 
 def _error_result(tool_name: str, message: str) -> MCPCallResult:

@@ -285,43 +285,44 @@ def _sanitize_tool_pairs(messages: list[dict]) -> list[dict]:
     1. 孤立 tool 消息（对应的 assistant 已丢失）→ 移除
     2. assistant(tool_calls) 但 tool 响应全部丢失 → 移除 tool_calls 字段
     """
-    # Pass 1: 收集所有 assistant 消息中声明的 tool_call ids
-    declared_ids: set[str] = set()
-    for msg in messages:
-        if msg.get("role") == "assistant" and "tool_calls" in msg:
-            for tc in msg["tool_calls"]:
-                tc_id = tc.get("id", "")
-                if tc_id:
-                    declared_ids.add(tc_id)
-
-    # Pass 2: 收集所有实际存在的 tool 响应 ids
-    responded_ids: set[str] = set()
-    for msg in messages:
+    result: list[dict] = []
+    index = 0
+    while index < len(messages):
+        msg = messages[index]
         if msg.get("role") == "tool":
-            tc_id = msg.get("tool_call_id", "")
-            if tc_id and tc_id in declared_ids:
-                responded_ids.add(tc_id)
+            # A response is valid only in the contiguous group immediately
+            # following its assistant call, not because its id exists globally.
+            index += 1
+            continue
 
-    # Pass 3: 重建消息列表
-    result = []
-    for msg in messages:
-        if msg.get("role") == "tool":
-            # 移除没有对应 assistant 的孤立 tool 消息
-            tc_id = msg.get("tool_call_id", "")
-            if tc_id not in declared_ids:
-                continue
-        elif msg.get("role") == "assistant" and "tool_calls" in msg:
-            # 检查这个 assistant 的 tool_calls 是否有 tool 响应
-            has_response = any(
-                tc.get("id", "") in responded_ids
-                for tc in msg["tool_calls"]
-            )
-            if not has_response:
-                # 所有 tool 响应都丢失了，移除 tool_calls 字段保留 content
-                cleaned = {"role": "assistant", "content": msg.get("content", "")}
-                result.append(cleaned)
-                continue
-        result.append(msg)
+        if msg.get("role") != "assistant" or "tool_calls" not in msg:
+            result.append(msg)
+            index += 1
+            continue
+
+        following: list[dict] = []
+        cursor = index + 1
+        while cursor < len(messages) and messages[cursor].get("role") == "tool":
+            following.append(messages[cursor])
+            cursor += 1
+
+        responses_by_id = {
+            response.get("tool_call_id"): response
+            for response in following
+            if response.get("tool_call_id")
+        }
+        paired_calls = [
+            call for call in msg["tool_calls"]
+            if call.get("id") in responses_by_id
+        ]
+        if paired_calls:
+            cleaned = dict(msg)
+            cleaned["tool_calls"] = paired_calls
+            result.append(cleaned)
+            result.extend(responses_by_id[call["id"]] for call in paired_calls)
+        else:
+            result.append({"role": "assistant", "content": msg.get("content", "")})
+        index = cursor
     return result
 
 
@@ -687,7 +688,7 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
     thought_for_parse = full_text or "(no thought)"
     action = _parse_openai_response(mock_choice, thought_for_parse)
     # 如果有推理内容，覆盖 action.thought
-    if full_reasoning and action.action_type.value == "finish":
+    if full_reasoning and action.action_type is ActionType.FINISH:
         action = action.__class__(
             action_type=action.action_type,
             thought=full_reasoning,

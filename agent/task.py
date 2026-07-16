@@ -30,6 +30,8 @@ class EventType(str, Enum):
     SUBTASK_COMPLETE = "subtask_complete"
     SUBTASK_FAILED = "subtask_failed"
     SUBTASK_SKIPPED = "subtask_skipped"
+    SUBAGENT_START = "subagent_start"
+    SUBAGENT_STOP = "subagent_stop"
     TASK_COMPLETE = "task_complete"
     TASK_FAILED = "task_failed"
 
@@ -47,22 +49,65 @@ class ObservationStatus(str, Enum):
     TIMEOUT = "timeout"
 
 
+class ToolOutcome(str, Enum):
+    NONE = "none"
+    TEST_TARGET_MISSING = "test_target_missing"
+
+
 class RunStatus(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
     MAX_STEPS = "max_steps"
     GAVE_UP = "gave_up"
     BLOCKED = "blocked"
+    CANCELLED = "cancelled"
 
 
-@dataclass(frozen=True)
-class TaskShape:
-    kind: str = "implementation"
-    explicit_paths: frozenset[str] = field(default_factory=frozenset)
-    requires_plan: bool = False
-    requires_read_plan: bool = False
-    confidence: float = 0.0
-    reason: str = ""
+class TaskIntent(str, Enum):
+    EDIT = "edit"
+    ANALYSIS = "analysis"
+
+
+class TerminationReason(str, Enum):
+    """Runtime-owned reason why execution stopped.
+
+    This is deliberately orthogonal to ``RunStatus`` and task lifecycle state:
+    callers can distinguish *how execution ended* without inventing compound
+    states or parsing diagnostic text.
+    """
+
+    NONE = "none"
+    USER_CANCELLED = "user_cancelled"
+    AGENT_GAVE_UP = "agent_gave_up"
+    CIRCUIT_BREAKER = "circuit_breaker"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    MAX_STEPS = "max_steps"
+    TOOL_FAILURE_LIMIT = "tool_failure_limit"
+    ENVIRONMENT_UNAVAILABLE = "environment_unavailable"
+    MODEL_ERROR = "model_error"
+    GUARD_REJECTED = "guard_rejected"
+    INTERNAL_ERROR = "internal_error"
+
+
+class VerificationStatus(str, Enum):
+    """Objective verification outcome, independent from task completion."""
+
+    NOT_APPLICABLE = "not_applicable"
+    VERIFIED = "verified"
+    UNVERIFIED = "unverified"
+    UNAVAILABLE = "unavailable"
+    FAILED = "failed"
+
+
+class VerificationReason(str, Enum):
+    """Typed explanation for a verification outcome."""
+
+    NONE = "none"
+    NOT_RUN = "not_run"
+    NO_TEST_ENVIRONMENT = "no_test_environment"
+    NO_VERSION_CONTROL = "no_version_control"
+    TEST_FAILED = "test_failed"
+    NO_NET_CHANGE = "no_net_change"
 
 
 @dataclass
@@ -70,7 +115,7 @@ class Task:
     description: str
     repo_path: str
     task_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    intent: str = "edit"
+    intent: TaskIntent = TaskIntent.EDIT
     issue_url: str | None = None
     test_cmd: str | None = None
     max_steps: int = 40
@@ -78,7 +123,10 @@ class Task:
     metadata: dict[str, Any] = field(default_factory=dict)
     explicit_read_paths: frozenset[str] | None = None
     explicit_write_paths: frozenset[str] | None = None
-    shape: TaskShape | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, TaskIntent):
+            self.intent = TaskIntent(self.intent)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -86,11 +134,6 @@ class Task:
             value = payload.get(key)
             if isinstance(value, frozenset):
                 payload[key] = sorted(value)
-        shape = payload.get("shape")
-        if isinstance(shape, dict):
-            explicit_paths = shape.get("explicit_paths")
-            if isinstance(explicit_paths, (list, tuple, set, frozenset)):
-                shape["explicit_paths"] = sorted(explicit_paths)
         return payload
 
     def __repr__(self) -> str:
@@ -143,6 +186,7 @@ class Observation:
     tokens_used: int = 0
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    outcome: ToolOutcome = ToolOutcome.NONE
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -189,6 +233,9 @@ class RunResult:
     patch: str | None = None
     error: str | None = None
     cache_stats: Any = None
+    termination_reason: TerminationReason = TerminationReason.NONE
+    verification_status: VerificationStatus = VerificationStatus.NOT_APPLICABLE
+    verification_reason: VerificationReason = VerificationReason.NONE
 
     def is_success(self) -> bool:
         return self.status == RunStatus.SUCCESS

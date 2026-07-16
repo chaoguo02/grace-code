@@ -32,7 +32,6 @@ pytestmark = [
 def _make_real_runtime(tmp_path: Path, *, max_steps: int = 5):
     from agent.core import AgentConfig
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore
-    from agent.v2.agent_registry import _BUILD_ALLOWED
     from llm.router import create_backend
     from tools.base import NoopTool, ToolRegistry
 
@@ -44,9 +43,9 @@ def _make_real_runtime(tmp_path: Path, *, max_steps: int = 5):
         timeout_seconds=30.0,
     )
 
-    agent_registry = AgentRegistryV2()
+    agent_registry = AgentRegistryV2(project_dir=tmp_path)
     base_registry = ToolRegistry()
-    for tool_name in sorted(_BUILD_ALLOWED):
+    for tool_name in sorted(agent_registry.tool_names_for("build")):
         base_registry.register(NoopTool(tool_name, output=f"[noop] {tool_name} executed successfully"))
 
     log_dir = str(tmp_path / "logs")
@@ -88,6 +87,7 @@ def _parent_called_task(log_dir: str) -> bool:
     return any(tc.get("name") == "task" for tc in _get_tool_calls_from_log(log_dir))
 
 
+@pytest.mark.e2e
 class TestE2EBehavioral:
     """L5 behavioral E2E tests: real LLM, noop tools, tool-call assertions."""
 

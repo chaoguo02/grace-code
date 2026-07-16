@@ -70,27 +70,6 @@ def check_lock_competition() -> None:
         print("OK lock contention skips async Dream safely")
 
 
-def check_bash_readonly_sandbox() -> None:
-    with tempfile.TemporaryDirectory(prefix="memory_bash_") as d:
-        agent = DreamAgent(memory_dir=Path(d), backend=NoopBackend())
-        assert agent._is_bash_readonly("ls -la")
-        assert agent._is_bash_readonly("git log --oneline -1")
-        dangerous = [
-            "rm -rf /",
-            "chmod 777 /etc/passwd",
-            "git push origin main",
-            "echo hacked > file.txt",
-        ]
-        for command in dangerous:
-            try:
-                agent._bash_readonly({"command": command})
-            except PermissionError as exc:
-                assert "Bash blocked" in str(exc)
-            else:
-                raise AssertionError(f"dangerous command was not blocked: {command}")
-        print("OK bash_readonly allows whitelist and blocks dangerous commands")
-
-
 def check_stale_memory_warning() -> None:
     with tempfile.TemporaryDirectory(prefix="memory_stale_") as d:
         memory_dir = Path(d)
@@ -136,7 +115,6 @@ def check_sensitive_path_rejection() -> None:
 def main() -> None:
     check_session_stop_non_blocking()
     check_lock_competition()
-    check_bash_readonly_sandbox()
     check_stale_memory_warning()
     check_sensitive_path_rejection()
     print("ALL MEMORY SAFETY CHECKS PASSED")

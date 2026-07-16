@@ -143,6 +143,7 @@ def build_tool(
     max_result_size_chars: int = 100_000,
     validate_input_fn: Callable[[Any, ToolUseContext], Awaitable[tuple[bool, str | None]]] | None = None,
     check_permissions_fn: Callable[[Any, ToolUseContext], Awaitable[PermissionDecision]] | None = None,
+    mcp_props: Any = None,
 ) -> "ConcreteTool":
     """Build a concrete tool instance from functional parts."""
 
@@ -159,6 +160,7 @@ def build_tool(
         _max_result_size_chars=max_result_size_chars,
         _validate_input_fn=validate_input_fn,
         _check_permissions_fn=check_permissions_fn,
+        _mcp_props=mcp_props,
     )
 
 
@@ -180,6 +182,7 @@ class ConcreteTool:
         _max_result_size_chars: int,
         _validate_input_fn: Callable | None,
         _check_permissions_fn: Callable | None,
+        _mcp_props: Any = None,
     ) -> None:
         self._name = _name
         self._input_schema = _input_schema
@@ -193,6 +196,7 @@ class ConcreteTool:
         self._max_result_size_chars = _max_result_size_chars
         self._validate_input_fn = _validate_input_fn
         self._check_permissions_fn = _check_permissions_fn
+        self.mcp_props = _mcp_props  # MCPToolProps | None — declarative MCP attachment
 
     @property
     def name(self) -> str:

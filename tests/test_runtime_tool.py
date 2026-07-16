@@ -14,7 +14,17 @@ from runtime import (
     execute_tool_calls,
     partition_tool_calls,
 )
-from runtime.tool_executor import Batch, execute_batch
+from runtime.tool_executor import Batch, execute_batch, execute_parallel_sync
+
+
+def test_execute_parallel_sync_preserves_order_and_validates_limit():
+    assert execute_parallel_sync(
+        [3, 1, 2], lambda value: value * 10, max_workers=2,
+    ) == [30, 10, 20]
+
+    import pytest
+    with pytest.raises(ValueError, match="max_workers must be positive"):
+        execute_parallel_sync([1, 2], lambda value: value, max_workers=0)
 
 
 async def _ok_call(input: dict, context: ToolUseContext) -> ToolResult[str]:

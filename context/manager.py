@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from context.compaction import snip_low_value_turns, trim_sliding_window
-from context.history import ConversationHistory
+from context.history import ConversationHistory, ConversationSnapshot
 from context.stats import ContextStats
 from context.structured import ContextLayer, ContextPriority, StructuredContext
 from context.token_budget import TokenBudget, estimate_tokens
@@ -245,6 +245,20 @@ class ContextManager:
 
         stats = ContextStats(
             estimated_total_tokens=sum(estimate_tokens(m.content or "") for m in messages),
+        )
+        return RequestContext(messages=messages, stats=stats)
+
+    def build_inherited_messages(
+        self,
+        snapshot: ConversationSnapshot,
+        history: ConversationHistory,
+    ) -> RequestContext:
+        """Append fork-local history to an immutable parent request prefix."""
+        messages = snapshot.materialize() + history.to_list()
+        stats = ContextStats(
+            estimated_total_tokens=sum(
+                estimate_tokens(message.content or "") for message in messages
+            ),
         )
         return RequestContext(messages=messages, stats=stats)
 

@@ -22,7 +22,7 @@ This document reflects the decisions already confirmed for v2:
 - built-in subagents are `explore` and `general`;
 - child sessions are persisted in SQLite from day one;
 - the `task` tool only accepts `description`, `subagent_type`, and `prompt`;
-- child sessions return summary text only;
+- child sessions return a typed result with summary-first parent rendering;
 - dependency management is primarily model-driven, not DAG-driven;
 - child sessions do not inherit parent conversation history by default.
 
@@ -34,7 +34,7 @@ Out of scope:
 
 - replacing existing `react`, `plan`, `dag`, or `multi-agent` flows;
 - implementing `plan_exit`-style agent switching;
-- adding worktree isolation, file locks, or merge orchestration;
+- adding file locks or automatic worktree merge orchestration;
 - building a full TUI for parent/child session navigation;
 - replaying full child event streams back into the parent prompt;
 - implementing DAG scheduling or explicit dependency planning;
@@ -43,7 +43,8 @@ Out of scope:
 The first milestone is smaller:
 
 > Parent agent calls `task` -> runtime creates a child session -> subagent runs
-> its own ReAct loop -> child returns summary text -> parent continues reasoning.
+> its own ReAct loop -> child returns a typed, summary-first result -> parent
+> continues reasoning.
 
 ## 3. Design principles
 
@@ -71,18 +72,21 @@ Child sessions are not temporary helper structs. Each child session must:
 - own its own execution lifecycle;
 - be queryable and resumable later.
 
-### 3.3 The parent only receives the conclusion
+### 3.3 The parent receives a bounded result
 
-The parent session should receive the child session's final summary text, not the
-full intermediate tool history. This keeps the parent prompt clean and aligns
-with the target OpenCode-like model.
+The parent session receives the child's final summary and bounded structured
+facts, not the full intermediate tool history. This keeps the parent prompt
+clean while preserving Runtime-owned evidence such as worktree change state.
 
 ### 3.4 The model manages most task decomposition
 
-The runtime should support multiple `task` tool calls in one model response and
-execute them in parallel. The runtime should not impose a DAG planner in phase 1.
-If the model needs sequencing, it can wait for earlier child results and then
-issue later `task` calls in a subsequent ReAct turn.
+The runtime supports multiple `task` tool calls in one model response. Calls
+whose selected children declare read-only analysis intent and shared workspace isolation run
+in parallel. Write-capable delegation remains serial; worktree isolation keeps
+its edits separate, and applying those edits is outside child execution. The
+runtime does not impose a DAG planner.
+If the model needs sequencing, it waits for earlier child results and issues
+later `task` calls in a subsequent ReAct turn.
 
 ### 3.5 Permission inheritance before specialization
 
@@ -180,8 +184,30 @@ new registry.
 - prompt/config retrieval;
 - future support for config-backed custom agents.
 
-The `task` tool description should be generated from the currently visible
-subagents in the registry, so the model sees what child agents are available.
+The `task` tool description is generated from the parent's effective grants.
+Public subagents are discoverable normally; a hidden subagent is exposed only
+when the parent's typed `delegation_policy` explicitly names it. YAML
+`allowedSubagents` is converted to this policy at the configuration boundary;
+an omitted or empty value disables delegation.
+
+Model selection is also validated at that boundary. The current Runtime
+supports only an omitted `model` or `model: inherit`, both of which reuse the
+parent session backend. Other values fail configuration loading explicitly;
+they must not appear supported until a provider-aware backend resolver is
+injected into the Runtime.
+
+For a one-shot deterministic delegation, the CLI accepts
+`--delegate-to <agent>`. This is a typed entry-boundary request, not task-text
+matching: Runtime creates the named child before the primary model runs,
+persists the child with `entrypoint=explicit`, and injects its typed
+`ForkResult` into the primary context for synthesis. The request is rejected
+before any model call when the parent definition does not grant that child.
+An explicit child `failed` or `cancelled` result terminates the entrypoint and
+converges the parent session to the same terminal state; `partial` output is
+preserved for primary-agent synthesis. Child token usage is deducted from the
+primary contract before that synthesis runs.
+Only one explicitly required child is supported; automatic fan-out remains a
+model routing decision, avoiding a premature workflow DSL.
 
 ## 5.3 Suggested built-in permissions
 
@@ -346,15 +372,16 @@ still be available in the tool result payload for future inspection hooks.
 
 ## 8.3 Parallel semantics
 
-If the model emits multiple `task` tool calls in one turn, the runtime should
-treat them as parallel-capable by default.
+If the model emits multiple read-only `task` tool calls in one turn, the runtime
+treats them as parallel-capable. Call-specific concurrency is a typed tool fact;
+unknown and write-capable calls fail closed to serial execution.
 
 Phase 1 guidance:
 
 - do not add a separate `task_batch`;
 - do not implement DAG ordering;
-- do not implement worktree isolation;
-- allow shared-workspace child execution;
+- allow concurrent shared-workspace execution only for read-only children;
+- keep write-capable delegation serial even when optional worktree isolation is used;
 - let the model decide whether sequencing is necessary.
 
 ## 9. Parent and child context rules
@@ -391,15 +418,54 @@ Example result shape:
 
 The prompt-facing content should remain summary-first.
 
+## 9.4 Resource and cancellation inheritance
+
+Each child receives an immutable `TaskContract` computed from the minimum of
+the parent allocation, root Runtime limits, and declarative agent limits
+(`max_turns` and optional `max_tokens`). Child-session metadata stores both the
+requested and effective limits.
+
+Cancellation tokens form a hierarchy. Cancelling a parent propagates to every
+descendant; cancelling one child affects only that child and its descendants,
+not its parent or siblings.
+
+## 9.5 Worktree result boundary
+
+A child declared with `isolation: worktree` runs against an immutable base
+commit captured when the worktree is created. Completion never implies
+acceptance: the child Runtime must not stage, commit, switch the parent's
+branch, or merge changes as a side effect of returning a result.
+
+Finalization is driven only by Git facts. An objectively unchanged worktree is
+removed. A changed or uninspectable worktree is preserved outside the tracked
+project tree, and the `ForkResult` carries typed evidence: absolute worktree
+path, branch, base branch, base commit, changed paths, and workspace revision.
+Applying or discarding those changes is a separate explicit operation.
+
+Coordinators receive three Runtime-managed tools:
+
+- `subagent_worktree_inspect` refreshes read-only Git evidence;
+- `subagent_worktree_apply` merges the reviewed revision into the parent's
+  current branch without switching branches;
+- `subagent_worktree_discard` permanently removes the reviewed child result.
+
+Apply and discard require the exact revision returned by inspection. A changed
+revision fails as `stale` rather than being guessed safe. Apply also fails
+closed when the parent worktree is dirty. Merge conflicts are identified from
+Git's unmerged-path facts, the merge is aborted, and the child worktree remains
+preserved. Successful resolution updates the persisted `ForkResult` with a
+typed disposition (`applied`, `discarded`, or `cleaned`).
+
 ## 10. Permissions
 
 ## 10.1 Phase 1 model
 
-Phase 1 permission flow is intentionally simple:
+The permission flow is intentionally simple:
 
 1. the active parent session has an effective permission profile;
 2. the selected child agent has a default profile;
-3. the child profile is computed as parent-constrained child defaults;
+3. the child profile is computed from the intersection of the parent's task
+   policy, the parent's physically visible tool effects, and child defaults;
 4. tools inside the child run under that narrowed profile.
 
 This avoids introducing a second independent dispatch-permission framework in

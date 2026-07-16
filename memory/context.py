@@ -11,11 +11,12 @@ MemoryContext — 管理记忆在 LLM 上下文中的注入。
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import re
-from collections import Counter
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from memory.models import MemoryStatus, MemoryType
 from memory.store import MemoryStore
 
 if TYPE_CHECKING:
@@ -23,27 +24,6 @@ if TYPE_CHECKING:
     from memory.retriever import ProactiveRetriever
 
 logger = logging.getLogger(__name__)
-
-# 停用词（中英文常见词，不用于相关性匹配）
-_STOPWORDS = frozenset({
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "need", "to", "of", "in",
-    "for", "on", "with", "at", "by", "from", "as", "into", "through",
-    "and", "or", "but", "if", "not", "no", "this", "that", "it", "its",
-    "all", "each", "every", "both", "few", "more", "most", "other",
-    "的", "了", "是", "在", "有", "和", "就", "不", "人", "都", "一",
-    "我", "你", "他", "她", "它", "们", "这", "那", "个", "中",
-    "上", "下", "把", "让", "用", "到", "说", "也", "去", "能",
-})
-
-_WORD_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]*|[一-鿿]+")
-
-
-def _extract_keywords(text: str) -> set[str]:
-    """从文本中提取关键词（去除停用词，全部小写）。"""
-    words = _WORD_RE.findall(text.lower())
-    return {w for w in words if w not in _STOPWORDS and len(w) > 1}
 
 
 class MemoryContext:
@@ -109,19 +89,9 @@ class MemoryContext:
         """
         构建 Memory Section 文本。
 
-        Injection strategy (aligned with Claude Code):
-        - user/feedback types: always inject full content (they're short rules)
-        - project/reference types: selected via Sonnet selector (max 5), or keyword fallback
-
-        返回格式：
-            ## Always-Loaded Memories (user/feedback)
-            <full content of user and feedback memories>
-
-            ## Selected Memories (project/reference)
-            <full content of selected on-demand memories>
-
-            ## Available Memories
-            <index listing for remaining memories>
+        Phase 4 injection strategy (data-driven, not LLM-mediated):
+        - user/feedback types: always inject full content (short rules)
+        - project/reference types: scope+confidence precision injection (max 5)
 
         没有记忆时返回空字符串。
         """
@@ -133,38 +103,28 @@ class MemoryContext:
 
         parts: list[str] = []
 
-        # 1. Always-inject: full content of user/feedback memories
+        # 1. Always-inject: full content of user/feedback memories (unchanged)
         always_section = self._build_always_inject_section()
         if always_section:
             parts.append(always_section)
 
-        # 2. On-demand: Sonnet selector or keyword fallback for project/reference
-        selected_section = self._build_selected_section()
-        if selected_section:
-            parts.append(selected_section)
+        # 2. Precision Injection: scope + confidence (Phase 4 — replaces
+        #    Sonnet Selector + keyword scoring + RAG vector retrieval)
+        precision_section = self._build_precision_section()
+        if precision_section:
+            parts.append(precision_section)
 
-        # 3. Index listing (for remaining memories the LLM can read on demand)
-        if self._task_context:
-            index_section = self._build_filtered_section()
-        else:
-            index_content = self._store.get_index_content(max_lines=self._max_lines)
-            if not index_content.strip():
-                index_section = ""
-            else:
-                index_section = "\n".join([
-                    "## Available Memories",
-                    index_content,
-                    "",
-                    "Use memory_read to read a specific memory, memory_write to",
-                    "save new information you want to remember across sessions.",
-                ])
-        if index_section:
+        # 3. Index listing (on-demand lookup — LLM can memory_read as needed)
+        index_content = self._store.get_index_content(max_lines=self._max_lines)
+        if index_content.strip():
+            index_section = "\n".join([
+                "## Available Memories",
+                index_content,
+                "",
+                "Use memory_read to read a specific memory, memory_write to",
+                "save new information you want to remember across sessions.",
+            ])
             parts.append(index_section)
-
-        # 4. RAG 主动检索
-        rag_section = self._build_rag_section()
-        if rag_section:
-            parts.append(rag_section)
 
         self._cached_section = "\n\n".join(parts)
         return self._cached_section
@@ -181,7 +141,8 @@ class MemoryContext:
         for s in always_mems:
             try:
                 mem = self._store.read_memory(s.name)
-                if mem and mem.content.strip():
+                # P1: skip deprecated memories — Code is Truth
+                if mem and mem.content.strip() and mem.metadata.status is MemoryStatus.ACTIVE:
                     lines.append(f"### {s.name} ({s.type})")
                     lines.append(mem.content.strip())
                     lines.append("")
@@ -192,8 +153,132 @@ class MemoryContext:
             return ""
         return "\n".join(lines)
 
+    def _build_precision_section(self) -> str:
+        """Phase 4 precision injection: scope + confidence filtering.
+
+        Replaces the old three-pipeline approach (Sonnet Selector + keyword
+        scoring + RAG retrieval) with a single deterministic pipeline:
+        1. list_by_scope("project", min_confidence=0.5)
+        2. Sort by confidence DESC, updated_at DESC
+        3. Take top-5, verify freshness (content_hash), format and inject
+
+        Zero extra LLM calls. Zero vector scans. Deterministic and fast.
+        """
+        try:
+            memories = self._store.list_by_scope("project", min_confidence=0.5)
+        except AttributeError:
+            # list_by_scope not available (old store) — fallback to empty
+            return ""
+
+        if not memories:
+            return ""
+
+        # Also include global-scoped memories (user preferences apply everywhere)
+        try:
+            global_mems = self._store.list_by_scope("global", min_confidence=0.5)
+        except AttributeError:
+            global_mems = []
+
+        # Sort: confidence DESC, then access_count DESC, then updated_at DESC
+        all_mems = memories + global_mems
+        all_mems.sort(
+            key=lambda m: (
+                -getattr(m.metadata, "confidence", 0.5),
+                -getattr(m.metadata, "access_count", 0),
+            )
+        )
+
+        # Take top-5 (already sorted, but deduplicate by name)
+        seen: set[str] = set()
+        top: list = []
+        for m in all_mems:
+            if m.name in seen:
+                continue
+            if getattr(m.metadata, "status", MemoryStatus.ACTIVE) is not MemoryStatus.ACTIVE:
+                continue
+            if m.name in self._already_surfaced:
+                continue
+            seen.add(m.name)
+            top.append(m)
+            if len(top) >= 5:
+                break
+
+        if not top:
+            return ""
+
+        lines: list[str] = ["## Relevant Project Knowledge"]
+        for mem in top:
+            # Phase 6: cache returns Memory without content — load from file on demand
+            if not mem.content.strip():
+                full = self._store.read_memory(mem.name)
+                if full:
+                    mem = full
+            freshness = self._verify_memory_freshness(mem)
+            lines.append(f"### {mem.name}")
+            lines.append(mem.content.strip())
+            if freshness:
+                lines.append(f"\n> {freshness}")
+            lines.append("")
+            self._already_surfaced.add(mem.name)
+
+        return "\n".join(lines)
+
+    def _verify_memory_freshness(self, memory) -> str:
+        """Phase 4 Step 3: Content hash verification before injection.
+
+        Checks all file anchors with content_hash. Returns a freshness
+        warning string, or empty string if memory is still fresh.
+
+        - Hash matches → confidence boost (no warning)
+        - Hash mismatch → confidence *= 0.5, warning injected
+        - File deleted → memory deprecated, returns "DEPRECATED" signal
+        """
+        import hashlib
+        from pathlib import Path
+
+        anchors = getattr(memory, "anchors", []) or []
+        hash_anchors = [
+            a for a in anchors
+            if getattr(a, "kind", "") == "file" and getattr(a, "content_hash", "")
+        ]
+        if not hash_anchors:
+            return ""  # No hash binding — cannot verify
+
+        all_match = True
+        for anchor in hash_anchors:
+            try:
+                p = Path(anchor.path)
+                if not p.exists():
+                    # File deleted — memory is orphaned
+                    memory.metadata.status = MemoryStatus.DEPRECATED
+                    try:
+                        self._store.write_memory(memory)
+                    except Exception:
+                        pass
+                    return "DEPRECATED"
+                current_hash = hashlib.sha256(p.read_bytes()).hexdigest()
+                if current_hash != anchor.content_hash:
+                    all_match = False
+            except (OSError, IOError):
+                continue
+
+        if not all_match:
+            # Partial mismatch — degrade confidence, don't discard
+            old_conf = getattr(memory.metadata, "confidence", 0.7)
+            memory.metadata.confidence = max(0.1, old_conf * 0.5)
+            try:
+                self._store.write_memory(memory)
+            except Exception:
+                pass
+            return "[FILE CHANGED] Associated files have changed since this memory was created. Confidence degraded. Verify before relying on this information."
+
+        return ""  # All hashes match — memory is fresh
+
     def _build_selected_section(self) -> str:
-        """Select and load on-demand (project/reference) memories via Sonnet selector."""
+        """Select and load on-demand (project/reference) memories via Sonnet selector.
+
+        Deprecated by Phase 4 _build_precision_section(). Kept for backward compat.
+        """
         query = self._user_message or self._task_context
         if not query:
             return ""
@@ -214,27 +299,8 @@ class MemoryContext:
         # Fallback: no selector configured or selector returned nothing
         return ""
 
-    def _load_selected_memories(self, names: list[str]) -> str:
-        """Load full content of selected memories, tracking what was surfaced."""
-        from agent.v2.runtime import SessionRuntime
-        lines: list[str] = ["## Selected Project Knowledge"]
-        loaded = 0
-        for name in names:
-            if name in self._already_surfaced:
-                continue
-            mem = self._store.read_memory(name)
-            if mem and mem.content.strip():
-                freshness = SessionRuntime._memory_freshness_text(name, self._store)
-                lines.append(f"### {name}")
-                lines.append(mem.content.strip())
-                if freshness:
-                    lines.append(f"\n> ⚠️ {freshness}")
-                lines.append("")
-                self._already_surfaced.add(name)
-                loaded += 1
-        if loaded == 0:
-            return ""
-        return "\n".join(lines)
+    # _load_selected_memories removed in Phase 4 — replaced by _build_precision_section.
+    # The old Sonnet selector path had a constitution violation (import agent.v2.runtime).
 
     def _build_rag_section(self) -> str:
         """用 ProactiveRetriever 检索相关 chunks 并格式化。
@@ -270,69 +336,6 @@ class MemoryContext:
         except Exception as exc:
             logger.debug("RAG retrieval failed: %s", exc)
             return ""
-
-    def _build_filtered_section(self) -> str:
-        """按相关性过滤和排序记忆条目。"""
-        summaries = self._store.list_memories()
-        if not summaries:
-            return ""
-
-        task_keywords = _extract_keywords(self._task_context)
-        if not task_keywords:
-            # 无可提取的关键词，退回完整索引
-            index_content = self._store.get_index_content(max_lines=self._max_lines)
-            if not index_content.strip():
-                return ""
-            return "\n".join([
-                "## Available Memories",
-                index_content,
-                "",
-                "Use memory_read to read a specific memory, memory_write to",
-                "save new information you want to remember across sessions.",
-            ])
-
-        # 计算每条记忆的相关性得分
-        scored: list[tuple[float, object]] = []
-        for mem in summaries:
-            mem_keywords = _extract_keywords(f"{mem.name} {mem.description}")
-            overlap = task_keywords & mem_keywords
-            score = len(overlap)
-            # feedback 规则优先展示，避免任务约束被项目记忆淹没。
-            if mem.type == "feedback":
-                score += 0.5
-            scored.append((score, mem))
-
-        # 按得分降序排列
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        # 相关记忆（得分 > 0）放前面，无关记忆简要列出
-        relevant = [(s, m) for s, m in scored if s > 0]
-        other = [(s, m) for s, m in scored if s == 0]
-
-        lines = ["## Available Memories"]
-
-        if relevant:
-            lines.append("### Relevant to current task")
-            self._append_grouped_memories(lines, [mem for _score, mem in relevant])
-
-        if other:
-            lines.append("### Other memories")
-            other_memories = [mem for _score, mem in other]
-            shown_count = self._append_grouped_memories(lines, other_memories, limit=10)
-            if len(other_memories) > shown_count:
-                lines.append(f"  ... and {len(other_memories) - shown_count} more")
-
-        lines.append("")
-        lines.append("Use memory_read to read a specific memory, memory_write to")
-        lines.append("save new information you want to remember across sessions.")
-
-        # 按行数限制
-        result = "\n".join(lines)
-        result_lines = result.splitlines()
-        if len(result_lines) > self._max_lines:
-            result = "\n".join(result_lines[:self._max_lines])
-
-        return result
 
     def get_feedback_for_files(
         self, accessed_files: set[str], *, record_access: bool = False,
@@ -373,11 +376,38 @@ class MemoryContext:
                 anchor_path = anchor.path.replace("\\", "/").lstrip("./")
                 for f in normalized_files:
                     if f == anchor_path or f.startswith(anchor_path + "/"):
-                        stale_warn = ""
-                        if mem.metadata.stale:
-                            stale_warn = "\n> **⚠ STALE**: This rule may be outdated — the anchored file was modified since this memory was created."
+                        # ── P1: deprecated memories are NOT injected ──
+                        if mem.metadata.status is not MemoryStatus.ACTIVE:
+                            logger.debug(
+                                "Skipping %s feedback memory '%s'",
+                                mem.metadata.status.value, mem.name,
+                            )
+                            break
+
+                        # ── P1-a: Content hash verification — Code is Truth ──
+                        # If the memory was bound to a specific file version (hash),
+                        # verify the current file matches. If not, physically discard.
+                        bound_hash = anchor.content_hash
+                        if bound_hash:
+                            try:
+                                _path = Path(anchor_path)
+                                if _path.exists():
+                                    _current = hashlib.sha256(
+                                        _path.read_bytes()
+                                    ).hexdigest()
+                                    if _current != bound_hash:
+                                        logger.info(
+                                            "Memory '%s' physically discarded: "
+                                            "content hash mismatch for %s",
+                                            mem.name, anchor_path,
+                                        )
+                                        mem.metadata.status = MemoryStatus.DEPRECATED
+                                        self._store.write_memory(mem)
+                                        break
+                            except (OSError, ImportError):
+                                pass  # can't verify — let it through
                         matched_memories.append(
-                            f"### {mem.name}\n{mem.content.strip()}{stale_warn}"
+                            f"### {mem.name}\n{mem.content.strip()}"
                         )
                         matched_names.append(mem.name)
                         break
@@ -403,33 +433,3 @@ class MemoryContext:
         """Backward-compatible alias for get_feedback_for_files()."""
         return self.get_feedback_for_files(accessed_files, record_access=record_access)
 
-    @staticmethod
-    def _append_grouped_memories(lines: list[str], memories: list[object], limit: int | None = None) -> int:
-        """按类型优先级输出记忆摘要，feedback 始终在最前。"""
-        groups = [
-            ("Rules to follow", "feedback"),
-            ("Project knowledge", "project"),
-            ("About the user", "user"),
-            ("References", "reference"),
-        ]
-        shown = 0
-        known_types = {t for _, t in groups}
-        for title, mem_type in groups:
-            typed = [mem for mem in memories if getattr(mem, "type", "") == mem_type]
-            if limit is not None:
-                typed = typed[:max(0, limit - shown)]
-            if not typed:
-                continue
-            lines.append(f"#### {title}")
-            for mem in typed:
-                lines.append(f"- [{mem.name}]({mem.name}.md) — {mem.description} ({mem.type})")
-                shown += 1
-                if limit is not None and shown >= limit:
-                    return shown
-        remaining = [mem for mem in memories if getattr(mem, "type", "") not in known_types]
-        for mem in remaining:
-            if limit is not None and shown >= limit:
-                break
-            lines.append(f"- [{mem.name}]({mem.name}.md) — {mem.description} ({mem.type})")
-            shown += 1
-        return shown

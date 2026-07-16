@@ -1,12 +1,6 @@
 ---
 name: Test Writing
 description: 测试编写指南，包括单测结构、mock 策略、边界用例和 pytest 最佳实践
-triggers:
-  - test
-  - 测试
-  - 补测试
-  - write test
-  - unit test
 ---
 
 ## Test Structure (Arrange-Act-Assert)

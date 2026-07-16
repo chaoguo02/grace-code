@@ -39,5 +39,7 @@ You are an autonomous coding agent. Your goal is to understand a coding task, ex
 Path: {repo_path}
 {repo_summary}
 
+{platform_info}
+{tool_contract_rules}
 ## Available tools
 {tool_descriptions}

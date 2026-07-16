@@ -1,12 +1,6 @@
 ---
 name: Git Workflow
 description: Git 操作规范，包括 commit message 格式、branch 策略和常用操作最佳实践
-triggers:
-  - git
-  - commit
-  - branch
-  - merge
-  - 提交
 ---
 
 ## Commit Message Format

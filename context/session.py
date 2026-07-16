@@ -20,10 +20,9 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Literal
-
 from context.stats import ContextStats
 from context.token_budget import estimate_tokens
+from agent.task import TaskIntent
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +34,7 @@ class TaskContext:
     """当前正在执行任务的高保真上下文。"""
     task_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     user_goal: str = ""
-    intent: str = "edit"
-    relationship: str = "unrelated_task"  # same_task / related_task / unrelated_task / quick_question
+    intent: TaskIntent = TaskIntent.EDIT
     started_at: float = field(default_factory=time.time)
     active_files: set[str] = field(default_factory=set)
     decisions: list[str] = field(default_factory=list)
@@ -99,13 +97,16 @@ class SessionState:
     compaction_count: int = 0
     last_compaction_reason: str | None = None
 
-    def start_task(self, user_goal: str, intent: str = "edit", relationship: str = "unrelated_task") -> TaskContext:
+    def start_task(
+        self,
+        user_goal: str,
+        intent: TaskIntent | str = TaskIntent.EDIT,
+    ) -> TaskContext:
         """开始一个新任务，返回 TaskContext。"""
         self.round_count += 1
         ctx = TaskContext(
             user_goal=user_goal,
-            intent=intent,
-            relationship=relationship,
+            intent=TaskIntent(intent),
         )
         self.active_task = ctx
         return ctx
