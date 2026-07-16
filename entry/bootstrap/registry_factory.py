@@ -39,7 +39,7 @@ def build_registry(
     from tools.submit_analysis_tool import SubmitAnalysisTool
     from tools.plan_mode_tool import EnterPlanModeTool, ExitPlanModeTool
     from tools.worktree_session_tool import EnterWorktreeTool, ExitWorktreeTool
-    from tools.workflow_tool import WorkflowTool, ToolSearchTool
+    from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool, WorkflowTool
     from tools.runtime import LocalRuntime
 
     from hitl.pipeline import PermissionPipeline
@@ -96,7 +96,7 @@ def build_registry(
         # CC-aligned plan mode + worktree session tools
         .register(EnterPlanModeTool()).register(ExitPlanModeTool())
         .register(EnterWorktreeTool()).register(ExitWorktreeTool())
-        .register(WorkflowTool()).register(ToolSearchTool())
+        .register(WorkflowTool()).register(ToolSearchTool()).register(WaitForMcpServersTool())
     )
     registry._artifact_store_ref = artifact_store_ref
     registry._evidence_ledger_ref = evidence_ledger_ref

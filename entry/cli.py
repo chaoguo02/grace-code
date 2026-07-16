@@ -507,6 +507,12 @@ def run(
         mcp_integration.initialize()
         mcp_integration.register_into(registry)
 
+        # Wire MCP context into ToolSearch + WaitForMcpServers tools
+        from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool
+        for _name, _tool in registry._tools.items():
+            if isinstance(_tool, (ToolSearchTool, WaitForMcpServersTool)):
+                _tool.set_mcp_context(registry, mcp_integration)
+
     if agent_name in ("build", "plan"):
         from agent.v2 import AgentDefinitionError, ExplicitDelegationError
         try:
