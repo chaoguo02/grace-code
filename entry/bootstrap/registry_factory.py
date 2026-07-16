@@ -37,6 +37,8 @@ def build_registry(
     from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
     from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
     from tools.submit_analysis_tool import SubmitAnalysisTool
+    from tools.plan_mode_tool import EnterPlanModeTool, ExitPlanModeTool
+    from tools.worktree_session_tool import EnterWorktreeTool, ExitWorktreeTool
     from tools.runtime import LocalRuntime
 
     from hitl.pipeline import PermissionPipeline
@@ -90,6 +92,9 @@ def build_registry(
         .register(EvidenceListTool(evidence_ledger_ref))
         .register(EvidenceGetTool(evidence_ledger_ref))
         .register(SubmitAnalysisTool())
+        # CC-aligned plan mode + worktree session tools
+        .register(EnterPlanModeTool()).register(ExitPlanModeTool())
+        .register(EnterWorktreeTool()).register(ExitWorktreeTool())
     )
     registry._artifact_store_ref = artifact_store_ref
     registry._evidence_ledger_ref = evidence_ledger_ref
