@@ -94,7 +94,7 @@ _MAX_STOP_HOOK_RETRIES = 3
 class AgentConfig:
     """Agent 运行时配置，从 config/default.yaml 加载后传入。"""
     max_steps: int = 40
-    budget_tokens: int = 80_000            # task spend 上限（billable tokens）
+    budget_tokens: int = 160_000            # task spend 上限（billable tokens）
     request_budget_tokens: int = 70_000    # 单次 request 输入上下文预算
     artifact_threshold_tokens: int = 2_000 # 工具输出超过此值时 artifact 化
     artifact_storage_dir: str = ""  # optional absolute override; default is isolated state root

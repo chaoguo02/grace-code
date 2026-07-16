@@ -8,7 +8,7 @@ llm:
 
 agent:
   max_steps: 40
-  budget_tokens: 80000
+  budget_tokens: 160000
   log_dir: "" # empty = isolated per-project runtime state
 
 tools:
