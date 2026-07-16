@@ -518,7 +518,7 @@ def _get_message_content(msg: Any) -> Any:
 
 
 def _is_readonly_tool_result(msg: Any) -> bool:
-    readonly_tools = {"read_file", "grep", "glob", "list_dir", "web_search", "read", "search"}
+    readonly_tools = {"Read", "Grep", "Glob", "WebSearch", "file_read", "grep", "glob", "list_dir", "web_search", "read", "search"}
     if isinstance(msg, dict):
         content = msg.get("content", [])
         if isinstance(content, list):
