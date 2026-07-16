@@ -583,12 +583,12 @@ class SkillRegistry:
         visible = model_skills if llm_invocable_only else list(self._metadata.values())
 
         if visible:
-            lines.append("Use the `Skill` tool to load a skill, or type /skill-name directly:")
+            lines.append("Use the `Skill` tool to load a skill (PREFERRED — saves context by injecting instructions without duplicating):")
             for meta in visible:
                 desc = meta.description or "(no description)"
                 if meta.when_to_use:
                     desc += f" (Use when: {meta.when_to_use})"
-                lines.append(f"- **/{meta.name}**: {desc}")
+                lines.append(f"- **{meta.name}**: {desc}")
 
         return "\n".join(lines)
 
