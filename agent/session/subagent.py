@@ -234,7 +234,7 @@ def run_child_agent(
 
     if request.agent_kind is AgentKind.NAMED_SUBAGENT:
         # Named agents start from their definition, never parent history.
-        history.add_many(_build_system_messages(definition))
+        history.add_many(_build_system_messages(definition, project_dir=repo_path))
 
     if request.context_origin is ContextOrigin.RESUMED:
         history.add_many(persisted_messages or [])
@@ -377,7 +377,9 @@ def run_child_agent(
     )
 
 
-def _build_system_messages(definition: AgentDefinition) -> list[LLMMessage]:
+def _build_system_messages(
+    definition: AgentDefinition, *, project_dir: str = "",
+) -> list[LLMMessage]:
     messages: list[LLMMessage] = []
 
     # Agent-specific system prompt (from .md body)
@@ -386,6 +388,24 @@ def _build_system_messages(definition: AgentDefinition) -> list[LLMMessage]:
             role="system",
             content=definition.system_prompt,
         ))
+
+    # CC-aligned: preload skills + memory for sub-agents
+    from agent.session.runtime_prompt_builder import _load_skills, _load_agent_memory
+    if definition.skills:
+        skill_contents = _load_skills(definition.skills, project_dir)
+        if skill_contents:
+            messages.append(LLMMessage(
+                role="user",
+                content="[PRELOADED SKILLS]\n" + "\n---\n".join(skill_contents),
+            ))
+    if definition.memory:
+        mem = _load_agent_memory(definition, project_dir)
+        if mem:
+            messages.append(LLMMessage(
+                role="user",
+                content=f"[AGENT MEMORY]\n{mem}\n\n"
+                        "Review your memory above for patterns from previous sessions.",
+            ))
 
     # Universal subagent rules
     messages.append(LLMMessage(
