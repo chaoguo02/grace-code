@@ -122,6 +122,7 @@ class AgentConfig:
     hook_dispatcher: object = None
     """Runtime-owned lifecycle dispatcher; registry remains the fallback."""
     confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
+    effort: str = ""                       # reasoning effort (low/medium/high/xhigh/max)
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
     compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
     circuit_breaker: object = None         # CircuitBreaker | None — 代码级熔断器

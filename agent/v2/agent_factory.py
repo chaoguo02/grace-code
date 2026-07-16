@@ -203,6 +203,8 @@ class AgentFactory:
         """Build per-agent AgentConfig from root + spec."""
         cfg = copy.copy(root_cfg)
         cfg.circuit_breaker = circuit_breaker
+        if spec.effort:
+            cfg.effort = spec.effort
         if spec.mode != SessionMode.PRIMARY:
             cfg.max_steps = min(cfg.max_steps, spec.max_turns)
             cfg.compact_history = False
