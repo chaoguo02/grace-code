@@ -95,12 +95,12 @@ class AgentConfig:
     """Agent 运行时配置，从 config/default.yaml 加载后传入。"""
     max_steps: int = 40
     budget_tokens: int = 160_000            # task spend 上限（billable tokens）
-    request_budget_tokens: int = 70_000    # 单次 request 输入上下文预算
+    request_budget_tokens: int = 110_000   # 单次 request 输入上下文预算 (85% of 128K)
     artifact_threshold_tokens: int = 2_000 # 工具输出超过此值时 artifact 化
     artifact_storage_dir: str = ""  # optional absolute override; default is isolated state root
     missing_test_target_max_followups: int = 2  # pytest 路径缺失后最多允许的确认性探索步数
     max_parallel_tool_calls: int = 3  # Runtime cap; model guidance is not enforcement
-    history_max_messages: int = 40         # 历史最大条数
+    history_max_messages: int = 200        # 历史最大条数
     llm_max_retries: int = 3               # LLM 调用失败最大重试次数
     llm_retry_delay: float = 2.0           # 重试间隔（秒，指数退避）
     stream: bool = False                   # 是否启用流式输出
@@ -1564,7 +1564,24 @@ class ReActAgent:
 
         self._compact_triggered_this_step = ctx.compact_triggered
         self._last_context_stats = ctx.stats
+
+        # Post-compaction recovery: re-inject critical context (CC-aligned)
+        if ctx.compact_triggered:
+            recovery_msgs = self._build_recovery_messages()
+            if recovery_msgs:
+                ctx.messages = list(ctx.messages) + recovery_msgs
+
         return ctx.messages
+
+    def _build_recovery_messages(self) -> list:
+        """Post-compaction context re-injection (CC-aligned)."""
+        from context.compaction import CompactionRecovery
+        recovery = CompactionRecovery(
+            file_cache=getattr(self._full_registry, "_read_cache", None),
+            skill_buffer=getattr(getattr(self._full_registry, "_skill_registry", None), "_buffer", None),
+            project_dir=getattr(self, "_current_repo_path", "."),
+        )
+        return recovery.build_recovery_messages([])
 
     def _check_pending_mode_switch(self, registry: Any, history: Any) -> None:
         """CC-aligned: check and apply _pending_mode_switch after tool execution.

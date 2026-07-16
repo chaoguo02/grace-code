@@ -265,6 +265,34 @@ class ConversationCompactor:
 
         return {"role": "user", "content": merged_content}
 
+    @staticmethod
+    def _adjust_index_for_tool_pairs(messages, cut_index):
+        """向后扩展 cut_index, 避免在 tool_use/tool_result 配对间切割。
+
+        CC: adjustIndexToPreserveAPIInvariants — 确保:
+          1. 每个 tool_result 都有对应的 tool_use
+          2. 同组 message.id 的内容块不分开
+        """
+        if cut_index <= 0:
+            return 0
+        # Collect tool_call IDs from the retention zone
+        result_ids = set()
+        for i in range(cut_index, len(messages)):
+            msg = messages[i]
+            if msg.get("tool_call_id"):
+                result_ids.add(msg["tool_call_id"])
+        if not result_ids:
+            return cut_index
+        # Search backward for matching tool_use blocks
+        while cut_index > 0:
+            msg = messages[cut_index - 1]
+            tool_calls = msg.get("tool_calls") or []
+            if any(tc.get("id") in result_ids if isinstance(tc, dict) else False for tc in tool_calls):
+                cut_index -= 1
+            else:
+                break
+        return cut_index
+
     def build_compact_block_for_history(
         self,
         history_dicts: list[dict],
@@ -290,7 +318,11 @@ class ConversationCompactor:
         return {
             "role": "user",
             "kind": "compaction_boundary",
-            "content": f"[Conversation compacted — earlier messages summarized]\n\n"
+            "compact_metadata": {
+                "type": "api_summary",
+                "compacted_count": len(rest),
+            },
+            "content": f"[Conversation compacted — {len(rest)} messages summarized]\n\n"
                        f"Original task: {first.get('content', '')[:200]}\n\n"
                        f"{compact_text}\n\n"
                        f"[End of compaction summary. Resume conversation.]",
@@ -901,3 +933,127 @@ def trim_sliding_window(
 def _compress_round(round_msgs: list[dict]) -> list[dict]:
     """压缩一轮消息：丢弃 tool_result，保留 assistant 消息。"""
     return [msg for msg in round_msgs if msg.get("role") == "assistant"]
+
+
+# ---------------------------------------------------------------------------
+# CompactionRecovery — post-compaction context re-injection (CC-aligned)
+# ---------------------------------------------------------------------------
+
+class CompactionRecovery:
+    """Re-inject critical context after compaction (files, skills, CLAUDE.md).
+
+    CC reference: POST_COMPACT_TOKEN_BUDGET=50,000 budget for:
+      - 5 most recent files (each ≤5K tokens)
+      - Active skill instructions (total ≤25K tokens)
+      - CLAUDE.md content
+    """
+
+    MAX_FILES = 5
+    MAX_CHARS_PER_FILE = 5_000
+    MAX_SKILLS_CHARS = 25_000
+
+    def __init__(
+        self,
+        file_cache: Any = None,
+        skill_buffer: Any = None,
+        project_dir: str = "",
+    ) -> None:
+        self._file_cache = file_cache
+        self._skill_buffer = skill_buffer
+        self._project_dir = project_dir
+
+    def build_recovery_messages(self, _compacted: list[dict]) -> list[dict]:
+        """Return messages to inject after compaction for context continuity."""
+        msgs: list[dict] = []
+
+        # 1. Re-inject active skill content (CC: POST_COMPACT_MAX_TOKENS_PER_SKILL=5K)
+        if self._skill_buffer is not None and hasattr(self._skill_buffer, "snapshot"):
+            snap = self._skill_buffer.snapshot()
+            total_chars = 0
+            for name, content in snap:
+                chunk = content[:self.MAX_CHARS_PER_SKILL]
+                total_chars += len(chunk)
+                if total_chars > self.MAX_SKILLS_CHARS:
+                    break
+                msgs.append({
+                    "role": "user",
+                    "kind": "runtime_notice",
+                    "content": f"[Skill restored: {name}]\n{chunk}",
+                })
+
+        # 2. Re-inject recent file reads (CC: POST_COMPACT_MAX_FILES_TO_RESTORE=5)
+        if self._file_cache is not None and hasattr(self._file_cache, "entries"):
+            recent = list(self._file_cache.entries.keys())[-self.MAX_FILES:]
+            for path in recent:
+                entry = self._file_cache.entries.get(path)
+                if entry and entry.content:
+                    chunk = entry.content[:self.MAX_CHARS_PER_FILE]
+                    msgs.append({
+                        "role": "user",
+                        "kind": "runtime_notice",
+                        "content": f"[File restored: {path}]\n{chunk}",
+                    })
+
+        # 3. Re-inject CLAUDE.md
+        if self._project_dir:
+            from pathlib import Path
+            claude_md = Path(self._project_dir) / "CLAUDE.md"
+            if claude_md.exists():
+                try:
+                    msgs.append({
+                        "role": "user",
+                        "kind": "runtime_notice",
+                        "content": "[CLAUDE.md restored]\n" + claude_md.read_text(encoding="utf-8")[:5_000],
+                    })
+                except OSError:
+                    pass
+
+        return msgs
+
+
+# ---------------------------------------------------------------------------
+# MicroCompact — zero-API old tool output clearing (CC-aligned Layer 1)
+# ---------------------------------------------------------------------------
+
+COMPACTABLE_TOOLS = frozenset({
+    "Read", "file_read", "file_view",
+    "Bash", "shell",
+    "Grep", "search_text",
+    "Glob", "find_files",
+    "WebSearch", "WebFetch",
+    "Edit", "file_edit",
+    "Write", "file_write",
+})
+
+
+class MicroCompactor:
+    """Replace old tool outputs with [Old tool result content cleared].
+
+    CC reference: microCompact.ts — runs silently, no API call, sub-ms.
+    Only affects compactable tools (Read/Bash/Grep/Glob/Web/Edit/Write).
+    Preserves recent results untouched.
+    """
+
+    _CLEARED_MARKER = "[Old tool result content cleared]"
+
+    def __init__(self, keep_recent: int = 5):
+        self._keep_recent = keep_recent
+
+    def compact(self, messages: list[dict]) -> list[dict]:
+        """Clear old tool result contents, keeping recent ones."""
+        result_indices = []
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "tool" and self._is_compactable(msg):
+                result_indices.append(i)
+        if len(result_indices) <= self._keep_recent:
+            return messages
+        to_clear = result_indices[:-self._keep_recent]
+        for i in to_clear:
+            messages[i] = {**messages[i], "content": self._CLEARED_MARKER}
+        return messages
+
+    @staticmethod
+    def _is_compactable(msg: dict) -> bool:
+        """Check if tool result is eligible for micro-compaction."""
+        name = msg.get("tool_name", "") or msg.get("name", "")
+        return name in COMPACTABLE_TOOLS

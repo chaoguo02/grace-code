@@ -80,8 +80,8 @@ prompts:
 context:
   repo_map_budget: 8000 # repo-map 最大 token 数
   history_window: 20 # 保留最近 N 轮对话
-  request_budget_tokens: 70000 # 单次 LLM request 输入上下文目标（不含 output room）
-  session_compact_tokens: 30000 # shared_history 超过此值触发自动压缩
+  request_budget_tokens: 110000 # 单次 LLM request 输入上下文目标 (85% of 128K)
+  session_compact_tokens: 50000 # shared_history 超过此值触发自动压缩
   auto_compact_after_round: true # 每轮结束后检查是否需要自动压缩
   compact_every_rounds: 3 # 每 N 轮强制检查压缩
   artifact_threshold_tokens: 2000 # 工具输出超过此值时 artifact 化（Phase 4）
