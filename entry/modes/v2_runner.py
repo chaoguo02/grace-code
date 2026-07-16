@@ -539,7 +539,7 @@ def run_v2_mode(
                     agent_name="build", description=description, repo_path=repo_path,
                     backend=backend, registry=registry, agent_config=agent_config,
                     memory_context=memory_context, log_dir=log_dir,
-                    intent_override=_contract.execution_intent.value,
+                    intent_override="edit",
                     plan_file=plan_path,
                     hook_dispatcher=hook_dispatcher,
                     renderer=renderer,
