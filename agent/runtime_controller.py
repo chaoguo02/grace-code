@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from agent.task import RunStatus, TerminationReason
 
 if TYPE_CHECKING:
-    from agent.circuit_breaker import CircuitBreaker
+    from core.circuit_breaker import CircuitBreaker
     from agent.event_log import EventLog
     from agent.v2.execution_budget import BudgetLevel, BudgetStatus, ExecutionBudget
     from agent.v2.task_state_machine import TaskStateMachine

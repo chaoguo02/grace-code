@@ -17,7 +17,7 @@ import json
 import pytest
 import time
 
-from agent.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+from core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
 from agent.task import (

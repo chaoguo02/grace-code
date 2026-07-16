@@ -68,7 +68,7 @@ def create_worktree(
     if isolation is not WorkspaceMode.WORKTREE:
         return None, repo_path
     try:
-        from tools.snapshot import WorktreeManager
+        from runtime.snapshot import WorktreeManager
         manager = WorktreeManager(
             repo_path,
             runtime=runtime or _get_runtime(repo_path),
@@ -347,7 +347,7 @@ def discard_worktree(
     if worktree is None:
         return
     try:
-        from tools.snapshot import WorktreeManager
+        from runtime.snapshot import WorktreeManager
         manager = WorktreeManager(
             repo_path,
             runtime=runtime or _get_runtime(repo_path),

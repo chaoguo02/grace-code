@@ -191,7 +191,7 @@ def run_on_issue(
     from agent.event_log import EventLog
     from agent.prompt import reset_prompt_usage, set_project_dir, set_prompt_config
     from agent.task import Task
-    from agent.factory import create_agent
+    from agent.runtime.agent_factory import AgentFactory as _AgentFactoryForCompat; create_agent = _AgentFactoryForCompat.create
     from llm.router import create_backend_from_config
     from observability import configure_observability, flush_observability
     from runtime.process import LocalRuntime

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from agent.policy import PhasePolicy, normalize_repo_path
+from core.policy import PhasePolicy, normalize_repo_path
 from core.base import (
     ExecutionContext,
     PathAccess,

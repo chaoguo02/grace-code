@@ -25,7 +25,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from agent.policy import TaskPolicy, build_task_policy
+from core.policy import TaskPolicy, build_task_policy
 from agent.runtime_controller import RecoveryAction, ToolDecision
 from agent.event_log import EventLog, summarize_run
 from context.evidence import EvidenceLedger
@@ -276,7 +276,7 @@ class ReActAgent:
         if callable(with_phase_policy):
             self._registry = with_phase_policy(policy.execution)
         else:
-            from agent.policy_registry import PolicyAwareToolRegistry
+            from core.policy_registry import PolicyAwareToolRegistry
             self._registry = PolicyAwareToolRegistry(
                 base=previous_registry,
                 phase_policy=policy.execution,
@@ -1145,7 +1145,7 @@ class ReActAgent:
                             if metadata.path_parameter else ""
                         )
                         if file_path:
-                            from agent.policy import normalize_repo_path
+                            from core.policy import normalize_repo_path
                             self._accessed_files.add(
                                 normalize_repo_path(file_path, task.repo_path)
                             )
@@ -1158,7 +1158,7 @@ class ReActAgent:
                                 if metadata.path_parameter else ""
                             )
                             if written_path:
-                                from agent.policy import normalize_repo_path
+                                from core.policy import normalize_repo_path
                                 self._mark_stale_for_written_file(
                                     normalize_repo_path(written_path, task.repo_path)
                                 )

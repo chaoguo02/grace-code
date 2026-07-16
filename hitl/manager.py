@@ -22,7 +22,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable
 
 from hitl.request import HitlDecision, HitlRequest, HitlResult, HitlStats
-from hitl.policy import PolicyEngine
+from hitl.policy_engine import PolicyEngine
 from core.base import RiskLevel
 
 if TYPE_CHECKING:

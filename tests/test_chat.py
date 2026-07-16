@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent.factory import resolve_task_intent
+from agent.runtime.agent_factory import AgentFactory as _AF; resolve_task_intent = _AF.resolve_task_intent
 from agent.task import TaskIntent
 
 

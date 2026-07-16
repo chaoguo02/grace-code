@@ -104,7 +104,7 @@ class AgentFactory:
                 f"registry={agent_registry.project_dir!r}, repo={_project_root!r}"
             )
         if circuit_breaker is None:
-            from agent.circuit_breaker import CircuitBreaker
+            from core.circuit_breaker import CircuitBreaker
             circuit_breaker = CircuitBreaker()
 
         # ── 1. Resolve agent name ──
@@ -155,8 +155,8 @@ class AgentFactory:
             )
         else:
             # No v2 session (e.g. ChatSession): wrap base registry directly
-            from agent.policy_registry import PolicyAwareToolRegistry
-            from agent.policy import PhasePolicy
+            from core.policy_registry import PolicyAwareToolRegistry
+            from core.policy import PhasePolicy
             declared = agent_registry.tool_names_for(spec.name)
             filtered_registry = base_registry.filtered(declared)
             registry = PolicyAwareToolRegistry(

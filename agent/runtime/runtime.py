@@ -61,10 +61,10 @@ class ExplicitDelegationError(ValueError):
 
 if TYPE_CHECKING:
     from agent.completion_guard import CompletionCheckResult
-    from agent.policy import PhasePolicy
+    from core.policy import PhasePolicy
     from agent.v2.models import SessionRecord
     from agent.v2.worktree_service import WorktreeOperationResult
-    from tools.snapshot import Worktree
+    from runtime.snapshot import Worktree
 
 
 class SessionRuntime:
@@ -104,7 +104,7 @@ class SessionRuntime:
         self._background_runs_lock = threading.Lock()
 
         # ── Circuit Breaker (code-level, not prompt-based) ──
-        from agent.circuit_breaker import CircuitBreaker
+        from core.circuit_breaker import CircuitBreaker
         self._circuit_breaker = CircuitBreaker()
 
         # ── P1-6: Dynamic Capability Registry ──
@@ -367,7 +367,7 @@ class SessionRuntime:
         if registered[worktree_path] != evidence.branch:
             raise ValueError("Stored child worktree branch does not match Git facts")
 
-        from tools.snapshot import Worktree
+        from runtime.snapshot import Worktree
         worktree = Worktree(
             name=worktree_path.name,
             path=str(worktree_path),
@@ -448,7 +448,7 @@ class SessionRuntime:
         contract: "TaskContract",
     ) -> AgentRunResult:
         """Guarantee one named child run without asking the parent model to route it."""
-        from agent.policy import PhasePolicy, READ_ONLY_EFFECTS
+        from core.policy import PhasePolicy, READ_ONLY_EFFECTS
         from agent.v2.task_contract import TaskContract
         from core.base import ToolEffect, ToolRole
 
@@ -752,7 +752,7 @@ class SessionRuntime:
             raise ValueError("child parent_max_steps must be positive")
         if not isinstance(cancellation_token, CancellationToken):
             raise TypeError("child cancellation_token must be a CancellationToken")
-        from agent.policy import PhasePolicy
+        from core.policy import PhasePolicy
         if not isinstance(parent_policy, PhasePolicy):
             raise TypeError("child parent_policy must be a PhasePolicy")
         if not isinstance(request, AgentSpawnRequest):
@@ -1143,7 +1143,7 @@ class SessionRuntime:
             raise ValueError("Resume budget and step limit must be positive")
         if not isinstance(cancellation_token, CancellationToken):
             raise TypeError("cancellation_token must be a CancellationToken")
-        from agent.policy import PhasePolicy
+        from core.policy import PhasePolicy
         from agent.v2.task_contract import TaskContract
         if not isinstance(parent_policy, PhasePolicy):
             raise TypeError("parent_policy must be a PhasePolicy")

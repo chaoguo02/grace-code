@@ -98,8 +98,8 @@ def build_registry_for_session(
     All tools are available. Permissions are restricted at execution time
     by PhasePolicy (e.g., analysis tasks get read-only shell).
     """
-    from agent.policy_registry import PolicyAwareToolRegistry
-    from agent.policy import PhasePolicy
+    from core.policy_registry import PolicyAwareToolRegistry
+    from core.policy import PhasePolicy
     from agent.v2.models import AgentKind, SessionMode
 
     declared = agent_registry.tool_names_for(spec.name)

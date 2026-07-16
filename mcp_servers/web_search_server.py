@@ -25,7 +25,7 @@ import asyncio
 import logging
 from typing import Any
 
-from tools.web_utils import (
+from core.web_utils import (
     DEFAULT_FETCH_TIMEOUT,
     DEFAULT_MAX_FETCH_CHARS,
     DEFAULT_MAX_RETRIES,
@@ -37,7 +37,7 @@ from tools.web_utils import (
     validate_redirect,
     validate_url,
 )
-from tools.utils import truncate_output
+from core.utils import truncate_output
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server

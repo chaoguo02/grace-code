@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Tools whose output should NOT be artifacted (always inline).
 # Derived from effect categories, not tool names. Use build_artifact_exempt_set()
 # to compute from a registry rather than maintaining this list manually.
-from tools.display import INLINE_EFFECTS as _INLINE_EFFECTS
+from entry.display import INLINE_EFFECTS as _INLINE_EFFECTS
 
 ARTIFACT_EXEMPT_TOOLS = frozenset({
     "file_read", "file_view", "file_edit", "file_write",

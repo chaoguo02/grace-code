@@ -30,7 +30,7 @@ class TestPermissionMode:
     """PhasePolicy.is_tool_blocked_by_permission_mode()"""
 
     def test_plan_mode_blocks_write_edit_bash(self):
-        from agent.policy import PhasePolicy
+        from core.policy import PhasePolicy
         policy = PhasePolicy(permission_mode="plan")
         assert policy.is_tool_blocked_by_permission_mode("Write") is True
         assert policy.is_tool_blocked_by_permission_mode("Edit") is True
@@ -39,13 +39,13 @@ class TestPermissionMode:
         assert policy.is_tool_blocked_by_permission_mode("Grep") is False
 
     def test_default_mode_blocks_nothing(self):
-        from agent.policy import PhasePolicy
+        from core.policy import PhasePolicy
         policy = PhasePolicy()
         assert policy.is_tool_blocked_by_permission_mode("Write") is False
         assert policy.is_tool_blocked_by_permission_mode("Bash") is False
 
     def test_dont_ask_mode_blocks_non_allowed(self):
-        from agent.policy import PhasePolicy
+        from core.policy import PhasePolicy
         policy = PhasePolicy(
             permission_mode="dontAsk",
             allowed_tools=frozenset({"Read", "Grep"}),
@@ -55,7 +55,7 @@ class TestPermissionMode:
         assert policy.is_tool_blocked_by_permission_mode("Bash") is True
 
     def test_accept_edits_does_not_block_write(self):
-        from agent.policy import PhasePolicy
+        from core.policy import PhasePolicy
         policy = PhasePolicy(permission_mode="acceptEdits")
         assert policy.is_tool_blocked_by_permission_mode("Write") is False
         assert policy.is_tool_blocked_by_permission_mode("Edit") is False

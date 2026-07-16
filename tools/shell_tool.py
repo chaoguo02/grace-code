@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 from runtime.process import LocalRuntime, Runtime
-from tools.utils import truncate_output
+from core.utils import truncate_output
 
 
 # ---------------------------------------------------------------------------

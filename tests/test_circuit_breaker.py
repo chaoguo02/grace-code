@@ -1,7 +1,7 @@
 """Unit tests for agent/circuit_breaker.py — Runtime-level circuit breaker."""
 
 import pytest
-from agent.circuit_breaker import (
+from core.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerConfig,
     CircuitBreakerState,

@@ -485,7 +485,7 @@ def run(
     from agent.core import AgentConfig
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
-    from agent.policy import normalize_repo_path
+    from core.policy import normalize_repo_path
     from entry.renderer import create_renderer
     try:
         from context.token_budget import is_tiktoken_available
@@ -968,7 +968,7 @@ def langfuse_validate(
     """Run repeatable Langfuse end-to-end validation scenarios."""
     from agent.core import AgentConfig
     from agent.event_log import EventLog
-    from agent.factory import create_agent
+    from agent.runtime.agent_factory import AgentFactory as _AgentFactoryForCompat; create_agent = _AgentFactoryForCompat.create
     from agent.task import Task
     from langfuse import get_client
     from observability.validation import (

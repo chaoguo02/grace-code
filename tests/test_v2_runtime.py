@@ -15,8 +15,8 @@ from hooks.events import HookContext, HookEvent
 from hooks.protocol import DispatchResult, HookControl
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
-from agent.policy import PhasePolicy, build_task_policy
-from agent.policy_registry import PolicyAwareToolRegistry
+from core.policy import PhasePolicy, build_task_policy
+from core.policy_registry import PolicyAwareToolRegistry
 from agent.task import (
     Action,
     ActionType,

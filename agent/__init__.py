@@ -22,7 +22,7 @@ def __getattr__(name: str):
             globals()[name] = _mod[name]
             return _mod[name]
     if name == "create_agent":
-        from agent.factory import create_agent
+        from agent.runtime.agent_factory import AgentFactory as _AgentFactoryForCompat; create_agent = _AgentFactoryForCompat.create
         globals()["create_agent"] = create_agent
         return create_agent
     raise AttributeError(f"module 'agent' has no attribute {name!r}")

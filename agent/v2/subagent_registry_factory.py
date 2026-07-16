@@ -12,7 +12,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from agent.policy import PhasePolicy
+    from core.policy import PhasePolicy
     from agent.v2.models import AgentDefinition, SessionRecord
     from core.base import ToolRegistry
 
@@ -44,8 +44,8 @@ def build_restricted_registry(
         repo_path: Working directory (for policy wrapper)
     """
     from agent.v2.agent_registry import resolve_tool_set
-    from agent.policy_registry import PolicyAwareToolRegistry
-    from agent.policy import PhasePolicy
+    from core.policy_registry import PolicyAwareToolRegistry
+    from core.policy import PhasePolicy
     from core.base import ExecutionContext, ToolRole
 
     # `definition` is the dispatch-time fact source.  Re-discovering an agent

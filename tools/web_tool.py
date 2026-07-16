@@ -23,8 +23,8 @@ import time
 from typing import Any
 
 from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
-from tools.utils import truncate_output
-from tools.web_utils import (
+from core.utils import truncate_output
+from core.web_utils import (
     DEFAULT_FETCH_TIMEOUT,
     DEFAULT_MAX_FETCH_CHARS,
     DEFAULT_MAX_RETRIES,

@@ -254,7 +254,7 @@ class TestWorktreeIsolation:
 
     def test_worktree_creation_and_cleanup(self, git_repo):
         """Worktree can be created, used, and cleaned up."""
-        from tools.snapshot import WorktreeManager
+        from runtime.snapshot import WorktreeManager
 
         manager = WorktreeManager(git_repo)
         wt = manager.create("test-agent-001")
@@ -290,7 +290,7 @@ class TestWorktreeIsolation:
 
     def test_discard_on_failure(self, git_repo):
         """When worktree is discarded, main repo is unchanged."""
-        from tools.snapshot import WorktreeManager
+        from runtime.snapshot import WorktreeManager
 
         manager = WorktreeManager(git_repo)
         wt = manager.create("test-agent-fail")

@@ -29,7 +29,7 @@ from agent.v2.run_context import AgentSpawnContext, CancellationToken
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from agent.policy import PhasePolicy
+    from core.policy import PhasePolicy
     from agent.v2.models import SessionRecord, WorktreeEvidence
     from agent.v2.runtime import SessionRuntime
     from agent.v2.task_contract import TaskContract
@@ -209,7 +209,7 @@ def run_child_agent(
         if cfg.circuit_breaker.config.max_elapsed_seconds == 0.0:
             cfg.circuit_breaker.config.max_elapsed_seconds = 120.0
     else:
-        from agent.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+        from core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
         cfg.circuit_breaker = CircuitBreaker(config=CircuitBreakerConfig(
             max_elapsed_seconds=120.0,
         ))

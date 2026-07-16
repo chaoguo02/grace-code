@@ -304,7 +304,7 @@ def test_declared_worktree_isolation_fails_closed(tmp_path, monkeypatch):
 
 
 def test_worktree_manager_refuses_discard_outside_managed_root(tmp_path, monkeypatch):
-    from tools.snapshot import Worktree, WorktreeError, WorktreeManager
+    from runtime.snapshot import Worktree, WorktreeError, WorktreeManager
 
     repo = _git_repo(tmp_path / "repo")
     monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "agent-state"))

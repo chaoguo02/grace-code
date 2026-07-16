@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent.policy import build_task_policy
+from core.policy import build_task_policy
 from agent.task import Task, ToolCall
 from llm.base import LLMToolSchema
 from llm.tool_call_validator import validate_tool_calls

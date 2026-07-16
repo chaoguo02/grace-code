@@ -13,7 +13,7 @@ Legacy 组件（保留向后兼容）：
 
 from hitl.request import HitlDecision, HitlRequest, HitlResult, HitlStats
 from hitl.manager import HitlManager
-from hitl.policy import PolicyEngine
+from hitl.policy_engine import PolicyEngine
 from hitl.pipeline import (
     PermissionDecision,
     PermissionLayer,

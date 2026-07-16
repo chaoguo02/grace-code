@@ -15,7 +15,7 @@ from context.history import ConversationSnapshot
 from llm.base import LLMMessage, LLMToolSchema
 
 if TYPE_CHECKING:
-    from agent.policy import PhasePolicy
+    from core.policy import PhasePolicy
     from core.base import ToolEffect
 
 

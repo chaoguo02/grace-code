@@ -20,7 +20,7 @@ from agent.task import TaskIntent
 from core.base import ToolEffect, ToolMetadata
 
 if TYPE_CHECKING:
-    from agent.policy import CompletionPolicy
+    from core.policy import CompletionPolicy
 
 logger = logging.getLogger(__name__)
 

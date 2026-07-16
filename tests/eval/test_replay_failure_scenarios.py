@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState
+from core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState
 from agent.completion_guard import CompletionContext, TaskCompletionGuard
 from agent.runtime_controller import RuntimeController, StepAction
 from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig

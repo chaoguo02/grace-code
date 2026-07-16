@@ -16,7 +16,7 @@ from agent.v2.session_store import SessionStore
 from agent.v2.worktree_service import inspect_worktree
 from entry.cli import cli
 from runtime.state_paths import ProjectStatePaths, STATE_HOME_ENV
-from tools.snapshot import WorktreeManager
+from runtime.snapshot import WorktreeManager
 
 
 def _git(repo: Path, *args: str) -> None:
