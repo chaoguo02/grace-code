@@ -949,7 +949,7 @@ _DEFAULT_GENERAL_TOOLS = frozenset({
     "artifact_list", "artifact_read", "artifact_search",
     "evidence_list", "evidence_get",
     "memory_read", "memory_list", "memory_search", "memory_write", "memory_delete",
-    "Agent",
+    "Agent", "Skill",
 })
 
 _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
