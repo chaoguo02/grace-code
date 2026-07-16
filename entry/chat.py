@@ -492,8 +492,18 @@ class ChatSession:
 
             if result.summary:
                 from llm.base import LLMMessage
+                content = f"[Skill fork: {name}]\n{result.summary}"
+                # Extract structured findings if any
+                if hasattr(result, "structured_findings") and result.structured_findings:
+                    finding_lines = ["\n## Fork Findings"]
+                    for f in result.structured_findings[:10]:
+                        finding_lines.append(
+                            f"- [{f.get('severity','info')}] {f.get('title','')}: "
+                            f"{f.get('description','')[:200]}"
+                        )
+                    content += "\n".join(finding_lines)
                 self._shared_history.add(LLMMessage(
-                    role="assistant", content=f"[Skill fork: {name}]\n{result.summary}"
+                    role="assistant", content=content
                 ))
 
             click.echo(
@@ -508,11 +518,8 @@ class ChatSession:
 
         agent_cfg = self._agent_cfg
         # SK-20: apply model/effort overrides from skill frontmatter
-        if meta.model or meta.effort:
-            from dataclasses import replace
-            agent_cfg = replace(agent_cfg)
-            # Note: actual model switching requires backend rebuild.
-            # For now, effort override is passed through agent_config metadata.
+        if meta.effort:
+            agent_cfg = agent_cfg.__class__(**{**agent_cfg.__dict__, "effort": meta.effort})
 
         return AgentFactory.create(
             agent_name=agent_type,
