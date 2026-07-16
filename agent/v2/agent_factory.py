@@ -24,6 +24,7 @@ import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from agent.task import TaskIntent
 from agent.v2.models import SessionMode
 
 if TYPE_CHECKING:
@@ -106,33 +107,38 @@ class AgentFactory:
             from agent.circuit_breaker import CircuitBreaker
             circuit_breaker = CircuitBreaker()
 
-        # ── 1. Resolve mode → agent name ──
-        # External modes (v2-build, v2-plan, auto, react, ...) map to
-        # internal agent names (build, plan). Unknown modes are rejected.
-        _MODE_MAP = {
-            "v2-build": "build", "v2-plan": "plan",
-            "build": "build", "plan": "plan",
-            "auto": "build", "react": "build",
-        }
+        # ── 1. Resolve agent name ──
+        # Try direct registry lookup first. Legacy mode names (v2-build,
+        # auto, react) are mapped as fallback for backward compatibility.
         try:
-            _resolved = _MODE_MAP[agent_name]
-        except KeyError as exc:
-            raise ValueError(f"Unknown agent mode: {agent_name!r}") from exc
-        spec = agent_registry.get(_resolved)
-        if _resolved == "plan":
+            spec = agent_registry.get(agent_name)
+        except KeyError:
+            _MODE_MAP = {
+                "v2-build": "build", "v2-plan": "plan",
+                "auto": "build", "react": "build",
+            }
+            _resolved = _MODE_MAP.get(agent_name)
+            if _resolved is None:
+                raise ValueError(
+                    f"Unknown agent: {agent_name!r}. "
+                    f"Available: {list(agent_registry.list_all())}"
+                ) from None
+            spec = agent_registry.get(_resolved)
+
+        # Validate plan-mode agents have analysis intent + read-only scope
+        if spec.permission_mode == "plan":
             from agent.v2.models import DelegationScope
-            from agent.task import TaskIntent
             if (
                 spec.intent is not TaskIntent.ANALYSIS
                 or spec.effective_delegation_scope is not DelegationScope.READ_ONLY
             ):
                 raise ValueError(
-                    "The v2-plan agent must declare analysis intent and a "
-                    "read-only delegation scope"
+                    "Agents with permission_mode 'plan' must declare analysis "
+                    "intent and a read-only delegation scope"
                 )
 
         contract: "TaskContract"
-        if _resolved == "plan":
+        if spec.intent is TaskIntent.ANALYSIS:
             contract = TaskContract.for_plan(root_agent_config)
         else:
             contract = TaskContract.for_build(root_agent_config)

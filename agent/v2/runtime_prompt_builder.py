@@ -36,7 +36,7 @@ def build_runtime_messages(
     from llm.base import LLMMessage
     messages: list[LLMMessage] = []
 
-    if spec.name == "plan":
+    if spec.permission_mode == "plan":
         from agent.prompt import get_plan_mode_injection
         messages.append(LLMMessage(role="user", content=get_plan_mode_injection()))
         # Structured contract: Plan agent MUST output JSON

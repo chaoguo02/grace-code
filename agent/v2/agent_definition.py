@@ -11,7 +11,6 @@ from agent.task import TaskIntent
 from agent.v2.models import (
     AgentDefinition,
     AgentKind,
-    AgentModel,
     AgentVisibility,
     DelegationMode,
     DelegationPolicy,
@@ -150,8 +149,6 @@ def _parse_definition(path: Path) -> AgentDefinition:
         raise _invalid(
             path, f"field 'isolation' has invalid value {isolation_raw!r}"
         ) from exc
-    if "background" in frontmatter:
-        raise _invalid(path, "unsupported field 'background'")
     if "hidden" in frontmatter:
         raise _invalid(path, "removed field 'hidden'; use 'visibility'")
     visibility_raw = frontmatter.get("visibility", AgentVisibility.PUBLIC.value)
@@ -175,17 +172,19 @@ def _parse_definition(path: Path) -> AgentDefinition:
             path,
             f"field 'delegationScope' has invalid value {delegation_scope_raw!r}",
         ) from exc
-    model_raw = frontmatter.get("model", AgentModel.INHERIT.value)
+    model_raw = frontmatter.get("model", "inherit")
     if not isinstance(model_raw, str):
         raise _invalid(path, "field 'model' must be a string")
-    try:
-        model = AgentModel(model_raw.strip().lower())
-    except ValueError as exc:
-        raise _invalid(
-            path,
-            f"field 'model' has unsupported value {model_raw!r}; "
-            "this Runtime currently supports only 'inherit'",
-        ) from exc
+    model = model_raw.strip().lower()
+    # Validate against known aliases, but accept arbitrary model IDs too
+    from agent.v2.models import AgentModel
+    known = {m.value for m in AgentModel}
+    if model not in known and not model.startswith("claude-"):
+        import logging
+        logging.getLogger(__name__).warning(
+            "Unrecognized model %r in %s; accepted model aliases: %s",
+            model, path, ", ".join(sorted(known)),
+        )
     try:
         max_turns = int(frontmatter.get("maxTurns", frontmatter.get("max_turns", 50)))
         max_tokens_raw = frontmatter.get(
@@ -198,6 +197,38 @@ def _parse_definition(path: Path) -> AgentDefinition:
         raise _invalid(
             path, "fields 'maxTurns' and 'maxTokens' must be positive integers"
         ) from exc
+
+    # ── CC-aligned frontmatter fields ──
+    permission_mode = str(frontmatter.get("permissionMode", "") or "")
+    mcp_servers_raw = frontmatter.get("mcpServers")
+    mcp_servers: tuple[str | dict, ...] = ()
+    if isinstance(mcp_servers_raw, list):
+        mcp_servers = tuple(mcp_servers_raw)
+    elif isinstance(mcp_servers_raw, str):
+        mcp_servers = (mcp_servers_raw,)
+    skills_raw = frontmatter.get("skills", "")
+    skills: tuple[str, ...] = ()
+    if isinstance(skills_raw, list):
+        skills = tuple(str(s) for s in skills_raw)
+    elif isinstance(skills_raw, str):
+        skills = tuple(s.strip() for s in skills_raw.replace(",", " ").split() if s.strip())
+    memory = str(frontmatter.get("memory", "") or "")
+    background_raw = frontmatter.get("background", False)
+    if isinstance(background_raw, bool):
+        background = background_raw
+    elif isinstance(background_raw, str):
+        background = background_raw.strip().lower() in ("true", "yes", "1")
+    else:
+        background = False
+    effort = str(frontmatter.get("effort", "") or "")
+    color = str(frontmatter.get("color", "") or "")
+    initial_prompt = str(frontmatter.get("initialPrompt", "") or "")
+    hooks_raw = frontmatter.get("hooks", {})
+    hooks: tuple[dict, ...] = ()
+    if isinstance(hooks_raw, dict):
+        hooks = (hooks_raw,)
+    elif isinstance(hooks_raw, list):
+        hooks = tuple(h for h in hooks_raw if isinstance(h, dict))
 
     delegation_policy = _parse_delegation_policy(path, allowed_subagents_raw)
     if (
@@ -225,6 +256,15 @@ def _parse_definition(path: Path) -> AgentDefinition:
         max_turns=max_turns,
         max_tokens=max_tokens,
         system_prompt=body or str(frontmatter.get("instructions", "")),
+        permission_mode=permission_mode,
+        mcp_servers=mcp_servers,
+        skills=skills,
+        memory=memory,
+        background=background,
+        effort=effort,
+        color=color,
+        initial_prompt=initial_prompt,
+        hooks=hooks,
     )
 
 

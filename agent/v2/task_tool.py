@@ -441,16 +441,16 @@ class AgentTool(BaseTool):
         prompt = (
             user_prompt
             if is_fork
-            else _build_subagent_prompt(user_prompt, subagent_type)
+            else _build_subagent_prompt(user_prompt, definition)
         )
-        if subagent_type == "code-reviewer":
+        if definition is not None and definition.required_tools:
             logger.debug(
                 "Injecting subagent protocol (%d chars) into prompt for agent %s",
                 len(_SUBAGENT_PROTOCOL), subagent_type,
             )
         else:
             logger.debug(
-                "Skipping subagent protocol for agent %s (not code-reviewer)",
+                "Skipping subagent protocol for agent %s (no required_tools or fork)",
                 subagent_type,
             )
         logger.info(
@@ -651,13 +651,13 @@ def _xml_escape(text: Any) -> str:
     return escape(str(text or ""))
 
 
-def _build_subagent_prompt(user_prompt: str, subagent_type: str) -> str:
+def _build_subagent_prompt(user_prompt: str, definition: "AgentDefinition | None") -> str:
     """Wrap the user's task prompt with the subagent analysis protocol.
 
-    Only code-reviewer subagents get the full verification protocol.
-    For explore/general, pass the prompt cleanly — their system prompt
-    already has tool selection rules from _SUBAGENT_SUMMARY_RULE.
+    Subagents with required_tools (structured-report agents like code-reviewer)
+    get the full verification protocol. Others pass through cleanly — their
+    system prompt already has tool selection rules from _SUBAGENT_SUMMARY_RULE.
     """
-    if subagent_type == "code-reviewer":
+    if definition is not None and definition.required_tools:
         return f"{_SUBAGENT_PROTOCOL}\n{user_prompt}"
     return user_prompt

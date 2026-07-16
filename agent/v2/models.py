@@ -143,10 +143,37 @@ class AgentVisibility(str, Enum):
     HIDDEN = "hidden"
 
 
+class PermissionMode(str, Enum):
+    """Permission mode for an agent (CC-aligned frontmatter field)."""
+
+    DEFAULT = "default"
+    ACCEPT_EDITS = "acceptEdits"
+    AUTO = "auto"
+    DONT_ASK = "dontAsk"
+    BYPASS_PERMISSIONS = "bypassPermissions"
+    PLAN = "plan"
+    MANUAL = "manual"
+
+
 class AgentModel(str, Enum):
-    """Subagent model selection currently supported by this Runtime."""
+    """Subagent model selection.
+
+    Supports CC model aliases plus arbitrary model IDs.
+    Use classmethod resolve() to normalize user input.
+    """
 
     INHERIT = "inherit"
+    SONNET = "sonnet"
+    OPUS = "opus"
+    HAIKU = "haiku"
+    FABLE = "fable"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "AgentModel | None":
+        """Accept arbitrary model IDs (e.g. 'claude-opus-4-8') as-is."""
+        if isinstance(value, str) and value.strip():
+            return cls.INHERIT  # passthrough — stored as raw str in AgentDefinition.model
+        return None
 
 
 class DelegationScope(str, Enum):
@@ -381,7 +408,11 @@ class SessionMessageRecord:
 
 @dataclass(frozen=True)
 class AgentDefinition:
-    """Runtime-validated agent definition loaded from Markdown frontmatter."""
+    """Runtime-validated agent definition loaded from Markdown frontmatter.
+
+    CC-aligned fields: permission_mode, mcp_servers, skills, memory,
+    background, effort, color, initial_prompt, hooks.
+    """
 
     name: str
     description: str
@@ -392,7 +423,7 @@ class AgentDefinition:
         default_factory=DelegationPolicy.disabled
     )
     delegation_scope: DelegationScope | None = None
-    model: AgentModel = AgentModel.INHERIT
+    model: str = "inherit"
     agent_kind: AgentKind = AgentKind.NAMED_SUBAGENT
     workspace_mode: WorkspaceMode = WorkspaceMode.CURRENT
     visibility: AgentVisibility = AgentVisibility.PUBLIC
@@ -408,6 +439,26 @@ class AgentDefinition:
     """Per-tool minimum call counts required before FINISH is accepted.
     e.g. {"submit_findings": 1} means the subagent MUST call submit_findings ≥ 1 time.
     The CompletionGuard enforces this at the Runtime level."""
+    # ── CC-aligned frontmatter fields ──
+    permission_mode: str = ""
+    """CC permissionMode: 'default', 'acceptEdits', 'auto', 'plan', etc.
+    Empty string means not set (inherits from parent context)."""
+    mcp_servers: tuple[str | dict, ...] = field(default_factory=tuple)
+    """MCP servers available to this agent (server names or inline defs)."""
+    skills: tuple[str, ...] = field(default_factory=tuple)
+    """Skill names to preload into this agent's context at startup."""
+    memory: str = ""
+    """Persistent memory scope: 'user', 'project', 'local', or empty (disabled)."""
+    background: bool = False
+    """Always run as a background task when True."""
+    effort: str = ""
+    """Reasoning effort: 'low', 'medium', 'high', 'xhigh', 'max'."""
+    color: str = ""
+    """Display color: 'red', 'blue', 'green', 'yellow', 'purple', etc."""
+    initial_prompt: str = ""
+    """Auto-submitted as the first user turn when running via --agent."""
+    hooks: tuple[dict, ...] = field(default_factory=tuple)
+    """Lifecycle hooks scoped to this agent (PreToolUse, PostToolUse, Stop)."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, TaskIntent):
@@ -422,8 +473,8 @@ class AgentDefinition:
             )
         if not isinstance(self.visibility, AgentVisibility):
             object.__setattr__(self, "visibility", AgentVisibility(self.visibility))
-        if not isinstance(self.model, AgentModel):
-            object.__setattr__(self, "model", AgentModel(self.model))
+        if not isinstance(self.model, str):
+            object.__setattr__(self, "model", str(self.model))
         if self.delegation_scope is not None and not isinstance(
             self.delegation_scope, DelegationScope
         ):
@@ -441,6 +492,17 @@ class AgentDefinition:
             raise ValueError("max_turns must be positive")
         if self.max_tokens is not None and self.max_tokens < 1:
             raise ValueError("max_tokens must be positive when provided")
+        if self.permission_mode and self.permission_mode not in {
+            "default", "acceptEdits", "auto", "dontAsk",
+            "bypassPermissions", "plan", "manual",
+        }:
+            raise ValueError(f"Invalid permission_mode: {self.permission_mode!r}")
+        if self.memory and self.memory not in {"user", "project", "local"}:
+            raise ValueError(f"Invalid memory scope: {self.memory!r}")
+        if self.effort and self.effort not in {
+            "low", "medium", "high", "xhigh", "max",
+        }:
+            raise ValueError(f"Invalid effort level: {self.effort!r}")
 
     @property
     def mode(self) -> SessionMode:
@@ -879,6 +941,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         visibility=AgentVisibility.PUBLIC,
         max_turns=100,
         system_prompt="",
+        permission_mode="default",
     ),
     "plan": AgentDefinition(
         name="plan",
@@ -892,6 +955,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         visibility=AgentVisibility.PUBLIC,
         max_turns=60,
         system_prompt="",
+        permission_mode="plan",
     ),
     "explore": AgentDefinition(
         name="explore",
@@ -912,6 +976,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
 - Return: Files inspected, Key findings with line numbers, Evidence (actual code read).
 - Do NOT edit code or leave follow-up work for the parent.
 - Your final message IS your return value.""",
+        permission_mode="default",
     ),
     "general": AgentDefinition(
         name="general",
@@ -932,6 +997,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
 - If finished: summarize concrete changes.
 - If blocked: explain precisely what's missing.
 - Your final message IS your return value.""",
+        permission_mode="default",
     ),
     "code-reviewer": AgentDefinition(
         name="code-reviewer",
@@ -950,5 +1016,6 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
 - Do NOT rubber-stamp weak work.
 - For each finding: file, line, summary, failure scenario.
 - Do NOT edit code. Your final message IS your review.""",
+        permission_mode="default",
     ),
 }

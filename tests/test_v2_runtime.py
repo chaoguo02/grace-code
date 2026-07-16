@@ -650,11 +650,29 @@ def test_agent_definition_model_inherits_parent_backend(configured, tmp_path):
         encoding="utf-8",
     )
 
-    assert _parse_definition(path).model is AgentModel.INHERIT
+    assert _parse_definition(path).model == "inherit"
 
 
-@pytest.mark.parametrize("configured", ("sonnet", "claude-sonnet-5", 7))
-def test_agent_definition_rejects_unsupported_model(configured, tmp_path):
+def test_agent_definition_accepts_known_model_aliases(tmp_path):
+    """CC-aligned: sonnet, opus, haiku, fable, inherit are accepted."""
+    from agent.v2.agent_definition import _parse_definition
+
+    for alias in ("sonnet", "opus", "haiku", "fable", "inherit"):
+        path = tmp_path / f"model-{alias}.md"
+        path.write_text(
+            "---\n"
+            f"name: model-{alias}\n"
+            "intent: analysis\n"
+            f"model: {alias}\n"
+            "---\n"
+            "Analyze.\n",
+            encoding="utf-8",
+        )
+        assert _parse_definition(path).model == alias
+
+
+def test_agent_definition_rejects_non_string_model(tmp_path):
+    """model field must be a string."""
     from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "unsupported-model.md"
@@ -662,20 +680,14 @@ def test_agent_definition_rejects_unsupported_model(configured, tmp_path):
         "---\n"
         "name: unsupported-model\n"
         "intent: analysis\n"
-        f"model: {configured}\n"
+        "model: 7\n"
         "---\n"
         "Analyze.\n",
         encoding="utf-8",
     )
 
-    with pytest.raises(AgentDefinitionError, match="field 'model'") as exc_info:
+    with pytest.raises(AgentDefinitionError, match="must be a string"):
         _parse_definition(path)
-
-    assert exc_info.value.path == path.resolve()
-    assert (
-        "supports only 'inherit'" in exc_info.value.detail
-        or "must be a string" in exc_info.value.detail
-    )
 
 
 @pytest.mark.parametrize(
@@ -746,7 +758,7 @@ def test_project_agent_definitions_declare_typed_intents():
 
 @pytest.mark.parametrize(
     "field",
-    ("visibility: private", "hidden: true", "background: true"),
+    ("visibility: private", "hidden: true"),
 )
 def test_agent_definition_rejects_invalid_or_unsupported_visibility(field, tmp_path):
     from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
@@ -759,6 +771,20 @@ def test_agent_definition_rejects_invalid_or_unsupported_visibility(field, tmp_p
 
     with pytest.raises(AgentDefinitionError):
         _parse_definition(path)
+
+
+def test_agent_definition_accepts_background_field(tmp_path):
+    """CC-aligned: background: true is now accepted (was rejected before Batch 9)."""
+    from agent.v2.agent_definition import _parse_definition
+
+    path = tmp_path / "background-agent.md"
+    path.write_text(
+        "---\nname: background-agent\nintent: analysis\nbackground: true\n---\nBG.",
+        encoding="utf-8",
+    )
+
+    definition = _parse_definition(path)
+    assert definition.background is True
 
 
 def test_agent_definition_parses_hidden_visibility(tmp_path):
@@ -3629,8 +3655,14 @@ from agent.v2.task_tool import (
 # ── Subagent prompt wrapper (Layer 1) ──
 
 def test_build_subagent_prompt_includes_protocol():
-    """_build_subagent_prompt wraps code-reviewer prompts with the full protocol."""
-    result = _build_subagent_prompt("Analyze task_tool.py for bugs.", "code-reviewer")
+    """_build_subagent_prompt wraps agents with required_tools with the full protocol."""
+    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+    reviewer_def = AgentDefinition(
+        name="code-reviewer", description="review",
+        intent=TaskIntent.ANALYSIS, agent_kind=AgentKind.NAMED_SUBAGENT,
+        required_tools=frozenset({"ReportFindings"}),
+    )
+    result = _build_subagent_prompt("Analyze task_tool.py for bugs.", reviewer_def)
     assert "[SUBAGENT ANALYSIS PROTOCOL]" in result
     assert "READ BEFORE YOU CLAIM" in result
     assert "Phase 1" in result and "Phase 2" in result and "Phase 3" in result and "Phase 4" in result
@@ -3642,16 +3674,27 @@ def test_build_subagent_prompt_includes_protocol():
 
 
 def test_build_subagent_prompt_non_reviewer_passthrough():
-    """Non-code-reviewer subagents get the prompt directly — no protocol wrapping."""
+    """Agents without required_tools get the prompt directly — no protocol wrapping."""
+    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
     for agent_type in ("explore", "general"):
-        result = _build_subagent_prompt("Find all config files.", agent_type)
+        agent_def = AgentDefinition(
+            name=agent_type, description="test",
+            intent=TaskIntent.ANALYSIS, agent_kind=AgentKind.NAMED_SUBAGENT,
+        )
+        result = _build_subagent_prompt("Find all config files.", agent_def)
         assert result == "Find all config files."
         assert "[SUBAGENT ANALYSIS PROTOCOL]" not in result
 
 
 def test_known_design_decisions_injected_into_protocol():
     """The shareable _KNOWN_DESIGN_DECISIONS list is injected into the protocol."""
-    result = _build_subagent_prompt("Do X.", "code-reviewer")
+    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+    reviewer_def = AgentDefinition(
+        name="code-reviewer", description="review",
+        intent=TaskIntent.ANALYSIS, agent_kind=AgentKind.NAMED_SUBAGENT,
+        required_tools=frozenset({"ReportFindings"}),
+    )
+    result = _build_subagent_prompt("Do X.", reviewer_def)
     assert "KNOWN DESIGN DECISIONS" in result
     for entry in _KNOWN_DESIGN_DECISIONS:
         # First 40 chars of each entry should appear in the protocol

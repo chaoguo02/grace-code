@@ -1490,7 +1490,9 @@ class SessionRuntime:
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()
-        if spec.name not in {"build", "general"}:
+        # MCP tools available to agents with EDIT intent (write-capable)
+        # or agents that explicitly declare mcpServers in their definition.
+        if spec.intent is not TaskIntent.EDIT and not spec.mcp_servers:
             return frozenset()
         # P1-6: Only return MCP tools that are ACTIVE in the capability registry
         raw_names = getattr(self._mcp_integration, "tool_names", frozenset())

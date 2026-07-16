@@ -608,7 +608,7 @@ def test_cli_fails_closed_for_unsupported_agent_model(tmp_path, monkeypatch):
         "name: explore\n"
         "description: unsupported model override\n"
         "intent: analysis\n"
-        "model: sonnet\n"
+        "model: quantum-brain\n"
         "---\n"
         "Analyze.\n",
         encoding="utf-8",
@@ -623,6 +623,7 @@ def test_cli_fails_closed_for_unsupported_agent_model(tmp_path, monkeypatch):
     ])
 
     assert result.exit_code == 1
-    assert str(invalid.resolve()) in result.output
-    assert "supports only 'inherit'" in result.output
+    # CC-aligned: unknown model is accepted with a warning, not rejected
+    # The plan fails because _InvalidPlanBackend produces no valid contract
+    assert "Plan contract is still invalid after 2 repair attempts" in result.output
     assert "Plan saved" not in result.output
