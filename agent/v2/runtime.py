@@ -1490,13 +1490,26 @@ class SessionRuntime:
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()
-        # MCP tools available to agents with EDIT intent (write-capable)
-        # or agents that explicitly declare mcpServers in their definition.
-        if spec.intent is not TaskIntent.EDIT and not spec.mcp_servers:
-            return frozenset()
-        # P1-6: Only return MCP tools that are ACTIVE in the capability registry
-        raw_names = getattr(self._mcp_integration, "tool_names", frozenset())
         from agent.capability_registry import CapabilityState
+        # CC-aligned: resolve named mcpServers references from frontmatter
+        if spec.mcp_servers:
+            server_tools = self._mcp_integration.server_tools
+            raw_names: set[str] = set()
+            for entry in spec.mcp_servers:
+                if isinstance(entry, str):
+                    raw_names.update(server_tools.get(entry, []))
+                elif isinstance(entry, dict):
+                    # Inline definition — connected at agent start, tools lazy-registered
+                    for name in entry:
+                        raw_names.update(server_tools.get(name, []))
+            return frozenset(
+                n for n in raw_names
+                if self._capability_registry.state_for(n) is CapabilityState.AVAILABLE
+            )
+        # Fallback (backward compat): EDIT-intent agents get session-level MCP tools
+        if spec.intent is not TaskIntent.EDIT:
+            return frozenset()
+        raw_names = getattr(self._mcp_integration, "tool_names", frozenset())
         return frozenset(
             n
             for n in raw_names

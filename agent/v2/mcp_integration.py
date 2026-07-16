@@ -100,6 +100,20 @@ class MCPToolIntegration:
         return self._initialized
 
     @property
+    def server_tools(self) -> dict[str, list[str]]:
+        """Map server name → tool names for resolving agent-scoped mcpServers."""
+        result: dict[str, list[str]] = {}
+        if self._manager is not None:
+            for name in getattr(self._manager, '_server_names', []):
+                result[name] = []
+        for tool in self._tools:
+            for server_name in list(result.keys()):
+                prefix = server_name.rstrip("/").replace("-", "_").replace(".", "_")
+                if tool.name.startswith(prefix + "__") or tool.name == prefix:
+                    result[server_name].append(tool.name)
+        return result
+
+    @property
     def manager(self) -> SyncMCPToolManager | None:
         return self._manager
 
