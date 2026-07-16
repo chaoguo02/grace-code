@@ -101,14 +101,18 @@ def _builtin_defaults() -> list[PermissionRule]:
         rules.append(PermissionRule.parse(f"shell({safe_pattern} *)", tier=PermissionRuleTier.DENY, source="builtin"))
 
     # ── allow: read-only tools (non-shell) — aligned with Claude Code ──
+    # Must match canonical tool names (not aliases) — the permission pipeline
+    # checks tool.name, and aliases are only resolved at execute_tool() time.
     allow_tools = [
-        "file_read",
-        "file_view",
-        "search_text",
-        "find_files",
-        "find_symbol",
-        "WebSearch",
-        "WebFetch",
+        "Read",         # was "file_read"
+        "file_view",    # unchanged
+        "Grep",         # was "search_text"
+        "Glob",         # was "find_files"
+        "find_symbol",  # unchanged
+        "WebSearch",    # unchanged (already PascalCase)
+        "WebFetch",     # unchanged (already PascalCase)
+        "git_status",   # read-only git inspection
+        "git_diff",     # read-only git diff
     ]
     for t in allow_tools:
         rules.append(PermissionRule.parse(t, tier=PermissionRuleTier.ALLOW, source="builtin"))
@@ -126,7 +130,9 @@ def _builtin_defaults() -> list[PermissionRule]:
         rules.append(PermissionRule.parse(f"shell({cmd} *)", tier=PermissionRuleTier.ALLOW, source="builtin"))
 
     # ── ask: file write operations ──
+    rules.append(PermissionRule.parse("Write", tier=PermissionRuleTier.ASK, source="builtin"))
     rules.append(PermissionRule.parse("file_write", tier=PermissionRuleTier.ASK, source="builtin"))
+    rules.append(PermissionRule.parse("Edit", tier=PermissionRuleTier.ASK, source="builtin"))
     rules.append(PermissionRule.parse("file_edit", tier=PermissionRuleTier.ASK, source="builtin"))
 
     # ── ask: potentially destructive or network-exposed commands ──
