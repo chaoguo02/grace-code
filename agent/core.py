@@ -124,7 +124,8 @@ class AgentConfig:
     confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
     effort: str = ""                       # reasoning effort (low/medium/high/xhigh/max)
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
-    compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
+    compact_history: bool = True           # 是否启用历史压缩
+    is_subagent: bool = False              # True=使用精简 system prompt
     circuit_breaker: object = None         # CircuitBreaker | None — 代码级熔断器
 
 
@@ -1516,8 +1517,8 @@ class ReActAgent:
             self._last_context_stats = ctx.stats
             return ctx.messages
 
-        # Sub-agent 模式（compact_history=False）：精简 system prompt，跳过所有裁剪
-        if not self._cfg.compact_history:
+        # Sub-agent 模式：精简 system prompt
+        if self._cfg.is_subagent:
             from agent.prompt import build_sub_agent_system_prompt
             system_content = build_sub_agent_system_prompt(schemas)
             ctx = self._context_manager.build_sub_agent_messages(history, system_content)

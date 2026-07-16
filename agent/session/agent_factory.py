@@ -207,7 +207,8 @@ class AgentFactory:
             cfg.effort = spec.effort
         if spec.mode != SessionMode.PRIMARY:
             cfg.max_steps = min(cfg.max_steps, spec.max_turns)
-            cfg.compact_history = False
+            cfg.is_subagent = True              # 精简 system prompt
+            # CC-aligned: sub-agents can compact for long-running tasks
             cfg.stream = False
             cfg.stream_callback = None
             cfg.thought_callback = None
