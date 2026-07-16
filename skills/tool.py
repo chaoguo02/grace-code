@@ -68,7 +68,7 @@ class SkillTool(BaseTool):
         skill_registry: "SkillRegistry",
         buffer: "SkillContextBuffer | None" = None,
     ) -> None:
-        self._registry = skill_registry
+        self._skill_registry = skill_registry
         self._buffer = buffer
 
     aliases = ("use_skill",)
@@ -112,10 +112,10 @@ class SkillTool(BaseTool):
                 error="'skill_name' is required",
             )
 
-        rendered = self._registry.load_and_render(skill_name, arguments)
+        rendered = self._skill_registry.load_and_render(skill_name, arguments)
 
         if rendered is None:
-            available = [m.name for m in self._registry.list_skills()]
+            available = [m.name for m in self._skill_registry.list_skills()]
             return ToolResult(
                 success=False, output="",
                 error=f"Skill '{skill_name}' not found. Available: {', '.join(available)}",

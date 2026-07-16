@@ -188,8 +188,36 @@ class PolicyAwareToolRegistry(ToolRegistry):
             self._record_timing(name, start, result)
             return result
         result = self._base.execute_tool(name, params, thought=thought)
+        # Consume CC-aligned SkillContextModifier from tool result metadata
+        if result.metadata and "skill_modifier" in result.metadata:
+            self._apply_skill_modifier(result.metadata["skill_modifier"])
         self._record_timing(name, start, result)
         return result
+
+    def _apply_skill_modifier(self, modifier) -> None:
+        """Apply skill contextModifier: update PhasePolicy for SK-05/SK-06."""
+        from skills.tool import SkillContextModifier
+        if not isinstance(modifier, SkillContextModifier):
+            return
+        if modifier.allowed_tools or modifier.disallowed_tools:
+            fake_skill = type("_Skill", (), {
+                "allowed_tools": modifier.allowed_tools,
+                "disallowed_tools": modifier.disallowed_tools,
+            })()
+            new_policy = self._phase_policy
+            if modifier.allowed_tools:
+                new_policy = new_policy.with_allowed_tools(modifier.allowed_tools)
+            if modifier.disallowed_tools:
+                new_policy = new_policy.with_denied_tools(modifier.disallowed_tools)
+            # Rebuild registry with new policy
+            rebuilt = PolicyAwareToolRegistry(
+                base=self._base,
+                phase_policy=new_policy,
+                repo_path=self._repo_path,
+                phase_name=self._phase_name,
+                base_allowed_tools=self._base_allowed_tools,
+            )
+            self._phase_policy = rebuilt._phase_policy
 
     def _check_tool_call(self, name: str, params: dict[str, Any]) -> str | None:
         # ── Scoped rules (Claude Code pattern: Deny→Allow order) ──

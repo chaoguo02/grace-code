@@ -516,8 +516,23 @@ class SkillRegistry:
         for key in sorted(subs.keys(), key=len, reverse=True):
             result = result.replace(key, subs[key])
 
-        # Handle escaped \$ — remove the backslash
-        result = result.replace("\\$", "$")
+        # Handle escaped \$: protect before substitutions, restore after
+        # This prevents \$ARGUMENTS from being replaced by actual argument content
+        result = content
+        ph_map = {}
+        for i, key in enumerate(sorted(subs.keys(), key=len, reverse=True)):
+            if key.startswith("$"):
+                esc = "\\" + key[1:]
+                ph = "\x00SKILL_ESC_" + str(i) + "\x00"
+                if esc in result:
+                    ph_map[ph] = "$" + key[1:]
+                    result = result.replace(esc, ph)
+
+        for key in sorted(subs.keys(), key=len, reverse=True):
+            result = result.replace(key, subs[key])
+
+        for ph, orig in ph_map.items():
+            result = result.replace(ph, "\\" + orig)
 
         return result
 
