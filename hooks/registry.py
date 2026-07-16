@@ -93,6 +93,17 @@ class HookRegistry:
         """Register a Python callable hook."""
         self._internal[event].append(hook)
 
+    def register_external(self, event: HookEvent, config: ExternalHookConfig) -> None:
+        """Dynamically register an external hook (e.g. from agent frontmatter)."""
+        self._external[event].append(config)
+
+    def unregister_external(self, event: HookEvent, config: ExternalHookConfig) -> None:
+        """Remove a dynamically registered external hook."""
+        try:
+            self._external[event].remove(config)
+        except (KeyError, ValueError):
+            pass
+
     def find_external(
         self, event: HookEvent, matcher_subject: str, tool_input: dict[str, Any]
     ) -> list[ExternalHookConfig]:
