@@ -107,8 +107,8 @@ def _builtin_defaults() -> list[PermissionRule]:
         "search_text",
         "find_files",
         "find_symbol",
-        "web_search",
-        "web_fetch",
+        "WebSearch",
+        "WebFetch",
     ]
     for t in allow_tools:
         rules.append(PermissionRule.parse(t, tier=PermissionRuleTier.ALLOW, source="builtin"))

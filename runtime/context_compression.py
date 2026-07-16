@@ -31,6 +31,7 @@ TOOL_RESULT_BUDGETS: dict[str, float] = {
     "grep": 20_000,
     "find_files": 100_000,
     "glob": 100_000,
+    "WebFetch": 100_000,
     "web_fetch": 100_000,
     "file_edit": 100_000,
     "file_write": 100_000,

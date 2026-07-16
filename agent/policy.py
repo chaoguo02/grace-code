@@ -104,7 +104,7 @@ def _match_path(params: dict, pattern: str) -> bool:
     return fnmatch(normalized, pattern)
 
 
-_WEB_TOOLS = frozenset({"web_fetch", "web_fetch_with_selector", "webfetch"})
+_WEB_TOOLS = frozenset({"WebFetch", "web_fetch", "web_fetch_with_selector", "webfetch"})
 
 
 def _match_domain(params: dict, pattern: str) -> bool:
