@@ -73,8 +73,9 @@ class PolicyAwareToolRegistry(ToolRegistry):
         Returns a new PolicyAwareToolRegistry with restrictions layered on.
         """
         result = self
+        # CC-aligned: allowed-tools = pre-approve (skip prompt), NOT filter visibility
         if skill.allowed_tools:
-            result = result.with_allowed_tools(skill.allowed_tools)
+            result = result.with_pre_approved_tools(skill.allowed_tools)
         if skill.disallowed_tools:
             result = result._with_disallowed_tools(skill.disallowed_tools)
         return result

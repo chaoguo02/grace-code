@@ -159,6 +159,9 @@ class PhasePolicy:
     # "dontAsk", "bypassPermissions", "plan", "manual"
     permission_mode: str = ""
 
+    # CC-aligned: tools pre-approved without prompting (does NOT narrow visibility)
+    pre_approved_tools: frozenset[str] = field(default_factory=frozenset)
+
     # Claude Code pattern: ToolName(specifier) parameter-scoped rules.
     # Deny rules evaluated first, then ask, then allow — specificity does NOT
     # change evaluation order.  Bare tool name (no param_contains) = whole-tool.
@@ -291,6 +294,24 @@ class PhasePolicy:
             allowed_write_paths=self.allowed_write_paths,
             strict_file_scope=self.strict_file_scope,
             notes=self.notes,
+        )
+
+    def with_pre_approved_tools(self, tools: frozenset[str]) -> "PhasePolicy":
+        """CC-aligned: skill allowed-tools = pre-approve, not filter.
+
+        pre_approved_tools skip the prompt but don't narrow tool visibility.
+        """
+        approved = self.pre_approved_tools | frozenset(tools)
+        return PhasePolicy(
+            allowed_tools=self.allowed_tools,
+            denied_tools=self.denied_tools,
+            allowed_effects=self.allowed_effects,
+            denied_effects=self.denied_effects,
+            allowed_read_paths=self.allowed_read_paths,
+            allowed_write_paths=self.allowed_write_paths,
+            strict_file_scope=self.strict_file_scope,
+            notes=self.notes,
+            pre_approved_tools=approved,
         )
 
     def with_denied_tools(self, denied_tools: set[str] | frozenset[str]) -> "PhasePolicy":
