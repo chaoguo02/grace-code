@@ -210,6 +210,45 @@ class MCPToolBridge:
             },
         )
 
+    # ── MCP Resources ───────────────────────────────────────────────
+
+    async def list_resources(self) -> list[dict[str, Any]]:
+        """Return all resources exposed by this MCP server (resources/list)."""
+        self._require_session()
+        try:
+            response = await self._session.list_resources()
+            result: list[dict[str, Any]] = []
+            for r in getattr(response, "resources", []) or []:
+                result.append({
+                    "uri": str(getattr(r, "uri", "")),
+                    "name": str(getattr(r, "name", "")),
+                    "description": str(getattr(r, "description", "")),
+                    "mimeType": str(getattr(r, "mimeType", "")),
+                })
+            return result
+        except Exception as exc:
+            _logger = __import__("logging").getLogger(__name__)
+            _logger.debug("list_resources failed for '%s': %s", self.config.name, exc)
+            return []
+
+    async def read_resource(self, uri: str) -> dict[str, Any]:
+        """Read a specific MCP resource by URI (resources/read)."""
+        self._require_session()
+        try:
+            result = await self._session.read_resource(uri)
+            contents: list[dict[str, Any]] = []
+            for c in getattr(result, "contents", []) or []:
+                contents.append({
+                    "uri": str(getattr(c, "uri", uri)),
+                    "mimeType": str(getattr(c, "mimeType", "")),
+                    "text": str(getattr(c, "text", "")),
+                })
+            return {"contents": contents}
+        except Exception as exc:
+            _logger = __import__("logging").getLogger(__name__)
+            _logger.debug("read_resource failed for '%s': %s", uri, exc)
+            return {"contents": [], "error": str(exc)}
+
     def _require_session(self) -> None:
         if self._session is None:
             raise RuntimeError("MCPToolBridge is not connected")
@@ -435,7 +474,13 @@ class SseMCPBridge(HttpMCPBridge):
         await super().close()
 
     async def _read_sse_stream(self) -> None:
-        """Background task: read SSE events from the server."""
+        """Background task: read SSE events and dispatch incoming messages.
+
+        MCP SSE spec: server sends 'message' events with JSON-RPC body.
+        Notifications (no id) are dispatched to handlers; responses are
+        route-matched by id for in-flight calls.
+        """
+        _logger = __import__("logging").getLogger(__name__)
         try:
             import httpx
             url = self.config.url.rstrip("/") + "/sse"
@@ -445,15 +490,19 @@ class SseMCPBridge(HttpMCPBridge):
                         data_str = line[6:]
                         if data_str == "[DONE]":
                             break
-                        # Parse JSON-RPC notification/response
                         try:
                             import json as _json
-                            _json.loads(data_str)
+                            msg = _json.loads(data_str)
+                            method = msg.get("method", "")
+                            # Dispatch notifications to registered handlers
+                            if method == "notifications/tools/list_changed":
+                                await self._on_list_changed(msg)
+                            elif method:
+                                _logger.debug("SSE notification: %s", method)
                         except Exception:
-                            pass
+                            _logger.debug("SSE parse skipped: %s", data_str[:100])
         except Exception as exc:
-            logger = __import__("logging").getLogger(__name__)
-            logger.debug("SSE stream ended: %s", exc)
+            _logger.debug("SSE stream ended: %s", exc)
 
     def _create_http_client(self) -> Any:
         client = super()._create_http_client()

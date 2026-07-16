@@ -130,6 +130,10 @@ class ShellTool(BaseTool):
                     "type": "boolean",
                     "description": "Set to true to run this command in the background. For long-running processes like dev servers.",
                 },
+                "dangerouslyDisableSandbox": {
+                    "type": "boolean",
+                    "description": "Set to true to override sandbox mode and run without sandboxing. Requires explicit user confirmation.",
+                },
             },
             "required": [],
         }

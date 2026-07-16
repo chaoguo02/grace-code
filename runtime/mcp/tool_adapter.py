@@ -182,6 +182,67 @@ def _sync_execute(tool: Any, arguments: dict[str, Any]) -> Any:
     return result.output
 
 
+# ── MCP Resource tools (ListMcpResourcesTool, ReadMcpResourceTool) ──
+
+def create_resource_list_tool(bridge: MCPToolBridge):
+    """Create a ListMcpResourcesTool wrapper for a connected MCP bridge."""
+    server_name = bridge.config.name
+
+    async def call_fn(input: dict, _context: ToolUseContext) -> ToolResult[str]:
+        try:
+            resources = await bridge.list_resources()
+        except Exception as exc:
+            return ToolResult(output="", metadata={"mcp_error": str(exc)})
+        if not resources:
+            return ToolResult(output=f"No resources from MCP server '{server_name}'")
+        lines = [f"MCP resources from '{server_name}':"]
+        for r in resources:
+            lines.append(f"  {r['uri']} — {r['name']} ({r.get('mimeType', '')})")
+        return ToolResult(output="\n".join(lines))
+
+    return build_tool(
+        name=f"mcp__{server_name}__list_resources",
+        description=f"List resources from MCP server '{server_name}'",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        call_fn=call_fn,
+        metadata={"mcp_server": server_name, "is_resource": True},
+    )
+
+
+def create_resource_read_tool(bridge: MCPToolBridge):
+    """Create a ReadMcpResourceTool wrapper for a connected MCP bridge."""
+    server_name = bridge.config.name
+
+    async def call_fn(input: dict, _context: ToolUseContext) -> ToolResult[str]:
+        uri = input.get("uri", "")
+        if not uri:
+            return ToolResult(output="", metadata={"mcp_error": "uri is required"})
+        try:
+            result = await bridge.read_resource(uri)
+        except Exception as exc:
+            return ToolResult(output="", metadata={"mcp_error": str(exc)})
+        contents = result.get("contents", [])
+        if not contents:
+            return ToolResult(output=f"Resource '{uri}' returned empty content")
+        text = "\n".join(c.get("text", "") for c in contents)
+        return ToolResult(output=text)
+
+    return build_tool(
+        name=f"mcp__{server_name}__read_resource",
+        description=f"Read an MCP resource from '{server_name}' by URI",
+        input_schema={
+            "type": "object",
+            "properties": {"uri": {"type": "string", "description": "Resource URI to read"}},
+            "required": ["uri"],
+        },
+        call_fn=call_fn,
+        metadata={"mcp_server": server_name, "is_resource": True},
+    )
+    if result.metadata.get("mcp_error"):
+        raise RuntimeError(result.metadata["mcp_error"])
+    return result.output
+
+
 def _coerce_execute_result(tool_name: str, result: Any) -> ToolResult[str]:
     if isinstance(result, ToolResult):
         return result

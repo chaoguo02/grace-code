@@ -127,6 +127,12 @@ class SyncMCPToolManager:
                 runtime_tool = mcp_tool_to_runtime_tool(bridge, tool_info)
                 runtime_tools.append(runtime_tool)
                 self._tool_map[runtime_tool.name] = (config.name, tool_info.name)
+            # MCP Resources: also register resource list/read tools
+            from runtime.mcp.tool_adapter import create_resource_list_tool, create_resource_read_tool
+            resource_list_tool = create_resource_list_tool(bridge)
+            runtime_tools.append(resource_list_tool)
+            resource_read_tool = create_resource_read_tool(bridge)
+            runtime_tools.append(resource_read_tool)
         return runtime_tools
 
     def execute_tool(
