@@ -108,7 +108,7 @@ class MCPToolIntegration:
                 result[name] = []
         for tool in self._tools:
             for server_name in list(result.keys()):
-                prefix = server_name.rstrip("/").replace("-", "_").replace(".", "_")
+                prefix = "mcp__" + server_name.rstrip("/").replace("-", "_").replace(".", "_")
                 if tool.name.startswith(prefix + "__") or tool.name == prefix:
                     result[server_name].append(tool.name)
         return result
@@ -197,8 +197,10 @@ class MCPToolIntegration:
         # Remove tools belonging to these servers
         self._runtime_tools = [
             rt for rt in self._runtime_tools
-            if not any(sn in getattr(rt, 'mcp_props', None) if hasattr(rt, 'mcp_props') else False
-                       for sn in server_names)
+            if not any(
+                getattr(getattr(rt, 'mcp_props', None), 'server_name', '') == sn
+                for sn in server_names
+            )
         ]
         count_before = len(self._tools)
         self._tools = [t for t in self._tools if t.server_name not in server_names]
