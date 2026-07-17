@@ -733,9 +733,13 @@ class ToolRegistry:
                 detail=f"Tool '{name}' raised an unexpected error: {exc}",
             )
 
-        # Fire PostToolUse / PostToolUseFailure hook
+        # Fire PostToolUse / PostToolUseFailure hook (CC-aligned)
         if self._hook_dispatcher:
-            self._fire_post_tool_hook(name, params, result)
+            _post_result = self._fire_post_tool_hook(name, actual_params, result)
+            if _post_result is not None:
+                # Apply additionalContext from PostToolUse hook
+                if getattr(_post_result, "additional_context", ""):
+                    result.output = result.output + "\n\n[Hook context]\n" + _post_result.additional_context
 
         self._record_timing(name, start, result)
         return result
@@ -827,8 +831,8 @@ class ToolRegistry:
     def __repr__(self) -> str:
         return f"ToolRegistry(tools={self.tool_names})"
 
-    def _fire_post_tool_hook(self, name: str, params: dict[str, Any], result: ToolResult) -> None:
-        """Fire PostToolUse or PostToolUseFailure event via the hook dispatcher."""
+    def _fire_post_tool_hook(self, name: str, params: dict[str, Any], result: ToolResult) -> Any:
+        """Fire PostToolUse or PostToolUseFailure via dispatcher. Returns DispatchResult."""
         from hooks.events import HookContext, HookEvent
 
         evt = HookEvent.POST_TOOL_USE if result.success else HookEvent.POST_TOOL_USE_FAILURE
@@ -843,9 +847,10 @@ class ToolRegistry:
             },
         )
         try:
-            self._hook_dispatcher.dispatch(evt, ctx)
+            return self._hook_dispatcher.dispatch(evt, ctx)
         except Exception:
             pass
+        return None
 
     def _record_timing(self, name: str, start: float, result: ToolResult) -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000
