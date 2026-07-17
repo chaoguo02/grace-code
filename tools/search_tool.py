@@ -60,6 +60,92 @@ def _resolve_search_path(raw_path: object, workspace_root: str) -> tuple[Path | 
 # Grep — CC-aligned search_text
 # ---------------------------------------------------------------------------
 
+def _search_with_rg(
+    *,
+    pattern: str,
+    search_path: Path,
+    file_glob: str,
+    case_insensitive: bool,
+    multiline: bool,
+    output_mode: str,
+    head_limit: int,
+    context_before: int,
+    context_after: int,
+) -> ToolResult | None:
+    """Try ripgrep first — 100x faster than pure Python for large trees."""
+    """Try ripgrep or grep — 100x faster than pure Python for large trees."""
+    import shutil, subprocess
+
+    rg_path = shutil.which("rg")
+    grep_path = shutil.which("grep")
+    use_grep = not rg_path and grep_path is not None
+
+    try:
+        if rg_path:
+            cmd = ["rg", "--no-heading", "--line-number", "--color", "never"]
+            if case_insensitive:
+                cmd.append("-i")
+            if multiline:
+                cmd.append("-U")
+            if output_mode == "files_with_matches":
+                cmd.append("--files-with-matches")
+            elif output_mode == "count":
+                cmd.append("--count")
+            if context_before > 0:
+                cmd.extend(["-B", str(context_before)])
+            if context_after > 0:
+                cmd.extend(["-A", str(context_after)])
+            cmd.extend(["-g", file_glob, str(pattern), str(search_path)])
+        elif use_grep:
+            cmd = ["grep", "-rn", "--color=never"]
+            if case_insensitive:
+                cmd.append("-i")
+            if output_mode == "files_with_matches":
+                cmd.append("-l")
+            elif output_mode == "count":
+                cmd.append("-c")
+            if context_before > 0:
+                cmd.extend(["-B", str(context_before)])
+            if context_after > 0:
+                cmd.extend(["-A", str(context_after)])
+            if file_glob != "*":
+                cmd.extend(["--include", file_glob])
+            cmd.extend([str(pattern), str(search_path)])
+        else:
+            return None
+
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return ToolResult(success=True, output="[rg timed out after 30s]")
+
+    if proc.returncode not in (0, 1):
+        return None  # fallback to Python
+
+    output = proc.stdout.strip()
+    if not output:
+        return ToolResult(success=True, output=f"No matches found for '{pattern}'")
+
+    # Parse rg output for "count" mode: "file:count"
+    if output_mode == "count":
+        lines = output.splitlines()[:head_limit]
+        total = sum(int(line.rsplit(":", 1)[-1]) for line in lines if ":" in line)
+        return ToolResult(success=True, output="\n".join(lines) + f"\n\n[Total: {total} matches]")
+
+    # files_with_matches mode
+    if output_mode == "files_with_matches":
+        lines = output.splitlines()[:head_limit]
+        return ToolResult(success=True, output="\n".join(lines))
+
+    # Content mode: already formatted as "file:line:content"
+    lines = output.splitlines()[:head_limit]
+    return ToolResult(success=True, output="\n".join(lines))
+
+
 class SearchTextTool(BaseTool):
     metadata = ToolMetadata(
         effects=frozenset({ToolEffect.DISCOVER_WORKSPACE}),
@@ -188,6 +274,25 @@ class SearchTextTool(BaseTool):
         if file_type:
             file_glob = f"*.{file_type}"
 
+        if not search_path.exists():
+            return ToolResult(success=False, output="", error=f"Path not found: {search_path}")
+
+        # CC-aligned: try ripgrep first (100x faster than pure Python)
+        result = _search_with_rg(
+            pattern=raw_pattern,
+            search_path=search_path,
+            file_glob=file_glob,
+            case_insensitive=case_insensitive,
+            multiline=multiline,
+            output_mode=output_mode,
+            head_limit=head_limit,
+            context_before=context_before,
+            context_after=context_after,
+        )
+        if result is not None:
+            return result
+
+        # Fallback: pure Python search
         flags = re.IGNORECASE if case_insensitive else 0
         if multiline:
             flags |= re.DOTALL
@@ -196,22 +301,18 @@ class SearchTextTool(BaseTool):
         except re.error as e:
             return ToolResult(success=False, output="", error=f"Invalid regex: {e}")
 
-        if not search_path.exists():
-            return ToolResult(success=False, output="", error=f"Path not found: {search_path}")
-
-        # Collect matches with optional context
         matches: list[str] = []
         match_counts: dict[str, int] = {}
         files = _iter_files(search_path, file_glob)
 
         import time as _time
-        _search_deadline = _time.monotonic() + 15.0  # 15s hard timeout
+        _deadline = _time.monotonic() + 15.0
 
         for filepath in files:
             if len(matches) >= head_limit:
                 break
-            if _time.monotonic() > _search_deadline:
-                matches.append("[Search timed out after 15s — partial results below]")
+            if _time.monotonic() > _deadline:
+                matches.append("[Search timed out — partial results below]")
                 break
             try:
                 file_lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -226,8 +327,6 @@ class SearchTextTool(BaseTool):
                     file_match_count += 1
                     if output_mode == "count":
                         continue
-
-                    # Build match line with optional context
                     start_ctx = max(0, lineno - context_before - 1)
                     end_ctx = min(len(file_lines), lineno + context_after)
                     if context_after or context_before:
@@ -244,14 +343,12 @@ class SearchTextTool(BaseTool):
                         if len(line) > MAX_LINE_LENGTH:
                             display_line += " ..."
                         matches.append(f"{rel_path}:{lineno}: {display_line}")
-
                     if output_mode != "count" and len(matches) >= head_limit:
                         break
-
             if file_match_count > 0:
                 match_counts[rel_path] = file_match_count
 
-        # Build output by mode
+        # Build output
         if output_mode == "count":
             if not match_counts:
                 return ToolResult(success=True, output=f"No matches found for '{raw_pattern}'")
@@ -259,7 +356,6 @@ class SearchTextTool(BaseTool):
             lines_out = [f"{p}: {c}" for p, c in sorted(match_counts.items())]
             lines_out.append(f"\n[Total: {total} matches across {len(match_counts)} files]")
             return ToolResult(success=True, output="\n".join(lines_out))
-
         if output_mode == "files_with_matches":
             if not match_counts:
                 return ToolResult(success=True, output=f"No matches found for '{raw_pattern}'")
@@ -268,10 +364,6 @@ class SearchTextTool(BaseTool):
             if len(unique_files) >= head_limit:
                 output += f"\n[Showing first {head_limit} matching files, there may be more]"
             return ToolResult(success=True, output=output)
-
-        # content mode (default)
-        if not matches:
-            return ToolResult(success=True, output=f"No matches found for '{raw_pattern}'")
 
         suffix = f"\n[Showing {min(len(matches), head_limit)} matches]"
         if len(matches) >= head_limit:
