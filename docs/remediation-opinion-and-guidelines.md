@@ -1,506 +1,637 @@
-# 架构整改意见与分批执行计划（更新版）
+# 架构整改意见与分批执行计划（施工版）
 
 最后更新：2026-07-17  
-适用基线：当前工作区（含你刚刚对 `agent/v2/*` shim 的小范围修正）
+适用仓库：`forge-agent` 当前工作区  
+本版特点：基于官方 Claude Code 文档重新对齐，并把计划展开到“函数/文件级修改方案”
 
-## 这次更新相对上一版的变化
+## 0. 本次复核结论
 
-这版文档基于你刚刚已经落地的小改动做了修正，不再把 `agent.v2` shim 问题当成“纯待做项”，而是改为：
+先给结论，避免我们又落回“只讲流程、不讲落点”的状态。
 
-- 已有正确方向的增量落地
-- 需要继续把 shim 收口做完整
-- 之后再迁移主入口和测试引用
+当前仓库最值得优先处理的，不再是 `agent.v2` 本身，而是下面 5 条主线：
 
-你刚刚已完成的部分：
+1. 主入口仍残留 `agent.v2` 兼容引用，需要彻底切到 `agent.session`
+2. Skill `allowed-tools` 语义仍然写偏了：现在是“过滤可见工具”，而不是“本轮免确认授权”
+3. Plan mode 虽然已经接进主循环，但 `entry/modes/v2_runner.py` 里仍保留独立 orchestration
+4. Subagent 过于依赖 `_SUBAGENT_PROTOCOL` 超长提示词，运行时契约还没有真正下沉
+5. MCP / Shell / 内部进程调用 仍有 bridge / legacy / 双语义问题，尚未完全收口
 
-- `agent/v2/agent_definition.py`
-- `agent/v2/agent_registry.py`
-- `agent/v2/subagent.py`
-- `agent/v2/task_tool.py`
+`agent.v2` 的状态我重新检查过：
 
-这些文件已经从“只有 `import *`”演进为“`import *` + 显式补齐私有符号 re-export”。这个方向我认同，而且说明我们的整改可以继续沿着“先稳兼容层、再迁主入口”的顺序推进。
+- `agent/v2/` 目录现在只剩 [`agent/v2/__init__.py`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/v2/__init__.py:1>)
+- 当前 `agent.v2` 引用只剩 14 处，已经从“多 shim 并存”收束成“单兼容入口 + 少量遗留引用”
 
----
+因此：
 
-## 总体判断
-
-我对你更新后的判断，结论仍然是：
-
-- 主方向基本正确
-- 但有几项不能过早判定为“已经解决”
-- 另外现在最需要的是把计划从“观点列表”升级成“可执行批次”
-
-我当前的判断分为三类。
-
-### A. 我认同，并建议继续推进
-
-- Point 1：编码污染清理
-- Point 2：`agent.v2` 兼容层收口
-- Point 3：主入口改用 `agent.session`
-- Point 9：subagent 协议减重
-- Point 10：`agent/core.py` 拆职责
-- Point 11：shell `cmd` legacy path 退场
-- Point 13：内部 `subprocess.run(...)` 统一适配
-- Point 14：MCP 一等公民化继续推进
-- Point 15：MCP deferred schema 接入核心 registry
-- Point 17：legacy / fallback 做 inventory 再收口
-- Point 18：示例和边角代码迁移到 canonical API
-
-### B. 我保留意见，但不建议现在先动
-
-- Point 7：`chat.py` 里的 skill fork 确实是分叉点，但它不是当前最阻塞成功率的问题。先把 session/subagent 主链收稳，再回头统一 chat-mode 的 spawn 语义更合理。
-
-### C. 我不同意当前“已解决/可移除”的判断
-
-- Point 4：Plan 不能算完全收口
-- Point 5：Plan 审批后递归重入 build runner 仍是架构债务
-- Point 8：Skill modifier 仍未完全对齐 Claude Code 语义
-- Point 12：L0 黑名单应保留，但不能继续膨胀为主权限系统
-- Point 16：工具别名可以长期保留，但应该冻结边界，不继续扩张
+- `Point 2` 可以从“主问题”降为“收尾项”
+- 后续第一优先级应该转到主入口迁移、Skill/Plan/Subagent/MCP 主线纠偏
 
 ---
 
-## 需要纠正的 5 个判断
+## 1. 本计划采用的 Claude Code 官方基线
 
-### 1) Point 4 不是“已完成”，而是“部分完成”
+下面这些结论，不是我自己拍脑袋设计的，都是按 Claude Code 官方文档抽出来的约束。
 
-当前已经完成的部分：
+### 1.1 Agent loop 应该是干净主循环，外围机制下沉
 
-- `tools/plan_mode_tool.py:22` 通过 `_pending_mode_switch` 发起模式切换
-- `agent/core.py:1608` 在主循环中消费 `_pending_mode_switch`
+来源：
 
-但仍未收口的部分：
+- Claude Code Agent SDK / Agent loop  
+  https://code.claude.com/docs/en/agent-sdk/agent-loop
 
-- `entry/modes/v2_runner.py:197`
-- `entry/modes/v2_runner.py:390`
-- `entry/modes/v2_runner.py:457`
+对我们代码的含义：
 
-也就是说：
+- 主循环应尽量只做：取消息、拿工具 schema、执行 tool use、写回结果、继续或结束
+- Plan / skill modifier / reflection / completion / child continuation 这些都应是外围组件，不应该继续堆进单个大文件
 
-- 权限语义层面，Plan mode 已经接上主循环
-- 运行编排层面，仍保留了一条独立的 Plan approval / replan / build orchestration 链路
+### 1.2 Plan mode 的正确语义是“模式切换”，不是第二套工作流
 
-所以这项更准确的状态应该是：
+来源：
 
-- 已部分完成
-- 还不是最终收口
+- Claude Code Permission modes  
+  https://code.claude.com/docs/en/permission-modes
 
-### 2) Point 5 不应删除，只能降级
+对我们代码的含义：
 
-我同意它不再是最前面的 P0 阻塞项，但不认同把它从整改计划里拿掉。
+- `plan` 首先是权限模式，不是另一套 runner 体系
+- 用户批准计划后，正确方向是退出 plan mode 并进入后续 mode
+- 允许 UI 层存在 approval adapter，但不应该长期维持第二套“plan 专用编排语义”
+
+### 1.3 Subagents 是原生能力；fresh context 与 fork context 要分清
+
+来源：
+
+- Claude Code Sub-agents  
+  https://code.claude.com/docs/en/sub-agents
+
+对我们代码的含义：
+
+- 命名 subagent 与 fork subagent 的上下文来源不同
+- 子代理可以继续调用自己的工具并继续派生子代理
+- 约束应主要由 runtime / tool schema / permission / context 决定，而不是压在一个超长 prompt 上
+
+### 1.4 Skills 的 `allowed-tools` 是“预授权”，不是“可见工具白名单”
+
+来源：
+
+- Claude Code Skills  
+  https://code.claude.com/docs/en/skills
+
+对我们代码的含义：
+
+- skill 生效后，`allowed-tools` 的正确含义是：这些工具在当前 skill 作用窗口内无需再询问
+- 它不是缩小工具显示集合
+- `disallowed-tools` 才更接近“从当前作用窗口里移除”
+
+### 1.5 MCP 是一等公民，且支持 deferred / on-demand 加载
+
+来源：
+
+- Claude Code MCP  
+  https://code.claude.com/docs/en/mcp
+
+对我们代码的含义：
+
+- MCP 不应该长期停留在 “runtime tool → legacy proxy → 再注册” 的桥接态
+- deferred schema、tool discovery、resources/roots 协议能力，应该让核心 registry 理解
+- bridge 可以保留一段时间，但不能成为长期事实源
+
+---
+
+## 2. 当前代码与官方基线的主要差距
+
+### 2.1 `agent.v2` 已收束，但主入口还没完全转正
+
+定位：
+
+- [`entry/cli.py:513`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/cli.py:513>)
+- [`entry/cli.py:564`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/cli.py:564>)
+- [`entry/worktree_admin.py:18`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/worktree_admin.py:18>)
+- [`entry/modes/v2_runner.py:142`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:142>)
+- [`entry/modes/v2_runner.py:221`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:221>)
+
+判断：
+
+- 实现层已经基本迁到 `agent.session`
+- 但入口层还在消费 `agent.v2`
+- 这会让兼容层长期留在主路径上，继续污染架构心智
+
+### 2.2 Skill modifier 的“声明式接口”有了，但“运行语义”还没对齐
+
+定位：
+
+- [`skills/tool.py:28`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/skills/tool.py:28>)
+- [`skills/tool.py:128`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/skills/tool.py:128>)
+- [`core/policy_registry.py:67`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy_registry.py:67>)
+- [`core/policy_registry.py:192`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy_registry.py:192>)
+- [`core/policy_registry.py:210`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy_registry.py:210>)
+- [`core/policy.py:299`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy.py:299>)
+
+判断：
+
+- 好消息：你们已经把 skill modifier 做成 typed dataclass 了
+- 真实问题：`_apply_skill_modifier()` 里，`allowed_tools` 现在走的是 `with_allowed_tools(...)`
+- 这会把“免审批”做成“过滤工具可见性”，语义错位
+
+### 2.3 Plan mode 已接入主循环，但 runner 仍有第二套 orchestration
+
+定位：
+
+- [`tools/plan_mode_tool.py:22`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/plan_mode_tool.py:22>)
+- [`agent/core.py:1218`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/core.py:1218>)
+- [`agent/core.py:1608`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/core.py:1608>)
+- [`entry/modes/v2_runner.py:390`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:390>)
+- [`entry/modes/v2_runner.py:457`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:457>)
+- [`entry/modes/v2_runner.py:496`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:496>)
+
+判断：
+
+- 模式切换语义已经接到 agent 主循环，这是正确方向
+- 但 `run_v2_mode()` 仍然自己管理 plan 保存、审批、replan、递归 build
+- 所以 Point 4 / 5 不能写成“已完成”，更准确是“权限模式层已接通，编排层未收口”
+
+### 2.4 Subagent 仍然被超长 prompt 强耦合
+
+定位：
+
+- [`agent/session/task_tool.py:52`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:52>)
+- [`agent/session/task_tool.py:121`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:121>)
+- [`agent/session/task_tool.py:227`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:227>)
+- [`agent/session/task_tool.py:267`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:267>)
+- [`agent/session/task_tool.py:666`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:666>)
+- [`agent/session/subagent.py:147`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/subagent.py:147>)
+
+判断：
+
+- 你们已经有一些正确方向：比如 typed result、runtime 约束、dynamic available subagent list
+- 但 `_SUBAGENT_PROTOCOL` 仍然承载了过多的执行纪律、验证规范、输出要求
+- 这在 Claude Code 思路里属于“提示层过重，运行时契约偏弱”
+
+### 2.5 MCP 还是 bridge-first，不是 registry-first
+
+定位：
+
+- [`agent/session/mcp_integration.py:17`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/mcp_integration.py:17>)
+- [`agent/session/mcp_integration.py:93`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/mcp_integration.py:93>)
+- [`agent/session/mcp_integration.py:163`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/mcp_integration.py:163>)
+- [`executor/mcp/registry.py:46`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/mcp/registry.py:46>)
+- [`executor/mcp/registry.py:58`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/mcp/registry.py:58>)
+- [`core/policy_registry.py:171`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy_registry.py:171>)
+
+判断：
+
+- 现在 MCP 先被包装成 `MCPRuntimeToolProxy(BaseTool)`，再喂给现有 registry
+- 这对过渡期是有价值的
+- 但 deferred schema 仍停在 executor 边缘，没有成为核心 registry 的一等能力
+
+### 2.6 Shell 与内部进程执行还有双语义
+
+定位：
+
+- [`tools/shell_tool.py:86`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/shell_tool.py:86>)
+- [`tools/shell_tool.py:165`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/shell_tool.py:165>)
+- [`tools/shell_tool.py:192`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/shell_tool.py:192>)
+- [`tools/shell_tool.py:230`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/shell_tool.py:230>)
+- [`executor/project_environment.py:132`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/project_environment.py:132>)
+- [`executor/workspace_facts.py:144`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/workspace_facts.py:144>)
+
+判断：
+
+- `command + args` 已经是主方向
+- 但 `cmd` 兼容路径仍然保留在主 schema
+- 内部事实采集仍散落 `subprocess.run(...)`
+- 这让“用户态执行”和“内部探测”的底层保证还没有统一
+
+---
+
+## 3. 更新后的详细执行计划
+
+下面这部分才是施工图。每一批都写目标、涉及代码、修改方案、风险边界、验收方式。
+
+## Batch A：主入口彻底切到 `agent.session`
+
+优先级：P0  
+文件数：4~6  
+目标：让 `agent.session` 成为唯一主实现入口，`agent.v2` 只留作兼容层
+
+### A.1 涉及代码
+
+- [`entry/cli.py:513`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/cli.py:513>)
+- [`entry/cli.py:564`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/cli.py:564>)
+- [`entry/worktree_admin.py:18`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/worktree_admin.py:18>)
+- [`entry/modes/v2_runner.py:142`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:142>)
+- [`entry/modes/v2_runner.py:221`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:221>)
+- 相关测试：
+  - [`tests/test_chat.py:55`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tests/test_chat.py:55>)
+  - [`tests/test_v2_e2e_behavioral.py:34`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tests/test_v2_e2e_behavioral.py:34>)
+  - [`tests/test_v2_runtime.py:33`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tests/test_v2_runtime.py:33>)
+
+### A.2 修改方案
+
+1. 把所有主入口 import 从 `agent.v2` 改成 `agent.session`
+2. `agent/v2/__init__.py` 保留，但仅作为兼容导出层，不再被 entry 层直接使用
+3. 测试分层：
+   - 行为测试：改用 `agent.session`
+   - 兼容测试：保留少量 `agent.v2` 断言
+
+### A.3 非目标
+
+- 本批不删除 `agent/v2/__init__.py`
+- 本批不顺手改 Plan/Skill/Subagent 行为
+
+### A.4 风险
+
+- 低风险，主要是 import 迁移与测试断言调整
+- 真正要小心的是别把“兼容层仍需要的测试”一起误删
+
+### A.5 验收
+
+- `entry/` 范围不再直接 import `agent.v2`
+- `agent.v2` 仅出现在兼容性测试与兼容层自身
+
+### A.6 来源
+
+- Claude Code Overview / Sub-agents / Agent loop  
+  https://code.claude.com/docs/en/overview  
+  https://code.claude.com/docs/en/sub-agents  
+  https://code.claude.com/docs/en/agent-sdk/agent-loop
+
+---
+
+## Batch B：修正 Skill modifier 语义
+
+优先级：P0  
+文件数：4~6  
+目标：让 `allowed-tools` 真正变成“当前 skill 作用窗口下的预授权”
+
+### B.1 涉及代码
+
+- [`skills/tool.py:28`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/skills/tool.py:28>)
+- [`skills/tool.py:128`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/skills/tool.py:128>)
+- [`core/policy_registry.py:67`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy_registry.py:67>)
+- [`core/policy_registry.py:192`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy_registry.py:192>)
+- [`core/policy_registry.py:210`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy_registry.py:210>)
+- [`core/policy.py:284`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy.py:284>)
+- [`core/policy.py:299`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy.py:299>)
+- [`skills/registry.py:286`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/skills/registry.py:286>)
+
+### B.2 当前问题
+
+`with_skill_restrictions()` 已经是对的：
+
+- `allowed_tools -> with_pre_approved_tools(...)`
+- `disallowed_tools -> denied_tools`
+
+但 `_apply_skill_modifier()` 仍然是错的：
+
+- `allowed_tools -> with_allowed_tools(...)`
+
+也就是说，同一个系统里现在同时存在两套 skill 语义。
+
+### B.3 修改方案
+
+1. 在 [`core/policy_registry.py:198`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy_registry.py:198>) 附近，把 `_apply_skill_modifier()` 改成：
+   - `allowed_tools` 走 `with_pre_approved_tools(...)`
+   - `disallowed_tools` 走 `with_denied_tools(...)`
+2. 明确 skill modifier 的生命周期：
+   - 生效范围：当前 turn / 当前 skill 激活窗口
+   - 清除时机：下一轮常规用户输入，或 skill 作用域结束
+3. 如果当前 registry 结构不方便表达“临时 grant”，增加一个小型 typed scope 对象，不要再用字符串/隐式约定
+4. 为 `with_skill_restrictions()` 与 `_apply_skill_modifier()` 建立同一套测试契约，禁止两处语义分叉
+
+### B.4 非目标
+
+- 不扩大 skill 功能
+- 不在这批里重构 skill registry 的所有解析逻辑
+
+### B.5 验收
+
+- `allowed-tools` 不再缩小工具可见集
+- `disallowed-tools` 仍然能按预期移除工具
+- 同一 skill 无论是“静态 frontmatter 限制”还是“tool result 注入 modifier”，语义一致
+
+### B.6 来源
+
+- Claude Code Skills  
+  https://code.claude.com/docs/en/skills
+
+---
+
+## Batch C：Plan mode 收口到“模式 + 审批适配”，缩减独立 orchestration
+
+优先级：P1  
+文件数：4~7  
+目标：保留现有可用性，但开始减少 `v2_runner.py` 里的第二套 plan 工作流
+
+### C.1 涉及代码
+
+- [`tools/plan_mode_tool.py:22`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/plan_mode_tool.py:22>)
+- [`agent/core.py:1218`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/core.py:1218>)
+- [`agent/core.py:1608`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/core.py:1608>)
+- [`entry/modes/v2_runner.py:197`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:197>)
+- [`entry/modes/v2_runner.py:390`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:390>)
+- [`entry/modes/v2_runner.py:457`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:457>)
+- [`entry/modes/v2_runner.py:496`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/modes/v2_runner.py:496>)
+
+### C.2 当前问题
+
+当前已经有一半是对的：
+
+- tool 可以设置 `_pending_mode_switch`
+- 主循环可以消费这个模式切换
+
+但仍有一半不对：
+
+- plan 保存逻辑、审批循环、replan、递归 build，仍集中在 `run_v2_mode()`
+
+### C.3 修改方案
+
+1. 先把 `run_v2_mode()` 中与 Plan 相关的逻辑拆出为两个层：
+   - `PlanReviewAdapter`：纯 UI / 文件保存 / 用户交互
+   - `PlanExecutionCoordinator`：纯状态推进
+2. 保持现有行为不变，但把“Plan mode 状态”和“Plan approval 编排”从一个函数中拆开
+3. 在第二阶段再把 `PlanAction.TRIGGER_BUILD` 的递归 `run_v2_mode(agent_name="build", ...)` 改造成更接近“同 session mode transition”的形态
+4. 计划文件命名规则保留 hash 稳定命名，但要在文档里明确：这是状态产物，不是模式事实源
+
+### C.4 非目标
+
+- 本批不要求一步到位消灭 `plan-action`
+- 本批不强行重写为单 session 全闭环
+
+### C.5 验收
+
+- `run_v2_mode()` 长度明显下降
+- Plan 的保存、展示、审批、replan 不再全部混在一个函数里
+- 后续若要切到更接近 Claude Code 的 session-mode transition，不需要再推倒重来
+
+### C.6 来源
+
+- Claude Code Permission modes  
+  https://code.claude.com/docs/en/permission-modes
+
+---
+
+## Batch D：Subagent 契约下沉，削弱 `_SUBAGENT_PROTOCOL`
+
+优先级：P1  
+文件数：5~8  
+目标：把“稳定性”从超长 prompt 转移到 typed contract + runtime enforcement
+
+### D.1 涉及代码
+
+- [`agent/session/task_tool.py:52`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:52>)
+- [`agent/session/task_tool.py:138`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:138>)
+- [`agent/session/task_tool.py:227`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:227>)
+- [`agent/session/task_tool.py:267`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:267>)
+- [`agent/session/task_tool.py:666`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/task_tool.py:666>)
+- [`agent/session/subagent.py:147`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/subagent.py:147>)
+- [`agent/session/agent_factory.py:51`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/agent_factory.py:51>)
+
+### D.2 当前问题
+
+现在的 prompt 里同时承担了：
+
+- 证据要求
+- 输出格式
+- 不得偷懒
+- 何时视为 verified / unverified
+- 必须调用 `submit_findings`
+
+这会导致两个问题：
+
+1. 协议一长，模型偏移风险就上升
+2. 真正的可靠性约束没有沉到 runtime / tool result / contract
+
+### D.3 修改方案
+
+1. 保留 `_SUBAGENT_PROTOCOL`，但只保留最小角色说明：
+   - 子代理身份
+   - fresh context vs fork context 提醒
+   - 高层交付目标
+2. 把下列内容从 prompt 下沉到运行时：
+   - “必须提交结构化发现” → typed tool contract
+   - “confirmed vs unverified” → schema / validator
+   - “至少交叉读取依赖和调用者” → findings validator 或 review gate
+3. 将 `submit_findings` 视为真正的 completion boundary，而不是附属建议
+4. 若需要保留“反偷懒”规则，改为更短的 invariant 列表，不继续扩张成 200+ 行协议
+
+### D.4 非目标
+
+- 本批不改变子代理能力范围
+- 本批不改多代理调度模型
+
+### D.5 验收
+
+- `_SUBAGENT_PROTOCOL` 明显缩短
+- 结构化输出质量不下降
+- 子代理正确性更多来自 runtime contract，而不是 prompt 长度
+
+### D.6 来源
+
+- Claude Code Sub-agents  
+  https://code.claude.com/docs/en/sub-agents
+
+---
+
+## Batch E：拆 `agent/core.py`，恢复干净 loop 骨架
+
+优先级：P1  
+文件数：1 个大文件 + 3~6 个 supporting module  
+目标：把 agent 主循环从“大一统”恢复成“骨架 + 外围组件”
+
+### E.1 涉及代码
+
+- [`agent/core.py:177`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/core.py:177>)
+- [`agent/core.py:1215`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/core.py:1215>)
+- [`agent/core.py:1608`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/core.py:1608>)
+
+### E.2 修改方案
+
+建议拆成 4 类支持模块：
+
+1. `loop_driver`
+   - 只保留 LLM 调用、tool execution、history append、termination
+2. `mode_switching`
+   - `_pending_mode_switch`、plan/build mode 过渡
+3. `completion_and_reflection`
+   - completion policy、review / reflection、child continuation
+4. `history_materialization`
+   - runtime messages、tool result materialization、history compaction 辅助
+
+### E.3 顺序
+
+第一轮只“搬函数”，不改行为。  
+第二轮才清理 legacy 分支。
+
+### E.4 验收
+
+- `agent/core.py` 显著瘦身
+- 主 loop 更接近 Claude Code 官方 loop 心智
+
+### E.5 来源
+
+- Claude Code Agent loop  
+  https://code.claude.com/docs/en/agent-sdk/agent-loop
+
+---
+
+## Batch F：统一 Shell 与内部进程调用适配层
+
+优先级：P1  
+文件数：4~6  
+目标：统一编码、cwd 校验、timeout、错误归类，同时继续保留项目级隔离
+
+### F.1 涉及代码
+
+- [`tools/shell_tool.py:86`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/shell_tool.py:86>)
+- [`tools/shell_tool.py:165`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/shell_tool.py:165>)
+- [`tools/shell_tool.py:192`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/shell_tool.py:192>)
+- [`tools/shell_tool.py:230`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/shell_tool.py:230>)
+- [`executor/process.py`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/process.py>)
+- [`executor/project_environment.py:132`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/project_environment.py:132>)
+- [`executor/workspace_facts.py:144`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/workspace_facts.py:144>)
+
+### F.2 修改方案
+
+1. 抽一个共享的内部 `ProcessInvoker`
+   - 统一 UTF-8/bytes decode
+   - 统一 timeout
+   - 统一 cwd must stay within project root / state root 的校验
+   - 统一错误分类
+2. `ShellTool` 继续保留 `cmd`，但：
+   - 标记为仅兼容路径
+   - 内部逐步迁空
+3. `_BLOCKED_PATTERNS` 保留为 L0，但明确冻结边界：
+   - 只保留绝对不可协商硬阻断
+   - 不再继续把更多主权限语义堆进去
+
+### F.3 非目标
+
+- 本批不删除所有 `subprocess.run(...)`
+- 本批不重写 Runtime 整体
+
+### F.4 验收
+
+- 用户态 shell 与内部探测共享底层保证
+- 项目级隔离不退化
+- `cmd` 不再是推荐路径
+
+### F.5 来源
+
+- Claude Code Permission modes  
+  https://code.claude.com/docs/en/permission-modes
+
+---
+
+## Batch G：MCP 从 bridge-first 过渡到 registry-first
+
+优先级：P2  
+文件数：3~6  
+目标：让 deferred schema / metadata 进入核心 registry，而不是停在 executor 边缘
+
+### G.1 涉及代码
+
+- [`agent/session/mcp_integration.py:17`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/mcp_integration.py:17>)
+- [`agent/session/mcp_integration.py:93`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/mcp_integration.py:93>)
+- [`agent/session/mcp_integration.py:163`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/session/mcp_integration.py:163>)
+- [`executor/mcp/registry.py:46`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/mcp/registry.py:46>)
+- [`executor/mcp/registry.py:58`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/mcp/registry.py:58>)
+- [`core/policy_registry.py:171`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/core/policy_registry.py:171>)
+- [`tools/workflow_tool.py:83`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/workflow_tool.py:83>)
+
+### G.2 修改方案
+
+1. `get_schemas()` 层面显式支持：
+   - built-in schema
+   - loaded MCP schema
+   - deferred MCP schema
+2. 将 `defer_loading` 的判定逻辑从 executor helper 提升到 registry 可理解的能力
+3. 保留 `MCPRuntimeToolProxy` 作为短期桥接层，但把它降级为适配细节，不再作为 MCP 架构中心
+4. 后续如果要补 `roots/list`、`tools/list_changed` 等协议行为，也应该挂在 runtime / registry 层，而不是塞进 proxy
+
+### G.3 非目标
+
+- 本批不要求彻底删 bridge
+- 本批不要求一次实现全部 MCP 高级协议
+
+### G.4 验收
+
+- registry 理解 deferred schema
+- MCP 不再主要依赖“包装成 legacy BaseTool”才能存在
+
+### G.5 来源
+
+- Claude Code MCP  
+  https://code.claude.com/docs/en/mcp
+
+---
+
+## Batch H：legacy/fallback inventory + examples 清理
+
+优先级：P2  
+文件数：4~8  
+目标：把历史残留从“默认永久保留”改成“可审计、可删除”
+
+### H.1 涉及代码
+
+- [`entry/chat.py`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/entry/chat.py>)
+- [`agent/core.py`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/agent/core.py>)
+- [`tools/shell_tool.py`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/tools/shell_tool.py>)
+- [`executor/examples.py`](</abs/path/D:/StudyProjects/ProjectBench/forge-agent/executor/examples.py>)
+
+### H.2 修改方案
+
+给每个 fallback 建一张最小卡片：
+
+- 它解决什么历史兼容问题
+- 现在谁还在调用
+- 何时可以删
+
+没有真实消费者的，优先删。  
+仍有兼容价值的，明确边界，不再自然扩张。
+
+### H.3 来源
+
+- Claude Code 整体产品心智更接近“兼容层可存在，但不应反过来主导架构”
+- 参考：
+  - https://code.claude.com/docs/en/overview
+  - https://code.claude.com/docs/en/agent-sdk/agent-loop
+
+---
+
+## 4. 推荐执行顺序
+
+按“先收主入口、再修语义、再减重、最后清边角”的顺序，我建议：
+
+1. Batch A：主入口迁移到 `agent.session`
+2. Batch B：Skill modifier 语义纠偏
+3. Batch C：Plan orchestration 收口
+4. Batch D：Subagent contract 下沉
+5. Batch E：`agent/core.py` 拆职责
+6. Batch F：Shell + Process adapter 统一
+7. Batch G：MCP registry-first
+8. Batch H：legacy/fallback + examples 清理
+
+---
+
+## 5. 当前最适合立即开工的批次
+
+如果我们要避免“改了一处，后面别处又炸”，那最合理的起手顺序是：
+
+- 先做 Batch A
+- 再做 Batch B
+- 然后做 Batch C
 
 原因很简单：
 
-- Claude Code 的理想语义是“同一 session 内切换 mode”
-- 我们当前仍是“Plan 产物落文件，再由 runner 触发后续 build 路径”
+- Batch A 先把 canonical namespace 定住
+- Batch B 修正 skill 权限语义这个硬偏差
+- Batch C 再处理 plan 这条用户最敏感、最容易暴露问题的主链
 
-这在功能上可工作，但仍然属于架构债务，而不是最终形态。
-
-### 3) Point 8 还没有真正对齐 Claude Code 技能授权语义
-
-关键定位：
-
-- `skills/tool.py:128`
-- `core/policy_registry.py:198`
-- `core/policy_registry.py:210`
-- `core/policy.py:299`
-
-当前问题不是“有没有 typed dataclass”，这个已经有了；真正的问题是：
-
-- skill 返回的是 `SkillContextModifier`
-- 但消费时对 `allowed_tools` 走的是 `with_allowed_tools(...)`
-- 而不是 `with_pre_approved_tools(...)`
-
-这会把“本轮免确认授权”做成“直接收窄可见工具集合”，语义不等价。
-
-所以这项状态应该是：
-
-- 类型层已完成一半
-- 语义层仍未完成
-
-### 4) Point 12 应保留 L0，但不要继续把更多语义堆进黑名单
-
-关键定位：
-
-- `tools/shell_tool.py:34`
-- `tools/shell_tool.py:244`
-
-我不建议删除 `_BLOCKED_PATTERNS`，因为它是最后一道硬阻断。  
-但我同样不建议继续扩张它，让它承担越来越多的权限判断职责。
-
-更合理的边界是：
-
-- L0：只保留少量绝对不可协商的硬阻断
-- L1+：主权限语义交给 policy / permission pipeline / protected paths
-
-### 5) Point 16 应冻结 alias 边界，而不是继续自然扩展
-
-关键定位：
-
-- `agent/session/agent_registry.py:16`
-- `tools/file_tool.py:208`
-- `tools/search_tool.py:81`
-- `tools/shell_tool.py:79`
-
-我的意见不是删除 alias，而是：
-
-- 保留现有兼容价值
-- 停止新增更多灰色别名
-- 文档、测试、新实现统一使用 canonical name
+这三批做完，再进 Subagent / Core / MCP，会稳很多。
 
 ---
 
-## 结合你刚刚代码改动后的新状态
+## 6. 备注
 
-### Point 2：从“建议”升级为“已启动，继续做完整”
-
-你已经修掉 4 个 shim：
-
-- `agent/v2/agent_definition.py`
-- `agent/v2/agent_registry.py`
-- `agent/v2/subagent.py`
-- `agent/v2/task_tool.py`
-
-仓库里仍然还有若干 `agent.v2` shim 仍是单纯 `import *`，例如：
-
-- `agent/v2/models.py`
-- `agent/v2/runtime_prompt_builder.py`
-- `agent/v2/runtime.py`
-- `agent/v2/mcp_integration.py`
-- `agent/v2/agent_factory.py`
-- `agent/v2/session_store.py`
-- `agent/v2/task_state_machine.py`
-- `agent/v2/run_context.py`
-- `agent/v2/task_contract.py`
-- `agent/v2/worktree_service.py`
-- `agent/v2/subagent_registry_factory.py`
-- `agent/v2/registry_builder.py`
-- `agent/v2/result_contract.py`
-- `agent/v2/execution_budget.py`
-
-其中并不是所有 shim 都需要显式补齐私有符号，但至少应该做一次分组：
-
-1. 纯公开 API shim：保留 `import *` 即可  
-2. 被测试或入口直接引用私有符号的 shim：显式补齐 re-export  
-3. 几乎无人引用的 shim：后续直接迁移入口后可删除
-
-这一步现在已经具备继续推进的条件。
-
-### Point 3：主入口仍大量依赖 `agent.v2`
-
-当前主入口和关键路径仍有明显 `agent.v2` 依赖：
-
-- `entry/chat.py`
-- `entry/cli.py`
-- `entry/modes/v2_runner.py`
-- `entry/worktree_admin.py`
-- `agent/core.py`
-- `agent/runtime_controller.py`
-
-这说明我们还没有真正让 `agent.session` 成为唯一 canonical implementation。
-
-### Point 8：文档里不能再写“已完成”
-
-因为 `core/policy_registry.py` 当前仍然是：
-
-- 有 `with_pre_approved_tools(...)`
-- 但 skill modifier 消费时走的是 `with_allowed_tools(...)`
-
-所以这项要从“已完成”改回“待修正”。
-
----
-
-## 批次划分
-
-下面的批次是按“先稳兼容层，再迁主入口，再收紧语义，再做减重”的顺序排的。每一批都控制在 15 个文件以内。
-
-### Batch 1：补齐 `agent.v2` shim 分组与显式 re-export 收口
-
-目标：
-
-- 把 `agent.v2` 兼容层从“半隐式”收口成“可审计的兼容层”
-- 不改主行为，只修兼容契约
-
-建议文件：
-
-- `agent/v2/models.py`
-- `agent/v2/runtime_prompt_builder.py`
-- `agent/v2/runtime.py`
-- `agent/v2/mcp_integration.py`
-- `agent/v2/agent_factory.py`
-- `agent/v2/session_store.py`
-- `agent/v2/task_state_machine.py`
-- `agent/v2/run_context.py`
-- `agent/v2/task_contract.py`
-- `agent/v2/worktree_service.py`
-- `agent/v2/subagent_registry_factory.py`
-- `agent/v2/registry_builder.py`
-- `agent/v2/result_contract.py`
-- `agent/v2/execution_budget.py`
-- `agent/v2/__init__.py`
-
-本批原则：
-
-- 不做业务重写
-- 只做 shim 分类、补齐缺失导出、补文档说明
-- 若某 shim 没有私有符号需求，不强行增加额外导出
-
-验收标准：
-
-- `agent.v2` shim 行为可预测
-- 私有符号引用不再依赖偶然行为
-
-### Batch 2：主入口 import 迁移到 `agent.session`
-
-目标：
-
-- 让真正的 canonical namespace 进入主入口
-
-建议文件：
-
-- `entry/chat.py`
-- `entry/cli.py`
-- `entry/modes/v2_runner.py`
-- `entry/worktree_admin.py`
-- `agent/core.py`
-- `agent/runtime_controller.py`
-
-本批原则：
-
-- 只迁 import 路径
-- 不顺手改业务逻辑
-- 保留 `agent.v2` 兼容层供测试与旧调用过渡
-
-验收标准：
-
-- 主入口不再依赖 `agent.v2` 作为一手实现层
-
-### Batch 3：Skill modifier 语义对齐
-
-目标：
-
-- 把 skill 的 allowed-tools 语义从“工具集合裁剪”纠正为“本轮预授权”
-
-建议文件：
-
-- `skills/tool.py`
-- `core/policy_registry.py`
-- `core/policy.py`
-- `skills/registry.py`
-- 如有必要：相关测试文件
-
-本批原则：
-
-- 不扩大 skill 功能面
-- 只修正授权语义与生命周期
-
-验收标准：
-
-- skill modifier 影响的是 pre-approval，而不是工具可见性误裁剪
-- 生命周期清晰，能说明何时生效、何时清除
-
-### Batch 4：Plan / approval 双轨收口设计
-
-目标：
-
-- 先把 Plan 的“当前状态”和“目标状态”在代码上分清
-- 再逐步缩减 `v2_runner.py` 的独立编排职责
-
-建议文件：
-
-- `tools/plan_mode_tool.py`
-- `agent/core.py`
-- `entry/modes/v2_runner.py`
-- `entry/cli.py`
-- 相关 plan approval 测试
-
-本批原则：
-
-- 先补注释、契约、状态边界
-- 不急于一步到位重写成同 session 切换
-- 先避免继续新增第二套 Plan 语义
-
-验收标准：
-
-- 文档和实现对 Plan 的状态描述一致
-- 后续可继续演进，而不是越改越分叉
-
-### Batch 5：subagent 协议减重 + completion contract 下沉
-
-目标：
-
-- 减少 `_SUBAGENT_PROTOCOL` 这种超重 prompt 对稳定性的依赖
-
-建议文件：
-
-- `agent/session/task_tool.py`
-- `agent/session/subagent.py`
-- `agent/session/runtime.py`
-- `agent/session/result_contract.py`
-- `agent/session/task_contract.py`
-- `agent/session/agent_factory.py`
-
-本批原则：
-
-- 角色说明保留
-- 输出结构、完成条件、诊断结构尽量下沉到 typed contract / runtime
-
-验收标准：
-
-- subagent 成功性不再过度依赖超长协议 prompt
-
-### Batch 6：`agent/core.py` 拆职责
-
-目标：
-
-- 将主循环与周边机制拆开
-
-建议文件：
-
-- `agent/core.py`
-- 新拆分出的 3~6 个 supporting module
-
-建议拆分方向：
-
-- loop driver
-- mode switch handling
-- reflection / review policy
-- completion policy
-- history materialization
-
-本批原则：
-
-- 第一轮只搬运职责，不变行为
-
-验收标准：
-
-- `agent/core.py` 明显瘦身
-- 主循环结构更接近 Claude Code 的干净 loop 骨架
-
-### Batch 7：Shell 收口 + 内部进程调用统一适配
-
-目标：
-
-- 统一“用户态 shell 调用”和“内部事实采集”的底层进程适配约束
-
-建议文件：
-
-- `tools/shell_tool.py`
-- `executor/process.py`
-- `executor/project_environment.py`
-- `executor/workspace_facts.py`
-- 必要的 shared adapter 文件
-
-本批原则：
-
-- `command + args` 成为唯一主路径
-- `cmd` 退为兼容路径并显式标记
-- 内部 `subprocess.run(...)` 共享编码、timeout、cwd 校验、错误归类
-
-验收标准：
-
-- 进程执行语义更统一
-- 项目隔离边界更稳定
-
-### Batch 8：MCP registry 一等公民化
-
-目标：
-
-- 让 MCP 的 deferred schema / metadata 真正接入核心 registry
-
-建议文件：
-
-- `agent/session/mcp_integration.py`
-- `executor/mcp/registry.py`
-- `core/policy_registry.py`
-- 相关 MCP 测试文件
-
-本批原则：
-
-- 短期保留 bridge
-- 中期把桥降为薄适配层
-
-验收标准：
-
-- registry 层理解 deferred schema
-- MCP 不再主要靠 legacy proxy 挂接
-
-### Batch 9：legacy inventory + examples 清理
-
-目标：
-
-- 把历史遗留路径做成可删除清单，而不是无限保留
-
-建议文件：
-
-- `executor/examples.py`
-- `entry/chat.py`
-- `tools/shell_tool.py`
-- `agent/core.py`
-- 其他 legacy/fallback 明显驻留点
-
-本批原则：
-
-- 每个 fallback 都写清楚“谁在用、为何保留、何时删除”
-- 没有调用价值的优先删
-
-验收标准：
-
-- 仓库里不再存在来源不明的 fallback
-
-### Batch 10：chat-mode / skill fork / subagent 统一评估专项
-
-目标：
-
-- 回头评估 `chat.py` 自己那套 fork 语义是否要并入统一 spawn service
-
-建议文件：
-
-- `entry/chat.py`
-- `agent/session/task_tool.py`
-- `agent/session/runtime.py`
-- `agent/session/agent_factory.py`
-
-本批原则：
-
-- 这批放到最后
-- 只在前面主链稳定后再做
-
-验收标准：
-
-- 不再存在第三套 subagent 语义继续长大
-
----
-
-## 推荐执行顺序
-
-如果我们按“低风险、先收口、再重构”的方式推进，我建议顺序如下：
-
-1. Batch 1：`agent.v2` shim 收口
-2. Batch 2：主入口 import 迁移
-3. Batch 3：Skill modifier 语义修正
-4. Batch 4：Plan / approval 双轨收口
-5. Batch 5：subagent contract 减重
-6. Batch 6：`agent/core.py` 拆职责
-7. Batch 7：shell + process adapter
-8. Batch 8：MCP registry 一等公民化
-9. Batch 9：legacy inventory + examples
-10. Batch 10：chat-mode fork 统一评估
-
----
-
-## 我的最终建议
-
-如果我们要继续保持“全局一致，不打补丁式修修补补”的原则，那么接下来最合理的做法不是直接散点改代码，而是：
-
-- 以这份文档为唯一整改基线
-- 从 Batch 1 开始按批推进
-- 每批结束都复核：是否让架构更单轨、更声明式、更 typed、更接近 Claude Code 的语义
-
-当前最适合立刻开工的是：
-
-- Batch 1
-- Batch 2
-- Batch 3
-
-因为这三批会直接决定后续所有整改，是不是建立在一个稳定的 canonical 架构之上。
+PowerShell 控制台里如果仍看到中文乱码，那是终端显示编码问题；这份文件本身已按 UTF-8 重写。
