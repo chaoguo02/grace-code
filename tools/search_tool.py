@@ -370,6 +370,12 @@ class SearchTextTool(BaseTool):
             if file_match_count > 0:
                 match_counts[rel_path] = file_match_count
 
+        import logging as _lg2
+        _lg2.getLogger(__name__).warning(
+            "Grep[result] pattern=%r match_count=%d matches_len=%d output_mode=%s head_limit=%d",
+            raw_pattern, len(match_counts), len(matches), output_mode, head_limit,
+        )
+
         # Build output
         if output_mode == "count":
             if not match_counts:
