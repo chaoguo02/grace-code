@@ -1,15 +1,12 @@
 """
 tools/shell_tool.py
 
-Shell 命令执行工具。
+Shell command execution tool. Platform-aware:
+- Windows: uses powershell.exe or cmd.exe as appropriate
+- Unix: uses /bin/sh
 
-安全模型：
-- L0 安全底线：拒绝明显破坏性命令（硬拦截，防御纵深）
-- 读写权限判断：不再使用工具内部字符串白名单/黑名单。
-  改为框架层通过 PhasePolicy.allowed_effects 声明式控制——
-  PolicyAwareToolRegistry._is_tool_visible() 在注册时过滤。
-- 用户确认：PermissionPipeline 统一处理，工具层不自行判断。
-- Timeout + 输出截断：防挂起、防上下文爆炸。
+CC-aligned: the tool is named "Bash" for CC compatibility but adapts
+to the platform. On Windows, commands execute via PowerShell.
 """
 
 from __future__ import annotations
@@ -24,48 +21,50 @@ from executor.process import LocalRuntime, Runtime
 from core.utils import truncate_output
 
 
-# ---------------------------------------------------------------------------
-# 配置常量
-# ---------------------------------------------------------------------------
-
 MAX_OUTPUT_CHARS = 50_000
 
-# L0 安全底线 — 硬拦截破坏性命令（永不执行，防御纵深最后一层）
 _BLOCKED_PATTERNS: tuple[str, ...] = (
     "rm -rf /",
     "rm -rf ~",
     "mkfs",
     "dd if=",
-    ":(){:|:&};:",       # fork bomb
+    ":(){:|:&};:",
     "chmod -R 777 /",
     "chown -R",
     "> /dev/sda",
 )
 
-# 确认回调类型：接收命令字符串，返回 True=允许 / False=拒绝
 ConfirmCallback = Callable[[str], bool]
 
+_READ_ONLY_COMMANDS: frozenset[str] = frozenset({
+    "ls", "dir", "cat", "head", "tail", "wc", "du", "df",
+    "grep", "find", "locate", "which", "where", "whereis",
+    "echo", "printf", "date", "uptime", "hostname", "uname",
+    "pwd", "env", "printenv", "whoami", "id", "groups",
+    "tree", "file", "stat", "readlink", "realpath",
+    "sort", "uniq", "cut", "tr", "awk", "sed",
+    "diff", "cmp", "comm", "join", "paste",
+    "pgrep", "pidof", "ps", "top", "free", "vmstat",
+    "lscpu", "lsblk", "lsusb", "lspci", "dmesg",
+    "type", "help", "man", "info", "whatis",
+    "Get-ChildItem", "Get-Content", "Get-Item", "Get-Command",
+    "Get-Process", "Get-Service", "Select-String",
+})
 
-# ---------------------------------------------------------------------------
-# ShellTool
-# ---------------------------------------------------------------------------
+_READ_ONLY_PREFIXES: tuple[str, ...] = (
+    "git status", "git log", "git diff", "git show",
+    "git branch", "git tag", "git remote",
+    "git config --get", "git config --list",
+    "git ls-", "git rev-",
+)
+
 
 class ShellTool(BaseTool):
     metadata = ToolMetadata(effects=frozenset({ToolEffect.EXECUTE}))
     """
-    执行 shell 命令，返回 stdout + stderr。
-
-    params:
-        command (str): 可执行程序名（推荐，shell=False，参数隔离）
-        args (list):   参数列表
-        cmd (str):     shell 命令字符串（legacy，shell=True）
-        timeout (int): 超时秒数（默认 30）
-        cwd (str):     工作目录（默认使用当前目录）
-
-    安全模型：
-        - L0 安全底线硬拦截：execute() 内 _check_blocked()
-        - 读写权限由框架层 PhasePolicy.allowed_effects 声明式控制
-        - 用户确认由 PermissionPipeline 统一处理
+    Execute shell commands. Platform-aware execution:
+    - Windows: PowerShell (Get-ChildItem) or cmd.exe (dir)
+    - macOS/Linux: bash/sh
     """
 
     def __init__(
@@ -84,15 +83,22 @@ class ShellTool(BaseTool):
 
     @property
     def description(self) -> str:
+        import platform
+        if platform.system() == "Windows":
+            return (
+                "Execute a shell command on Windows via PowerShell. "
+                "Use standard PowerShell cmdlets (Get-ChildItem, Get-Content, Select-String). "
+                "Timeout is 30s by default. "
+                "For reading files, prefer the Read tool. "
+                "For searching file contents, prefer Grep. "
+                "For listing files, prefer Glob."
+            )
         return (
-            "Execute a shell command and return its output (stdout + stderr combined). "
+            "Execute a shell command and return its output. "
             "Timeout is 30s by default. "
-            "CRITICAL: Use the 'cwd' parameter to set the working directory. "
-            "Never write 'cd /some/path' in the command string — use cwd instead. "
-            "RESTRICTION: Do NOT use this tool to read files (use file_read instead) "
-            "or modify files (use file_edit / file_write instead). "
-            "Use shell ONLY for operations that have no dedicated tool: "
-            "running tests, git commands, builds, package managers, etc."
+            "For reading files, prefer the Read tool. "
+            "For searching file contents, prefer Grep. "
+            "For listing files, prefer Glob."
         )
 
     @property
@@ -102,134 +108,61 @@ class ShellTool(BaseTool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The program to run (e.g., 'pytest', 'git', 'ls'). PREFERRED over 'cmd' — uses parameterized execution with shell=False.",
+                    "description": "Command to execute (e.g., 'Get-ChildItem' or 'ls')",
                 },
                 "args": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Arguments as separate items. Each item is ONE argument, never parsed by shell.",
+                    "description": "Arguments passed as separate list items",
                 },
                 "cmd": {
                     "type": "string",
-                    "description": "DEPRECATED. Use 'command' + 'args' instead. Shell command string (legacy).",
-                    "deprecated": True,
+                    "description": "DEPRECATED. Full command string (legacy). Use command+args instead.",
                 },
-                "description": {
-                    "type": "string",
-                    "description": "Human-readable description of what this command does (shown in permission prompts)",
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds (default 120, max 600)",
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory (optional)",
-                },
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": "Set to true to run this command in the background. For long-running processes like dev servers.",
-                },
-                "dangerouslyDisableSandbox": {
-                    "type": "boolean",
-                    "description": "Set to true to override sandbox mode and run without sandboxing. Requires explicit user confirmation.",
-                },
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)"},
+                "cwd": {"type": "string", "description": "Working directory"},
             },
-            "required": [],
         }
-
-    # ── Per-call concurrency safety (CC-aligned) ───────────────────────
-
-    # Commands that are stateless and safe to parallelize with other reads.
-    # Commands that are always safe to parallelize (pure readers / info display).
-    # Package managers and build tools are excluded — their subcommands can be
-    # destructive (install, build, publish). Use _READ_ONLY_PREFIXES for safe
-    # git subcommands like "git status" / "git log".
-    _READ_ONLY_COMMANDS: frozenset[str] = frozenset({
-        "ls", "dir", "cat", "head", "tail", "wc", "du", "df",
-        "grep", "find", "locate", "which", "where", "whereis",
-        "echo", "printf", "date", "uptime", "hostname", "uname",
-        "pwd", "env", "printenv", "whoami", "id", "groups",
-        "tree", "file", "stat", "readlink", "realpath",
-        "sort", "uniq", "cut", "tr", "awk", "sed",
-        "diff", "cmp", "comm", "join", "paste",
-        "pgrep", "pidof", "ps", "top", "free", "vmstat",
-        "lscpu", "lsblk", "lsusb", "lspci", "dmesg",
-        "type", "help", "man", "info", "whatis",
-    })
-    _READ_ONLY_PREFIXES: tuple[str, ...] = (
-        "git status", "git log", "git diff", "git show",
-        "git branch", "git tag", "git remote",
-        "git config --get", "git config --list",
-        "git ls-", "git rev-",
-    )
-
-    def concurrency_mode(self, params: dict[str, Any]) -> Any:
-        """CC-aligned per-call safety: read-only commands are PARALLEL_SAFE.
-
-        Parses the command string to distinguish read-only operations
-        (ls, grep, git status) from destructive ones (rm, mv, npm install).
-        The check is fail-closed: any parsing failure defaults to SERIAL.
-        """
-        from core.base import ToolConcurrency
-
-        command = (params.get("command") or "").strip()
-        args = params.get("args") or []
-
-        if not command:
-            # Legacy cmd mode — always serial
-            return ToolConcurrency.SERIAL
-
-        full_cmd = f"{command} {' '.join(args)}" if args else command
-        full_cmd_lower = full_cmd.lower().strip()
-
-        # Check read-only prefixes first (multi-word patterns)
-        for prefix in self._READ_ONLY_PREFIXES:
-            if full_cmd_lower.startswith(prefix):
-                return ToolConcurrency.PARALLEL_SAFE
-
-        # Check if the base command is read-only
-        base = command.lower().strip()
-        if base in self._READ_ONLY_COMMANDS:
-            return ToolConcurrency.PARALLEL_SAFE
-
-        # Check command with path (e.g. /usr/bin/ls)
-        if "/" in base:
-            leaf = base.rsplit("/", 1)[-1]
-            if leaf in self._READ_ONLY_COMMANDS:
-                return ToolConcurrency.PARALLEL_SAFE
-
-        return ToolConcurrency.SERIAL
 
     @property
     def risk_level(self) -> str:
         from core.base import RiskLevel
         return RiskLevel.HIGH
 
-    def classify_risk(self, params: dict[str, Any]) -> str:
-        """Dynamic risk classification: shell is always HIGH by default.
+    def concurrency_mode(self, params: dict[str, Any]) -> Any:
+        from core.base import ToolConcurrency
+        command = (params.get("command") or "").strip()
+        args = params.get("args", [])
+        if not command:
+            return ToolConcurrency.SERIAL
+        full_cmd = f"{command} {' '.join(args)}" if args else command
+        full_cmd_lower = full_cmd.lower().strip()
+        base = command.lower().strip().split()[0] if command.split() else command
+        if base in _READ_ONLY_COMMANDS:
+            return ToolConcurrency.PARALLEL_SAFE
+        if "/" in base:
+            leaf = base.rsplit("/", 1)[-1]
+            if leaf in _READ_ONLY_COMMANDS:
+                return ToolConcurrency.PARALLEL_SAFE
+        for prefix in _READ_ONLY_PREFIXES:
+            if full_cmd_lower.startswith(prefix):
+                return ToolConcurrency.PARALLEL_SAFE
+        return ToolConcurrency.SERIAL
 
-        PermissionPipeline refines this with per-command rules.
-        """
-        from core.base import RiskLevel
-        return RiskLevel.HIGH
+    def permission_denial_reason(self, params: dict[str, Any]) -> str | None:
+        cmd = self._build_cmd_repr(params)
+        if _check_blocked(cmd):
+            return f"Blocked by safety floor: matched pattern"
+        if "\x00" in cmd or len(cmd) > 10_000:
+            return "Blocked: malicious input detected"
+        return None
 
     def _build_cmd_repr(self, params: dict[str, Any]) -> str:
-        """Build a string representation for safety checks (L0/L1/L2)."""
         command = params.get("command", "")
         args = params.get("args", [])
         if command:
             return f"{command} {' '.join(args)}" if args else command
         return params.get("cmd", "")
-
-    def permission_denial_reason(self, params: dict[str, Any]) -> str | None:
-        cmd = self._build_cmd_repr(params)
-        blocked = _check_blocked(cmd)
-        if blocked:
-            return f"Blocked by safety floor: matched '{blocked}'"
-        if "\x00" in cmd or len(cmd) > 10_000:
-            return "Blocked: malicious input detected"
-        return None
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         cmd: str = params.get("cmd", "").strip()
@@ -238,147 +171,134 @@ class ShellTool(BaseTool):
         timeout: int = int(params.get("timeout", 30))
         cwd: str | None = params.get("cwd", None)
 
-        # Prefer parameterized execution (command+args) over legacy (cmd)
+        if not command and not cmd:
+            return ToolResult(success=False, output="", error="Either 'command' or 'cmd' is required")
+
         if command:
             return self._execute_parameterized(command, args, timeout, cwd)
-        if cmd:
-            return self._execute_legacy(cmd, timeout, cwd)
+        return self._execute_legacy(cmd, timeout, cwd)
 
-        return ToolResult(success=False, output="", error="Either 'command' or 'cmd' is required")
+    # ── Parameterized execution (preferred) ──────────────────────────────
 
     def _execute_parameterized(self, command: str, args: list[str], timeout: int, cwd: str | None) -> ToolResult:
-        """Execute via Runtime.execute() — shell=False, physically isolated parameters."""
+        import logging, platform, shutil
+        _log = logging.getLogger(__name__)
         cmd_repr = f"{command} {' '.join(args)}" if args else command
 
-        # L0 safety floor
         blocked = _check_blocked(cmd_repr)
         if blocked:
+            return ToolResult(success=False, output="", error=f"Command blocked for safety: matched '{blocked}'")
+
+        cmd_name = command.split()[0] if command.split() else command
+
+        # ── Windows: use PowerShell or cmd.exe ──
+        if platform.system() == "Windows":
+            _log.debug("shell cmd=%s args=%s cwd=%s PATH=%s", cmd_name, args, cwd,
+                       os.environ.get("PATH", "")[:200])
+
+            # Try direct execution first (for native exes like git, python)
+            exe_path = shutil.which(cmd_name)
+            if exe_path:
+                try:
+                    run_result = self._runtime.execute(exe_path, args=args, cwd=cwd, timeout=timeout)
+                    return self._build_result(run_result, cmd_repr)
+                except Exception as exc:
+                    _log.debug("direct execute failed: %s", exc)
+
+            # Try PowerShell (for PowerShell cmdlets like Get-ChildItem)
+            ps_exe = shutil.which("powershell.exe") or r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            if os.path.exists(ps_exe):
+                ps_cmd = f"& {{ {command} {' '.join(args)} }}" if args else f"& {{ {command} }}"
+                try:
+                    run_result = self._runtime.execute(
+                        ps_exe, args=["-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                        cwd=cwd, timeout=timeout,
+                    )
+                    return self._build_result(run_result, cmd_repr)
+                except Exception as exc:
+                    _log.debug("powershell execute failed: %s", exc)
+
+            # Try cmd.exe (for legacy DOS commands like dir, tree)
+            comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+            if os.path.exists(comspec):
+                full_cmd = f"{command} {' '.join(args)}" if args else command
+                try:
+                    run_result = self._runtime.execute(
+                        comspec, args=["/d", "/s", "/c", full_cmd],
+                        cwd=cwd, timeout=timeout,
+                    )
+                    return self._build_result(run_result, cmd_repr)
+                except Exception as exc:
+                    _log.debug("cmd.exe execute failed: %s", exc)
+
             return ToolResult(
                 success=False, output="",
-                error=f"Command blocked for safety: matched '{blocked}'",
+                error=(
+                    f"Command '{cmd_name}' could not run on Windows. "
+                    f"PowerShell and cmd.exe both failed. "
+                    f"Use Glob/Grep/Read tools instead of shell."
+                ),
             )
 
-        # On Windows, check if the executable exists before trying to run it.
-        # command may be a full path (ls, git) or contain args accidentally.
-        import platform as _platform
-        if _platform.system() == "Windows":
-            import shutil as _shutil
-            _cmd_name = command.split()[0] if command.split() else command
-            if _shutil.which(_cmd_name) is None and _cmd_name not in ("cmd", "powershell"):
-                return ToolResult(
-                    success=False, output="",
-                    error=(
-                        f"Command '{command}' not found on Windows. "
-                        f"Use Windows-native commands (dir, type) or Glob/Grep tools instead."
-                    ),
-                )
-
-        from executor.process import RunResult
+        # ── Unix: direct execution ──
         try:
-            run_result: RunResult = self._runtime.execute(
-                command, args=args, cwd=cwd, timeout=timeout,
-            )
+            run_result = self._runtime.execute(command, args=args, cwd=cwd, timeout=timeout)
         except FileNotFoundError:
             return ToolResult(
                 success=False, output="",
                 error=f"Command '{command}' not found. Make sure it is installed and in your PATH.",
             )
-
         return self._build_result(run_result, cmd_repr)
 
+    # ── Legacy execution ─────────────────────────────────────────────────
+
     def _execute_legacy(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
-        """Execute via Runtime.exec() — shell=True, backward compatible."""
-        # L0 safety floor
         blocked = _check_blocked(cmd)
         if blocked:
-            return ToolResult(
-                success=False, output="",
-                error=f"Command blocked for safety: matched '{blocked}'",
-            )
-
+            return ToolResult(success=False, output="", error=f"Command blocked for safety: matched '{blocked}'")
         return self._run(cmd, timeout, cwd)
 
-    # ------------------------------------------------------------------
-    # 内部
-    # ------------------------------------------------------------------
-
     def _run(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
-        """Execute via Runtime.exec() — legacy path with shell=True."""
-        result = self._runtime.exec(cmd, cwd=cwd, timeout=timeout)
-        return self._build_result(result, cmd)
+        import logging, platform
 
-    def _build_result(self, run_result: "Any", cmd_repr: str) -> ToolResult:
-        """Convert RunResult to ToolResult with proper error classification."""
-        from core.base import classify_runtime_error
-        output = truncate_output(run_result.output, MAX_OUTPUT_CHARS)
-        if not run_result.success:
-            _tool_err = classify_runtime_error(run_result, cmd_repr)
-            return ToolResult(
-                success=False, output=output,
-                error=_tool_err.to_message() if _tool_err else f"Exit code: {run_result.returncode}",
-                tool_error=_tool_err,
-            )
-        return ToolResult(success=True, output=output)
+        if platform.system() == "Windows":
+            _log = logging.getLogger(__name__)
+            ps_exe = shutil.which("powershell.exe") or r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            if os.path.exists(ps_exe):
+                try:
+                    run_result = self._runtime.execute(
+                        ps_exe, args=["-NoProfile", "-NonInteractive", "-Command", cmd],
+                        cwd=cwd, timeout=timeout,
+                    )
+                    return self._build_result(run_result, cmd)
+                except Exception:
+                    pass
+
+        run_result = self._runtime.run(cmd, shell=True, cwd=cwd, timeout=timeout)
+        return self._build_result(run_result, cmd)
+
+    def _build_result(self, run_result, cmd_repr: str) -> ToolResult:
+        stdout = run_result.stdout or ""
+        stderr = run_result.stderr or ""
+
+        # Combine stdout + stderr (CC convention)
+        output = stdout
+        if stderr and stderr != stdout:
+            output += "\n" + stderr
+
+        # Truncate
+        if len(output) > MAX_OUTPUT_CHARS:
+            output = truncate_output(output, MAX_OUTPUT_CHARS)
+
+        return ToolResult(
+            success=run_result.success,
+            output=output,
+            error=run_result.error or None,
+        )
 
 
-# ---------------------------------------------------------------------------
-# 辅助函数（对外暴露供测试）
-# ---------------------------------------------------------------------------
-
-def _check_blocked(cmd: str) -> str | None:
-    """返回匹配到的 L0 安全底线 pattern，没有匹配返回 None。"""
-    cmd_lower = cmd.lower()
+def _check_blocked(cmd: str) -> str:
     for pattern in _BLOCKED_PATTERNS:
-        if pattern.lower() in cmd_lower:
+        if pattern in cmd:
             return pattern
-    return None
-
-
-# ---------------------------------------------------------------------------
-# 终端确认函数（在 cli/chat 里直接使用）
-# ---------------------------------------------------------------------------
-
-def terminal_confirm(cmd: str) -> bool:
-    """
-    在终端显示命令并等待用户确认。
-    返回 True 表示允许，False 表示拒绝。
-
-    显示格式：
-        ⚠  Agent wants to run:
-           $ git commit -m "fix parser"
-        Allow? [y/N/a(lways)] _
-    """
-    import sys
-
-    # 判断是否在交互式终端
-    if not sys.stdin.isatty():
-        # 非交互式（pipe / CI）：默认拒绝，避免意外执行
-        print(f"\n[confirm] Non-interactive terminal, rejecting: {cmd!r}", flush=True)
-        return False
-
-    print(f"\n\033[33m  ⚠  Agent wants to run:\033[0m")
-    print(f"     \033[1m$ {cmd}\033[0m")
-
-    while True:
-        try:
-            ans = input("  Allow? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
-
-        if ans in ("y", "yes"):
-            return True
-        if ans in ("n", "no", ""):
-            print("  \033[31m✗ Rejected\033[0m")
-            return False
-        print("  Please enter y or n.")
-
-
-def always_allow(cmd: str) -> bool:
-    """跳过确认，直接允许（用于 --no-confirm 模式）。"""
-    return True
-
-
-def always_deny(cmd: str) -> bool:
-    """跳过确认，直接拒绝（用于测试或 CI 模式）。"""
-    return False
+    return ""
