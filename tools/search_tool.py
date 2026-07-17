@@ -75,8 +75,15 @@ def _search_with_rg(
 ) -> ToolResult | None:
     """Try ripgrep first — 100x faster than pure Python for large trees."""
     """Try ripgrep or grep — 100x faster than pure Python for large trees."""
-    import logging, shutil, subprocess
+    import logging, platform, shutil, subprocess
     _log = logging.getLogger(__name__)
+
+    # On Windows, Git Bash grep ignores LC_ALL env var and reads files
+    # as system locale (GBK), which corrupts UTF-8 source files.
+    # Pure Python fallback is fast enough with os.walk dir pruning.
+    if platform.system() == "Windows":
+        _log.info("Grep using pure Python (Windows, skipping subprocess)")
+        return None
 
     rg_path = shutil.which("rg")
     grep_path = shutil.which("grep")
