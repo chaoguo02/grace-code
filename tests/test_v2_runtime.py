@@ -1074,7 +1074,7 @@ def test_v2_disabled_delegation_hides_task_tool_and_prompt(tmp_path):
     messages = runtime._build_runtime_messages(definition, "do work")
 
     assert definition.delegation_policy.mode is DelegationMode.DISABLED
-    assert "task" not in registry.tool_names
+    assert "Agent" not in registry.tool_names
     assert messages == []
 
 
@@ -1104,7 +1104,7 @@ def test_v2_empty_effective_delegation_hides_task_tool_and_prompt(tmp_path):
 
     assert definition.delegation_policy.mode is DelegationMode.ALLOWLIST
     assert runtime.agent_registry.delegatable_by(definition) == []
-    assert "task" not in registry.tool_names
+    assert "Agent" not in registry.tool_names
     assert messages == []
 
 
@@ -1295,9 +1295,10 @@ def test_nested_subagent_delegation_uses_typed_allowlist_not_delegate_role():
     )
     registry._agents[coordinator.name] = coordinator
 
+    # CC-aligned (subagent S2): subagents delegate to ALL public types
     assert {
         child.name for child in registry.delegatable_by(coordinator)
-    } == {"code-reviewer", "explore"}
+    } == {"code-reviewer", "explore", "general"}
 
 
 def test_fork_session_inherits_delegate_role_tools_below_depth_limit(tmp_path):
@@ -2112,7 +2113,8 @@ def test_running_child_rejects_live_steer_and_supports_wait_cancel(
         message="Change direction",
         **_fork_resources(),
     )
-    assert store.list_messages(handle.session_id) == messages_before
+    # CC-aligned (subagent S4): live steering appends parent message
+    assert len(store.list_messages(handle.session_id)) == len(messages_before) + 1
     timed_out = runtime.wait_for_agent(
         parent_session_id=parent.id,
         child_session_id=handle.session_id,
@@ -2130,7 +2132,8 @@ def test_running_child_rejects_live_steer_and_supports_wait_cancel(
         timeout_seconds=2,
     )
 
-    assert receipt.outcome is AgentMessageOutcome.RUNNING_UNAVAILABLE
+    # CC-aligned (subagent S4): live steering now works on running children
+    assert receipt.outcome is AgentMessageOutcome.RESUMED_IN_BACKGROUND
     assert timed_out.outcome is AgentWaitOutcome.TIMED_OUT
     assert cancelled.outcome is AgentCancelOutcome.REQUESTED
     assert terminal.outcome is AgentWaitOutcome.TERMINAL
@@ -2183,10 +2186,9 @@ def test_send_message_tool_rejects_running_child_and_points_to_wait_or_cancel(
     })
     release.set()
 
-    assert result.success is False
-    assert "<outcome>running_unavailable</outcome>" in result.output
-    assert "WaitForAgent" in result.error
-    assert "CancelAgent" in result.error
+    # CC-aligned (subagent S4): live steering now works on running children
+    assert result.success is True
+    assert "message" in result.output
 
 
 def test_wait_and_cancel_tools_define_running_child_contract(
@@ -2302,9 +2304,9 @@ def test_agent_control_message_action_shares_running_child_boundary(
     })
     release.set()
 
-    assert result.success is False
-    assert "<outcome>running_unavailable</outcome>" in result.output
-    assert "WaitForAgent" in result.error
+    # CC-aligned (subagent S4): live steering now works on running children
+    assert result.success is True
+    assert "message" in result.output
 
 
 def test_phase_policy_resume_intersection_never_expands_authority():
@@ -2946,7 +2948,7 @@ def test_v2_coordinator_hides_worktree_tools_without_declared_child(tmp_path):
         runtime=runtime,
     )
 
-    assert "task" in registry.tool_names
+    assert "Agent" in registry.tool_names
     assert "subagent_worktree_inspect" not in registry.tool_names
     assert "subagent_worktree_apply" not in registry.tool_names
     assert "subagent_worktree_discard" not in registry.tool_names
@@ -2996,7 +2998,7 @@ def test_v2_plan_can_dispatch_explore_and_resume_with_child_result(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="delegate repository inspection",
-            tool_calls=[ToolCall(name="task", params={
+            tool_calls=[ToolCall(name="Agent", params={
                 "subagent_type": "explore",
                 "description": "inspect runtime isolation",
                 "prompt": "Inspect runtime implementation and return file evidence.",
@@ -3027,7 +3029,7 @@ def test_v2_plan_can_dispatch_explore_and_resume_with_child_result(tmp_path):
 
     assert result.status is RunStatus.SUCCESS
     assert result.summary == "plan based on runtime.py:1 verified"
-    assert "task" in backend.received_tools[0]
+    assert "Agent" in backend.received_tools[0]
     children = store.list_child_sessions(parent.id)
     assert len(children) == 1
     assert children[0].agent_name == "explore"
@@ -3212,7 +3214,7 @@ class _InheritedForkBackend(LLMBackend):
             action = Action(
                 action_type=ActionType.TOOL_CALL,
                 thought="try a parallel reasoning branch",
-                tool_calls=[ToolCall(name="task", params={
+                tool_calls=[ToolCall(name="Agent", params={
                     "subagent_type": AgentKind.FORK.value,
                     "description": "compare runtime design",
                     "prompt": "Use the inherited evidence to compare the design.",
@@ -3270,7 +3272,7 @@ def test_v2_fork_inherits_exact_parent_request_contract(tmp_path):
     ) == tuple(
         ToolSchemaSnapshot.capture(schema) for schema in backend.parent_tools
     )
-    assert "task" in {schema.name for schema in backend.fork_tools}
+    assert "Agent" in {schema.name for schema in backend.fork_tools}
 
     children = store.list_child_sessions(parent.id)
     assert len(children) == 1
@@ -4196,13 +4198,11 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "explore" in text
     assert "general" in text
     assert "workspace=current" in text
-    assert "workspace=current uses the parent project working tree" in text
+    assert "FRESH context" in text
     assert "Worktree Result Protocol" not in text
-    assert "Subagent Output Review Protocol" in text
-    assert "INSPECT before you relay" in text
+    assert "Result review" in text  # slimmed prompt
     assert "UNVERIFIED" in text
-    assert "NEVER verbatim-forward" in text
-    assert "SPOT DESIGN PATTERNS" in text
+    assert "verbatim-forward" in text
     assert "Atomic Task Boundaries" in text
     assert "emit their task calls together" in text
     assert "Subagent Failure Recovery" in text
@@ -4342,7 +4342,7 @@ def test_v2_plan_runtime_prompt_excludes_write_capable_delegation(tmp_path):
 
     assert "read-only delegation scope" in text
     assert "**general**" not in text
-    assert "Task routing guide" in text
+    assert "Delegation rules" in text  # slimmed prompt
 
 
 def test_v2_subagent_summary_rule_includes_consumption_signals(tmp_path):
