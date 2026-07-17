@@ -688,10 +688,7 @@ def chat(
         repo_path=repo_path,
     )
 
-    # 注册 SkillTool（如果有已发现的 skills）
-    if skill_registry.list_skills():
-        from skills.tool import SkillTool
-        registry.register(SkillTool(skill_registry))
+    # SkillTool 已在 build_registry() 中注册
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
     from entry.renderer import create_renderer
