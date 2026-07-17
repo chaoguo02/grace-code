@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import copy
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
@@ -49,6 +50,32 @@ Stop as soon as you have enough evidence to answer the assigned task.
 
 ## Deliverable contract
 """
+
+
+@dataclass(frozen=True)
+class _SpawnPlanningFacts:
+    """Typed runtime facts used to plan one child launch.
+
+    This is intentionally narrower than ``AgentSpawnRequest``:
+    it captures caller-provided spawn intent plus the resolved target
+    definition/workspace facts that runtime policy needs for concurrency and
+    AUTO placement decisions.
+    """
+
+    subagent_type: str
+    is_fork: bool
+    workspace_mode: WorkspaceMode
+    definition: Any | None
+
+
+@dataclass(frozen=True)
+class _SpawnInvocationPlan:
+    """Validated caller input plus resolved typed facts for one launch."""
+
+    description: str
+    user_prompt: str
+    requested_placement: ExecutionPlacement
+    facts: _SpawnPlanningFacts
 
 
 class AgentTool(BaseTool):
@@ -102,39 +129,222 @@ class AgentTool(BaseTool):
         bound._run_context = context
         return bound
 
+    def _planning_facts_from_params(
+        self, params: dict[str, Any],
+    ) -> _SpawnPlanningFacts | None:
+        """Best-effort typed spawn facts for runtime policy decisions.
+
+        Returns ``None`` for invalid or unauthorized inputs so the caller can
+        fall back to the safest serial/foreground behavior or report a richer
+        execution-time validation error.
+        """
+        raw_subagent_type = params.get("subagent_type")
+        if not isinstance(raw_subagent_type, str):
+            return None
+        subagent_type = raw_subagent_type.strip()
+        if not subagent_type:
+            return None
+        allowed = self._allowed_subagent_names()
+        if subagent_type not in allowed:
+            return None
+
+        is_fork = subagent_type == AgentKind.FORK.value
+        try:
+            workspace_mode = WorkspaceMode(
+                params.get("isolation", WorkspaceMode.CURRENT.value)
+            )
+        except (TypeError, ValueError):
+            return None
+
+        if is_fork:
+            return _SpawnPlanningFacts(
+                subagent_type=subagent_type,
+                is_fork=True,
+                workspace_mode=workspace_mode,
+                definition=None,
+            )
+
+        if not self._runtime.agent_registry.has(subagent_type):
+            return None
+        definition = self._runtime.agent_registry.get(subagent_type)
+        if "isolation" in params:
+            definition = replace(definition, workspace_mode=workspace_mode)
+        else:
+            workspace_mode = definition.workspace_mode
+        return _SpawnPlanningFacts(
+            subagent_type=subagent_type,
+            is_fork=False,
+            workspace_mode=workspace_mode,
+            definition=definition,
+        )
+
+    def _plan_from_params(
+        self, params: dict[str, Any],
+    ) -> tuple[_SpawnInvocationPlan | None, ToolResult | None]:
+        raw_subagent_type = params.get("subagent_type")
+        raw_description = params.get("description")
+        raw_prompt = params.get("prompt")
+        raw_placement = params.get(
+            "execution_placement", ExecutionPlacement.AUTO.value,
+        )
+        raw_isolation = params.get("isolation", WorkspaceMode.CURRENT.value)
+
+        if (
+            not isinstance(raw_subagent_type, str) or not raw_subagent_type.strip()
+            or not isinstance(raw_description, str) or not raw_description.strip()
+            or not isinstance(raw_prompt, str) or not raw_prompt.strip()
+        ):
+            return None, ToolResult(
+                success=False,
+                output="",
+                error="task requires subagent_type, description, and prompt",
+            )
+
+        subagent_type = raw_subagent_type.strip()
+        description = raw_description.strip()
+        user_prompt = raw_prompt.strip()
+        try:
+            requested_placement = ExecutionPlacement(raw_placement)
+        except (TypeError, ValueError):
+            return None, ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "execution_placement must be 'auto', 'foreground', or "
+                    "'background'"
+                ),
+            )
+        try:
+            workspace_mode = WorkspaceMode(raw_isolation)
+        except (TypeError, ValueError):
+            return None, ToolResult(
+                success=False,
+                output="",
+                error="isolation must be 'current' or 'worktree'",
+            )
+
+        allowed = self._allowed_subagent_names()
+        is_fork = subagent_type == AgentKind.FORK.value
+        if not is_fork and not self._runtime.agent_registry.has(subagent_type):
+            return None, ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Unknown subagent_type: {subagent_type!r}. "
+                    f"Available: {sorted(allowed)}"
+                ),
+            )
+        if subagent_type not in allowed:
+            return None, ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"subagent_type {subagent_type!r} is not allowed for this "
+                    f"agent. Available: {sorted(allowed)}"
+                ),
+            )
+
+        planning_params = (
+            {
+                "subagent_type": subagent_type,
+                "isolation": workspace_mode.value,
+            }
+            if is_fork or "isolation" in params
+            else {"subagent_type": subagent_type}
+        )
+        facts = self._planning_facts_from_params(planning_params)
+        if facts is None:
+            return None, ToolResult.from_error(
+                error_type=ToolErrorType.INVALID_INPUT,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail=(
+                    "Delegation parameters could not be resolved into typed "
+                    "spawn facts"
+                ),
+            )
+        return _SpawnInvocationPlan(
+            description=description,
+            user_prompt=user_prompt,
+            requested_placement=requested_placement,
+            facts=facts,
+        ), None
+
+    def _validate_run_context(self, *, is_fork: bool) -> ToolResult | None:
+        run_context = getattr(self, "_run_context", None)
+        if run_context is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires a Runtime-bound run context",
+            )
+        if run_context.phase_policy is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires the parent's effective phase policy",
+            )
+        if run_context.delegation_effects is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires the parent's effective tool effects",
+            )
+        if run_context.delegation_step_limit is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires the parent's effective step limit",
+            )
+        if is_fork and run_context.spawn_context is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.UNAVAILABLE,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Fork requires a valid live parent conversation snapshot",
+            )
+        if run_context.cancellation.is_cancelled:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERRUPTED,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail=run_context.cancellation.detail,
+            )
+        if run_context.delegation_token_limit <= 0:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.UNAVAILABLE,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail=(
+                    "Parent execution budget has no tokens available for "
+                    "delegation"
+                ),
+            )
+        return None
+
+    def _build_spawn_request(
+        self,
+        *,
+        plan: _SpawnInvocationPlan,
+        prompt: str,
+        execution_placement: ExecutionPlacement,
+    ) -> AgentSpawnRequest:
+        if plan.facts.is_fork:
+            return AgentSpawnRequest.fork(
+                description=plan.description,
+                prompt=prompt,
+                workspace_mode=plan.facts.workspace_mode,
+                execution_placement=execution_placement,
+            )
+        return AgentSpawnRequest.named(
+            definition=plan.facts.definition,
+            description=plan.description,
+            prompt=prompt,
+            execution_placement=execution_placement,
+        )
+
     def concurrency_mode(self, params: dict[str, Any]) -> ToolConcurrency:
         """Only shared-workspace read-only children are safe to fan out."""
-        subagent_type = params.get("subagent_type")
-        if not isinstance(subagent_type, str):
+        facts = self._planning_facts_from_params(params)
+        if facts is None:
             return ToolConcurrency.SERIAL
-        subagent_type = subagent_type.strip()
-        allowed = self._allowed_subagent_names()
-        if not subagent_type or subagent_type not in allowed:
-            return ToolConcurrency.SERIAL
-        if subagent_type == AgentKind.FORK.value:
-            try:
-                workspace_mode = WorkspaceMode(
-                    params.get("isolation", WorkspaceMode.CURRENT.value)
-                )
-            except (TypeError, ValueError):
-                return ToolConcurrency.SERIAL
-            if workspace_mode is WorkspaceMode.WORKTREE:
-                return ToolConcurrency.PARALLEL_SAFE
-            caller = self._runtime.agent_registry.get(self._caller_agent_name)
-            return (
-                ToolConcurrency.PARALLEL_SAFE
-                if caller.intent is TaskIntent.ANALYSIS
-                else ToolConcurrency.SERIAL
-            )
-        if not self._runtime.agent_registry.has(subagent_type):
-            return ToolConcurrency.SERIAL
-        definition = self._runtime.agent_registry.get(subagent_type)
-        if (
-            definition.intent is TaskIntent.ANALYSIS
-            and definition.workspace_mode is WorkspaceMode.CURRENT
-        ):
-            return ToolConcurrency.PARALLEL_SAFE
-        return ToolConcurrency.SERIAL
+        return self._concurrency_mode_for_facts(facts)
 
     # ── BaseTool interface ──
 
@@ -154,10 +364,7 @@ class AgentTool(BaseTool):
         self,
         *,
         requested: ExecutionPlacement,
-        subagent_type: str,
-        is_fork: bool,
-        definition,
-        workspace_mode: WorkspaceMode,
+        facts: _SpawnPlanningFacts,
         run_context,
     ) -> ExecutionPlacement:
         """Resolve AUTO using only typed runtime facts.
@@ -178,10 +385,12 @@ class AgentTool(BaseTool):
 
         base = AgentSpawnRequest.resolve_execution_placement(
             agent_kind=(
-                AgentKind.FORK if is_fork else AgentKind.NAMED_SUBAGENT
+                AgentKind.FORK
+                if facts.is_fork
+                else AgentKind.NAMED_SUBAGENT
             ),
             requested=requested,
-            definition=definition,
+            definition=facts.definition,
         )
         if base is ExecutionPlacement.BACKGROUND:
             return base
@@ -190,15 +399,33 @@ class AgentTool(BaseTool):
             return base
 
         if (
-            is_fork
-            and workspace_mode is WorkspaceMode.WORKTREE
-            and self.concurrency_mode({
-                "subagent_type": subagent_type,
-                "isolation": workspace_mode.value,
-            }) is ToolConcurrency.PARALLEL_SAFE
+            facts.is_fork
+            and facts.workspace_mode is WorkspaceMode.WORKTREE
+            and self._concurrency_mode_for_facts(facts)
+            is ToolConcurrency.PARALLEL_SAFE
         ):
             return ExecutionPlacement.BACKGROUND
         return base
+
+    def _concurrency_mode_for_facts(
+        self, facts: _SpawnPlanningFacts,
+    ) -> ToolConcurrency:
+        if facts.is_fork:
+            if facts.workspace_mode is WorkspaceMode.WORKTREE:
+                return ToolConcurrency.PARALLEL_SAFE
+            caller = self._runtime.agent_registry.get(self._caller_agent_name)
+            return (
+                ToolConcurrency.PARALLEL_SAFE
+                if caller.intent is TaskIntent.ANALYSIS
+                else ToolConcurrency.SERIAL
+            )
+        if (
+            facts.definition is not None
+            and facts.definition.intent is TaskIntent.ANALYSIS
+            and facts.workspace_mode is WorkspaceMode.CURRENT
+        ):
+            return ToolConcurrency.PARALLEL_SAFE
+        return ToolConcurrency.SERIAL
 
     @property
     def description(self) -> str:
@@ -290,176 +517,61 @@ class AgentTool(BaseTool):
     # ── Execution ──
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        raw_subagent_type = params.get("subagent_type")
-        raw_description = params.get("description")
-        raw_prompt = params.get("prompt")
-        raw_placement = params.get(
-            "execution_placement", ExecutionPlacement.AUTO.value,
-        )
-        raw_isolation = params.get("isolation", WorkspaceMode.CURRENT.value)
+        plan, plan_error = self._plan_from_params(params)
+        if plan_error is not None:
+            return plan_error
+        assert plan is not None
 
-        # Validate
-        if (
-            not isinstance(raw_subagent_type, str) or not raw_subagent_type.strip()
-            or not isinstance(raw_description, str) or not raw_description.strip()
-            or not isinstance(raw_prompt, str) or not raw_prompt.strip()
-        ):
-            return ToolResult(
-                success=False, output="",
-                error="task requires subagent_type, description, and prompt",
-            )
+        run_context_error = self._validate_run_context(is_fork=plan.facts.is_fork)
+        if run_context_error is not None:
+            return run_context_error
+        run_context = self._run_context
+        assert run_context is not None
 
-        subagent_type = raw_subagent_type.strip()
-        description = raw_description.strip()
-        user_prompt = raw_prompt.strip()
-        try:
-            execution_placement = ExecutionPlacement(raw_placement)
-        except (TypeError, ValueError):
-            return ToolResult(
-                success=False, output="",
-                error=(
-                    "execution_placement must be 'auto', 'foreground', or 'background'"
-                ),
-            )
-        try:
-            workspace_mode = WorkspaceMode(raw_isolation)
-        except (TypeError, ValueError):
-            return ToolResult(
-                success=False, output="",
-                error="isolation must be 'current' or 'worktree'",
-            )
-        allowed = self._allowed_subagent_names()
-        is_fork = subagent_type == AgentKind.FORK.value
-        if not is_fork and not self._runtime.agent_registry.has(subagent_type):
-            return ToolResult(
-                success=False, output="",
-                error=f"Unknown subagent_type: {subagent_type!r}. "
-                      f"Available: {sorted(allowed)}",
-            )
-        if subagent_type not in allowed:
-            return ToolResult(
-                success=False, output="",
-                error=f"subagent_type {subagent_type!r} is not allowed for this agent. "
-                      f"Available: {sorted(allowed)}",
-            )
-
-        definition = (
-            None if is_fork
-            else self._runtime.agent_registry.get(subagent_type)
-        )
-        if not is_fork and "isolation" in params:
-            raw_isolation = params["isolation"]
-            try:
-                workspace_mode = WorkspaceMode(raw_isolation)
-            except (TypeError, ValueError):
-                return ToolResult(
-                    success=False, output="",
-                    error=f"Invalid isolation value: {raw_isolation!r}. Must be 'current' or 'worktree'.",
-                )
-            # CC-aligned: per-invocation isolation overrides the definition's workspace_mode
-            import dataclasses
-            new_definition = dataclasses.replace(definition, workspace_mode=workspace_mode)
-            definition = new_definition
-
-        run_context = getattr(self, "_run_context", None)
-        if run_context is None:
-            return ToolResult.from_error(
-                error_type=ToolErrorType.INTERNAL,
-                retry=ToolRetryDirective.DO_NOT_RETRY,
-                detail="Delegation requires a Runtime-bound run context",
-            )
-        if run_context.phase_policy is None:
-            return ToolResult.from_error(
-                error_type=ToolErrorType.INTERNAL,
-                retry=ToolRetryDirective.DO_NOT_RETRY,
-                detail="Delegation requires the parent's effective phase policy",
-            )
-        if run_context.delegation_effects is None:
-            return ToolResult.from_error(
-                error_type=ToolErrorType.INTERNAL,
-                retry=ToolRetryDirective.DO_NOT_RETRY,
-                detail="Delegation requires the parent's effective tool effects",
-            )
-        if run_context.delegation_step_limit is None:
-            return ToolResult.from_error(
-                error_type=ToolErrorType.INTERNAL,
-                retry=ToolRetryDirective.DO_NOT_RETRY,
-                detail="Delegation requires the parent's effective step limit",
-            )
-        if is_fork and run_context.spawn_context is None:
-            return ToolResult.from_error(
-                error_type=ToolErrorType.UNAVAILABLE,
-                retry=ToolRetryDirective.DO_NOT_RETRY,
-                detail="Fork requires a valid live parent conversation snapshot",
-            )
-        if run_context.cancellation.is_cancelled:
-            return ToolResult.from_error(
-                error_type=ToolErrorType.INTERRUPTED,
-                retry=ToolRetryDirective.DO_NOT_RETRY,
-                detail=run_context.cancellation.detail,
-            )
-        child_token_limit = run_context.delegation_token_limit
-        if child_token_limit <= 0:
-            return ToolResult.from_error(
-                error_type=ToolErrorType.UNAVAILABLE,
-                retry=ToolRetryDirective.DO_NOT_RETRY,
-                detail="Parent execution budget has no tokens available for delegation",
-            )
         execution_placement = self._resolve_execution_placement(
-            requested=execution_placement,
-            subagent_type=subagent_type,
-            is_fork=is_fork,
-            definition=definition,
-            workspace_mode=workspace_mode,
+            requested=plan.requested_placement,
+            facts=plan.facts,
             run_context=run_context,
         )
 
-        # Wrap user prompt with agent-type-appropriate protocol (Layer 1)
         prompt = (
-            user_prompt
-            if is_fork
-            else _build_subagent_prompt(user_prompt, definition)
+            plan.user_prompt
+            if plan.facts.is_fork
+            else _build_subagent_prompt(plan.user_prompt, plan.facts.definition)
         )
-        if definition is not None and definition.required_tools:
+        if (
+            plan.facts.definition is not None
+            and plan.facts.definition.required_tools
+        ):
             logger.debug(
                 "Injecting subagent protocol (%d chars) into prompt for agent %s",
-                len(_SUBAGENT_PROTOCOL), subagent_type,
+                len(_SUBAGENT_PROTOCOL), plan.facts.subagent_type,
             )
         else:
             logger.debug(
                 "Skipping subagent protocol for agent %s (no required_tools or fork)",
-                subagent_type,
+                plan.facts.subagent_type,
             )
         logger.info(
             "Dispatching subagent '%s' for task: %s",
-            subagent_type, description,
+            plan.facts.subagent_type, plan.description,
         )
 
         try:
-            request = (
-                AgentSpawnRequest.fork(
-                    description=description,
-                    prompt=prompt,
-                    workspace_mode=workspace_mode,
-                    execution_placement=execution_placement,
-                )
-                if is_fork
-                else AgentSpawnRequest.named(
-                    definition=definition,
-                    description=description,
-                    prompt=prompt,
-                    execution_placement=execution_placement,
-                )
+            request = self._build_spawn_request(
+                plan=plan,
+                prompt=prompt,
+                execution_placement=execution_placement,
             )
             dispatch_result = self._runtime.spawn_agent(
                 parent_session_id=self._parent_session_id,
                 request=request,
-                budget_tokens=child_token_limit,
+                budget_tokens=run_context.delegation_token_limit,
                 parent_max_steps=run_context.delegation_step_limit,
                 cancellation_token=run_context.cancellation,
                 parent_policy=(
                     run_context.phase_policy
-                    if is_fork
+                    if plan.facts.is_fork
                     else run_context.phase_policy.with_allowed_effects(
                         run_context.delegation_effects
                     )
@@ -470,12 +582,12 @@ class AgentTool(BaseTool):
                 return ToolResult(
                     success=True,
                     output=_format_background_handle(
-                        subagent_type, dispatch_result,
+                        plan.facts.subagent_type, dispatch_result,
                     ),
                     subagent_tokens_used=0,
                 )
             fork_result = dispatch_result
-            output = _format_fork_result(subagent_type, fork_result)
+            output = _format_fork_result(plan.facts.subagent_type, fork_result)
             if fork_result.status == ForkStatus.PARTIAL:
                 output = (
                     f"WARNING: Subagent reached max steps ({fork_result.turns_used} turns). "
@@ -483,12 +595,12 @@ class AgentTool(BaseTool):
                     f"{output}"
                 )
         except Exception as exc:
-            logger.exception("Subagent '%s' crashed", subagent_type)
+            logger.exception("Subagent '%s' crashed", plan.facts.subagent_type)
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_subagent_failure()
             return ToolResult(
                 success=False, output="",
-                error=f"Subagent '{subagent_type}' failed: {exc}",
+                error=f"Subagent '{plan.facts.subagent_type}' failed: {exc}",
             )
 
         # ── Circuit breaker: track subagent success/failure rhythm ──

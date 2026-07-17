@@ -84,6 +84,36 @@ def test_skill_tool_unknown_skill_returns_error():
         assert "not found" in result.error.lower() or "not found" in result.error
 
 
+def test_skill_tool_passes_runtime_to_rendering():
+    """SkillTool should pass its bound runtime into skill rendering."""
+    from skills.tool import SkillTool
+
+    captured: dict[str, object] = {}
+
+    class _Registry:
+        def load_and_render(self, name, arguments="", **kwargs):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            captured["runtime"] = kwargs.get("runtime")
+            return "Rendered via runtime"
+
+        def list_skills(self):
+            return []
+
+        def get_skill_meta(self, name):
+            return None
+
+    runtime = object()
+    tool = SkillTool(_Registry(), runtime=runtime)
+
+    result = tool.execute({"skill_name": "demo", "arguments": "arg"})
+
+    assert result.success is True
+    assert captured["name"] == "demo"
+    assert captured["arguments"] == "arg"
+    assert captured["runtime"] is runtime
+
+
 # ---------------------------------------------------------------------------
 # SK-E2: 无 triggers 字段 / 无 match_triggers()
 # ---------------------------------------------------------------------------

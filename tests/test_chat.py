@@ -146,13 +146,17 @@ def test_chat_skill_fork_routes_through_session_runtime(monkeypatch, tmp_path):
         model = ""
 
     class _SkillRegistry:
+        def __init__(self):
+            self.runtime = None
+
         def has_skill(self, name):
             return name == "inspect"
 
         def get_skill_meta(self, name):
             return _Meta()
 
-        def load_and_render(self, name, args):
+        def load_and_render(self, name, args, *, runtime=None):
+            self.runtime = runtime
             return "Inspect runtime isolation"
 
         def list_skills(self):
@@ -169,11 +173,13 @@ def test_chat_skill_fork_routes_through_session_runtime(monkeypatch, tmp_path):
         log_dir=str(tmp_path / "logs"),
         renderer=_DummyRenderer(),
         skill_registry=_SkillRegistry(),
+        runtime=object(),
     )
 
     assert session._handle_slash_skill("/inspect runtime") is None
     assert captured["request"].definition.name == "explore"
     assert captured["request"].execution_placement is ExecutionPlacement.FOREGROUND
+    assert session._skill_registry.runtime is session._runtime
     history = session._shared_history.to_dicts()
     assert history[-1]["role"] == "assistant"
     assert "forked summary" in history[-1]["content"]
@@ -218,13 +224,17 @@ def test_chat_skill_fork_refuses_non_primary_chat_mode(monkeypatch, tmp_path):
         model = ""
 
     class _SkillRegistry:
+        def __init__(self):
+            self.runtime = None
+
         def has_skill(self, name):
             return name == "inspect"
 
         def get_skill_meta(self, name):
             return _Meta()
 
-        def load_and_render(self, name, args):
+        def load_and_render(self, name, args, *, runtime=None):
+            self.runtime = runtime
             return "Inspect runtime isolation"
 
         def list_skills(self):
@@ -241,8 +251,10 @@ def test_chat_skill_fork_refuses_non_primary_chat_mode(monkeypatch, tmp_path):
         log_dir=str(tmp_path / "logs"),
         renderer=_DummyRenderer(),
         skill_registry=_SkillRegistry(),
+        runtime=object(),
     )
     session.switch_mode("explore")
 
     assert session._handle_slash_skill("/inspect runtime") is None
     assert called["spawn"] == 0
+    assert session._skill_registry.runtime is session._runtime
