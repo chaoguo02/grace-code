@@ -204,8 +204,14 @@ class SearchTextTool(BaseTool):
         match_counts: dict[str, int] = {}
         files = _iter_files(search_path, file_glob)
 
+        import time as _time
+        _search_deadline = _time.monotonic() + 15.0  # 15s hard timeout
+
         for filepath in files:
             if len(matches) >= head_limit:
+                break
+            if _time.monotonic() > _search_deadline:
+                matches.append("[Search timed out after 15s — partial results below]")
                 break
             try:
                 file_lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
