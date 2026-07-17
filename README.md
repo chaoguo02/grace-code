@@ -1,18 +1,6 @@
 # Forge Agent
 
-Forge Agent 是一个本地自主编程智能体：给它一个任务，它会读取代码、调用工具、修改文件、运行验证，并把过程记录到日志中。
-
----
-
-## 亮点
-
-- **自主执行任务**：从理解需求、探索代码到修改和验证，自动完成多步骤软件工程任务。
-- **多模型支持**：可通过配置或命令切换 Claude、DeepSeek、OpenAI、Groq、Ollama。
-- **安全工具调用**：内置风险分级、危险命令拦截和 HITL 人工确认。
-- **上下文管理**：支持对话历史压缩、Prompt Cache、结构化上下文和长期记忆。
-- **测试与防漂移机制**：测试失败会触发反思；pytest 路径不存在、未收集测试等场景会停止并明确报告。
-- **工具耗时统计**：记录每个工具的调用次数、失败次数和耗时，方便定位慢操作和无效探索。
-- **多模式协作**：支持 ReAct、Plan-and-Execute、Multi-Agent、GitHub Issue 自动修复等工作流。
+Claude Code 架构对齐的自主编程智能体框架。支持 ReAct 循环、流式工具执行、子代理编排、MCP 协议、权限管线、上下文压缩和持久记忆。
 
 ---
 
@@ -26,20 +14,17 @@ cd forge-agent
 python -m venv .venv
 ```
 
-Windows：
-
+Windows:
 ```powershell
 .venv\Scripts\activate
 ```
 
-macOS / Linux：
-
+macOS / Linux:
 ```bash
 source .venv/bin/activate
 ```
 
-安装依赖：
-
+安装依赖:
 ```bash
 pip install -e ".[dev]"
 ```
@@ -52,79 +37,88 @@ pip install -e ".[dev]"
 cp .env.template .env
 ```
 
-### 3. 启动交互模式
+支持的 provider: `deepseek`（默认）、`openai`、`anthropic`、`groq`、`ollama`。
+
+### 3. 一次性任务（Run 模式）
+
+```bash
+# 基础用法
+python -m entry.cli run --repo . --task "分析项目结构并列出所有 Python 文件"
+
+# 指定模型
+python -m entry.cli run --repo . --task "修复这个报错并验证" --model deepseek-chat
+
+# Plan → Execute 流程
+python -m entry.cli run --repo . --agent plan --intent analysis --task "设计一个日志模块"
+```
+
+### 4. 交互式对话（Chat 模式）
 
 ```bash
 python -m entry.cli chat --repo .
 ```
 
-```text
-解释一下这个项目的核心模块
-```
-
-### 4. 运行一次性任务
-
-```bash
-python -m entry.cli run --repo . --task "反复读取 README.md 文件直到你找到一个不存在的章节叫 'Secret Section'" --max-steps 15
-```
-
----
-
-## 常用命令
-
-### Chat 模式
-
-```bash
-python -m entry.cli chat --repo .
-python -m entry.cli chat --repo . --model gpt-4o --provider openai
-python -m entry.cli chat --repo . --sandbox
-```
-
-交互内常用命令：
+交互内命令:
 
 | 命令 | 说明 |
 |------|------|
 | `/help` | 查看帮助 |
-| `/mode react\|plan\|auto\|multi-agent` | 切换工作模式 |
+| `/mode react\|plan\|auto` | 切换工作模式 |
 | `/model <name>` | 切换模型 |
 | `/stats` | 查看会话统计 |
 | `/compact` | 压缩上下文 |
 | `/clear` | 清空当前会话历史 |
 | `/exit` | 退出 |
 
-### Run 模式
+---
 
-```bash
-python -m entry.cli run --repo . --task "修复这个报错并验证"
-python -m entry.cli run --repo . --task-file task.txt
-python -m entry.cli run --repo . --task "..." --confirm
-python -m entry.cli run --repo . --task "..." --sandbox
+## 架构
+
+```
+entry/cli.py → AgentConfig → ReActAgent.run()
+                                  │
+                    ┌─────────────┼─────────────┐
+                    ▼             ▼             ▼
+             StreamingTool    Permission    Compaction
+             Executor         Pipeline      Pipeline
+                    │             │             │
+                    ▼             ▼             ▼
+              LLM Backend     ToolRegistry   MemoryStore
+              (DeepSeek /     (BaseTool +    (MEMORY.md +
+               OpenAI /        Hook +         metadata +
+               Anthropic)      Policy)        DreamAgent)
 ```
 
-### 查看日志
+### 六大子系统
 
-```bash
-python -m entry.cli log list
-python -m entry.cli log show logs/<log-file>.jsonl
-```
+| 子系统 | 能力 |
+|--------|------|
+| **ReAct** | 流式 dispatch、per-call 并发安全、5 层压缩管道（Budget→Snip→Micro→Collapse→AutoCompact）、4 种恢复路径、immutable AgentTurnState |
+| **Plan** | Session 连续性、prompt-based permissions、JSON contract、prompt 节流 |
+| **Subagent** | Fork/Worktree、background 默认、live steering、nested delegation、_ChildTurnPhase 生命周期 |
+| **MCP** | 4 种 transport（stdio/HTTP/SSE/WS）、agent-scoped 生命周期、自动重连、ToolSearch |
+| **Skills** | 文件系统 Skill、runtime-based 安全执行、SkillContextModifier、$ARGUMENTS 替换 |
+| **Hooks** | 10 种 HookEvent、per-session 隔离、PreToolUse updatedInput、PostToolUse updatedToolOutput、PostResponse |
 
-### GitHub Issue 自动修复
+### 环境变量
 
-```bash
-python -m entry.github_issue \
-  --repo owner/repo \
-  --issue 42 \
-  --local-path /path/to/local/repo
-```
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `FORGE_STREAMING` | `1` | 流式 dispatch（设为 `0` 禁用） |
+| `FORGE_NUDGE` | `1` | Token 预算续接 nudge（设为 `0` 禁用） |
+| `STATE_HOME` | `~/.forge-agent/state` | 会话和记忆持久化路径 |
 
 ---
 
-## 本地测试
-
-### Plan Mode 回归测试
-
-项目根目录下的 `test_plan_mode.py` 包含 Plan-and-Execute 模式的回归测试用例，使用 `MockBackend` 模拟 LLM 响应：
+## 测试
 
 ```bash
-pytest test_plan_mode.py -v
+# 回归测试（MockBackend）
+pytest tests/test_cc_alignment_features.py tests/test_plan_approval.py -q
+
+# CC 对齐检查
+python tests/manual/verify_cc_alignment.py
+
+# 端到端测试（需 DEEPSEEK_API_KEY）
+pytest tests/test_smoke_e2e.py -v -m e2e
 ```
