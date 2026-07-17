@@ -323,7 +323,12 @@ class SearchTextTool(BaseTool):
 
         matches: list[str] = []
         match_counts: dict[str, int] = {}
-        files = _iter_files(search_path, file_glob)
+        files = list(_iter_files(search_path, file_glob))
+        import logging as _lg3
+        _lg3.getLogger(__name__).warning(
+            "Grep[files] search_path=%s glob=%r file_count=%d first5=%s",
+            search_path, file_glob, len(files), [str(f)[-30:] for f in files[:5]],
+        )
 
         import time as _time
         _deadline = _time.monotonic() + 15.0
