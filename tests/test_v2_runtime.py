@@ -14,7 +14,15 @@ import pytest
 
 from hooks.events import HookContext, HookEvent
 from hooks.protocol import DispatchResult, HookControl
-from agent.core import AgentConfig, ReActAgent
+from agent.core import (
+    AgentConfig,
+    ReActAgent,
+    _ChildTurnPhase,
+    _advance_child_turn_phase,
+    _phase_from_observations,
+    _phase_from_runtime_messages,
+    _resolution_was_completed,
+)
 from agent.event_log import EventLog
 from core.policy import PhasePolicy, build_task_policy
 from core.policy_registry import PolicyAwareToolRegistry
@@ -977,7 +985,7 @@ def test_duplicate_agent_names_in_one_scope_fail_closed(tmp_path):
 def test_v2_agent_registry_resolves_tool_names():
     registry = AgentRegistryV2()
     names = registry.tool_names_for("explore")
-    assert "file_read" in names or "Read" in names
+    assert 'Read' in names
 
 
 def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
@@ -990,8 +998,8 @@ def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
         tools=frozenset({"Read"}),
     )
     base = ToolRegistry()
-    base.register(NoopTool("file_read"))
-    base.register(NoopTool("shell"))
+    base.register(NoopTool("Read"))
+    base.register(NoopTool("Bash"))
 
     restricted, _ = build_restricted_registry(
         definition,
@@ -1000,8 +1008,8 @@ def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
         parent_policy=PhasePolicy(),
     )
 
-    assert "file_read" in restricted.tool_names
-    assert "shell" not in restricted.tool_names
+    assert "Read" in restricted.tool_names
+    assert "Bash" not in restricted.tool_names
     assert "submit_findings" not in restricted.tool_names
 
     reviewer = AgentRegistryV2().get("code-reviewer")
@@ -1412,13 +1420,13 @@ def test_subagent_registry_inherits_parent_effect_and_path_policy(tmp_path):
     allowed_file = tmp_path / "allowed.py"
     allowed_file.write_text("ok\n", encoding="utf-8")
     base = ToolRegistry()
-    read_tool = NoopTool("file_read")
+    read_tool = NoopTool("Read")
     read_tool.metadata = ToolMetadata(
         effects=frozenset({ToolEffect.READ_WORKSPACE}),
         path_access=PathAccess.READ,
         path_parameter="path",
     )
-    shell_tool = NoopTool("shell")
+    shell_tool = NoopTool("Bash")
     shell_tool.metadata = ToolMetadata(
         effects=frozenset({ToolEffect.EXECUTE}),
     )
@@ -1446,13 +1454,13 @@ def test_subagent_registry_inherits_parent_effect_and_path_policy(tmp_path):
         parent_policy=parent_policy,
     )
 
-    assert "file_read" in restricted.tool_names
-    assert "shell" not in restricted.tool_names
+    assert "Read" in restricted.tool_names
+    assert "Bash" not in restricted.tool_names
     assert restricted.execute_tool(
-        "file_read", {"path": "allowed.py"},
+        "Read", {"path": "allowed.py"},
     ).success is True
     denied = restricted.execute_tool(
-        "file_read", {"path": "outside.py"},
+        "Read", {"path": "outside.py"},
     )
     assert denied.success is False
     assert "PATH ACCESS DENIED" in denied.error
@@ -1740,6 +1748,104 @@ def test_v2_task_tool_keeps_parallel_named_readonly_auto_in_foreground_for_synth
     )
 
 
+def test_v2_task_tool_applies_named_isolation_override_to_spawn_request():
+    runtime = _StubRuntime(ForkResult(
+        agent_name="general", session_id="child", status="completed", summary="done",
+    ))
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build",
+    ).with_run_context(_run_context())
+
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "isolated implementation",
+        "prompt": "Implement in isolation",
+        "isolation": WorkspaceMode.WORKTREE.value,
+    })
+
+    assert result.success is True
+    assert (
+        runtime.last_fork_kwargs["request"].workspace_mode
+        is WorkspaceMode.WORKTREE
+    )
+
+
+def test_child_phase_from_runtime_messages_detects_resolution_pending_from_notification_xml():
+    messages = [LLMMessage(
+        role="user",
+        content=(
+            "<task-notification>\n"
+            "  <status>completed</status>\n"
+            "  <worktree-disposition>preserved</worktree-disposition>\n"
+            "</task-notification>"
+        ),
+    )]
+
+    assert _phase_from_runtime_messages(messages) is _ChildTurnPhase.RESOLUTION_PENDING
+
+
+def test_child_phase_from_observations_detects_synthesis_without_preserved_worktree():
+    observations = [Observation(
+        tool_name="Agent",
+        status=ObservationStatus.SUCCESS,
+        output=(
+            "<task-notification>\n"
+            "  <status>completed</status>\n"
+            "  <worktree-disposition>not_applicable</worktree-disposition>\n"
+            "</task-notification>"
+        ),
+    )]
+
+    assert _phase_from_observations(observations) is _ChildTurnPhase.SYNTHESIS
+
+
+def test_resolution_was_completed_parses_runtime_worktree_operation_xml():
+    observations = [Observation(
+        tool_name="subagent_worktree_apply",
+        status=ObservationStatus.SUCCESS,
+        output=(
+            "<subagent-worktree-operation status='applied'>\n"
+            "  <subagent-worktree change='modified'>\n"
+            "    <path>/tmp/worktree</path>\n"
+            "  </subagent-worktree>\n"
+            "</subagent-worktree-operation>"
+        ),
+    )]
+
+    assert _resolution_was_completed(observations) is True
+
+
+def test_advance_child_turn_phase_clears_resolution_pending_after_terminal_worktree_action():
+    observations = [Observation(
+        tool_name="subagent_worktree_retain",
+        status=ObservationStatus.SUCCESS,
+        output=(
+            "<subagent-worktree-operation status='retained'>\n"
+            "  <subagent-worktree change='modified'>\n"
+            "    <path>/tmp/worktree</path>\n"
+            "  </subagent-worktree>\n"
+            "</subagent-worktree-operation>"
+        ),
+    )]
+
+    assert _advance_child_turn_phase(
+        _ChildTurnPhase.RESOLUTION_PENDING,
+        observation_phase=_ChildTurnPhase.NONE,
+        observations=observations,
+    ) is _ChildTurnPhase.NONE
+
+
+def test_advance_child_turn_phase_promotes_runtime_synthesis_only_from_none():
+    assert _advance_child_turn_phase(
+        _ChildTurnPhase.NONE,
+        runtime_phase=_ChildTurnPhase.SYNTHESIS,
+    ) is _ChildTurnPhase.SYNTHESIS
+    assert _advance_child_turn_phase(
+        _ChildTurnPhase.RESOLUTION_PENDING,
+        runtime_phase=_ChildTurnPhase.SYNTHESIS,
+    ) is _ChildTurnPhase.RESOLUTION_PENDING
+
+
 def test_v2_task_tool_routes_isolated_fork_request():
     runtime = _StubRuntime(ForkResult(
         agent_name="fork", session_id="child", status="completed", summary="done",
@@ -1890,14 +1996,14 @@ def test_terminal_child_resumes_same_session_with_complete_transcript(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="inspect auth",
-            tool_calls=[ToolCall(name="file_read", params={})],
+            tool_calls=[ToolCall(name="Read", params={})],
         ),
         Action(ActionType.FINISH, "first pass", message="first findings"),
     ])
     runtime, store = _make_runtime(
         tmp_path,
         first_backend,
-        tool_overrides={"file_read": _WorkspaceReadNoop("file_read")},
+        tool_overrides={"Read": _WorkspaceReadNoop("Read")},
     )
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
@@ -2460,7 +2566,7 @@ def test_v2_unattached_artifact_and_evidence_tools_hidden_from_schemas():
     base = ToolRegistry()
     base.register(ArtifactReadTool(artifact_ref))
     base.register(EvidenceListTool(evidence_ref))
-    base.register(NoopTool("file_read"))
+    base.register(NoopTool("Read"))
     base._artifact_store_ref = artifact_ref
     base._evidence_ledger_ref = evidence_ref
 
@@ -2471,7 +2577,7 @@ def test_v2_unattached_artifact_and_evidence_tools_hidden_from_schemas():
         phase_name="test",
     )
 
-    assert {schema.name for schema in registry.get_schemas()} == {"file_read"}
+    assert {schema.name for schema in registry.get_schemas()} == {"Read"}
     assert "artifact_read" not in registry.tool_names
     blocked = registry.execute_tool("artifact_read", {"artifact_id": "art_x"})
     assert blocked.success is False
@@ -2479,11 +2585,11 @@ def test_v2_unattached_artifact_and_evidence_tools_hidden_from_schemas():
 
     artifact_ref.store = ArtifactStore()
     evidence_ref.ledger = EvidenceLedger()
-    assert {schema.name for schema in registry.get_schemas()} == {"artifact_read", "evidence_list", "file_read"}
+    assert {schema.name for schema in registry.get_schemas()} == {"artifact_read", "evidence_list", "Read"}
     assert "artifact_read" in registry.tool_names
     run_bound = registry.with_run_context(_run_context())
     assert {schema.name for schema in run_bound.get_schemas()} == {
-        "artifact_read", "evidence_list", "file_read",
+        "artifact_read", "evidence_list", "Read",
     }
 
 
@@ -2521,7 +2627,7 @@ def test_v2_build_agent_runs_to_completion(tmp_path):
     # at least one write for edit tasks.
     backend = MockBackend([
         Action(action_type=ActionType.TOOL_CALL, thought="writing",
-               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "out.txt"), "content": "ok"})]),
+               tool_calls=[ToolCall(name="Write", params={"path": str(tmp_path / "out.txt"), "content": "ok"})]),
         Action(action_type=ActionType.FINISH, thought="done", message="Task complete."),
         # Stop Hook blocks first FINISH (no verification), agent retries
         Action(action_type=ActionType.FINISH, thought="retry after verify", message="Task complete."),
@@ -2597,10 +2703,10 @@ def test_v2_task_tool_fails_closed_for_missing_parent_session(tmp_path):
 def test_v2_identical_task_executes_again_without_result_cache(tmp_path):
     backend = MockBackend([
         Action(action_type=ActionType.TOOL_CALL, thought="first write",
-               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "first.txt"), "content": "one"})]),
+               tool_calls=[ToolCall(name="Write", params={"path": str(tmp_path / "first.txt"), "content": "one"})]),
         Action(action_type=ActionType.FINISH, thought="done", message="first run"),
         Action(action_type=ActionType.TOOL_CALL, thought="second write",
-               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "second.txt"), "content": "two"})]),
+               tool_calls=[ToolCall(name="Write", params={"path": str(tmp_path / "second.txt"), "content": "two"})]),
         Action(action_type=ActionType.FINISH, thought="done", message="second run"),
     ])
     runtime, _ = _make_runtime(tmp_path, backend)
@@ -3506,14 +3612,14 @@ def test_v2_subagent_persists_native_tool_pairs_in_child_transcript(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="inspect",
-            tool_calls=[ToolCall(name="file_read", params={})],
+            tool_calls=[ToolCall(name="Read", params={})],
         ),
         Action(action_type=ActionType.FINISH, thought="done", message="inspected"),
     ])
     runtime, store = _make_runtime(
         tmp_path,
         backend,
-        tool_overrides={"file_read": WorkspaceReadNoop("file_read")},
+        tool_overrides={"Read": WorkspaceReadNoop("Read")},
     )
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
@@ -3531,7 +3637,7 @@ def test_v2_subagent_persists_native_tool_pairs_in_child_transcript(tmp_path):
     tool_request = next(message for message in messages if message.tool_calls)
     tool_response = next(message for message in messages if message.role == "tool")
     assert tool_request.role == "assistant"
-    assert tool_request.tool_calls[0].name == "file_read"
+    assert tool_request.tool_calls[0].name == "Read"
     assert tool_request.tool_calls[0].id is not None
     assert tool_response.tool_call_id == tool_request.tool_calls[0].id
     assert messages[-1].role == "assistant"
@@ -4027,7 +4133,7 @@ def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):
     for _ in range(55):
         actions.append(Action(
             action_type=ActionType.TOOL_CALL, thought="searching",
-            tool_calls=[ToolCall(name="file_read", params={"path": "a.py"})],
+            tool_calls=[ToolCall(name="Read", params={"path": "a.py"})],
         ))
     backend = MockBackend(actions)
     runtime, store = _make_runtime(tmp_path, backend)
@@ -4068,7 +4174,7 @@ def test_v2_parent_recovers_after_failed_child(tmp_path):
     # but here we verify fork doesn't crash and session still works.
     parent_backend = MockBackend([
         Action(action_type=ActionType.TOOL_CALL, thought="writing",
-               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "x.txt"), "content": "x"})]),
+               tool_calls=[ToolCall(name="Write", params={"path": str(tmp_path / "x.txt"), "content": "x"})]),
         Action(action_type=ActionType.FINISH, thought="ok", message="parent done"),
         Action(action_type=ActionType.FINISH, thought="retry", message="parent done"),
     ])
@@ -4141,7 +4247,7 @@ def test_v2_plan_keeps_read_only_tools_available_until_model_finishes(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="inspect",
-            tool_calls=[ToolCall(name="file_read", params={"path": "a.py"})],
+            tool_calls=[ToolCall(name="Read", params={"path": "a.py"})],
         )
         for _ in range(3)
     ]
@@ -4164,7 +4270,7 @@ def test_v2_plan_keeps_read_only_tools_available_until_model_finishes(tmp_path):
     runtime, _ = _make_runtime(
         tmp_path,
         backend,
-        tool_overrides={"file_read": _WorkspaceReadNoop("file_read")},
+        tool_overrides={"Read": _WorkspaceReadNoop("Read")},
     )
     session = runtime.create_root_session(
         agent_name="plan", repo_path=str(tmp_path), title="plan",
@@ -4179,7 +4285,7 @@ def test_v2_plan_keeps_read_only_tools_available_until_model_finishes(tmp_path):
 
     assert result.status is RunStatus.SUCCESS
     assert "### Goal" in result.summary
-    assert "file_read" in backend.received_tools[-1]
+    assert "Read" in backend.received_tools[-1]
     assert all(
         "Planning exploration is complete" not in str(message.content)
         for message in backend.received_messages[-1]
@@ -4191,7 +4297,7 @@ def test_v2_plan_can_continue_read_only_research_past_eighty_percent(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="inspect",
-            tool_calls=[ToolCall(name="file_read", params={"path": "a.py"})],
+            tool_calls=[ToolCall(name="Read", params={"path": "a.py"})],
         )
         for _ in range(4)
     ]
@@ -4204,7 +4310,7 @@ def test_v2_plan_can_continue_read_only_research_past_eighty_percent(tmp_path):
     runtime, _ = _make_runtime(
         tmp_path,
         backend,
-        tool_overrides={"file_read": _WorkspaceReadNoop("file_read")},
+        tool_overrides={"Read": _WorkspaceReadNoop("Read")},
     )
     session = runtime.create_root_session(
         agent_name="plan", repo_path=str(tmp_path), title="plan",
@@ -4218,7 +4324,7 @@ def test_v2_plan_can_continue_read_only_research_past_eighty_percent(tmp_path):
     )
 
     assert result.status is RunStatus.SUCCESS
-    assert all("file_read" in tools for tools in backend.received_tools)
+    assert all("Read" in tools for tools in backend.received_tools)
     assert all(
         "Tool calls are disabled" not in str(message.content)
         for message in backend.received_messages[-1]
@@ -4365,11 +4471,11 @@ def test_build_structured_diagnosis_includes_all_fields():
         steps_taken=21, total_tokens=5000,
     )
     recent = [
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
     ]
     diag = _build_structured_diagnosis(result, recent)
 
@@ -4388,7 +4494,7 @@ def test_build_structured_diagnosis_no_repeat_when_varied():
     )
     recent = [
         {"name": "bash", "params": {"command": "pytest"}},
-        {"name": "file_read", "params": {"path": "x.py"}},
+        {"name": "Read", "params": {"path": "x.py"}},
         {"name": "search_text", "params": {"pattern": "foo"}},
     ]
     diag = _build_structured_diagnosis(result, recent)
