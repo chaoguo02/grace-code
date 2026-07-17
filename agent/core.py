@@ -212,6 +212,38 @@ def _resolution_was_completed(observations: list[Observation]) -> bool:
             return True
     return False
 
+
+def _advance_child_turn_phase(
+    current: _ChildTurnPhase,
+    *,
+    runtime_phase: _ChildTurnPhase = _ChildTurnPhase.NONE,
+    observation_phase: _ChildTurnPhase = _ChildTurnPhase.NONE,
+    observations: list[Observation] | None = None,
+) -> _ChildTurnPhase:
+    """Advance child-result turn state using typed runtime facts only."""
+    if runtime_phase is _ChildTurnPhase.RESOLUTION_PENDING:
+        return runtime_phase
+    if (
+        runtime_phase is _ChildTurnPhase.SYNTHESIS
+        and current is _ChildTurnPhase.NONE
+    ):
+        current = runtime_phase
+
+    if observation_phase is _ChildTurnPhase.RESOLUTION_PENDING:
+        return observation_phase
+    if observation_phase is _ChildTurnPhase.SYNTHESIS:
+        return observation_phase
+    if observations is None:
+        return current
+    if (
+        current is _ChildTurnPhase.RESOLUTION_PENDING
+        and _resolution_was_completed(observations)
+    ):
+        return _ChildTurnPhase.NONE
+    if current is _ChildTurnPhase.SYNTHESIS:
+        return _ChildTurnPhase.NONE
+    return current
+
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
@@ -255,6 +287,68 @@ class AgentConfig:
     circuit_breaker: object = None         # CircuitBreaker | None — 代码级熔断器
     streaming_tool_execution: bool = False
     """CC-aligned: dispatch tool_use blocks during LLM streaming (Phase 1b)."""
+    token_budget_continuation: bool = False
+    """CC-aligned: nudge model to continue when token budget has room (Phase 2)."""
+
+
+# ---------------------------------------------------------------------------
+# Recovery State (CC-aligned continue-site tracking)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RecoveryState:
+    """Tracks recovery attempts across loop iterations (CC: State fields).
+
+    CC's queryLoop uses immutable State replacement; we use a mutable dataclass
+    that the agent loop updates in place for simplicity.
+    """
+    # max_output_tokens escalation
+    escalation_applied: bool = False
+    """First 8k truncation → silently bump to 64k (CC: maxOutputTokensOverride)."""
+    output_recovery_count: int = 0
+    """Times 'Resume directly' injected after escalation (CC: maxOutputTokensRecoveryCount)."""
+    # reactive compact
+    has_attempted_reactive_compact: bool = False
+    """Circuit breaker: only attempt full reactive compaction once (CC: same name)."""
+    # token budget continuation (nudge)
+    nudge_count: int = 0
+    """Consecutive nudge rounds in the current continuation phase."""
+    last_nudge_tokens: int = 0
+    """Billable tokens at the previous nudge check (for diminishing-returns detection)."""
+
+    _MAX_OUTPUT_RECOVERY: int = 3
+    _DIMINISHING_THRESHOLD: int = 500
+    _COMPLETION_RATIO: float = 0.9
+    _ESCALATED_MAX_TOKENS: int = 64000
+
+    def can_escalate(self, current_max_tokens: int) -> bool:
+        return not self.escalation_applied and current_max_tokens < self._ESCALATED_MAX_TOKENS
+
+    def can_recover_output(self) -> bool:
+        return self.output_recovery_count < self._MAX_OUTPUT_RECOVERY
+
+    def can_reactive_compact(self) -> bool:
+        return not self.has_attempted_reactive_compact
+
+    def is_diminishing(self, current_tokens: int) -> bool:
+        """CC: 3+ continuations AND delta < 500 twice in a row."""
+        if self.nudge_count < 3:
+            return False
+        delta = current_tokens - self.last_nudge_tokens
+        return delta < self._DIMINISHING_THRESHOLD
+
+    def should_nudge(self, total_tokens: int, budget: int) -> bool:
+        """Return True if budget has room (>10%) AND not diminishing."""
+        if budget <= 0:
+            return False
+        return (
+            total_tokens < int(budget * self._COMPLETION_RATIO)
+            and not self.is_diminishing(total_tokens)
+        )
+
+    def reset_for_new_turn(self) -> None:
+        """Reset per-turn guards (called after successful recovery)."""
+        self.has_attempted_reactive_compact = False
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +774,7 @@ class ReActAgent:
         from agent.session.task_state_machine import TaskState as TSMState
         _tsm.transition(TSMState.RUNNING, "workspace ready")
         _child_turn_phase = _ChildTurnPhase.NONE
+        _recovery = RecoveryState()  # CC: cross-turn recovery tracking
 
         for step in range(1, task.max_steps + 1):
             if _cancellation.is_cancelled:
@@ -706,13 +801,10 @@ class ReActAgent:
                 except Exception:
                     logger.exception("Failed to load Runtime messages")
             runtime_phase = _phase_from_runtime_messages(_runtime_messages)
-            if runtime_phase is _ChildTurnPhase.RESOLUTION_PENDING:
-                _child_turn_phase = runtime_phase
-            elif (
-                runtime_phase is _ChildTurnPhase.SYNTHESIS
-                and _child_turn_phase is _ChildTurnPhase.NONE
-            ):
-                _child_turn_phase = runtime_phase
+            _child_turn_phase = _advance_child_turn_phase(
+                _child_turn_phase,
+                runtime_phase=runtime_phase,
+            )
 
             # ── Runtime Controller: single pre-step enforcement gate ──
             # Replaces scattered inline checks. Returns StepDecision that the
@@ -828,6 +920,7 @@ class ReActAgent:
 
             # ── LLM call: streaming dispatch (Phase 1b) or classic complete ──
             _streaming_executor: StreamingToolExecutor | None = None
+            response: Any = None  # bound in classic path; None for streaming
             if self._cfg.streaming_tool_execution:
                 # CC-aligned: dispatch tool_use blocks during LLM streaming.
                 # The executor is created BEFORE the LLM call so tool_use events
@@ -859,6 +952,23 @@ class ReActAgent:
                 try:
                     response = self._call_with_retry(messages, tools)
                 except Exception as exc:
+                    _exc_str = str(exc).lower()
+                    # ── Recovery C: prompt-too-long → reactive compact (CC: reactive_compact_retry) ──
+                    if (
+                        any(kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length"))
+                        and _recovery.can_reactive_compact()
+                        and self.compactor is not None
+                    ):
+                        _recovery.has_attempted_reactive_compact = True
+                        logger.warning(
+                            "Prompt too long — attempting reactive compact (CC: reactive_compact_retry)"
+                        )
+                        try:
+                            self.compactor.compact(history, total_tokens)
+                            logger.info("Reactive compact succeeded — retrying LLM call")
+                            continue
+                        except Exception as _cexc:
+                            logger.warning("Reactive compact failed: %s", _cexc)
                     logger.error("LLM call failed at step %d after retries: %s", step, exc)
                     _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
                     log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
@@ -883,6 +993,33 @@ class ReActAgent:
             _execution_budget.record_step()
             if self._cfg.token_callback is not None:
                 self._cfg.token_callback(total_tokens)
+
+            # ── Recovery A: output truncation (CC: max_output_tokens_escalate/recovery) ──
+            _truncated = (
+                getattr(response, "finish_reason", "") == "length"
+                or response.output_tokens >= getattr(self._cfg, "max_tokens", 32000) - 100
+            )
+            if _truncated and action.action_type != ActionType.TOOL_CALL:
+                if _recovery.can_escalate(getattr(self._cfg, "max_tokens", 32000)):
+                    _recovery.escalation_applied = True
+                    logger.info("Output truncated — escalating max_tokens 8k→64k (CC: max_output_tokens_escalate)")
+                    self._cfg.max_tokens = RecoveryState._ESCALATED_MAX_TOKENS
+                    continue
+                elif _recovery.can_recover_output():
+                    _recovery.output_recovery_count += 1
+                    logger.info("Output still truncated after escalation — injecting recovery (attempt %d/%d)",
+                                _recovery.output_recovery_count, RecoveryState._MAX_OUTPUT_RECOVERY)
+                    history.add(LLMMessage(role="user", content=(
+                        "[SYSTEM] Output truncated. Resume directly — no apology, no recap."
+                    )))
+                    continue
+                else:
+                    logger.warning("Output recovery exhausted after %d attempts", RecoveryState._MAX_OUTPUT_RECOVERY)
+
+            # ── Recovery B: prompt-too-long → reactive compact (CC: reactive_compact_retry) ──
+            # Triggered by exception in LLM call above; handled in the except block.
+            # We add the compact-attempt check here for the non-exception path
+            # (model may signal context pressure via short responses).
 
             # Provider adapters may omit native call ids (notably text/DSML
             # fallbacks). Runtime owns protocol normalization so persisted
@@ -938,7 +1075,7 @@ class ReActAgent:
                     )
                     observations = [_observation]
                     # Skip tool execution entirely — go straight to post-tool processing
-                    log.log_action(step=step, action=action, raw_content=response.raw_content)
+                    log.log_action(step=step, action=action, raw_content=getattr(response, "raw_content", ""))
                     break  # exit the for-step loop, let the LLM see the error
                 else:
                     # Validation passed — proceed to normal tool execution below
@@ -961,11 +1098,27 @@ class ReActAgent:
                 )
 
             # ── 2. 写入 Action event ────────────────────────────────────
-            log.log_action(step=step, action=action, raw_content=response.raw_content)
+            log.log_action(step=step, action=action, raw_content=getattr(response, "raw_content", ""))
             logger.info("Step %d: %r", step, action)
 
             # ── 4. 终止 action ──────────────────────────────────────────
             if action.action_type == ActionType.FINISH:
+                # ── Recovery D: token budget continuation (CC: token_budget_continuation) ──
+                if self._cfg.token_budget_continuation and _recovery.should_nudge(total_tokens, task.budget_tokens):
+                    _recovery.last_nudge_tokens = total_tokens
+                    _recovery.nudge_count += 1
+                    _remaining = max(0, task.budget_tokens - total_tokens)
+                    logger.info(
+                        "Token budget nudge %d (remaining=%d, total=%d, budget=%d)",
+                        _recovery.nudge_count, _remaining, total_tokens, task.budget_tokens,
+                    )
+                    history.add(LLMMessage(role="user", content=(
+                        f"[SYSTEM] Token budget remaining: {_remaining}. "
+                        "Continue working on the task if there are remaining items. "
+                        "If you believe the task is complete, call finish again."
+                    )))
+                    continue
+
                 # ── Runtime: transition to COMPLETING before guard evaluation ──
                 _tsm.transition(TSMState.COMPLETING, "model called FINISH")
 
@@ -1427,17 +1580,11 @@ class ReActAgent:
                     ))
 
                 next_phase = _phase_from_observations(observations)
-                if next_phase is _ChildTurnPhase.RESOLUTION_PENDING:
-                    _child_turn_phase = next_phase
-                elif next_phase is _ChildTurnPhase.SYNTHESIS:
-                    _child_turn_phase = next_phase
-                elif (
-                    _child_turn_phase is _ChildTurnPhase.RESOLUTION_PENDING
-                    and _resolution_was_completed(observations)
-                ):
-                    _child_turn_phase = _ChildTurnPhase.NONE
-                elif _child_turn_phase is _ChildTurnPhase.SYNTHESIS:
-                    _child_turn_phase = _ChildTurnPhase.NONE
+                _child_turn_phase = _advance_child_turn_phase(
+                    _child_turn_phase,
+                    observation_phase=next_phase,
+                    observations=observations,
+                )
 
                 # 缺失测试目标后，只允许少量确认性搜索，随后强制停止。
                 if (

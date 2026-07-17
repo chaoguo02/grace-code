@@ -847,3 +847,102 @@ class TestStreamIter:
         assert StreamEventKind.FINISH in kinds
         finish = [e for e in events if e.kind == StreamEventKind.FINISH][0]
         assert finish.finish_message == "All good"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 2: RecoveryState (CC-aligned continue-site tracking)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestRecoveryState:
+    """CC-aligned: max_output_tokens escalation + token budget nudge + reactive compact."""
+
+    def test_escalation_not_applied_initially(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        assert r.escalation_applied is False
+        assert r.output_recovery_count == 0
+
+    def test_can_escalate_when_below_threshold(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        assert r.can_escalate(8000) is True  # 8k < 64k
+        assert r.can_escalate(32000) is True
+
+    def test_cannot_escalate_when_already_escalated(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        r.escalation_applied = True
+        assert r.can_escalate(8000) is False
+
+    def test_cannot_escalate_when_already_at_max(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        assert r.can_escalate(64000) is False  # already at escalated max
+
+    def test_can_recover_output_up_to_3_times(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        assert r.can_recover_output() is True
+        r.output_recovery_count = 1
+        assert r.can_recover_output() is True
+        r.output_recovery_count = 3
+        assert r.can_recover_output() is False  # 3 == max
+
+    def test_should_nudge_when_budget_has_room(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        r.nudge_count = 0
+        r.last_nudge_tokens = 0
+        # 1000 used out of 100000 budget → 1% used → should nudge
+        assert r.should_nudge(1000, 100000) is True
+
+    def test_should_not_nudge_when_budget_exhausted(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        # 95000 used out of 100000 → 95% used → beyond 90% threshold
+        assert r.should_nudge(95000, 100000) is False
+
+    def test_should_not_nudge_when_diminishing(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        r.nudge_count = 4  # 3+ triggers diminishing check
+        r.last_nudge_tokens = 1000
+        # delta = 1100 - 1000 = 100 < 500 → diminishing
+        assert r.is_diminishing(1100) is True
+        assert r.should_nudge(1100, 100000) is False
+
+    def test_diminishing_not_triggered_under_3_nudges(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        r.nudge_count = 2  # < 3, diminishing detection not active
+        r.last_nudge_tokens = 1000
+        assert r.is_diminishing(1100) is False
+
+    def test_can_reactive_compact_initially_true(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        assert r.can_reactive_compact() is True
+
+    def test_cannot_reactive_compact_after_attempt(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        r.has_attempted_reactive_compact = True
+        assert r.can_reactive_compact() is False
+
+    def test_reset_for_new_turn(self):
+        from agent.core import RecoveryState
+        r = RecoveryState()
+        r.has_attempted_reactive_compact = True
+        r.reset_for_new_turn()
+        assert r.has_attempted_reactive_compact is False
+
+    def test_finish_reason_populated_in_response(self):
+        """LLMResponse carries finish_reason from provider."""
+        from llm.base import LLMResponse
+        from agent.task import Action, ActionType
+        resp = LLMResponse(
+            action=Action(action_type=ActionType.FINISH, thought="done", message="ok"),
+            raw_content="ok",
+            finish_reason="stop",
+        )
+        assert resp.finish_reason == "stop"

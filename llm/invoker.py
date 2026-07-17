@@ -27,6 +27,8 @@ class InvokeResult:
     response: Any                # LLMResponse
     billable_tokens: int         # tokens charged to budget (cache-aware)
     duration_ms: float = 0.0
+    truncated: bool = False      # CC: output was cut off (finish_reason="length")
+    finish_reason: str = ""      # provider finish_reason ("stop", "length", "tool_calls")
 
 
 @dataclass
@@ -104,8 +106,18 @@ class LLMInvoker:
                     cumulative_cache.non_cached_input_tokens += response.cache_stats.non_cached_input_tokens
                     billable = max(0, billable - response.cache_stats.cache_read_tokens)
 
+                truncated = (
+                    response.finish_reason == "length"
+                    or response.output_tokens >= getattr(self.config, "max_tokens", 32000) - 100
+                )
                 duration = (_time.perf_counter() - start) * 1000
-                return InvokeResult(response=response, billable_tokens=max(0, billable), duration_ms=duration)
+                return InvokeResult(
+                    response=response,
+                    billable_tokens=max(0, billable),
+                    duration_ms=duration,
+                    truncated=truncated,
+                    finish_reason=response.finish_reason,
+                )
 
             except Exception as exc:
                 last_exc = exc

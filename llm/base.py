@@ -93,6 +93,7 @@ class LLMResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_stats: CacheStats = field(default_factory=CacheStats)
+    finish_reason: str = ""             # provider finish_reason ("stop"/"length"/"tool_calls")
 
     @property
     def total_tokens(self) -> int:

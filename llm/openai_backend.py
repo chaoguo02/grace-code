@@ -779,6 +779,7 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cache_stats=cache_stats,
+                finish_reason=finish_reason or "",
             )
 
     # 构造 mock choice 供 _parse_openai_response 复用
@@ -830,6 +831,7 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_stats=cache_stats,
+        finish_reason=finish_reason or "",
     )
 
 
