@@ -82,7 +82,7 @@ def _search_with_rg(
     # as system locale (GBK), which corrupts UTF-8 source files.
     # Pure Python fallback is fast enough with os.walk dir pruning.
     if platform.system() == "Windows":
-        _log.warning("Grep using pure Python (Windows, skipping subprocess)")
+        _log.debug("grep-backend: pure Python (Windows)")
         return None
 
     rg_path = shutil.which("rg")
@@ -91,7 +91,7 @@ def _search_with_rg(
 
     try:
         if rg_path:
-            _log.warning("Grep using subprocess: rg")
+            _log.debug("grep-backend: rg")
             cmd = ["rg", "--no-heading", "--line-number", "--color", "never"]
             if case_insensitive:
                 cmd.append("-i")
@@ -107,7 +107,7 @@ def _search_with_rg(
                 cmd.extend(["-A", str(context_after)])
             cmd.extend(["-g", file_glob, str(pattern), str(search_path)])
         elif use_grep:
-            _log.warning("Grep using subprocess: grep")
+            _log.debug("grep-backend: grep")
             cmd = ["grep", "-rn", "--color=never"]
             if case_insensitive:
                 cmd.append("-i")
@@ -136,7 +136,7 @@ def _search_with_rg(
         return ToolResult(success=True, output="[rg timed out after 30s]")
 
     if proc.returncode not in (0, 1):
-        _log.warning("Grep using pure Python fallback")
+        _log.debug("grep-backend: pure Python fallback")
         return None
 
     output = proc.stdout.strip()
