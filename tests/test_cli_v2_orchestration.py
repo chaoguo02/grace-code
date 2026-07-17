@@ -382,6 +382,7 @@ def _patch_cli(monkeypatch, backend: LLMBackend) -> None:
     monkeypatch.setattr(cli_module, "_init_hook_dispatcher", lambda *args, **kwargs: None)
     # CLI tests use mock backends — disable streaming dispatch (threading conflict with mocks)
     monkeypatch.setenv("FORGE_STREAMING", "0")
+    monkeypatch.setenv("FORGE_NUDGE", "0")
 
 
 def _session_id(output: str) -> str:

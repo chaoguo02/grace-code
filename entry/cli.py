@@ -510,6 +510,7 @@ def run(
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
         streaming_tool_execution=_ste,
+        token_budget_continuation=os.environ.get("FORGE_NUDGE", "1") != "0",
     )
     mcp_integration = None
     from agent.session import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration
