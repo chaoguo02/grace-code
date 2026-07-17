@@ -90,9 +90,20 @@ _MAX_STOP_HOOK_RETRIES = 3
 
 
 class _ChildTurnPhase(str, Enum):
+    """Parent-turn phase after receiving child subagent results.
+
+    CC-aligned child lifecycle overlay (subagent report P1-1).
+    Connects SessionStatus (child-side) to parent turn discipline (parent-side).
+
+    Lifecycle: NONE → SYNTHESIS (child completed, parent should synthesize)
+                      → RESOLUTION_PENDING (worktree needs explicit apply/discard)
+                      → NONE (resolution complete or synthesis done)
+    """
     NONE = "none"
     SYNTHESIS = "synthesis"
+    """Child completed with results; parent should synthesize before next action."""
     RESOLUTION_PENDING = "resolution_pending"
+    """Worktree child completed; parent MUST inspect + apply/discard/retain before finishing."""
 
 
 @dataclass(frozen=True)
