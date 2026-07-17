@@ -182,6 +182,9 @@ class AgentTool(BaseTool):
         self, params: dict[str, Any],
     ) -> tuple[_SpawnInvocationPlan | None, ToolResult | None]:
         raw_subagent_type = params.get("subagent_type")
+        # When called as "Explore" alias, infer subagent_type="explore"
+        if not raw_subagent_type:
+            raw_subagent_type = "explore"
         raw_description = params.get("description")
         raw_prompt = params.get("prompt")
         raw_placement = params.get(
