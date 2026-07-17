@@ -140,18 +140,17 @@ class ConversationCompactor:
         self,
         history_dicts: list[dict],
         history_budget: int,
+        *,
+        tokens_freed: int = 0,
     ) -> bool:
         """
         判断是否需要 compaction。
 
+        CC-aligned: *tokens_freed* from SnipCompact + MicroCompact is subtracted
+        from the effective token count so AutoCompact doesn't fire unnecessarily
+        when cheap layers already freed enough space.
+
         内置 thrashing 保护：连续触发超过阈值时返回 False。
-
-        Args:
-            history_dicts: history.to_dicts() 的输出
-            history_budget: 本轮历史配额（plan.history），触发阈值 = budget × trigger_ratio
-
-        Returns:
-            True 表示需要 compaction
         """
         if len(history_dicts) < self._min_history:
             return False
@@ -170,8 +169,10 @@ class ConversationCompactor:
         total_tokens = sum(
             estimate_tokens(m.get("content", "")) for m in history_dicts
         )
+        # CC: effective = raw - freed_by_cheap_layers
+        effective = max(0, total_tokens - tokens_freed)
         threshold = int(history_budget * self._trigger_ratio)
-        return total_tokens > threshold
+        return effective > threshold
 
     # ------------------------------------------------------------------
     # 执行 compaction

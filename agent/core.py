@@ -1129,16 +1129,19 @@ class ReActAgent:
 
             # ── 2. Pre-LLM context trimming (CC: 3-layer zero-cost pipeline) ──
             # Order: Budget → Snip → MicroCompact (cheapest first).
+            # CC: tokens_freed from these layers is passed to AutoCompact so it
+            # doesn't fire unnecessarily when cheap layers already freed enough.
+            _trim_tokens_freed = 0
             if step > 1 and self._cfg.compact_history:
                 _budget = _apply_tool_result_budget(history)
-                if _budget > 0:
-                    logger.debug("ToolResultBudget freed ~%d tokens", _budget)
+                _trim_tokens_freed += _budget
                 _snipped = _snip_history(history)
-                if _snipped > 0:
-                    logger.debug("SnipCompact freed ~%d tokens", _snipped)
+                _trim_tokens_freed += _snipped
                 _micro = _micro_compact(history)
-                if _micro > 0:
-                    logger.debug("MicroCompact freed ~%d tokens", _micro)
+                _trim_tokens_freed += _micro
+                if _trim_tokens_freed > 0:
+                    logger.debug("Pre-LLM trimming freed ~%d tokens total", _trim_tokens_freed)
+            self._trim_tokens_freed = _trim_tokens_freed  # CC: passed to compaction threshold
 
             # ── 3. 组装 messages，调用 LLM ──────────────────────────────
             if self._memory_context:
@@ -2552,8 +2555,11 @@ class ReActAgent:
         return self._compactor
 
     def _should_compact(self, history_dicts: list[dict], history_budget: int) -> bool:
-        """判断是否需要自动 compaction。"""
-        return self.compactor.should_compact(history_dicts, history_budget)
+        """判断是否需要自动 compaction。CC: tokens_freed reduces effective count."""
+        return self.compactor.should_compact(
+            history_dicts, history_budget,
+            tokens_freed=getattr(self, "_trim_tokens_freed", 0),
+        )
 
     def _compact_history_from_dicts(self, history_dicts: list[dict]) -> list[dict]:
         """执行 compaction (MicroCompact → full compact)，返回压缩后的 dict 列表。"""
