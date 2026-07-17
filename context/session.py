@@ -117,26 +117,38 @@ class SessionState:
         self.active_task = None
         self._update_rolling_summary()
 
+    # CC-aligned: per-task resume with file-level granularity.
+    _MAX_TASK_RETENTION: int = 20
+
     def _update_rolling_summary(self) -> None:
-        """从已完成任务列表构建滚动摘要文本。"""
+        """Build rolling summary with per-task file anchors (CC: per-task resume)."""
         if not self.completed_tasks:
             self.rolling_summary = ""
             return
+        # Trim to retention limit
+        if len(self.completed_tasks) > self._MAX_TASK_RETENTION:
+            self.completed_tasks = self.completed_tasks[-self._MAX_TASK_RETENTION:]
         parts = []
-        for i, ts in enumerate(self.completed_tasks[-5:], 1):
-            parts.append(f"[Round {i}] {ts.to_text()}")
+        for i, ts in enumerate(self.completed_tasks, 1):
+            text = ts.to_text()
+            # CC: file-anchored task context — model knows which files per task
+            if ts.changed_files:
+                text += f"\n  Files: {', '.join(ts.changed_files[:8])}"
+            parts.append(f"[Task {i}/{len(self.completed_tasks)}] {text}")
         self.rolling_summary = "\n\n".join(parts)
 
     def get_session_context_for_prompt(self, budget_tokens: int = 12000) -> str:
-        """获取适合注入 prompt 的 session 上下文。尊重 token 预算。"""
+        """CC-aligned: budget-aware session context with per-task granularity."""
         if not self.rolling_summary:
             return ""
         if estimate_tokens(self.rolling_summary) <= budget_tokens:
             return self.rolling_summary
-        # 预算不足：只保留最近几个任务
+        # Budget trimming: keep most recent tasks that fit
         parts = []
         for ts in reversed(self.completed_tasks):
             text = ts.to_text()
+            if ts.changed_files:
+                text += f"\n  Files: {', '.join(ts.changed_files[:8])}"
             parts.insert(0, text)
             combined = "\n\n".join(parts)
             if estimate_tokens(combined) > budget_tokens:

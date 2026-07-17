@@ -202,9 +202,16 @@ class SessionMemoryTracker:
         current_tool_calls: int,
         context_summary: str = "",
         last_turn_had_tools: bool | None = None,
+        *,
+        recent_files: list[str] | None = None,
+        recent_commands: list[str] | None = None,
     ) -> bool:
-        """Check thresholds and fork extraction when needed."""
-        del last_turn_had_tools  # Compatibility with older callers; not a trigger.
+        """Check thresholds and fork extraction when needed.
+
+        CC-aligned (M6): accepts recent_files and recent_commands for richer
+        session memory extraction context.
+        """
+        del last_turn_had_tools
 
         if getattr(self._runner, "running", False):
             return False
@@ -222,7 +229,11 @@ class SessionMemoryTracker:
             return False
 
         current_notes = self._read_or_create_notes()
-        prompt = self._build_prompt(context_summary, current_notes)
+        prompt = self._build_prompt(
+            context_summary, current_notes,
+            recent_files=recent_files or [],
+            recent_commands=recent_commands or [],
+        )
         self._last_extracted_tokens = current_tokens
         self._last_tool_call_count = current_tool_calls
         self._runner.fork(prompt=prompt, notes_path=self._notes_path, current_notes=current_notes)
@@ -244,13 +255,33 @@ class SessionMemoryTracker:
             raise PermissionError(result.error or f"Unable to create session notes: {self._notes_path}")
         return notes
 
-    def _build_prompt(self, context_summary: str, current_notes: str) -> str:
-        return (
-            f"Session notes path (the only allowed write target): {self._notes_path}\n\n"
-            f"Current conversation context:\n{context_summary}\n\n"
+    def _build_prompt(
+        self,
+        context_summary: str,
+        current_notes: str,
+        *,
+        recent_files: list[str] | None = None,
+        recent_commands: list[str] | None = None,
+    ) -> str:
+        parts = [
+            f"Session notes path: {self._notes_path}",
+            f"Current conversation context:\n{context_summary}",
+        ]
+        if recent_files:
+            parts.append(
+                "Recently accessed files:\n"
+                + "\n".join(f"  - {f}" for f in recent_files[:15])
+            )
+        if recent_commands:
+            parts.append(
+                "Recent commands:\n"
+                + "\n".join(f"  $ {c}" for c in recent_commands[:10])
+            )
+        parts.append(
             f"<current_notes_content>\n{current_notes}\n</current_notes_content>\n\n"
             "Update the notes to reflect the latest work. Return the COMPLETE updated file content."
         )
+        return "\n\n".join(parts)
 
 
 def _response_text(response: object) -> str:

@@ -1472,10 +1472,13 @@ class ReActAgent:
                 context_for_extraction = ""
                 if history:
                     context_for_extraction = self._build_session_memory_context(history)
+                # M6: pass recent files + commands for richer extraction context
+                _recent_files = sorted(self._accessed_files)[-20:] if self._accessed_files else []
                 self._session_memory_tracker.tick(
                     current_tokens=total_tokens,
                     current_tool_calls=_cumulative_tool_calls,
                     context_summary=context_for_extraction,
+                    recent_files=_recent_files,
                 )
 
             # ── 2. 写入 Action event ────────────────────────────────────
