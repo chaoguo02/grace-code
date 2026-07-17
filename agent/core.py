@@ -1085,14 +1085,17 @@ class ReActAgent:
                     _batch_seen.add(_tc_key)
                     effective_tool_calls.append(tc)
 
-                parallel_safe = (
-                    len(effective_tool_calls) > 1
-                    and all(
-                        self._registry.concurrency_for(tc.name, tc.params)
-                        is ToolConcurrency.PARALLEL_SAFE
-                        for tc in effective_tool_calls
-                    )
+                # ── StreamingToolExecutor: CC-aligned partition + dispatch ──
+                # Replaces the old all-or-nothing PARALLEL_SAFE check with
+                # per-call concurrency safety. Read-only Bash commands (ls, grep,
+                # git status) can now execute in the same batch as Read/Grep.
+                from core.streaming_executor import (
+                    StreamingToolExecutor,
+                    partition_tool_calls,
                 )
+                _batches = partition_tool_calls(effective_tool_calls, self._registry)
+
+                # Build execution context with spawn_context for delegation tools
                 execution_context = _base_run_context
                 if any(
                     ToolRole.DELEGATE in self._registry.metadata_for(tc.name).roles
@@ -1102,33 +1105,48 @@ class ReActAgent:
                         execution_context,
                         spawn_context=_live_spawn_context,
                     )
-                if parallel_safe:
+                # Multi-batch or multi-call: set delegation width for parallel-safe batches
+                _max_batch = max(len(b) for b in _batches) if _batches else 1
+                if _max_batch > 1:
                     execution_context = replace(
                         execution_context,
-                        delegation_width=len(effective_tool_calls),
+                        delegation_width=_max_batch,
                     )
                 execution_registry = self._registry.with_run_context(execution_context)
 
-                def _execute_observed(tc: ToolCall):
+                # ── Execute via StreamingToolExecutor (CC-aligned) ──
+                # Partition + batch-dispatch preserves input order.
+                # Results are collected in the same order as effective_tool_calls.
+                _executor = StreamingToolExecutor(execution_registry)
+                for _batch in _batches:
+                    for _tc in _batch:
+                        _executor.enqueue(_tc)
+                _executor.dispatch()
+                # Collect preserves input order — zip with effective_tool_calls
+                _ordered_results = _executor.collect()
+                # Build lookup by tool name (observability fallback)
+                _results_by_tc = dict(zip(
+                    [tc.id for tc in effective_tool_calls],
+                    _ordered_results,
+                ))
+
+                for call_index, tc in enumerate(effective_tool_calls):
+                    metadata = self._registry.metadata_for(tc.name)
+                    result = _ordered_results[call_index] if call_index < len(_ordered_results) else ToolResult.from_error_str("Tool execution lost result")
+
+                    # Observability: wrap in tool span after execution
                     with observer.start_tool(
                         name=f"tool:{tc.name}",
                         input_data=build_tool_input(
-                            tc.name,
-                            tc.params,
-                            action.thought or "",
-                            step,
+                            tc.name, tc.params, action.thought or "", step,
                         ),
                         metadata=merge_metadata(
-                            {"tool_name": tc.name, "step": step},
-                            task.metadata,
+                            {"tool_name": tc.name, "step": step}, task.metadata,
                         ),
                     ) as tool_obs:
-                        tool_result = execution_registry.execute_tool(
-                            tc.name, tc.params, thought=action.thought or ""
-                        )
                         tool_obs.update(
                             output=build_tool_output(
-                                tool_result,
+                                result,
                                 capture_tool_outputs=(
                                     observer.config.capture_tool_outputs
                                     if observer.config else True
@@ -1136,28 +1154,9 @@ class ReActAgent:
                             ),
                             metadata={
                                 "tool_name": tc.name,
-                                "duration_ms": tool_result.duration_ms,
+                                "duration_ms": result.duration_ms,
                             },
                         )
-                    return tool_result
-
-                parallel_results = None
-                if parallel_safe:
-                    from executor.tool_executor import execute_parallel_sync
-                    parallel_results = execute_parallel_sync(
-                        effective_tool_calls,
-                        _execute_observed,
-                        max_workers=self._cfg.max_parallel_tool_calls,
-                    )
-
-                for call_index, tc in enumerate(effective_tool_calls):
-
-                    metadata = self._registry.metadata_for(tc.name)
-                    result = (
-                        parallel_results[call_index]
-                        if parallel_results is not None
-                        else _execute_observed(tc)
-                    )
                     observation = result.to_observation(tc.name)
 
                     # Runtime intercepts typed environment failures before the LLM sees them.
@@ -1694,13 +1693,16 @@ class ReActAgent:
         _file_cache = None
         _skill_buf = None
         base = self._full_registry
+        if getattr(base, "_skill_buffer", None) is not None:
+            _skill_buf = base._skill_buffer
         if hasattr(base, "_tools"):
             rt = base._tools.get("Read") or base._tools.get("file_read")
             if rt is not None and hasattr(rt, "_read_cache"):
                 _file_cache = rt._read_cache
-            st = base._tools.get("Skill")
-            if st is not None and hasattr(st, "_buffer"):
-                _skill_buf = st._buffer
+            if _skill_buf is None:
+                st = base._tools.get("Skill")
+                if st is not None and hasattr(st, "_buffer"):
+                    _skill_buf = st._buffer
         recovery = CompactionRecovery(
             file_cache=_file_cache,
             skill_buffer=_skill_buf,

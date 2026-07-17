@@ -22,6 +22,67 @@ from agent.session.models import (
 )
 
 
+def test_build_registry_registers_skill_tool_and_skill_registry(tmp_path):
+    from config.schema import AppConfig
+    from entry.bootstrap.registry_factory import build_registry
+
+    skill_dir = tmp_path / ".forge-agent" / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("""---
+name: Demo
+description: Demo skill
+---
+
+Use this skill for demo tasks.
+""", encoding="utf-8")
+
+    registry = build_registry(AppConfig(), repo_path=tmp_path)
+
+    assert getattr(registry, "_skill_registry", None) is not None
+    assert getattr(registry, "_skill_buffer", None) is not None
+    assert "Skill" in registry.tool_names
+
+
+def test_v2_runtime_messages_include_available_skills_from_registry(tmp_path):
+    from config.schema import AppConfig
+    from entry.bootstrap.registry_factory import build_registry
+    from agent.core import AgentConfig
+    from agent.session.agent_registry import AgentRegistryV2
+    from agent.session.runtime import SessionRuntime
+    from agent.session.session_store import SessionStore
+    from llm.base import MockBackend
+
+    skill_dir = tmp_path / ".forge-agent" / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("""---
+name: Review
+description: Review code carefully
+when_to_use: Use for read-only code review tasks
+---
+
+Review the target carefully.
+""", encoding="utf-8")
+
+    registry = build_registry(AppConfig(), repo_path=tmp_path)
+    runtime = SessionRuntime(
+        store=SessionStore(str(tmp_path / "sessions.db")),
+        backend=MockBackend([]),
+        base_registry=registry,
+        agent_registry=AgentRegistryV2(project_dir=tmp_path),
+        root_agent_config=AgentConfig(stream=False),
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    definition = runtime.agent_registry.get("build")
+    text = " ".join(
+        str(message.content)
+        for message in runtime._build_runtime_messages(definition, "inspect repo")
+    )
+
+    assert "## Available Skills" in text
+    assert "Review code carefully" in text
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # C1: permission_mode
 # ═══════════════════════════════════════════════════════════════════════
@@ -457,3 +518,251 @@ class TestAgentsCLI:
         assert "my-agent" in data
         assert data["my-agent"]["intent"] == "edit"
         assert data["my-reader"]["tools"] == ["Read", "Grep", "Glob"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 1: StreamingToolExecutor + Per-call Concurrency (CC-aligned)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPartitionToolCalls:
+    """CC-aligned partition: consecutive safe tools → batch, non-safe → break."""
+
+    def test_all_safe_single_batch(self):
+        from core.streaming_executor import partition_tool_calls
+        from core.base import ToolRegistry, NoopTool, ToolConcurrency
+        from agent.task import ToolCall
+
+        registry = ToolRegistry()
+        for name in ("Read", "Grep", "Glob"):
+            t = NoopTool(name)
+            t.concurrency_mode = lambda _params=None, _t=t: ToolConcurrency.PARALLEL_SAFE  # type: ignore[method-assign]
+            registry.register(t)
+
+        calls = [
+            ToolCall(name="Read", params={"path": "a.py"}),
+            ToolCall(name="Grep", params={"pattern": "foo"}),
+            ToolCall(name="Glob", params={"pattern": "*.py"}),
+        ]
+        batches = partition_tool_calls(calls, registry)
+        assert len(batches) == 1
+        assert len(batches[0]) == 3
+
+    def test_unsafe_breaks_batch(self):
+        from core.streaming_executor import partition_tool_calls
+        from core.base import ToolRegistry, NoopTool, ToolConcurrency
+        from agent.task import ToolCall
+
+        registry = ToolRegistry()
+        for name, conc in [("Read", ToolConcurrency.PARALLEL_SAFE),
+                           ("Edit", ToolConcurrency.SERIAL),
+                           ("Read2", ToolConcurrency.PARALLEL_SAFE)]:
+            t = NoopTool(name)
+            t.concurrency_mode = lambda _p=None, _c=conc: _c  # type: ignore[method-assign]
+            registry.register(t)
+
+        calls = [
+            ToolCall(name="Read", params={"path": "a.py"}),
+            ToolCall(name="Edit", params={"path": "b.py"}),
+            ToolCall(name="Read2", params={"path": "c.py"}),
+        ]
+        batches = partition_tool_calls(calls, registry)
+        assert len(batches) == 3  # Read, Edit, Read2
+        assert len(batches[0]) == 1
+        assert len(batches[1]) == 1
+        assert len(batches[2]) == 1
+
+    def test_consecutive_safe_grouped(self):
+        from core.streaming_executor import partition_tool_calls
+        from core.base import ToolRegistry, NoopTool, ToolConcurrency
+        from agent.task import ToolCall
+
+        registry = ToolRegistry()
+        for name, conc in [("Read", ToolConcurrency.PARALLEL_SAFE),
+                           ("Grep", ToolConcurrency.PARALLEL_SAFE),
+                           ("Edit", ToolConcurrency.SERIAL)]:
+            t = NoopTool(name)
+            t.concurrency_mode = lambda _p=None, _c=conc: _c  # type: ignore[method-assign]
+            registry.register(t)
+
+        calls = [
+            ToolCall(name="Read", params={}),
+            ToolCall(name="Grep", params={}),
+            ToolCall(name="Edit", params={}),
+        ]
+        batches = partition_tool_calls(calls, registry)
+        assert len(batches) == 2  # [Read,Grep], [Edit]
+        assert len(batches[0]) == 2
+        assert len(batches[1]) == 1
+
+    def test_empty_list(self):
+        from core.streaming_executor import partition_tool_calls
+        from core.base import ToolRegistry
+        assert partition_tool_calls([], ToolRegistry()) == []
+
+    def test_fail_closed_unknown_tool(self):
+        """Unknown tools default to serial (fail-closed)."""
+        from core.streaming_executor import partition_tool_calls
+        from core.base import ToolRegistry, NoopTool, ToolConcurrency
+        from agent.task import ToolCall
+
+        registry = ToolRegistry()
+        t = NoopTool("Read")
+        t.concurrency_mode = lambda _p=None: ToolConcurrency.PARALLEL_SAFE  # type: ignore[method-assign]
+        registry.register(t)
+
+        calls = [
+            ToolCall(name="Read", params={}),
+            ToolCall(name="UnknownTool", params={}),
+        ]
+        batches = partition_tool_calls(calls, registry)
+        assert len(batches) == 2  # Unknown breaks batch
+
+
+class TestBashPerCallConcurrency:
+    """Bash.concurrency_mode(): read-only commands are PARALLEL_SAFE."""
+
+    def test_read_only_command_is_parallel_safe(self):
+        from tools.shell_tool import ShellTool
+        from core.base import ToolConcurrency
+        tool = ShellTool()
+        assert tool.concurrency_mode({"command": "ls"}) is ToolConcurrency.PARALLEL_SAFE
+        assert tool.concurrency_mode({"command": "grep"}) is ToolConcurrency.PARALLEL_SAFE
+        assert tool.concurrency_mode({"command": "cat"}) is ToolConcurrency.PARALLEL_SAFE
+
+    def test_git_read_commands_are_parallel_safe(self):
+        from tools.shell_tool import ShellTool
+        from core.base import ToolConcurrency
+        tool = ShellTool()
+        assert tool.concurrency_mode({"command": "git", "args": ["status"]}) is ToolConcurrency.PARALLEL_SAFE
+        assert tool.concurrency_mode({"command": "git", "args": ["log", "--oneline"]}) is ToolConcurrency.PARALLEL_SAFE
+        assert tool.concurrency_mode({"command": "git", "args": ["diff"]}) is ToolConcurrency.PARALLEL_SAFE
+
+    def test_destructive_commands_are_serial(self):
+        from tools.shell_tool import ShellTool
+        from core.base import ToolConcurrency
+        tool = ShellTool()
+        assert tool.concurrency_mode({"command": "rm"}) is ToolConcurrency.SERIAL
+        assert tool.concurrency_mode({"command": "mv"}) is ToolConcurrency.SERIAL
+        assert tool.concurrency_mode({"command": "npm", "args": ["install"]}) is ToolConcurrency.SERIAL
+
+    def test_path_prefixed_read_command_is_safe(self):
+        from tools.shell_tool import ShellTool
+        from core.base import ToolConcurrency
+        tool = ShellTool()
+        assert tool.concurrency_mode({"command": "/usr/bin/ls"}) is ToolConcurrency.PARALLEL_SAFE
+        assert tool.concurrency_mode({"command": "/bin/cat"}) is ToolConcurrency.PARALLEL_SAFE
+
+    def test_package_managers_are_serial(self):
+        """npm, cargo, pip etc. are serial — subcommands can be destructive."""
+        from tools.shell_tool import ShellTool
+        from core.base import ToolConcurrency
+        tool = ShellTool()
+        assert tool.concurrency_mode({"command": "npm"}) is ToolConcurrency.SERIAL
+        assert tool.concurrency_mode({"command": "cargo"}) is ToolConcurrency.SERIAL
+        assert tool.concurrency_mode({"command": "python"}) is ToolConcurrency.SERIAL
+
+    def test_empty_command_defaults_serial(self):
+        from tools.shell_tool import ShellTool
+        from core.base import ToolConcurrency
+        tool = ShellTool()
+        assert tool.concurrency_mode({"command": ""}) is ToolConcurrency.SERIAL
+        assert tool.concurrency_mode({}) is ToolConcurrency.SERIAL
+
+
+class TestStreamingToolExecutor:
+    """StreamingToolExecutor: enqueue → dispatch → collect in input order."""
+
+    def _registry(self):
+        from core.base import ToolRegistry, NoopTool, ToolConcurrency
+        r = ToolRegistry()
+        for name in ("Read", "Write", "Bash"):
+            t = NoopTool(name, output=f"{name} ok")
+            if name == "Read":
+                t.concurrency_mode = lambda _p=None: ToolConcurrency.PARALLEL_SAFE  # type: ignore[method-assign]
+            else:
+                t.concurrency_mode = lambda _p=None: ToolConcurrency.SERIAL  # type: ignore[method-assign]
+            r.register(t)
+        return r
+
+    def test_enqueue_dispatch_collect_preserves_order(self):
+        from core.streaming_executor import StreamingToolExecutor
+        from agent.task import ToolCall
+
+        executor = StreamingToolExecutor(self._registry())
+        calls = [
+            ToolCall(name="Read", params={"path": "a.py"}, id="c1"),
+            ToolCall(name="Read", params={"path": "b.py"}, id="c2"),
+            ToolCall(name="Read", params={"path": "c.py"}, id="c3"),
+        ]
+        for c in calls:
+            executor.enqueue(c)
+        executor.dispatch()
+        results = executor.collect()
+        assert len(results) == 3
+        assert all(r.success for r in results)
+
+    def test_serial_tool_breaks_concurrent_batch(self):
+        """Write (SERIAL) should cause Read → serial Write → serial, not all-concurrent."""
+        from core.streaming_executor import StreamingToolExecutor
+        from agent.task import ToolCall
+
+        executor = StreamingToolExecutor(self._registry())
+        calls = [
+            ToolCall(name="Read", params={}, id="c1"),
+            ToolCall(name="Write", params={}, id="c2"),
+            ToolCall(name="Read", params={}, id="c3"),
+        ]
+        for c in calls:
+            executor.enqueue(c)
+        executor.dispatch()
+        results = executor.collect()
+        assert len(results) == 3
+        # Write runs alone (serial), Reads run together
+        assert results[0].success  # Read
+        assert results[1].success  # Write
+        assert results[2].success  # Read
+
+    def test_single_tool(self):
+        from core.streaming_executor import StreamingToolExecutor
+        from agent.task import ToolCall
+
+        executor = StreamingToolExecutor(self._registry())
+        executor.enqueue(ToolCall(name="Read", params={}, id="c1"))
+        executor.dispatch()
+        results = executor.collect()
+        assert len(results) == 1
+        assert results[0].success
+
+    def test_no_tools(self):
+        from core.streaming_executor import StreamingToolExecutor
+
+        executor = StreamingToolExecutor(self._registry())
+        executor.dispatch()
+        results = executor.collect()
+        assert results == []
+
+    def test_executor_stats(self):
+        from core.streaming_executor import StreamingToolExecutor
+        from agent.task import ToolCall
+
+        executor = StreamingToolExecutor(self._registry())
+        executor.enqueue(ToolCall(name="Read", params={}, id="c1"))
+        executor.dispatch()
+        executor.collect()
+        stats = executor.stats
+        assert stats["total"] == 1
+        assert stats["statuses"].get("yielded", 0) == 1
+
+    def test_abort_all_cancels_queued(self):
+        from core.streaming_executor import StreamingToolExecutor
+        from agent.task import ToolCall
+
+        executor = StreamingToolExecutor(self._registry())
+        executor.enqueue(ToolCall(name="Read", params={}, id="c1"))
+        executor.enqueue(ToolCall(name="Read", params={}, id="c2"))
+        executor.abort_all("test abort")
+        results = executor.collect()
+        assert len(results) == 2
+        assert not results[0].success
+        assert "test abort" in results[0].error
+        assert not results[1].success

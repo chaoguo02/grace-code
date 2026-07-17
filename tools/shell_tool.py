@@ -138,6 +138,69 @@ class ShellTool(BaseTool):
             "required": [],
         }
 
+    # ── Per-call concurrency safety (CC-aligned) ───────────────────────
+
+    # Commands that are stateless and safe to parallelize with other reads.
+    # Commands that are always safe to parallelize (pure readers / info display).
+    # Package managers and build tools are excluded — their subcommands can be
+    # destructive (install, build, publish). Use _READ_ONLY_PREFIXES for safe
+    # git subcommands like "git status" / "git log".
+    _READ_ONLY_COMMANDS: frozenset[str] = frozenset({
+        "ls", "dir", "cat", "head", "tail", "wc", "du", "df",
+        "grep", "find", "locate", "which", "where", "whereis",
+        "echo", "printf", "date", "uptime", "hostname", "uname",
+        "pwd", "env", "printenv", "whoami", "id", "groups",
+        "tree", "file", "stat", "readlink", "realpath",
+        "sort", "uniq", "cut", "tr", "awk", "sed",
+        "diff", "cmp", "comm", "join", "paste",
+        "pgrep", "pidof", "ps", "top", "free", "vmstat",
+        "lscpu", "lsblk", "lsusb", "lspci", "dmesg",
+        "type", "help", "man", "info", "whatis",
+    })
+    _READ_ONLY_PREFIXES: tuple[str, ...] = (
+        "git status", "git log", "git diff", "git show",
+        "git branch", "git tag", "git remote",
+        "git config --get", "git config --list",
+        "git ls-", "git rev-",
+    )
+
+    def concurrency_mode(self, params: dict[str, Any]) -> Any:
+        """CC-aligned per-call safety: read-only commands are PARALLEL_SAFE.
+
+        Parses the command string to distinguish read-only operations
+        (ls, grep, git status) from destructive ones (rm, mv, npm install).
+        The check is fail-closed: any parsing failure defaults to SERIAL.
+        """
+        from core.base import ToolConcurrency
+
+        command = (params.get("command") or "").strip()
+        args = params.get("args") or []
+
+        if not command:
+            # Legacy cmd mode — always serial
+            return ToolConcurrency.SERIAL
+
+        full_cmd = f"{command} {' '.join(args)}" if args else command
+        full_cmd_lower = full_cmd.lower().strip()
+
+        # Check read-only prefixes first (multi-word patterns)
+        for prefix in self._READ_ONLY_PREFIXES:
+            if full_cmd_lower.startswith(prefix):
+                return ToolConcurrency.PARALLEL_SAFE
+
+        # Check if the base command is read-only
+        base = command.lower().strip()
+        if base in self._READ_ONLY_COMMANDS:
+            return ToolConcurrency.PARALLEL_SAFE
+
+        # Check command with path (e.g. /usr/bin/ls)
+        if "/" in base:
+            leaf = base.rsplit("/", 1)[-1]
+            if leaf in self._READ_ONLY_COMMANDS:
+                return ToolConcurrency.PARALLEL_SAFE
+
+        return ToolConcurrency.SERIAL
+
     @property
     def risk_level(self) -> str:
         from core.base import RiskLevel
