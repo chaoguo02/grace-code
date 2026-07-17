@@ -14,6 +14,7 @@ Design:
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -547,22 +548,27 @@ class FindSymbolTool(BaseTool):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _is_skipped_dir(name: str) -> bool:
+    """Check if a directory name should be skipped (exact or prefix match)."""
+    return name in _SKIP_DIRS or name.startswith(_SKIP_DIR_PREFIXES)
+
+
 def _iter_files(root: Path, glob_pattern: str):
-    """Recursively iterate files matching glob, skipping _SKIP_DIRS."""
+    """Recursively iterate files matching glob, PRUNING skipped dirs at walk time.
+
+    Uses os.walk with topdown=True to avoid traversing skipped directories.
+    This is the CC pattern — rglob() would visit everything first.
+    """
+    import fnmatch
+
     if root.is_file():
         yield root
         return
 
-    for filepath in sorted(root.rglob(glob_pattern)):
-        skip = False
-        for part in filepath.parts:
-            if part in _SKIP_DIRS:
-                skip = True
-                break
-            if part.startswith(_SKIP_DIR_PREFIXES):
-                skip = True
-                break
-        if skip:
-            continue
-        if filepath.is_file():
-            yield filepath
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune: remove skipped dirs in-place so os.walk doesn't descend
+        dirnames[:] = [d for d in dirnames if not _is_skipped_dir(d)]
+        # Filter files by glob
+        for fn in filenames:
+            if fnmatch.fnmatch(fn, glob_pattern):
+                yield Path(dirpath) / fn
