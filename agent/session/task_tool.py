@@ -348,7 +348,7 @@ class AgentTool(BaseTool):
 
     # ── BaseTool interface ──
 
-    aliases = ("task",)
+    aliases = ("task", "Explore")
 
     @property
     def name(self) -> str:
