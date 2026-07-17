@@ -23,6 +23,7 @@ def build_registry(
     memory_store: Any = None,
     external_store: Any = None,
     repo_path: Any = None,
+    skill_registry: Any = None,
     approval_mode: ToolApprovalMode = ToolApprovalMode.PROMPT,
 ) -> Any:
     """Build the complete ToolRegistry with all built-in tools + permission pipeline."""
@@ -100,6 +101,23 @@ def build_registry(
     )
     registry._artifact_store_ref = artifact_store_ref
     registry._evidence_ledger_ref = evidence_ledger_ref
+
+    if skill_registry is None and project_root:
+        from skills.registry import SkillRegistry
+        skill_registry = SkillRegistry(str(Path(project_root) / ".forge-agent" / "skills"))
+
+    if skill_registry is not None:
+        from skills.buffer import SkillContextBuffer
+        skill_buffer = SkillContextBuffer()
+        registry._skill_registry = skill_registry
+        registry._skill_buffer = skill_buffer
+        if skill_registry.list_skills():
+            from skills.tool import SkillTool
+            registry.register(SkillTool(
+                skill_registry,
+                buffer=skill_buffer,
+                runtime=runtime,
+            ))
 
     if memory_store is not None:
         from tools.memory_tool import (

@@ -14,6 +14,7 @@ CC 对齐:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -67,9 +68,11 @@ class SkillTool(BaseTool):
         self,
         skill_registry: "SkillRegistry",
         buffer: "SkillContextBuffer | None" = None,
+        runtime: Any = None,
     ) -> None:
         self._skill_registry = skill_registry
         self._buffer = buffer
+        self._runtime = runtime
 
     aliases = ("use_skill",)
 
@@ -112,7 +115,11 @@ class SkillTool(BaseTool):
                 error="'skill_name' is required",
             )
 
-        rendered = self._skill_registry.load_and_render(skill_name, arguments)
+        rendered = self._skill_registry.load_and_render(
+            skill_name,
+            arguments,
+            runtime=self._runtime,
+        )
 
         if rendered is None:
             available = [m.name for m in self._skill_registry.list_skills()]
@@ -142,3 +149,11 @@ class SkillTool(BaseTool):
             output=f"[Skill: {skill_name}]\n\n{rendered}",
             metadata={"skill_modifier": modifier},
         )
+
+    def with_run_context(self, context: Any) -> "SkillTool":
+        """Preserve skill tool behavior while carrying any bound runtime fact."""
+        bound = copy.copy(self)
+        runtime = getattr(context, "runtime", None)
+        if runtime is not None:
+            bound._runtime = runtime
+        return bound
