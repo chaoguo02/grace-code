@@ -863,12 +863,20 @@ class ReActAgent:
                     ))
                     continue
 
-                # ── Stop Hook: verify before accepting FINISH ──
-                # Claude Code pattern: if files were modified but no test/validate
-                # tool ran successfully, BLOCK the finish. Force the agent to
-                # verify by reading the changed files directly.
+                # ── Stop Hook: dispatcher-first, built-in verification as fallback ──
+                # CC-aligned: external hooks (from dispatcher) fire FIRST with
+                # generic block/reason. Built-in git-diff verification is the
+                # safety net that only fires if no external hook blocked.
                 _stop_hook_blocked = False
-                if _git_state.has_changes and not _verification_ok:
+                _stop_reason = self._run_stop_hook(
+                    history=history,
+                    stop_hook_active=(self._stop_hook_verify_count > 0),
+                    last_assistant_message=action.message or "",
+                )
+                if _stop_reason is not None:
+                    _stop_hook_blocked = True
+                elif _git_state.has_changes and not _verification_ok:
+                    # Built-in safety net: force verification before finish
                     if self._stop_hook_verify_count < 1:
                         self._stop_hook_verify_count += 1
                         _stop_hook_blocked = True
@@ -883,7 +891,6 @@ class ReActAgent:
                                 "Do NOT retry shell commands or pytest — use file_read instead."
                             ),
                         ))
-                    # After 2 retries, allow finish with [UNVERIFIED] marker
 
                 if _stop_hook_blocked:
                     _tsm.transition(TSMState.RUNNING, "stop hook blocked — verify changes")
