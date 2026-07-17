@@ -269,12 +269,7 @@ class SearchTextTool(BaseTool):
         search_path, path_error = _resolve_search_path(
             raw_path, self._workspace_root,
         )
-        import logging as _lg
-        _lg.getLogger(__name__).warning(
-            "Grep[path] pattern=%r workspace_root=%s raw_path=%r resolved=%s exists=%s",
-            raw_pattern, self._workspace_root, raw_path,
-            search_path, search_path.exists() if search_path else "N/A",
-        )
+        pass  # path debug removed
         if search_path is None:
             return ToolResult(success=False, output="", error=path_error)
 
@@ -324,11 +319,7 @@ class SearchTextTool(BaseTool):
         matches: list[str] = []
         match_counts: dict[str, int] = {}
         files = list(_iter_files(search_path, file_glob))
-        import logging as _lg3
-        _lg3.getLogger(__name__).warning(
-            "Grep[files] search_path=%s glob=%r file_count=%d first5=%s",
-            search_path, file_glob, len(files), [str(f)[-30:] for f in files[:5]],
-        )
+
 
         import time as _time
         _deadline = _time.monotonic() + 15.0
@@ -375,11 +366,7 @@ class SearchTextTool(BaseTool):
             if file_match_count > 0:
                 match_counts[rel_path] = file_match_count
 
-        import logging as _lg2
-        _lg2.getLogger(__name__).warning(
-            "Grep[result] pattern=%r match_count=%d matches_len=%d output_mode=%s head_limit=%d",
-            raw_pattern, len(match_counts), len(matches), output_mode, head_limit,
-        )
+
 
         # Build output
         if output_mode == "count":
