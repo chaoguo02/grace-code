@@ -3665,8 +3665,10 @@ def test_build_subagent_prompt_includes_protocol():
     result = _build_subagent_prompt("Analyze task_tool.py for bugs.", reviewer_def)
     assert "[SUBAGENT ANALYSIS PROTOCOL]" in result
     assert "READ BEFORE YOU CLAIM" in result
-    assert "Phase 1" in result and "Phase 2" in result and "Phase 3" in result and "Phase 4" in result
-    assert "Anti-Laziness" in result
+    assert "[SUBAGENT ANALYSIS PROTOCOL]" in result
+    assert "FRESH context" in result
+    assert "READ BEFORE YOU CLAIM" in result
+    assert "KNOWN DECISIONS" in result
     assert "submit_findings" in result
     assert "Analyze task_tool.py for bugs." in result
     # User prompt must come after the protocol
@@ -3695,7 +3697,7 @@ def test_known_design_decisions_injected_into_protocol():
         required_tools=frozenset({"ReportFindings"}),
     )
     result = _build_subagent_prompt("Do X.", reviewer_def)
-    assert "KNOWN DESIGN DECISIONS" in result
+    assert "KNOWN DECISIONS" in result
     for entry in _KNOWN_DESIGN_DECISIONS:
         # First 40 chars of each entry should appear in the protocol
         assert entry[:40] in result
