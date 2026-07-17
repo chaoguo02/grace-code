@@ -206,16 +206,17 @@ class ShellTool(BaseTool):
                     _log.debug("direct execute failed: %s", exc)
 
             # Step 2: Try PowerShell (for PowerShell cmdlets like Get-ChildItem)
-            # Build the full command as a PowerShell script block
+            # Use shutil.which which bypasses WOW64 file system redirector.
+            # os.path.exists on System32 paths returns False from 32-bit Python.
             ps_exe = shutil.which("powershell.exe") or shutil.which("powershell")
             if ps_exe is None:
-                # Known Windows paths for PowerShell
-                for _p in [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-                           r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"]:
+                # Known Windows paths (SysNative for 32-bit Python → 64-bit System32)
+                for _p in [r"C:\Windows\SysNative\WindowsPowerShell\v1.0\powershell.exe",
+                           r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"]:
                     if os.path.exists(_p):
                         ps_exe = _p
                         break
-            if ps_exe and os.path.exists(ps_exe):
+            if ps_exe:
                 ps_args = ["-NoProfile", "-NonInteractive", "-Command", full_cmd]
                 try:
                     run_result = self._runtime.execute(ps_exe, args=ps_args, cwd=cwd, timeout=timeout)
@@ -225,14 +226,13 @@ class ShellTool(BaseTool):
 
             # Step 3: Try cmd.exe (for legacy commands like dir, tree)
             comspec = os.environ.get("COMSPEC")
-            if comspec and os.path.exists(comspec):
+            if comspec:
                 cmd_args = ["/d", "/s", "/c", full_cmd]
                 try:
                     run_result = self._runtime.execute(comspec, args=cmd_args, cwd=cwd, timeout=timeout)
                     return self._build_result(run_result, cmd_repr)
                 except Exception as exc:
                     _log.debug("cmd.exe execute failed: %s", exc)
-
             return ToolResult(
                 success=False, output="",
                 error=(
@@ -265,8 +265,9 @@ class ShellTool(BaseTool):
 
         if platform.system() == "Windows":
             _log = logging.getLogger(__name__)
-            ps_exe = shutil.which("powershell.exe") or r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-            if os.path.exists(ps_exe):
+            # shutil.which bypasses WOW64 redirector; os.path.exists doesn't
+            ps_exe = shutil.which("powershell.exe") or shutil.which("powershell")
+            if ps_exe:
                 try:
                     run_result = self._runtime.execute(
                         ps_exe, args=["-NoProfile", "-NonInteractive", "-Command", cmd],
