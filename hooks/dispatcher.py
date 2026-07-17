@@ -89,6 +89,7 @@ class HookDispatcher:
             return DispatchResult()
 
         collected_context: list[str] = []
+        updated_input: dict[str, Any] | None = None
         is_blockable = event in BLOCKABLE_EVENTS
 
         for hook_config in external_hooks:
@@ -114,7 +115,9 @@ class HookDispatcher:
             if result.control is HookControl.APPROVE:
                 return DispatchResult(control=HookControl.APPROVE)
 
-            # Collect additional context
+            # Collect CC-aligned: updatedInput + additionalContext
+            if result.parsed and result.parsed.updated_input:
+                updated_input = {**(updated_input or {}), **result.parsed.updated_input}
             if result.context:
                 collected_context.append(result.context)
 
@@ -127,4 +130,5 @@ class HookDispatcher:
 
         return DispatchResult(
             additional_context="\n".join(collected_context) if collected_context else "",
+            updated_input=updated_input,
         )

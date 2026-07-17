@@ -688,6 +688,7 @@ class ToolRegistry:
                 self._record_timing(name, start, result)
                 return result
 
+        perm_result = None
         # Permission Pipeline gate (5-layer evaluation)
         if self._permission_pipeline is not None:
             perm_result = self._permission_pipeline.check(tool, params, thought=thought)
@@ -718,8 +719,13 @@ class ToolRegistry:
                 self._record_timing(name, start, result)
                 return result
 
+        # Apply updatedInput from PreToolUse hooks (CC-aligned)
+        actual_params = params
+        if perm_result is not None and getattr(perm_result, "updated_params", None):
+            actual_params = {**params, **perm_result.updated_params}
+
         try:
-            result = tool.execute(params)
+            result = tool.execute(actual_params)
         except Exception as exc:
             # 工具内部未捕获的异常，降级为 error 结果
             result = ToolResult.from_error(

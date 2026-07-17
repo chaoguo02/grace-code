@@ -59,6 +59,7 @@ class PermissionResult:
     feedback: str = ""
     rule: PermissionRule | None = None
     wait_ms: float = 0.0
+    updated_params: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.decision = PermissionDecision(self.decision)
@@ -337,10 +338,21 @@ class PermissionPipeline:
                 reason=dispatch_result.reason or "Blocked by hook",
             )
         if dispatch_result.control is HookControl.APPROVE:
-            return PermissionResult(
+            result = PermissionResult(
                 decision=PermissionDecision.ALLOW,
                 layer=PermissionLayer.PRE_TOOL_HOOK,
                 reason="Hook approved",
+            )
+            if dispatch_result.updated_input:
+                result.updated_params = dispatch_result.updated_input
+            return result
+        # CONTINUE: no decision, but may have updated_input from hooks
+        if dispatch_result.updated_input:
+            return PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.PRE_TOOL_HOOK,
+                reason="Hook approved (input modified)",
+                updated_params=dispatch_result.updated_input,
             )
         return None
 

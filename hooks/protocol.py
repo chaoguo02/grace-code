@@ -95,3 +95,4 @@ class DispatchResult:
     control: HookControl = HookControl.CONTINUE
     reason: str = ""
     additional_context: str = ""
+    updated_input: dict[str, Any] | None = None
