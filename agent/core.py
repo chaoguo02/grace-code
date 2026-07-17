@@ -557,12 +557,12 @@ class AgentTurnState:
     """CC: State.turnCount — which iteration this is."""
 
     # ── Turn snapshot (CC: State.messages + toolUseContext) ──
-    message_count: int = 0
-    """Number of messages in history at the START of this turn."""
+    messages: tuple["LLMMessage", ...] = ()
+    """CC: State.messages — immutable snapshot of conversation at turn start."""
+    tool_schemas: tuple["LLMToolSchema", ...] = ()
+    """CC: State.toolUseContext — available tools this turn."""
     total_tokens: int = 0
     """Cumulative billable tokens consumed before this turn."""
-    tool_count: int = 0
-    """Number of tool schemas available this turn."""
 
     # ── Control state ──
     child_turn_phase: "_ChildTurnPhase" = _ChildTurnPhase.NONE
@@ -1146,12 +1146,12 @@ class ReActAgent:
             tools = _without_new_agent_spawns(
                 tools, phase=_state.child_turn_phase,
             )
-            # CC-aligned: snapshot turn state before LLM call (State.messages + toolUseContext)
+            # CC-aligned: immutable snapshot of turn input (State.messages + toolUseContext)
             _state = _state.with_updates(
                 turn_count=step,
-                message_count=len(history._messages),
+                messages=tuple(history._messages),  # shallow copy safe (LLMMessage is immutable)
+                tool_schemas=tuple(tools),
                 total_tokens=total_tokens,
-                tool_count=len(tools),
             )
             _live_spawn_context = None
             if any(
