@@ -404,13 +404,19 @@ def _apply_context_collapse(
     *,
     history_budget: int,
     collapse_store: Any = None,
-) -> int:
-    """CC: Context Collapse — summarize old message ranges via LLM.
+) -> tuple[int, Any]:
+    """CC: Context Collapse — read-time projection, never mutates original messages.
 
-    Runs between MicroCompact and AutoCompact.  If a collapse frees enough
-    tokens, AutoCompact is skipped entirely (CC: decoupling).
+    On each call:
+      1. Checks if collapse would help (token threshold + batch age)
+      2. Picks a range of old messages to summarize via LLM
+      3. Records the collapse in CollapseStore (NOT mutating messages)
+      4. Returns (tokens_freed, store) — the caller applies projectView at read time
 
-    Returns estimated tokens freed.
+    CC pattern: CollapseStore persists across turns.  projectView() is a pure
+    function that generates a compressed view WITHOUT mutating the original
+    message list.  This means collapses can be refined incrementally without
+    losing data.
     """
     from context.collapse import ContextCollapser, CollapseStore, project_view
     from context.token_budget import estimate_tokens
@@ -420,13 +426,13 @@ def _apply_context_collapse(
     dicts = history.to_dicts()
 
     if not collapser.should_collapse(dicts, history_budget, store=store):
-        return 0
+        return 0, store
 
     start, end = collapser.pick_range(dicts, store)
     if end <= start:
-        return 0
+        return 0, store
 
-    # Generate collapse summary via the existing compactor (reuses LLM path)
+    # Generate collapse summary via LLM (CC: collapse agent)
     range_msgs = dicts[start:end]
     prompt = collapser.build_collapse_prompt(range_msgs, start, end)
     try:
@@ -434,29 +440,23 @@ def _apply_context_collapse(
             range_msgs, max_tokens=600, task_context="context collapse",
         )
         if not summary:
-            return 0
+            return 0, store
     except Exception:
         logger.debug("Context collapse summarization failed", exc_info=True)
-        return 0
+        return 0, store
 
-    # Record the collapse
+    # Record the collapse — original messages are NEVER mutated (CC pattern)
     entry = __import__("context.collapse", fromlist=["CollapseEntry"]).CollapseEntry(
         start=start, end=end, summary=summary,
     )
     store.add(entry)
 
-    # Apply projection in-place
-    before = estimate_tokens(" ".join(str(m.get("content", "")) for m in dicts))
+    # Estimate freed tokens (for decoupling AutoCompact)
     projected = project_view(dicts, store)
+    before = estimate_tokens(" ".join(str(m.get("content", "")) for m in dicts))
     after = estimate_tokens(" ".join(str(m.get("content", "")) for m in projected))
 
-    # Rebuild history from projected view
-    from context.history import ConversationHistory
-    restored = ConversationHistory.from_dicts(projected, max_messages=history._max)
-    history._messages.clear()
-    history._messages.extend(restored._messages)
-
-    return max(0, before - after)
+    return max(0, before - after), store
 
 
 def _micro_compact(history: "ConversationHistory") -> int:
@@ -1204,12 +1204,12 @@ class ReActAgent:
                     logger.debug("Pre-LLM trimming freed ~%d tokens total", _trim_tokens_freed)
             self._trim_tokens_freed = _trim_tokens_freed
 
-            # ── 2.5. Context Collapse: read-time projection (CC: collapse store) ──
-            # Runs between MicroCompact and AutoCompact.  If collapse frees enough
-            # tokens, AutoCompact is skipped entirely (decoupling).
-            # gated: only active when compact_history is enabled.
+            # ── 2.5. Context Collapse: read-time projection (CC: CollapseStore) ──
+            # Runs between MicroCompact and AutoCompact.  CollapseStore persists
+            # across turns — collapses are recorded, NOT applied in-place.
+            # projectView() generates the compressed view at read time.
             if step > 1 and self._cfg.compact_history:
-                _collapse_freed = _apply_context_collapse(
+                _collapse_freed, self._collapse_store = _apply_context_collapse(
                     history, self.compactor,
                     history_budget=(self._cfg.request_budget_tokens or 110_000),
                     collapse_store=getattr(self, "_collapse_store", None),
@@ -2286,8 +2286,18 @@ class ReActAgent:
         long_term = self._build_long_term_context()
         anchor = self._build_task_anchor()
 
+        # CC: apply collapse projection at read time (original messages unchanged)
+        _collapse_store = getattr(self, "_collapse_store", None)
+        if _collapse_store is not None and not _collapse_store.is_empty:
+            from context.collapse import project_view
+            _history_dicts = project_view(history.to_dicts(), _collapse_store)
+            _projected = ConversationHistory.from_dicts(_history_dicts, max_messages=history._max)
+            _effective_history = _projected
+        else:
+            _effective_history = history
+
         ctx = self._context_manager.build_request_messages(
-            history=history,
+            history=_effective_history,
             token_budget=token_budget,
             system_core_text=core_text,
             variable_text=variable_text,
