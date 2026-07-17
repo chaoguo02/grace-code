@@ -224,20 +224,18 @@ class ShellTool(BaseTool):
                 except Exception as exc:
                     _log.debug("powershell execute failed: %s", exc)
 
-            # Step 3: Try cmd.exe (for legacy commands like dir, tree)
-            comspec = os.environ.get("COMSPEC")
-            if comspec:
-                cmd_args = ["/d", "/s", "/c", full_cmd]
-                try:
-                    run_result = self._runtime.execute(comspec, args=cmd_args, cwd=cwd, timeout=timeout)
-                    return self._build_result(run_result, cmd_repr)
-                except Exception as exc:
-                    _log.debug("cmd.exe execute failed: %s", exc)
+            # Step 3: shell=True via LocalRuntime.exec() — handles dir, tree, type.
+            # exec() uses subprocess with shell=True, resolving via COMSPEC.
+            try:
+                run_result = self._runtime.exec(full_cmd, cwd=cwd, timeout=timeout)
+                return self._build_result(run_result, cmd_repr)
+            except Exception as exc:
+                _log.debug("exec(shell=True) failed: %s", exc)
+
             return ToolResult(
                 success=False, output="",
                 error=(
                     f"Command '{cmd_name}' could not run on Windows. "
-                    f"Neither PowerShell nor cmd.exe were available. "
                     f"Use Glob/Grep/Read tools instead of shell."
                 ),
             )
@@ -277,7 +275,7 @@ class ShellTool(BaseTool):
                 except Exception:
                     pass
 
-        run_result = self._runtime.run(cmd, shell=True, cwd=cwd, timeout=timeout)
+        run_result = self._runtime.exec(cmd, cwd=cwd, timeout=timeout)
         return self._build_result(run_result, cmd)
 
     def _build_result(self, run_result, cmd_repr: str) -> ToolResult:
@@ -296,7 +294,7 @@ class ShellTool(BaseTool):
         return ToolResult(
             success=run_result.success,
             output=output,
-            error=run_result.error or None,
+            error=getattr(run_result, "error", None) or None,
         )
 
 
