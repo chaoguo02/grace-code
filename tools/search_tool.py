@@ -33,10 +33,17 @@ MAX_RESULTS = 50
 MAX_LINE_LENGTH = 200
 
 # Directories skipped during recursive search
+# Exact-match skip dirs (fast path)
 _SKIP_DIRS: frozenset[str] = frozenset({
     ".git", "__pycache__", ".venv", "venv", "node_modules",
-    ".mypy_cache", ".pytest_cache", "dist", "build", "*.egg-info",
+    ".mypy_cache", ".pytest_cache", "dist", "build",
 })
+
+# Prefix-match skip dirs (for temp/artifact dirs with hash suffixes)
+_SKIP_DIR_PREFIXES: tuple[str, ...] = (
+    ".pytest-", ".tmp-", ".pytest_tmp", ".tmp",
+    ".pytest-of-", ".pytest-plan-",
+)
 
 
 def _resolve_search_path(raw_path: object, workspace_root: str) -> tuple[Path | None, str]:
@@ -449,7 +456,15 @@ def _iter_files(root: Path, glob_pattern: str):
         return
 
     for filepath in sorted(root.rglob(glob_pattern)):
-        if any(part in _SKIP_DIRS for part in filepath.parts):
+        skip = False
+        for part in filepath.parts:
+            if part in _SKIP_DIRS:
+                skip = True
+                break
+            if part.startswith(_SKIP_DIR_PREFIXES):
+                skip = True
+                break
+        if skip:
             continue
         if filepath.is_file():
             yield filepath
