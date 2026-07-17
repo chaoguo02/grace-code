@@ -82,7 +82,7 @@ def _search_with_rg(
     # as system locale (GBK), which corrupts UTF-8 source files.
     # Pure Python fallback is fast enough with os.walk dir pruning.
     if platform.system() == "Windows":
-        _log.info("Grep using pure Python (Windows, skipping subprocess)")
+        _log.warning("Grep using pure Python (Windows, skipping subprocess)")
         return None
 
     rg_path = shutil.which("rg")
@@ -91,7 +91,7 @@ def _search_with_rg(
 
     try:
         if rg_path:
-            _log.info("Grep using subprocess: rg")
+            _log.warning("Grep using subprocess: rg")
             cmd = ["rg", "--no-heading", "--line-number", "--color", "never"]
             if case_insensitive:
                 cmd.append("-i")
@@ -107,7 +107,7 @@ def _search_with_rg(
                 cmd.extend(["-A", str(context_after)])
             cmd.extend(["-g", file_glob, str(pattern), str(search_path)])
         elif use_grep:
-            _log.info("Grep using subprocess: grep")
+            _log.warning("Grep using subprocess: grep")
             cmd = ["grep", "-rn", "--color=never"]
             if case_insensitive:
                 cmd.append("-i")
@@ -136,7 +136,7 @@ def _search_with_rg(
         return ToolResult(success=True, output="[rg timed out after 30s]")
 
     if proc.returncode not in (0, 1):
-        _log.info("Grep using pure Python fallback")
+        _log.warning("Grep using pure Python fallback")
         return None
 
     output = proc.stdout.strip()
@@ -270,8 +270,8 @@ class SearchTextTool(BaseTool):
             raw_path, self._workspace_root,
         )
         import logging as _lg
-        _lg.getLogger(__name__).info(
-            "Grep %r workspace_root=%s raw_path=%r resolved=%s exists=%s",
+        _lg.getLogger(__name__).warning(
+            "Grep[path] pattern=%r workspace_root=%s raw_path=%r resolved=%s exists=%s",
             raw_pattern, self._workspace_root, raw_path,
             search_path, search_path.exists() if search_path else "N/A",
         )
