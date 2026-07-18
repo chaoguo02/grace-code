@@ -566,16 +566,14 @@ class PermissionPipeline:
         # 5. No rule matched — continue to Layer 4 (permission mode)
         return None
 
-    # --- Layer 6: canUseTool Callback ----------------------------------
-
-    
-
     def _apply_tool_check(self, result, tool, params):
         if result.decision is PermissionDecision.ALLOW:
             l5 = self._layer5_check(tool, params)
             if l5 is not None:
-                self._stats.record(l5)
-                return l5
+                # Layer 5 (path sandbox) overrides the allow decision.
+                # Use the denied result so the circuit breaker and denial
+                # counters below see it (previously return l5 skipped them).
+                result = l5
         if result.decision is PermissionDecision.ALLOW:
             if getattr(self, '_circuit_breaker', None) is not None:
                 self._circuit_breaker.record_approval()
