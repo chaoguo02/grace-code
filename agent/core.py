@@ -440,6 +440,19 @@ class ReActAgent:
     # 公开接口
     # ------------------------------------------------------------------
 
+    @property
+    def _circuit_breaker_tripped(self) -> bool:
+        """Check if the permission pipeline's circuit breaker has tripped.
+
+        CC-aligned: when 3 consecutive denials or 20 total denials occur
+        in headless Web mode, the pipeline sets _terminate_session = True
+        and the agent loop should force GIVE_UP immediately.
+        """
+        try:
+            return self._full_registry._base._permission_pipeline._terminate_session
+        except Exception:
+            return False
+
     def run(self, task: Task, log: EventLog) -> RunResult:
         """
         执行一次完整的 agent 运行。
@@ -778,6 +791,21 @@ class ReActAgent:
                     error=_cancellation.detail,
                     cache_stats=cumulative_cache,
                 )
+
+            # ── Circuit breaker: check BEFORE any step logic ──
+            # CC-aligned: if the permission pipeline tripped (3 consecutive
+            # denials or 20 total), force GIVE_UP immediately — before LLM
+            # call, before reflection, before any other work.
+            if getattr(self, '_circuit_breaker_tripped', False):
+                logger.warning("Circuit breaker tripped — forcing GIVE_UP at step %d", step)
+                return _finish_run(
+                    status=RunStatus.GAVE_UP,
+                    summary="Session terminated: permission circuit breaker tripped.",
+                    steps_taken=step,
+                    total_tokens_used=total_tokens,
+                    cache_stats=cumulative_cache,
+                )
+
             _tsm.record_step()
             self._current_step = step  # 用于 compaction 日志
             self.compactor.tick_step()
@@ -1801,22 +1829,6 @@ class ReActAgent:
                             total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
-
-                # ── Circuit breaker termination check ──────────────────
-                # CC-aligned: if the permission pipeline's circuit breaker
-                # tripped (3 consecutive denials or 20 total), force
-                # GIVE_UP instead of letting the agent loop indefinitely.
-                _pipeline = getattr(getattr(self, '_full_registry', None), '_base', None)
-                _pipeline = getattr(_pipeline, '_permission_pipeline', None) if _pipeline else None
-                if _pipeline is not None and getattr(_pipeline, '_terminate_session', False):
-                    logger.warning("Circuit breaker tripped — forcing GIVE_UP")
-                    return _finish_run(
-                        status=RunStatus.GAVE_UP,
-                        summary="Session terminated: permission circuit breaker tripped.",
-                        steps_taken=step,
-                        total_tokens_used=total_tokens,
-                        cache_stats=cumulative_cache,
-                    )
 
                 # ── 6. Reflection 触发判断 ──────────────────────────────
 
