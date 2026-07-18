@@ -2,10 +2,11 @@ import { useEffect, useRef } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { useChatStore } from "../stores/chatStore";
 import { MessageBubble } from "./MessageBubble";
+import * as api from "../api/sessions";
 
 export function ChatView() {
   const { activeId, activeDetail } = useSessionStore();
-  const { messages, isRunning, error, sendChat, setMessages, connectWs, clear } =
+  const { messages, isRunning, error, sendChat, setMessages, connectWs, disconnectWs, clear } =
     useChatStore();
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -13,16 +14,13 @@ export function ChatView() {
   // Load messages when session changes
   useEffect(() => {
     if (activeId) {
-      import("../api/sessions").then((api) => {
-        api.getMessages(activeId).then(setMessages);
-        connectWs(activeId);
-      });
+      api.getMessages(activeId).then(setMessages);
+      connectWs(activeId);
     }
     return () => {
-      const { disconnectWs } = useChatStore.getState();
       disconnectWs();
     };
-  }, [activeId, setMessages, connectWs]);
+  }, [activeId, setMessages, connectWs, disconnectWs]);
 
   // Scroll to bottom on new messages
   useEffect(() => {

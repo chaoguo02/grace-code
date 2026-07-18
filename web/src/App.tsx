@@ -27,7 +27,7 @@ export default function App() {
   const [activeView, setActiveView] = useState<ViewName>("chat");
 
   return (
-    <div id="app">
+    <div id="app" className={activeView === "chat" ? "has-event-sidebar" : ""}>
       <SessionSidebar />
 
       <main className="main">
