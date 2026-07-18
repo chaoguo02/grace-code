@@ -2,6 +2,7 @@ import { useState } from "react";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { ChatView } from "./components/ChatView";
 import { PlanView } from "./components/PlanView";
+import { MemoryView } from "./components/MemoryView";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { useChatStore } from "./stores/chatStore";
@@ -11,16 +12,18 @@ const TABS = [
   { key: "chat", label: "Chat" },
   { key: "tasks", label: "Tasks" },
   { key: "plan", label: "Plan" },
+  { key: "memory", label: "Memory" },
   { key: "events", label: "Events" },
 ] as const;
 
 type ViewName = (typeof TABS)[number]["key"];
 
 function TabIcon({ name }: { name: ViewName }) {
-  if (name === "chat") return <span className="tab-icon">◌</span>;
-  if (name === "tasks") return <span className="tab-icon">▦</span>;
-  if (name === "plan") return <span className="tab-icon">✧</span>;
-  return <span className="tab-icon">☰</span>;
+  if (name === "chat") return <span className="tab-icon">C</span>;
+  if (name === "tasks") return <span className="tab-icon">T</span>;
+  if (name === "plan") return <span className="tab-icon">P</span>;
+  if (name === "memory") return <span className="tab-icon">M</span>;
+  return <span className="tab-icon">E</span>;
 }
 
 function PlaceholderView({ name }: { name: string }) {
@@ -74,44 +77,47 @@ export default function App() {
   return (
     <div id="app-shell">
       <div id="app" className={activeView === "chat" ? "has-event-sidebar" : ""}>
-      <SessionSidebar />
+        <SessionSidebar />
 
-      <main className="main">
-        <header className="topbar">
-          <div className="topbar-left">
-            <div className="view-tabs">
-              {TABS.map((tab) => (
-                <button
-                  key={tab.key}
-                  className={`view-tab ${activeView === tab.key ? "active" : ""}`}
-                  data-view={tab.key}
-                  type="button"
-                  onClick={() => setActiveView(tab.key)}
-                >
-                  <TabIcon name={tab.key} />
-                  {tab.label}
-                </button>
-              ))}
+        <main className="main">
+          <header className="topbar">
+            <div className="topbar-left">
+              <div className="view-tabs">
+                {TABS.map((tab) => (
+                  <button
+                    key={tab.key}
+                    className={`view-tab ${activeView === tab.key ? "active" : ""}`}
+                    data-view={tab.key}
+                    type="button"
+                    onClick={() => setActiveView(tab.key)}
+                  >
+                    <TabIcon name={tab.key} />
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
-          <div className="topbar-right">
-            <StatusCluster />
-            <button className="topbar-action" type="button">
-              Share
-            </button>
-            <button className="topbar-icon-action" type="button" aria-label="More actions">
-              ⋯
-            </button>
-            <ThemeToggle />
-          </div>
-        </header>
+            <div className="topbar-right">
+              <StatusCluster />
+              <button className="topbar-action" type="button">
+                Share
+              </button>
+              <button className="topbar-icon-action" type="button" aria-label="More actions">
+                •••
+              </button>
+              <ThemeToggle />
+            </div>
+          </header>
 
-        {activeView === "chat" && <ChatView />}
-        {activeView === "plan" && <PlanView />}
-        {activeView !== "chat" && activeView !== "plan" && <PlaceholderView name={activeView} />}
-      </main>
+          {activeView === "chat" && <ChatView />}
+          {activeView === "plan" && <PlanView />}
+          {activeView === "memory" && <MemoryView />}
+          {activeView !== "chat" && activeView !== "plan" && activeView !== "memory" && (
+            <PlaceholderView name={activeView} />
+          )}
+        </main>
 
-      {activeView === "chat" && <EventSidebar />}
+        {activeView === "chat" && <EventSidebar />}
       </div>
     </div>
   );
