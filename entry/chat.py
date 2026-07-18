@@ -98,6 +98,7 @@ class ChatSession:
                 log_dir=log_dir,
                 hook_dispatcher=hook_dispatcher,
                 mcp_integration=mcp_integration,
+                memory_context=memory_context,
                 event_callback=self._make_event_callback(),
             )
 

@@ -688,7 +688,31 @@ def chat(
         repo_path=repo_path,
     )
 
-    # SkillTool 已在 build_registry() 中注册
+
+    # HookDispatcher: per-session lifecycle hooks
+    hook_dispatcher = _init_hook_dispatcher(
+        repo_path,
+        memory_store=memory_store,
+        log_dir=config.agent.log_dir,
+        backend=backend,
+    )
+    registry._hook_dispatcher = hook_dispatcher
+    if hasattr(registry, '_permission_pipeline') and registry._permission_pipeline is not None:
+        registry._permission_pipeline._hook_dispatcher = hook_dispatcher
+
+    # MCP integration
+    mcp_integration = None
+    if getattr(config, 'mcp_servers', None):
+        from agent.session import MCPToolIntegration
+        mcp_integration = MCPToolIntegration({'mcp_servers': config.mcp_servers})
+        mcp_integration.initialize()
+        mcp_integration.register_into(registry)
+        from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool
+        for _n, _t in registry._tools.items():
+            if isinstance(_t, (ToolSearchTool, WaitForMcpServersTool)):
+                _t.set_mcp_context(registry, mcp_integration)
+
+        # SkillTool 已在 build_registry() 中注册
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
     from entry.renderer import create_renderer
@@ -699,6 +723,8 @@ def chat(
         config=config,
         repo_path=str(repo_path),
         log_dir=config.agent.log_dir,
+        hook_dispatcher=hook_dispatcher,
+        mcp_integration=mcp_integration,
         confirm_callback=terminal_confirm,
         renderer=rend,
         memory_store=memory_store,
