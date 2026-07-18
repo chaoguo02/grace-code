@@ -117,12 +117,12 @@ class AgentService:
         # ── 3. Build ToolRegistry ──
         from entry.bootstrap.registry_factory import build_registry
 
-        # CC-aligned: use PROMPT mode with a web_confirm_callback.
-        # The callback blocks the agent thread on threading.Event while
-        # waiting for a frontend decision — the exact equivalent of CC's
-        # stdin-blocking control_request / control_response protocol.
-        # When no callback is injected (CLI mode), the pipeline falls
-        # back to TTY terminal_confirm.
+        # CC-aligned: approval_mode="auto" so unclassified tools pass
+        # without prompting.  ASK-rule tools (Write/Edit/dangerous Bash)
+        # are force_interactive=True and always show the approval card.
+        # The web_confirm_callback blocks the agent thread on
+        # threading.Event — the exact equivalent of CC's stdin-blocking
+        # control_request / control_response protocol.
         self._registry = build_registry(
             self._config,
             repo_path=self.repo_path,
@@ -230,7 +230,6 @@ class AgentService:
         Returns:
             list[PermissionRule]: Merged rules from all sources.
         """
-        from hitl.settings_loader import load_permission_settings
         from hitl.permission_rule import PermissionRule
 
         rules: list[PermissionRule] = []
@@ -434,17 +433,9 @@ class AgentService:
         )
 
         def _run_and_notify():
-            # ── Inject web_confirm_callback + rules for this session ──
-            # CC-aligned: in headless Web mode, the pipeline's Layer 6
-            # blocks on threading.Event instead of stdin.
+            # ── Build web_confirm_callback for this session ──
             _web_cb = self._build_web_confirm_callback(session_id)
             self._runtime.set_web_confirm_callback(session_id, _web_cb)
-            # Push loaded permission rules so the pipeline picks them up
-            self._runtime._pending_rules = list(self._loaded_rules)
-            # acceptEdits: auto-approve Write/Edit/Bash-filesystem-commands
-            # at Layer 4, reducing approval-card fatigue for build agents.
-            # ASK rules (Layer 3) still force interactive approval regardless.
-            self._runtime._pending_permission_mode = "acceptEdits"
 
             try:
                 result = self._runtime.run_session(
@@ -452,6 +443,8 @@ class AgentService:
                     agent_name=agent_name,
                     task_description=prompt,
                     intent=resolved_intent,
+                    inject_rules=list(self._loaded_rules),
+                    inject_permission_mode="acceptEdits",
                 )
                 # Push completion event
                 if self._event_bus is not None:

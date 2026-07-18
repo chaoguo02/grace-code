@@ -56,6 +56,24 @@ from core.base import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
+def _resolve_permission_pipeline(agent: "ReActAgent") -> "PermissionPipeline | None":
+    """Walk the registry chain to find the PermissionPipeline.
+
+    Chain: ReActAgent._full_registry (PolicyAwareToolRegistry)
+           → ._base (ToolRegistry)
+           → ._permission_pipeline (PermissionPipeline)
+    """
+    registry = getattr(agent, "_full_registry", None)
+    if registry is None:
+        return None
+    # PolicyAwareToolRegistry wraps a ToolRegistry at ._base
+    base = getattr(registry, "_base", None)
+    if base is not None:
+        return getattr(base, "_permission_pipeline", None)
+    # Fallback: check the wrapped registry directly
+    return getattr(registry, "_permission_pipeline", None)
+
+
 class ExplicitDelegationError(ValueError):
     """An explicit child request cannot be honored by the parent contract."""
 
@@ -99,6 +117,13 @@ class SessionRuntime:
         self._hook_dispatcher = hook_dispatcher
         self._mcp_integration = mcp_integration
         self._event_callback = event_callback
+        # Per-session ApprovalBroker instances for headless Web mode.
+        # CC-aligned: each session has its own blocking approval queue,
+        # equivalent to CC's per-session stdin control_request channel.
+        self._approval_brokers: dict[str, "ApprovalBroker"] = {}
+        # Per-session web_confirm_callback factories, set by agent_service
+        # before run_session().  keyed by session_id.
+        self._web_confirm_callbacks: dict[str, "WebConfirmCallback"] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
         self._background_runs: dict[tuple[str, int], threading.Thread] = {}
         self._background_runs_lock = threading.Lock()
@@ -546,6 +571,8 @@ class SessionRuntime:
         max_steps_override: int | None = None,        # deprecated: use contract
         budget_tokens_override: int | None = None,    # deprecated: use contract
         contract: "TaskContract | None" = None,
+        inject_rules: list | None = None,              # Web: permission rules from settings
+        inject_permission_mode: str | None = None,     # Web: "acceptEdits" / "default" / etc.
     ) -> RunResult:
         session = self._store.get_session(session_id)
         if session is None:
@@ -600,6 +627,32 @@ class SessionRuntime:
             _eff_contract = contract if contract is not None else _assembly.contract
             agent = _assembly.agent
             agent_cfg = _assembly.agent_cfg
+
+            # ── Inject web_confirm_callback into the PermissionPipeline ──
+            # CC-aligned: in headless Web mode, the pipeline's Layer 6
+            # blocks on threading.Event instead of stdin.  The callback,
+            # rules, and permission mode are passed as explicit parameters
+            # (rather than shared instance attributes) so concurrent
+            # sessions cannot interfere.
+            _pipeline = _resolve_permission_pipeline(agent)
+            if _pipeline is not None:
+                # Only pop the callback when we can actually use it
+                _web_cb = self._web_confirm_callbacks.pop(session_id, None)
+                if _web_cb is not None:
+                    _pipeline._web_confirm_callback = _web_cb
+                # Inject loaded permission rules (from settings.json)
+                if inject_rules:
+                    for rule in inject_rules:
+                        if rule.tier.value == "deny":
+                            _pipeline._deny_rules.append(rule)
+                        elif rule.tier.value == "ask":
+                            _pipeline._ask_rules.append(rule)
+                        elif rule.tier.value == "allow":
+                            _pipeline._allow_rules.append(rule)
+                # Set permission mode
+                if inject_permission_mode:
+                    _pipeline.set_permission_mode(inject_permission_mode)
+
             agent_cfg.cancellation_token = cancellation_token
             agent_cfg.completion_fact_check = (
                 lambda: self._check_session_completion(session_id)
@@ -701,8 +754,10 @@ class SessionRuntime:
             with EventLog.create(task, log_dir=self._log_dir) as log:
                 if self._event_callback is not None:
                     original_append = log._append
+                    _captured_session_id = session_id
 
                     def _append_and_emit(event):
+                        event.session_id = _captured_session_id
                         original_append(event)
                         try:
                             self._event_callback(event)
@@ -1034,6 +1089,12 @@ class SessionRuntime:
                         raise ValueError(
                             "Fork tool contract changed since its prior generation"
                         )
+            # ── Snapshot parent pipeline state for child inheritance ──
+            # CC-aligned: subagents inherit parent's deny/allow rules,
+            # session_rules, and permission_mode (subject to constraints).
+            _parent_pipeline = getattr(self._base_registry, '_permission_pipeline', None)
+            _inherited_state = _parent_pipeline.get_inheritable_state() if _parent_pipeline else {}
+
             child_result = run_child_agent(
                 agent_id=child.id,
                 request=request,
@@ -1053,6 +1114,7 @@ class SessionRuntime:
                 persisted_messages=persisted_messages,
                 session_record=child,
                 session_runtime=self,
+                parent_pipeline_state=_inherited_state,
             )
             self._store.set_agent_result(child.id, child_result)
             self._store.append_message(
@@ -1579,6 +1641,7 @@ class SessionRuntime:
                 event_type=event_type,
                 task_id=child_session_id,
                 payload=payload,
+                session_id=parent_session_id,
             ))
         except Exception:
             logger.debug(
@@ -1627,13 +1690,69 @@ class SessionRuntime:
     def _resolve_child_permission_mode(
         self, parent: AgentDefinition, child: AgentDefinition | None
     ) -> str:
-        """CC-aligned: parent mode bypassPermissions/acceptEdits/auto overrides child."""
-        parent_mode = parent.permission_mode
-        if parent_mode in ("bypassPermissions", "acceptEdits", "auto"):
-            return parent_mode
-        if child is not None and child.permission_mode:
-            return child.permission_mode
-        return parent_mode
+        """CC-aligned: resolve effective permission_mode for a child subagent.
+
+        CC rules (from Agent SDK permissions docs):
+        1. Parent bypassPermissions → child forced bypassPermissions
+           (cannot be downgraded by child definition)
+        2. Parent acceptEdits/auto → child inherits parent mode
+           (child cannot upgrade to bypassPermissions)
+        3. Parent plan → child forced plan (read-only)
+        4. Parent dontAsk → child inherits dontAsk + parent's allow rules
+        5. Otherwise → child uses its own AgentDefinition.permission_mode,
+           falling back to parent mode.
+        """
+        parent_mode = parent.permission_mode or "default"
+
+        # bypassPermissions is the highest privilege — forced inherit
+        if parent_mode == "bypassPermissions":
+            return "bypassPermissions"
+
+        # plan is read-only — forced inherit
+        if parent_mode == "plan":
+            return "plan"
+
+        # acceptEdits / auto / dontAsk: child can't upgrade
+        if parent_mode in ("acceptEdits", "auto", "dontAsk"):
+            child_mode = child.permission_mode if child else ""
+            # Child cannot upgrade to bypassPermissions
+            if child_mode == "bypassPermissions":
+                return parent_mode
+            # Use child's mode if set, otherwise inherit parent
+            return child_mode or parent_mode
+
+        # default / manual: child uses own config
+        child_mode = child.permission_mode if child else ""
+        return child_mode or parent_mode
+
+    # ── Headless Web Approval (CC control_request/control_response equivalent) ─
+
+    def _ensure_approval_broker(self, session_id: str) -> "ApprovalBroker":
+        """Get or create the per-session ApprovalBroker.
+
+        One broker per session.  The agent thread blocks on
+        ``broker.wait_for_decision()``; the HTTP handler resolves via
+        ``broker.resolve()``.  This is the exact same synchronous-blocking
+        pattern as CC's stdin ``control_response``.
+        """
+        if session_id not in self._approval_brokers:
+            from server.services.approval_broker import ApprovalBroker
+            self._approval_brokers[session_id] = ApprovalBroker(session_id)
+        return self._approval_brokers[session_id]
+
+    def get_approval_broker(self, session_id: str) -> "ApprovalBroker | None":
+        """Return the ApprovalBroker for *session_id*, if one exists."""
+        return self._approval_brokers.get(session_id)
+
+    def set_web_confirm_callback(
+        self, session_id: str, callback: "WebConfirmCallback",
+    ) -> None:
+        """Register a web_confirm_callback for the next run of *session_id*.
+
+        Called by agent_service before run_session().  The callback is
+        injected into the PermissionPipeline during registry construction.
+        """
+        self._web_confirm_callbacks[session_id] = callback
 
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
