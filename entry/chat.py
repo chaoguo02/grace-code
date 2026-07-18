@@ -323,7 +323,7 @@ class ChatSession:
         self._renderer.mode = agent_name
 
     def switch_model(self, model, provider=None, api_key=None, base_url=None) -> None:
-        from entry.chat_services.agent_session_factory import rebuild_backend_for_model
+        from entry.agent_session_factory import rebuild_backend_for_model
         self._backend, self._model, self._provider = rebuild_backend_for_model(
             model, provider=provider, api_key=api_key, base_url=base_url,
             current_provider=self._provider,
