@@ -1,122 +1,108 @@
 import type { WsMessage } from "../types";
-import { ToolCallCard } from "./ToolCallCard";
-import { ObservationBlock } from "./ObservationBlock";
 
-function escapeHtml(s: string): string {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-/** Renders a live WS event as a timeline block. */
-export function WsEventBlock({ event }: { event: WsMessage }) {
+function iconFor(event: WsMessage): string {
   switch (event.type) {
     case "thought":
-      return (
-        <div className="message assistant">
-          <div className="message-row">
-            <div className="message-avatar" style={{ background: "var(--bg-soft)", color: "var(--text-dim)", fontSize: 10 }}>🤔</div>
-            <div className="message-bubble" style={{ opacity: 0.75, fontStyle: "italic" }}>
-              {escapeHtml(event.content || "")}
-            </div>
-          </div>
-        </div>
-      );
-
+      return "◎";
     case "tool_call":
-      return (
-        <ToolCallCard
-          name={event.name || ""}
-          params={event.params || {}}
-          id={event.id}
-          step={event.step}
-        />
-      );
-
+      return "⚙";
     case "observation":
-      return (
-        <ObservationBlock
-          tool_name={event.tool_name || ""}
-          output={event.output || ""}
-          status={event.status}
-          error={event.error}
-          id={event.id}
-          step={event.step}
-        />
-      );
-
+      return event.status === "error" ? "!" : "✓";
     case "reflection":
-      return (
-        <div className="message assistant">
-          <div className="message-row">
-            <div className="message-avatar" style={{ background: "var(--bg-soft)", color: "var(--text-dim)", fontSize: 10 }}>💭</div>
-            <div className="message-bubble" style={{ opacity: 0.6, fontStyle: "italic", fontSize: 13 }}>
-              {escapeHtml(event.content || "")}
-            </div>
-          </div>
-        </div>
-      );
-
+      return "↺";
     case "subagent_start":
-      return (
-        <div className="message" style={{ marginBottom: 4 }}>
-          <div className="message-row">
-            <div className="message-avatar" style={{ background: "var(--accent-soft)", color: "var(--accent)", fontSize: 10 }}>⊞</div>
-            <div className="message-bubble" style={{ fontSize: 12, color: "var(--text-dim)" }}>
-              Subagent <strong>{escapeHtml(event.agent_name || "")}</strong> started ({escapeHtml(event.child_session_id || "").slice(0, 8)})
-            </div>
-          </div>
-        </div>
-      );
-
+      return "⇢";
     case "subagent_stop":
-      return (
-        <div className="message" style={{ marginBottom: 4 }}>
-          <div className="message-row">
-            <div className="message-avatar" style={{ background: "var(--bg-soft)", color: "var(--text-dim)", fontSize: 10 }}>⊟</div>
-            <div className="message-bubble" style={{ fontSize: 12, color: "var(--text-dim)" }}>
-              Subagent completed: {escapeHtml(event.status || "")}
-            </div>
-          </div>
-        </div>
-      );
-
-    case "plan_ready":
-      return (
-        <div className="plan-card">
-          <h2>📋 Plan Ready for Review</h2>
-          <div
-            style={{
-              maxHeight: 300,
-              overflow: "auto",
-              whiteSpace: "pre-wrap",
-              fontSize: 13,
-              color: "var(--text)",
-              lineHeight: 1.6,
-            }}
-            dangerouslySetInnerHTML={{
-              __html: (event.plan_text || "").replace(/\n/g, "<br>"),
-            }}
-          />
-          <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 8 }}>
-            {event.result?.steps_taken != null && `Steps: ${event.result.steps_taken} · `}
-            {event.result?.total_tokens != null && `Tokens: ${event.result.total_tokens}`}
-          </div>
-        </div>
-      );
-
+      return "⇠";
     case "status":
-      if (event.status === "finish" || event.status === "gave_up") {
-        return (
-          <div className="message assistant">
-            <div className="message-row">
-              <div className="message-avatar" style={{ background: "var(--success-soft)", color: "var(--success)" }}>✓</div>
-              <div className="message-bubble">{escapeHtml(event.message || "")}</div>
-            </div>
-          </div>
-        );
-      }
-      return null;
-
+      return "●";
     default:
-      return null;
+      return "•";
   }
+}
+
+function titleFor(event: WsMessage): string {
+  switch (event.type) {
+    case "thought":
+      return "Thought";
+    case "tool_call":
+      return event.name || "Tool Call";
+    case "observation":
+      return event.tool_name || "Observation";
+    case "reflection":
+      return "Reflection";
+    case "subagent_start":
+      return `Subagent ${event.agent_name || ""}`.trim();
+    case "subagent_stop":
+      return "Subagent finished";
+    case "status":
+      return event.status || "Status";
+    default:
+      return event.type || "Event";
+  }
+}
+
+function bodyFor(event: WsMessage): string {
+  if (event.type === "thought" || event.type === "reflection") return event.content || "";
+  if (event.type === "tool_call") return JSON.stringify(event.params || {}, null, 2);
+  if (event.type === "observation") return event.output || event.error || "";
+  if (event.type === "subagent_start") return `Child session ${event.child_session_id || ""}`;
+  if (event.type === "subagent_stop") return event.status || "";
+  if (event.type === "status") return event.message || event.error || "";
+  return JSON.stringify(event.payload || {}, null, 2);
+}
+
+function cardClass(event: WsMessage): string {
+  switch (event.type) {
+    case "thought":
+      return "trace-card trace-thought";
+    case "tool_call":
+      return "trace-card trace-tool";
+    case "observation":
+      return "trace-card trace-observation";
+    case "reflection":
+      return "trace-card trace-reflection";
+    default:
+      return "trace-card";
+  }
+}
+
+export function WsEventBlock({ event }: { event: WsMessage }) {
+  if (event.type === "status" && !["finish", "gave_up"].includes(event.status || "")) {
+    return null;
+  }
+
+  const body = bodyFor(event);
+
+  return (
+    <div className="trace-block">
+      <div className={cardClass(event)}>
+        <div className="trace-header">
+          <div className="trace-icon">{iconFor(event)}</div>
+          <div className="trace-title">{titleFor(event)}</div>
+          <div className="trace-meta">
+            {event.step != null && <span className="trace-pill">Step {event.step}</span>}
+            {event.status && event.type !== "status" && (
+              <span className="trace-pill">{event.status}</span>
+            )}
+          </div>
+        </div>
+        <div className="trace-content">
+          {event.type === "tool_call" || event.type === "observation" ? (
+            <pre>{body}</pre>
+          ) : (
+            body
+          )}
+        </div>
+        {event.diff && event.type === "observation" && (
+          <details className="trace-diff" style={{ marginTop: 8, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
+            <summary style={{ cursor: "pointer", fontSize: 12, fontWeight: 600, color: "var(--accent)", userSelect: "none" }}>
+              View Diff ({event.diff.split("\n").length} lines)
+            </summary>
+            <pre style={{ fontSize: 11, lineHeight: 1.4, marginTop: 6, background: "var(--code-bg)", padding: 8, borderRadius: 6, overflowX: "auto" }}>{event.diff}</pre>
+          </details>
+        )}
+      </div>
+    </div>
+  );
 }

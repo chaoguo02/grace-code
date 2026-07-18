@@ -91,8 +91,20 @@ class StorageBackend(Protocol):
         """Permanently delete a session and all its messages. Returns True if deleted."""
         ...
 
+    def delete_sessions_batch(self, session_ids: list[str]) -> int:
+        """Delete multiple sessions in one transaction.
+
+        Returns the count of sessions actually deleted (IDs that existed).
+        Non-existent IDs are silently skipped.
+        """
+        ...
+
     def update_title(self, session_id: str, title: str) -> bool:
         """Update a session's title. Returns True if updated, False if not found."""
+        ...
+
+    def update_agent_name(self, session_id: str, agent_name: str) -> bool:
+        """Update a session's agent_name. Returns True if updated, False if not found."""
         ...
 
     # ── Messages ──────────────────────────────────────────────────────────

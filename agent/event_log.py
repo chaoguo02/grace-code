@@ -20,7 +20,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Any
 
 from agent.task import Event, EventType, ObservationStatus, Task, Action, Observation, RunResult
 
@@ -105,15 +105,18 @@ class EventLog:
             },
         ))
 
-    def log_observation(self, step: int, observation: Observation) -> None:
+    def log_observation(self, step: int, observation: Observation, *, tool_call_id: str | None = None) -> None:
         """工具执行结果。"""
+        payload: dict[str, Any] = {
+            "step":        step,
+            "observation": observation.to_dict(),
+        }
+        if tool_call_id is not None:
+            payload["tool_call_id"] = tool_call_id
         self._append(Event(
             event_type=EventType.OBSERVATION,
             task_id=self._current_task_id,
-            payload={
-                "step":        step,
-                "observation": observation.to_dict(),
-            },
+            payload=payload,
         ))
 
     def log_reflection(self, step: int, reason: str, prompt: str) -> None:

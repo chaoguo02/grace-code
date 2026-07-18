@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 from fastapi import WebSocket
@@ -210,9 +211,10 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
 class EventBus:
     """Manages per-session event queues and WebSocket subscribers."""
 
-    def __init__(self) -> None:
+    def __init__(self, repo_path: str = "") -> None:
         self._sessions: dict[str, SessionSubscriber] = {}
         self._lock = asyncio.Lock()
+        self._repo_path = repo_path
 
     # ── Session lifecycle ──────────────────────────────────────────────────
 
@@ -235,6 +237,37 @@ class EventBus:
 
     def get_subscriber(self, session_id: str) -> SessionSubscriber | None:
         return self._sessions.get(session_id)
+
+    # ── Diff computation ────────────────────────────────────────────────────
+
+    _FILE_PATH_RE = re.compile(r"(?:Edited |Created new file: |Applied edit to )(\S+)")
+
+    def _compute_diff(self, tool_name: str, output: str) -> str | None:
+        """Run git diff for a file modified by Edit/Write tool.
+
+        Returns unified diff string, or None if diff can't be computed.
+        """
+        if tool_name not in ("Edit", "Write", "file_edit", "file_write"):
+            return None
+        if not self._repo_path:
+            return None
+
+        m = self._FILE_PATH_RE.search(output)
+        if not m:
+            return None
+        filepath = m.group(1)
+
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "diff", "--", filepath],
+                capture_output=True, text=True,
+                cwd=self._repo_path, timeout=5,
+            )
+            diff = result.stdout.strip()
+            return diff if diff else None
+        except Exception:
+            return None
 
     # ── Publish (called from SessionRuntime thread) ────────────────────────
 
@@ -266,9 +299,20 @@ class EventBus:
                 sub = self._sessions.get(target_session_id)
                 if sub is not None and sub.has_subscribers:
                     for msg in msgs:
+                        # Compute git diff for Edit/Write observations
+                        if msg.get("type") == "observation" and msg.get("tool_name") in ("Edit", "Write", "file_edit", "file_write"):
+                            diff = self._compute_diff(msg["tool_name"], msg.get("output", ""))
+                            if diff:
+                                msg["diff"] = diff
+                        logger.info("EVENT → %s | type=%s step=%s",
+                                     target_session_id[:8], msg.get("type"), msg.get("step", ""))
                         sub.publish(msg)
+                else:
+                    logger.debug("EVENT dropped (no subscriber): session=%s", target_session_id[:8])
             else:
                 # Legacy fallback: broadcast to all sessions (backward compat)
+                logger.warning("EVENT broadcast (no session_id): type=%s",
+                               getattr(event, "event_type", "?"))
                 for sub in list(self._sessions.values()):
                     if sub.has_subscribers:
                         for msg in msgs:

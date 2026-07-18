@@ -88,16 +88,36 @@ def migrate_legacy_session_db(
     project_root: str | Path,
     target: str | Path,
 ) -> StateMigration:
-    """Copy the legacy project-local DB once, without altering the source."""
+    """Copy the legacy project-local DB once, if neither has been migrated yet.
+
+    Only runs on the very first startup or when the new-format DB is absent.
+    Subsequent restarts leave the new-format DB untouched so that runtime
+    changes (session deletes, title edits, …) survive a server restart.
+    """
     project = Path(project_root).resolve()
-    source = project / ".grace" / "v2" / "sessions.db"
-    if not source.is_file():
-        legacy = project / ".forge-agent" / "v2" / "sessions.db"
-        if legacy.is_file():
-            source = legacy
+
+    # Find legacy source
+    source: Path | None = None
+    for candidate in (
+        project / ".grace" / "v2" / "sessions.db",
+        project / ".forge-agent" / "v2" / "sessions.db",
+    ):
+        if candidate.is_file():
+            source = candidate
+            break
+
+    # No legacy DB — nothing to migrate
+    if source is None:
+        return StateMigration.NOT_NEEDED
+
     destination = Path(target).resolve()
+
+    # Destination already exists — don't overwrite runtime changes
+    if destination.exists():
+        return StateMigration.NOT_NEEDED
+
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
+    shutil.copy2(str(source), str(destination))
     return StateMigration.COPIED
 
 

@@ -50,6 +50,14 @@ checks are enforced outside this prompt.
 """
 
 
+def _resolve_registry_pipeline(registry) -> "PermissionPipeline | None":
+    """Walk the registry chain to find the PermissionPipeline."""
+    base = getattr(registry, "_base", None)
+    if base is not None:
+        return getattr(base, "_permission_pipeline", None)
+    return getattr(registry, "_permission_pipeline", None)
+
+
 def run_child_agent(
     *,
     agent_id: str,
@@ -70,6 +78,7 @@ def run_child_agent(
     persisted_messages: list[LLMMessage] | None = None,
     session_record: "SessionRecord | None" = None,
     session_runtime: "SessionRuntime | None" = None,
+    parent_pipeline_state: dict | None = None,
 ) -> AgentRunResult:
     """Run a typed child request while preserving its context-origin contract."""
     definition = source_definition
@@ -151,6 +160,31 @@ def run_child_agent(
         from tools.submit_findings_tool import FindingsAccumulator
         wrapped_registry = inherited_registry
         _findings_accumulator = FindingsAccumulator()
+
+    # ── Apply parent pipeline inheritance (CC subagent permission model) ──
+    _child_pipeline = _resolve_registry_pipeline(wrapped_registry)
+    if _child_pipeline is not None:
+        # 1. Inherit parent pipeline rules + permission_mode
+        if parent_pipeline_state:
+            _child_mode = parent_pipeline_state.get("permission_mode", "")
+            if session_runtime is not None:
+                _child_mode = session_runtime._resolve_child_permission_mode(
+                    source_definition, definition
+                    if request.agent_kind is AgentKind.NAMED_SUBAGENT else None
+                )
+            _child_pipeline.apply_inherited_state(
+                parent_pipeline_state,
+                child_permission_mode=_child_mode or "dontAsk",
+            )
+
+        # 2. Inject web_confirm_callback for child's own tool approvals
+        #    (CC: subagents also need interactive approval in headless mode)
+        if session_runtime is not None:
+            _web_cb = session_runtime._web_confirm_callbacks.pop(agent_id, None)
+            if _web_cb is not None:
+                _child_pipeline._web_confirm_callback = _web_cb
+            # Also register a broker for the child session
+            _broker = session_runtime._ensure_approval_broker(agent_id)
 
     # Build agent config
     if root_agent_config is not None:
@@ -282,8 +316,10 @@ def run_child_agent(
         with EventLog.create(task, log_dir=log_dir) as event_log:
             if event_callback is not None:
                 original_append = event_log._append
+                _captured_session_id = agent_id
 
                 def _append_and_emit(event):
+                    event.session_id = _captured_session_id
                     original_append(event)
                     try:
                         event_callback(event)

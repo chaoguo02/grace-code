@@ -64,6 +64,17 @@ def create_app(service: AgentService) -> FastAPI:
     Returns:
         FastAPI app with all routes mounted.
     """
+
+    # ── Lifespan handler (startup / shutdown) ──────────────────────────
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        # Startup: nothing special (service is already initialised)
+        yield
+        # Shutdown: release resources
+        await service.shutdown()
+
     app = FastAPI(
         title="Grace Code Web MVP",
         version="0.1.0",
@@ -72,6 +83,7 @@ def create_app(service: AgentService) -> FastAPI:
             "Provides session management, chat execution, "
             "and real-time event streaming via WebSocket."
         ),
+        lifespan=_lifespan,
     )
 
     # Store service reference in app.state for dependency injection
@@ -85,10 +97,14 @@ def create_app(service: AgentService) -> FastAPI:
     from server.routers.sessions import create_sessions_router
     from server.routers.approvals import create_approvals_router
     from server.routers.websocket import create_websocket_router
+    from server.routers.config import create_config_router
+    from server.routers.attachments import create_attachments_router
 
     app.include_router(create_sessions_router(get_service))
     app.include_router(create_approvals_router(get_service))
-    app.include_router(create_websocket_router(get_service))
+    app.include_router(create_websocket_router(service))
+    app.include_router(create_config_router(get_service))
+    app.include_router(create_attachments_router(get_service))
 
     # ── Static / built frontend ─────────────────────────────────────────
     static_dir = Path(__file__).parent / "static"
@@ -142,11 +158,6 @@ def create_app(service: AgentService) -> FastAPI:
             "db_size_bytes": stats.db_size_bytes,
         }
 
-    # ── Lifespan events ───────────────────────────────────────────────────
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
-        await service.shutdown()
-
     return app
 
 
@@ -193,7 +204,7 @@ def main() -> None:
     print(f"  provider: {args.provider or '(from config)'}")
 
     # Create EventBus
-    event_bus = EventBus()
+    event_bus = EventBus(repo_path=repo_path)
 
     # Create AgentService
     service = AgentService(

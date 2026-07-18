@@ -101,10 +101,15 @@ export interface WsMessage {
   // Observation
   tool_name?: string;
   output?: string;
+  diff?: string;           // Git diff for Edit/Write tools
 
   // Plan ready
   plan_text?: string;
   revision?: number;
+
+  // Tool approval (CC control_request equivalent)
+  request_id?: string;
+  thought?: string;
 
   // Subagent
   child_session_id?: string;

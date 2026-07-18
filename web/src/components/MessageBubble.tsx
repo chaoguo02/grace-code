@@ -52,19 +52,8 @@ export function MessageBubble({ message, toolResults }: Props) {
     return (
       <div className="message tool">
         <div className="message-row">
-          <div
-            className="message-avatar"
-            style={{
-              background: isError ? "var(--error-soft)" : "var(--success-soft)",
-              color: isError ? "var(--error)" : "var(--success)",
-            }}
-          >
-            {isError ? "⚠" : "✓"}
-          </div>
-          <div
-            className="observation-block"
-            style={{ flex: 1 }}
-          >
+          <div className="message-avatar">{isError ? "!" : "✓"}</div>
+          <div className={`observation-block ${isError ? "error" : "success"}`} style={{ flex: 1 }}>
             <div className="obs-header">
               {tcId && <span className="obs-id" title={tcId}>{tcId.slice(0, 8)}</span>}
               <span className="obs-status-tag">{isError ? "error" : "success"}</span>

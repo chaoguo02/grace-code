@@ -1,8 +1,8 @@
 # agent/__init__.py
 #
 # 延迟导入以避免循环依赖：
-#   tools.base → agent.task → agent (触发 __init__.py)
-#   → agent.core → tools.base (循环!)
+#   core.base → agent.task → agent (触发 __init__.py)
+#   → agent.core → core.base (循环!)
 #
 # 所以 __init__.py 不做顶层 import，需要符号时从子模块直接引入。
 

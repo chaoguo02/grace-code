@@ -112,6 +112,26 @@ class SqliteStorageBackend(StorageBackend):
             logger.exception("Failed to delete session %s", session_id)
             return False
 
+    def delete_sessions_batch(self, session_ids: list[str]) -> int:
+        """Delete multiple sessions in one transaction. Returns count deleted."""
+        if not session_ids:
+            return 0
+        deleted = 0
+        try:
+            with self._store._connect() as conn:
+                for sid in session_ids:
+                    conn.execute("DELETE FROM session_messages WHERE session_id = ?", (sid,))
+                    conn.execute("DELETE FROM agent_notifications WHERE parent_session_id = ?", (sid,))
+                    conn.execute("DELETE FROM agent_notifications WHERE child_session_id = ?", (sid,))
+                    c = conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+                    if c.rowcount > 0:
+                        deleted += 1
+            logger.info("Batch deleted %d/%d sessions", deleted, len(session_ids))
+            return deleted
+        except Exception:
+            logger.exception("Failed to batch delete sessions")
+            return deleted
+
     def update_title(self, session_id: str, title: str) -> bool:
         """Update a session's title. Returns True if updated."""
         session = self._store.get_session(session_id)
@@ -128,6 +148,24 @@ class SqliteStorageBackend(StorageBackend):
             return True
         except Exception:
             logger.exception("Failed to update title for %s", session_id)
+            return False
+
+    def update_agent_name(self, session_id: str, agent_name: str) -> bool:
+        """Update a session's agent_name. Returns True if updated."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return False
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            with self._store._connect() as conn:
+                conn.execute(
+                    "UPDATE sessions SET agent_name = ?, updated_at = ? WHERE id = ?",
+                    (agent_name, now, session_id),
+                )
+            return True
+        except Exception:
+            logger.exception("Failed to update agent_name for %s", session_id)
             return False
 
     # ── Messages ──────────────────────────────────────────────────────────

@@ -3,11 +3,29 @@ import { useSessionStore } from "../stores/sessionStore";
 import { useChatStore } from "../stores/chatStore";
 import * as api from "../api/sessions";
 
+function PlanEmptyState({
+  title,
+  body,
+  action,
+}: {
+  title: string;
+  body: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="plan-empty">
+      <div className="plan-empty-icon">◇</div>
+      <div className="plan-empty-title">{title}</div>
+      <div className="plan-empty-body">{body}</div>
+      {action}
+    </div>
+  );
+}
+
 export function PlanView() {
   const { activeId, activeDetail } = useSessionStore();
   const { planApproval, approvePlan, rejectPlan, isRunning, clear } = useChatStore();
 
-  // Load the active session's details on mount
   useEffect(() => {
     if (activeId) {
       useSessionStore.getState().refreshActive();
@@ -18,99 +36,126 @@ export function PlanView() {
   const hasPlan = planApproval?.isWaiting;
 
   return (
-    <section className="view active" data-view-name="plan" style={{ padding: 20, overflow: "auto" }}>
-      <h2 style={{ margin: "0 0 16px", fontSize: 18 }}>Plan Mode</h2>
-
-      {!activeId && (
-        <div className="empty-state" style={{ padding: 40 }}>
-          Select a session to view its plan.
-        </div>
-      )}
-
-      {activeId && !hasPlan && !isPlanSession && (
-        <div className="empty-state" style={{ padding: 40 }}>
-          <p>No plan available for this session.</p>
-          <p style={{ color: "var(--text-muted)", fontSize: 13 }}>
-            Start a plan by creating a session with the <strong>plan</strong> agent
-            or sending a message with <strong>analyze-first</strong> intent.
-          </p>
-          <button
-            className="btn-primary"
-            style={{ marginTop: 12 }}
-            type="button"
-            onClick={async () => {
-              if (!activeId) return;
-              clear();
-              try {
-                await api.chat(
-                  activeId,
-                  "Analyze the codebase and produce a structured implementation plan."
-                );
-              } catch {
-                /* ignore */
-              }
-            }}
-          >
-            Start Plan Analysis
-          </button>
-        </div>
-      )}
-
-      {hasPlan && planApproval && (
-        <div className="plan-card">
-          <h2>📋 Plan Ready for Review</h2>
-          <div
-            style={{
-              maxHeight: 400,
-              overflow: "auto",
-              whiteSpace: "pre-wrap",
-              fontSize: 13,
-              lineHeight: 1.7,
-              color: "var(--text)",
-              fontFamily: "var(--font-ui)",
-            }}
-          >
-            {planApproval.planText}
+    <section className="view active" data-view-name="plan">
+      <div className="plan-page">
+        <div className="plan-hero">
+          <div>
+            <div className="summary-label">Plan Workspace</div>
+            <h2 className="plan-hero-title">Review before execution</h2>
+            <p className="plan-hero-body">
+              Use this space to inspect a generated plan, approve it into build execution,
+              or send it back for revision.
+            </p>
           </div>
-          <div className="plan-actions" style={{ marginTop: 16 }}>
-            <button
-              className="btn-approve"
-              type="button"
-              disabled={isRunning}
-              onClick={() => approvePlan()}
-            >
-              ✓ Approve & Build
-            </button>
-            <button
-              className="btn-reject"
-              type="button"
-              disabled={isRunning}
-              onClick={() => rejectPlan("Please revise the plan with more detail.")}
-            >
-              ✗ Reject
-            </button>
-          </div>
-        </div>
-      )}
-
-      {activeId && isPlanSession && !hasPlan && (
-        <div className="empty-state" style={{ padding: 20 }}>
-          <p style={{ color: "var(--text-dim)" }}>
-            Session agent: <strong>{activeDetail?.agent_name}</strong>
-            {" · "} status: <strong>{activeDetail?.status}</strong>
-          </p>
-          {activeDetail?.summary && (
-            <div
-              className="plan-card"
-              style={{ marginTop: 12, maxHeight: 300, overflow: "auto" }}
-            >
-              <pre style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
-                {activeDetail.summary}
-              </pre>
+          <div className="plan-hero-stats">
+            <div className="meta-pill">
+              <div className="meta-pill-label">Agent</div>
+              <div className="meta-pill-value">{activeDetail?.agent_name || "—"}</div>
             </div>
-          )}
+            <div className="meta-pill">
+              <div className="meta-pill-label">Status</div>
+              <div className="meta-pill-value">{activeDetail?.status || "idle"}</div>
+            </div>
+          </div>
         </div>
-      )}
+
+        {!activeId && (
+          <PlanEmptyState
+            title="No active session"
+            body="Select a session from the sidebar, or create a new one, to start using the planning workflow."
+          />
+        )}
+
+        {activeId && !hasPlan && !isPlanSession && (
+          <PlanEmptyState
+            title="No plan has been generated yet"
+            body="You can trigger a planning pass for this session. Grace Code will analyze the task, propose a structured plan, and pause here for approval."
+            action={
+              <button
+                className="btn-primary"
+                type="button"
+                onClick={async () => {
+                  if (!activeId) return;
+                  clear();
+                  try {
+                    await api.chat(
+                      activeId,
+                      "Analyze the codebase and produce a structured implementation plan.",
+                    );
+                  } catch {
+                    /* ignore */
+                  }
+                }}
+              >
+                Start Plan Analysis
+              </button>
+            }
+          />
+        )}
+
+        {hasPlan && planApproval && (
+          <div className="plan-card plan-card-prominent">
+            <div className="plan-card-header">
+              <div>
+                <div className="summary-label">Plan Ready</div>
+                <h3 className="plan-card-title">Structured execution proposal</h3>
+              </div>
+              <span className="trace-pill">Waiting for approval</span>
+            </div>
+
+            <div className="plan-scroll">
+              <pre className="plan-pre">{planApproval.planText}</pre>
+            </div>
+
+            <div className="plan-card-footer">
+              <div className="summary-subtle">
+                Approve to continue into build execution, or reject to request a revised plan.
+              </div>
+              <div className="plan-actions">
+                <button
+                  className="btn-approve"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => approvePlan()}
+                >
+                  Approve & Build
+                </button>
+                <button
+                  className="btn-reject"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => rejectPlan("Please revise the plan with more detail.")}
+                >
+                  Reject
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeId && isPlanSession && !hasPlan && (
+          <div className="plan-card">
+            <div className="plan-card-header">
+              <div>
+                <div className="summary-label">Plan Session</div>
+                <h3 className="plan-card-title">Current planning state</h3>
+              </div>
+              <span className="trace-pill">{activeDetail?.status || "idle"}</span>
+            </div>
+
+            {activeDetail?.summary ? (
+              <div className="plan-scroll">
+                <pre className="plan-pre">{activeDetail.summary}</pre>
+              </div>
+            ) : (
+              <PlanEmptyState
+                title="This plan session has not produced output yet"
+                body="Once the plan agent generates a structured result, it will appear here for review."
+              />
+            )}
+          </div>
+        )}
+      </div>
     </section>
   );
 }

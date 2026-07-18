@@ -1,0 +1,12 @@
+{
+  "name": "Grace-Code",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Grace-Code — Claude Code aligned autonomous coding agent framework",
+  "scripts": {
+    "build:web": "cd web && npm run build",
+    "dev:web": "cd web && npm run dev",
+    "server": "python -m server.main --repo .",
+    "start": "npm run build:web && npm run server"
+  }
+}

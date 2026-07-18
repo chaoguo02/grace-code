@@ -14,7 +14,7 @@ from typing import Any
 from hitl.permission_rule import PermissionRule, PermissionRuleTier
 
 
-DEFAULT_SETTINGS_FILE = ".grace/settings.json"
+DEFAULT_SETTINGS_FILE = ".forge-agent/settings.json"
 
 
 def load_permission_settings(

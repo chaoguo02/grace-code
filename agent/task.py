@@ -143,6 +143,7 @@ class Event:
     payload: dict[str, Any]
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     event_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    session_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -151,6 +152,7 @@ class Event:
             "task_id": self.task_id,
             "timestamp": self.timestamp,
             "payload": self.payload,
+            "session_id": self.session_id,
         }
 
 

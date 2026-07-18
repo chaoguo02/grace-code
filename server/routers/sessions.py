@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
+from server.routers.approvals import ToolApprovalBody
 from server.schemas.session import (
     CancelRequest,
     CancelResponse,
@@ -25,6 +26,10 @@ from server.schemas.session import (
     SessionDetail,
     SessionSummary,
     MessageResponse,
+    BatchDeleteRequest,
+    BatchDeleteResponse,
+    UpdateSessionRequest,
+    UpdateSessionResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -384,6 +389,127 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             logger.exception("Failed to cancel session %s", session_id)
             return {"cancelled": False}
 
+    # ── PATCH /api/sessions/{session_id} ─────────────────────────────────
+
+    @router.patch("/{session_id}", response_model=UpdateSessionResponse)
+    async def update_session(
+        session_id: str,
+        body: UpdateSessionRequest,
+        service=Depends(get_service),
+    ) -> dict:
+        """
+        Update session attributes (e.g. switch agent mode).
+
+        **Path Parameters:**
+        - ``session_id`` (string): 12-char hex session ID.
+
+        **Request Body:**
+        - ``agent_name`` (string|null): New agent name, e.g. ``"plan"``.
+
+        **Response (200):**
+        - ``updated`` (bool): True if any field was updated.
+        - ``agent_name`` (string|null): The new agent name, if changed.
+
+        **Errors:**
+        - 404: Session not found.
+        """
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        updated = False
+        new_agent_name = None
+        if body.agent_name is not None and body.agent_name != rec.agent_name:
+            ok = service.session_service.update_agent_name(session_id, body.agent_name)
+            if ok:
+                updated = True
+                new_agent_name = body.agent_name
+
+        return {"updated": updated, "agent_name": new_agent_name}
+
+    # ── POST /api/sessions/{session_id}/compact ──────────────────────────
+
+    @router.post("/{session_id}/compact", status_code=202)
+    async def compact_session(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict:
+        """
+        Trigger context compression for a session.
+
+        Runs the compression pipeline (Snip → MicroCompact → AutoCompact)
+        in a background thread. Results are pushed via WebSocket.
+
+        **Path Parameters:**
+        - ``session_id`` (string): 12-char hex session ID.
+
+        **Response (202):**
+        - ``accepted`` (bool): True if compaction was scheduled.
+        """
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        service.compact_session_async(session_id)
+        return {"accepted": True}
+
+    # ── GET /api/sessions/{session_id}/diff ───────────────────────────────
+
+    @router.get("/{session_id}/diff")
+    async def get_session_diff(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict:
+        """
+        Get git diff of files modified during this session.
+
+        Shows the unified diff of all unstaged changes in the repo.
+        For per-file diffs in real time, see the ``diff`` field on
+        ``observation`` WS events for Edit/Write tools.
+
+        **Path Parameters:**
+        - ``session_id`` (string): 12-char hex session ID.
+
+        **Response (200):**
+        - ``diff`` (string): Unified git diff output.
+        - ``has_diff`` (bool): True if there are uncommitted changes.
+        """
+        import subprocess
+        repo = service.repo_path
+        try:
+            result = subprocess.run(
+                ["git", "diff"],
+                capture_output=True, text=True,
+                cwd=repo, timeout=10,
+            )
+            raw = result.stdout.strip()
+            return {"diff": raw, "has_diff": bool(raw)}
+        except Exception as exc:
+            return {"diff": "", "has_diff": False, "error": str(exc)}
+
+    # ── POST /api/sessions/batch-delete ────────────────────────────────────
+    # POST (not DELETE) because some HTTP clients strip DELETE request bodies.
+
+    @router.post("/batch-delete", response_model=BatchDeleteResponse)
+    async def delete_sessions_batch(
+        body: BatchDeleteRequest,
+        service=Depends(get_service),
+    ) -> dict[str, int]:
+        """
+        Permanently delete multiple sessions and all their messages.
+
+        **Request Body:**
+        - ``session_ids`` (list[str]): Session IDs to delete.
+
+        **Response (200):**
+        - ``deleted_count`` (int): Number of sessions actually deleted.
+        - ``total_requested`` (int): Number of IDs sent.
+
+        Non-existent IDs are silently skipped.
+        """
+        deleted = service.session_service.delete_sessions_batch(body.session_ids)
+        return {"deleted_count": deleted, "total_requested": len(body.session_ids)}
+
     # ── DELETE /api/sessions/{session_id} ──────────────────────────────
 
     @router.delete("/{session_id}")
@@ -408,5 +534,38 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
         deleted = service.session_service.delete_session(session_id)
         return {"deleted": deleted}
+
+    # ── POST /api/sessions/{session_id}/tool-approve ────────────────────
+    # CC control_response equivalent.  Moved here (sessions router with
+    # /api/sessions prefix) because approvals router has no prefix and
+    # FastAPI path matching fails for absolute paths on un-prefixed routers.
+
+    @router.post("/{session_id}/tool-approve")
+    async def approve_tool(
+        session_id: str,
+        body: "ToolApprovalBody",
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Resolve a pending tool approval (CC control_response equivalent)."""
+        from hitl.pipeline import PromptAction, PromptDecision
+
+        broker = service._runtime.get_approval_broker(session_id)
+        if broker is None:
+            raise HTTPException(status_code=404, detail=f"No active approval broker for session {session_id}")
+
+        if body.decision == "allow":
+            action = PromptAction.ALWAYS_ALLOW if body.always else PromptAction.ALLOW_ONCE
+        else:
+            action = PromptAction.DENY
+
+        decision = PromptDecision(
+            action=action, note=body.note or "",
+            updated_params=body.updated_input,
+        )
+        ok = broker.resolve(body.request_id, decision)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Approval request {body.request_id} not found (may have timed out)")
+
+        return {"resolved": True}
 
     return router

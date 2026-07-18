@@ -1,4 +1,4 @@
-import { apiGet, apiPost, apiDelete } from "./client";
+import { apiGet, apiPost, apiDelete, apiPatch } from "./client";
 import type {
   SessionSummary,
   SessionDetail,
@@ -42,17 +42,39 @@ export function createSession(
 
 export function chat(
   sessionId: string,
-  prompt: string
+  prompt: string,
+  intent?: string,
+  agentName?: string,
 ): Promise<Record<string, unknown>> {
-  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
-    prompt,
-  });
+  const body: Record<string, unknown> = { prompt };
+  if (intent) body.intent = intent;
+  if (agentName) body.agent_name = agentName;
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, body);
+}
+
+export function updateSession(
+  sessionId: string,
+  data: { agent_name?: string },
+): Promise<{ updated: boolean; agent_name: string | null }> {
+  return apiPatch(`/api/sessions/${encodeURIComponent(sessionId)}`, data);
+}
+
+export function compactSession(
+  sessionId: string,
+): Promise<{ accepted: boolean }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/compact`);
 }
 
 export function deleteSession(
   sessionId: string
 ): Promise<{ deleted: boolean }> {
   return apiDelete(`/api/sessions/${encodeURIComponent(sessionId)}`);
+}
+
+export function deleteSessionsBatch(
+  sessionIds: string[]
+): Promise<{ deleted_count: number; total_requested: number }> {
+  return apiPost("/api/sessions/batch-delete", { session_ids: sessionIds });
 }
 
 export function cancelSession(

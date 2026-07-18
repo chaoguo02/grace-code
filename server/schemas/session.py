@@ -91,6 +91,12 @@ class SessionDetail(BaseModel):
     updated_at: str = Field(description="ISO-8601 last-update timestamp.")
     completed_at: str | None = Field(default=None, description="ISO-8601 completion timestamp.")
     metadata: dict = Field(default_factory=dict, description="Session metadata dict.")
+    message_count: int = Field(
+        default=0, description="Number of messages in the session.",
+    )
+    total_tokens_estimate: int = Field(
+        default=0, description="Rough token estimate from message lengths.",
+    )
 
 
 # ── Messages ────────────────────────────────────────────────────────────────
@@ -223,3 +229,41 @@ class ApprovalResponse(BaseModel):
     approved: bool = Field(description="True if approved, False if rejected.")
     session_id: str = Field(description="The session ID.")
     status: str = Field(description="Updated session status after the action.")
+
+
+# ── Batch delete ──────────────────────────────────────────────────────────────
+
+
+class BatchDeleteRequest(BaseModel):
+    """Request body for ``DELETE /api/sessions/batch``."""
+
+    session_ids: list[str] = Field(
+        description="List of session IDs to delete.",
+    )
+
+
+class BatchDeleteResponse(BaseModel):
+    """Response for ``DELETE /api/sessions/batch``."""
+
+    deleted_count: int = Field(description="Number of sessions actually deleted.")
+    total_requested: int = Field(description="Number of sessions requested for deletion.")
+
+
+# ── PATCH session ────────────────────────────────────────────────────────────
+
+
+class UpdateSessionRequest(BaseModel):
+    """Request body for ``PATCH /api/sessions/{id}``."""
+
+    agent_name: str | None = Field(
+        default=None,
+        description="New agent name (mode) to switch to. "
+        "Must be a primary agent: 'build', 'plan', etc.",
+    )
+
+
+class UpdateSessionResponse(BaseModel):
+    """Response for ``PATCH /api/sessions/{id}``."""
+
+    updated: bool = Field(description="True if session was updated.")
+    agent_name: str | None = Field(description="The new agent name, if changed.")

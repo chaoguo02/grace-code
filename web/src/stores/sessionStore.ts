@@ -13,6 +13,7 @@ interface SessionState {
   openSession: (id: string) => Promise<void>;
   createSession: (agentName?: string, repoPath?: string) => Promise<string | null>;
   deleteSession: (id: string) => Promise<boolean>;
+  deleteSessionsBatch: (ids: string[]) => Promise<number>;
   refreshActive: () => Promise<void>;
 }
 
@@ -72,6 +73,21 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       }
       return false;
     } catch { return false; }
+  },
+
+  deleteSessionsBatch: async (ids: string[]) => {
+    if (!ids.length) return 0;
+    try {
+      const resp = await api.deleteSessionsBatch(ids);
+      if (resp.deleted_count > 0) {
+        const { activeId } = get();
+        if (activeId && ids.includes(activeId)) {
+          set({ activeId: null, activeDetail: null });
+        }
+        await get().loadSessions();
+      }
+      return resp.deleted_count;
+    } catch { return 0; }
   },
 
   refreshActive: async () => {

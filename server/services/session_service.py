@@ -134,6 +134,14 @@ class SessionService:
         """
         return self._storage.delete_session(session_id)
 
+    def delete_sessions_batch(self, session_ids: list[str]) -> int:
+        """Delete multiple sessions in one transaction.
+
+        Returns:
+            int: Number of sessions actually deleted.
+        """
+        return self._storage.delete_sessions_batch(session_ids)
+
     def update_title(self, session_id: str, title: str) -> bool:
         """Update a session's title.
 
@@ -141,6 +149,14 @@ class SessionService:
             bool: True if updated, False if not found.
         """
         return self._storage.update_title(session_id, title)
+
+    def update_agent_name(self, session_id: str, agent_name: str) -> bool:
+        """Update a session's agent_name (mode).
+
+        Returns:
+            bool: True if updated, False if not found.
+        """
+        return self._storage.update_agent_name(session_id, agent_name)
 
     def get_session_detail(self, session_id: str) -> dict | None:
         """Get session detail with computed stats.

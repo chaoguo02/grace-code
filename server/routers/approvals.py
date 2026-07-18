@@ -181,6 +181,27 @@ def create_approvals_router(get_service: Any) -> APIRouter:
     return router
 
 
+# ── ToolApprovalBody schema ──────────────────────────────────────────────────
+
+
+from pydantic import BaseModel, Field
+
+
+class ToolApprovalBody(BaseModel):
+    """Request body for ``POST /api/sessions/{id}/tool-approve``.
+
+    CC control_response equivalent.
+    """
+    request_id: str = Field(description="Approval request ID from the WS event")
+    decision: str = Field(description="'allow' or 'deny'")
+    note: str = Field(default="", description="Optional feedback")
+    always: bool = Field(default=False, description="Persist as 'Always Allow' rule")
+    updated_input: dict[str, Any] | None = Field(
+        default=None,
+        description="Modified tool parameters (CC updatedInput equivalent)",
+    )
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _clear_plan_metadata(service, session_id: str) -> None:
