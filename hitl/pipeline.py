@@ -624,6 +624,14 @@ class PermissionPipeline:
                 # counters below see it (previously return l5 skipped them).
                 result = l5
         if result.decision is PermissionDecision.ALLOW:
+            # CC-aligned: reset consecutive denial counter on success.
+            # A single tool-call success means the agent has adapted —
+            # don't let past rejections count toward the 3-consecutive limit.
+            if tool is not None and hasattr(tool, 'name'):
+                _prev = self._denial_counters.get(tool.name, 0)
+                if _prev > 0:
+                    logger.debug("Reset denial counter for %s (was %d consecutive)", tool.name, _prev)
+                    self._denial_counters[tool.name] = 0
             if getattr(self, '_circuit_breaker', None) is not None:
                 self._circuit_breaker.record_approval()
         else:

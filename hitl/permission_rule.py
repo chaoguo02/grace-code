@@ -114,10 +114,22 @@ def _glob_match(pattern: str, target: str) -> bool:
 def _pattern_to_regex(pattern: str) -> str:
     """Convert a Tool(pattern) glob to a regex.
 
+    **      → recursive: matches zero or more path segments (.*)
+              e.g. ``src/**`` matches ``src/foo.py`` and ``src/sub/bar.py``
     Trailing " *" → prefix match (matches prefix alone or prefix + anything).
     Middle *      → matches one non-space token [^ ]*.
     No *          → exact match.
     """
+    if "**" in pattern:
+        # Recursive glob: ** matches across path separators
+        escaped = re.escape(pattern)
+        # \*\*/ → match any nested path segment
+        escaped = escaped.replace(r"\*\*/", r".*(?:/.*)?")
+        # /\*\* → match any trailing path
+        escaped = escaped.replace(r"/\*\*", r"(?:/.*)?")
+        # standalone ** → match anything
+        escaped = escaped.replace(r"\*\*", ".*")
+        return f"^{escaped}$"
     if pattern.endswith(" *"):
         # Trailing * = prefix match: the prefix itself, or prefix + whitespace + anything
         prefix = pattern[:-2]
