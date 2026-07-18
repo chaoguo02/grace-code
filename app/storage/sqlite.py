@@ -101,10 +101,34 @@ class SqliteStorageBackend(StorageBackend):
         session = self._store.get_session(session_id)
         if session is None:
             return False
-        # SessionStore does not have a delete method yet.
-        # Future: DELETE FROM sessions WHERE id = ?
-        #        DELETE FROM session_messages WHERE session_id = ?
-        raise NotImplementedError("Session deletion is not yet implemented in SessionStore")
+        try:
+            with self._store._connect() as conn:
+                conn.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM agent_notifications WHERE parent_session_id = ?", (session_id,))
+                conn.execute("DELETE FROM agent_notifications WHERE child_session_id = ?", (session_id,))
+                conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            return True
+        except Exception:
+            logger.exception("Failed to delete session %s", session_id)
+            return False
+
+    def update_title(self, session_id: str, title: str) -> bool:
+        """Update a session's title. Returns True if updated."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return False
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            with self._store._connect() as conn:
+                conn.execute(
+                    "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
+                    (title[:200], now, session_id),
+                )
+            return True
+        except Exception:
+            logger.exception("Failed to update title for %s", session_id)
+            return False
 
     # ── Messages ──────────────────────────────────────────────────────────
 

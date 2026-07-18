@@ -489,3 +489,224 @@ html, body {
 }
 .approval-bar .btn-approve { background: var(--success); color: #fff; border: none; }
 .approval-bar .btn-reject { background: var(--error); color: #fff; border: none; }
+
+/* ── ToolCallCard (enhanced) ──────────────────────────────────────────── */
+.tool-call-card {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin: 4px 0;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  transition: border-color 0.15s;
+  user-select: none;
+}
+.tool-call-card:hover { border-color: var(--accent); }
+.tool-call-card.has-observation { border-left: 3px solid var(--success); }
+.tool-call-card.observation-error { border-left: 3px solid var(--error); }
+
+.tc-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.tc-icon { font-size: 14px; flex-shrink: 0; }
+.tc-name { color: var(--accent); font-weight: 600; }
+.tc-id {
+  color: var(--text-muted);
+  font-size: 10px;
+  background: var(--bg-soft);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.tc-step {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-left: auto;
+}
+.tc-expand {
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+  margin-left: 4px;
+}
+.tc-params {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-dim);
+  overflow: hidden;
+  line-height: 1.5;
+  font-size: 11px;
+}
+
+.tc-observation-summary {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  overflow: hidden;
+}
+.tc-observation-summary.success { color: var(--success); }
+.tc-observation-summary.error { color: var(--error); }
+.tc-observation-summary .obs-output-preview {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+/* ── ObservationBlock ─────────────────────────────────────────────────── */
+.observation-block {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin: 4px 0;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  transition: border-color 0.15s;
+  user-select: none;
+}
+.observation-block:hover { border-color: var(--accent); }
+.observation-block.success { border-left: 3px solid var(--success); }
+.observation-block.error { border-left: 3px solid var(--error); }
+
+.obs-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.obs-status-icon { font-size: 12px; flex-shrink: 0; }
+.obs-tool-name {
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 12px;
+}
+.obs-status-tag {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  text-transform: uppercase;
+}
+.observation-block.success .obs-status-tag {
+  background: var(--success);
+  color: #fff;
+}
+.observation-block.error .obs-status-tag {
+  background: var(--error);
+  color: #fff;
+}
+.obs-step { color: var(--text-dim); font-size: 10px; margin-left: auto; }
+.obs-id {
+  color: var(--text-muted);
+  font-size: 10px;
+  background: var(--bg-soft);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.obs-expand {
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+.obs-output {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-dim);
+  overflow: hidden;
+  line-height: 1.5;
+  font-size: 11px;
+}
+
+/* ── Loading dots animation ───────────────────────────────────────────── */
+.loading-dots::after {
+  content: "";
+  animation: dots 1.2s steps(4, end) infinite;
+}
+@keyframes dots {
+  0% { content: ""; }
+  25% { content: "."; }
+  50% { content: ".."; }
+  75% { content: "..."; }
+}
+
+/* ── Plan card ────────────────────────────────────────────────────────── */
+.plan-card {
+  background: var(--bg-elev);
+  border: 2px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  margin: 12px 0;
+}
+.plan-card h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  color: var(--accent);
+}
+.plan-card h3 {
+  margin: 10px 0 4px;
+  font-size: 13px;
+  color: var(--text);
+}
+.plan-card p, .plan-card ul, .plan-card li {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 2px 0;
+}
+.plan-card ul { padding-left: 20px; }
+.plan-card code {
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.plan-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.plan-actions .btn-approve {
+  padding: 8px 16px;
+  background: var(--success);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.plan-actions .btn-reject {
+  padding: 8px 16px;
+  background: var(--error);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.plan-actions .btn-approve:hover { opacity: 0.85; }
+.plan-actions .btn-reject:hover { opacity: 0.85; }
+.plan-actions textarea {
+  flex: 1;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  resize: none;
+  min-height: 32px;
+}

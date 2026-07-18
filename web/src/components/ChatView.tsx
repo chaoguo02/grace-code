@@ -1,15 +1,17 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useMemo } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { useChatStore } from "../stores/chatStore";
 import { MessageBubble } from "./MessageBubble";
 import { WsEventBlock } from "./WsEventBlock";
-import * as api from "../api/sessions";
 import type { TimelineItem } from "../types";
 
 export function ChatView() {
   const { activeId, activeDetail } = useSessionStore();
-  const { timeline, isRunning, error, sendChat, loadMessages, connectWs, disconnectWs, clear } =
-    useChatStore();
+  const {
+    timeline, isRunning, error, planApproval,
+    sendChat, loadMessages, connectWs, disconnectWs,
+    approvePlan, rejectPlan, clearPlanApproval,
+  } = useChatStore();
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -43,6 +45,17 @@ export function ChatView() {
     }
   };
 
+  // Build tool_call_id → result content map for pairing persisted messages
+  const toolResults = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const item of timeline) {
+      if (item.source === "message" && item.msg.role === "tool" && item.msg.tool_call_id) {
+        map.set(item.msg.tool_call_id, item.msg.content);
+      }
+    }
+    return map;
+  }, [timeline]);
+
   return (
     <>
       <section className="chat view active" data-view-name="chat">
@@ -55,7 +68,7 @@ export function ChatView() {
         <div id="messages">
           {timeline.map((item, i) =>
             item.source === "message" ? (
-              <MessageBubble key={`m-${i}`} message={item.msg} />
+              <MessageBubble key={`m-${i}`} message={item.msg} toolResults={toolResults} />
             ) : (
               <WsEventBlock key={`ws-${i}`} event={item.ws} />
             )
@@ -88,25 +101,67 @@ export function ChatView() {
       </section>
 
       <footer className="composer">
-        <div className="composer-inner">
-          <textarea
-            ref={inputRef}
-            id="prompt-input"
-            placeholder="Send a message… (Enter to send, Shift+Enter for newline)"
-            rows={1}
-            autoComplete="off"
-            disabled={isRunning || !activeId}
-            onKeyDown={handleKeyDown}
-          />
-          <button
-            className="btn-send"
-            type="button"
-            disabled={isRunning || !activeId}
-            onClick={handleSend}
-          >
-            {isRunning ? "● Running" : "Send"}
-          </button>
-        </div>
+        {planApproval?.isWaiting ? (
+          <div className="plan-actions">
+            <textarea
+              ref={inputRef}
+              placeholder="Optional feedback before approving…"
+              rows={1}
+              autoComplete="off"
+              disabled={isRunning}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && e.shiftKey) {
+                  e.preventDefault();
+                  rejectPlan(inputRef.current?.value || "Request revision");
+                  if (inputRef.current) inputRef.current.value = "";
+                }
+              }}
+            />
+            <button
+              className="btn-approve"
+              type="button"
+              disabled={isRunning}
+              onClick={() => {
+                approvePlan(inputRef.current?.value?.trim());
+                if (inputRef.current) inputRef.current.value = "";
+              }}
+            >
+              ✓ Approve & Build
+            </button>
+            <button
+              className="btn-reject"
+              type="button"
+              disabled={isRunning}
+              onClick={() => {
+                const reason = inputRef.current?.value?.trim() || "Please revise the plan";
+                rejectPlan(reason);
+                if (inputRef.current) inputRef.current.value = "";
+              }}
+            >
+              ✗ Reject
+            </button>
+          </div>
+        ) : (
+          <div className="composer-inner">
+            <textarea
+              ref={inputRef}
+              id="prompt-input"
+              placeholder="Send a message… (Enter to send, Shift+Enter for newline)"
+              rows={1}
+              autoComplete="off"
+              disabled={isRunning || !activeId}
+              onKeyDown={handleKeyDown}
+            />
+            <button
+              className="btn-send"
+              type="button"
+              disabled={isRunning || !activeId}
+              onClick={handleSend}
+            >
+              {isRunning ? "● Running" : "Send"}
+            </button>
+          </div>
+        )}
         <div className="composer-meta">
           <span>
             {activeDetail

@@ -172,6 +172,7 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
             "status": obs.get("status", ""),
             "output": obs.get("output", ""),
             "error": obs.get("error"),
+            "id": payload.get("tool_call_id"),
             "timestamp": ts,
         }]
 

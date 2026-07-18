@@ -12,6 +12,7 @@ interface SessionState {
   loadSessions: () => Promise<void>;
   openSession: (id: string) => Promise<void>;
   createSession: (agentName?: string, repoPath?: string) => Promise<string | null>;
+  deleteSession: (id: string) => Promise<boolean>;
   refreshActive: () => Promise<void>;
 }
 
@@ -56,6 +57,21 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       set({ error: msg, isLoading: false });
       return null;
     }
+  },
+
+  deleteSession: async (id: string) => {
+    try {
+      const resp = await api.deleteSession(id);
+      if (resp.deleted) {
+        const { activeId } = get();
+        if (activeId === id) {
+          set({ activeId: null, activeDetail: null });
+        }
+        await get().loadSessions();
+        return true;
+      }
+      return false;
+    } catch { return false; }
   },
 
   refreshActive: async () => {

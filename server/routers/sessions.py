@@ -134,7 +134,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
     # ── GET /api/sessions ────────────────────────────────────────────────
 
-    @router.get("", response_model=list[SessionSummary])
+    @router.get("")
     async def list_sessions(
         limit: int = 50,
         offset: int = 0,
@@ -167,8 +167,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         - 500: Internal error querying sessions.
         """
         try:
-            records = service.session_service.list_sessions(limit=limit, offset=offset)
-            return [_summary_from_record(r) for r in records]
+            return service.session_service.list_sessions(limit=limit, offset=offset)
         except Exception as exc:
             logger.exception("Failed to list sessions")
             raise HTTPException(status_code=500, detail=str(exc))
@@ -331,6 +330,15 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         if hasattr(service, "_event_bus") and service._event_bus is not None:
             await service._event_bus.create_session(session_id)
 
+        # Auto-title: if the session has an auto-generated title,
+        # update it to the first 50 chars of the first prompt
+        if rec.title.startswith("Session ") and body.prompt.strip():
+            try:
+                new_title = body.prompt.strip()[:60]
+                service.session_service.update_title(session_id, new_title)
+            except Exception:
+                pass
+
         # Start async execution in background thread
         service.run_chat_async(
             session_id=session_id,
@@ -375,5 +383,30 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         except Exception as exc:
             logger.exception("Failed to cancel session %s", session_id)
             return {"cancelled": False}
+
+    # ── DELETE /api/sessions/{session_id} ──────────────────────────────
+
+    @router.delete("/{session_id}")
+    async def delete_session(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict[str, bool]:
+        """
+        Permanently delete a session and all its messages.
+
+        **Path Parameters:**
+        - ``session_id`` (string): 12-char hex session ID.
+
+        **Response (200):**
+        - ``deleted`` (bool): True if the session was found and deleted.
+
+        **Errors:**
+        - 404: Session not found.
+        """
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        deleted = service.session_service.delete_session(session_id)
+        return {"deleted": deleted}
 
     return router

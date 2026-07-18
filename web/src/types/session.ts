@@ -10,6 +10,8 @@ export interface SessionSummary {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  message_count?: number;
+  total_tokens_estimate?: number;
 }
 
 export interface SessionDetail {
@@ -99,6 +101,10 @@ export interface WsMessage {
   // Observation
   tool_name?: string;
   output?: string;
+
+  // Plan ready
+  plan_text?: string;
+  revision?: number;
 
   // Subagent
   child_session_id?: string;

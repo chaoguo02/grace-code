@@ -2,6 +2,12 @@ import { create } from "zustand";
 import type { Message, WsMessage, TimelineItem } from "../types";
 import * as api from "../api/sessions";
 
+export interface PlanApproval {
+  planText: string;
+  isWaiting: boolean;
+  sessionId: string;
+}
+
 interface ChatState {
   /** Timeline: persisted messages + live WS events */
   timeline: TimelineItem[];
@@ -12,17 +18,27 @@ interface ChatState {
   tokens: number;
   error: string | null;
   ws: WebSocket | null;
+  /** Internal: the session ID the current WS is connected to */
+  _wsSessionId: string;
+  /** Plan approval state (set when plan_ready event arrives) */
+  planApproval: PlanApproval | null;
 
   setMessages: (msgs: Message[]) => void;
   handleWsEvent: (ev: WsMessage) => void;
   clearEvents: () => void;
   clear: () => void;
   /** Submit chat (async — returns immediately, events come via WS) */
-  sendChat: (sessionId: string, prompt: string) => Promise<void>;
+  sendChat: (sessionId: string, prompt: string, intent?: string) => Promise<void>;
   /** Load persisted messages for a past session */
   loadMessages: (sessionId: string) => Promise<void>;
   connectWs: (sessionId: string) => void;
   disconnectWs: () => void;
+  /** Approve the current plan and trigger build */
+  approvePlan: (comment?: string) => Promise<void>;
+  /** Reject the current plan and request revision */
+  rejectPlan: (reason: string) => Promise<void>;
+  /** Clear plan approval state */
+  clearPlanApproval: () => void;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -33,6 +49,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   tokens: 0,
   error: null,
   ws: null,
+  _wsSessionId: "",
+  planApproval: null,
 
   setMessages: (msgs) =>
     set({ timeline: msgs.map((m) => ({ source: "message" as const, msg: m })) }),
@@ -49,22 +67,42 @@ export const useChatStore = create<ChatState>((set, get) => ({
           steps: ev.result?.steps_taken ?? s.steps,
           tokens: ev.result?.total_tokens ?? s.tokens,
         });
-        // Reload persisted messages for the final state
-        return; // don't add to timeline
+        return;
       } else if (ev.status === "failed") {
         set({ isRunning: false, error: ev.error || "Execution failed" });
         return;
       } else if (ev.status === "finish" || ev.status === "gave_up") {
-        // finish/give_up with message — add to timeline
         set({ isRunning: false });
-        // fall through to add to timeline
       }
     }
 
+    if (ev.type === "plan_ready") {
+      set({
+        isRunning: false,
+        steps: ev.result?.steps_taken ?? s.steps,
+        tokens: ev.result?.total_tokens ?? s.tokens,
+        planApproval: {
+          planText: ev.plan_text || ev.result?.summary || "",
+          isWaiting: true,
+          sessionId: s._wsSessionId,
+        },
+      });
+      // Also add to timeline for rendering
+      set((prev) => ({
+        timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
+      }));
+      return;
+    }
+
     // Add to timeline (for thought, tool_call, observation, reflection, etc.)
-    if (ev.type === "thought" || ev.type === "tool_call" ||
-        ev.type === "observation" || ev.type === "reflection" ||
-        ev.type === "subagent_start" || ev.type === "subagent_stop") {
+    if (
+      ev.type === "thought" ||
+      ev.type === "tool_call" ||
+      ev.type === "observation" ||
+      ev.type === "reflection" ||
+      ev.type === "subagent_start" ||
+      ev.type === "subagent_stop"
+    ) {
       set((prev) => ({
         timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
       }));
@@ -79,17 +117,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
   clearEvents: () => set({ events: [] }),
 
   clear: () =>
-    set({ timeline: [], events: [], steps: 0, tokens: 0, error: null, isRunning: false }),
+    set({
+      timeline: [],
+      events: [],
+      steps: 0,
+      tokens: 0,
+      error: null,
+      isRunning: false,
+      _wsSessionId: "",
+      planApproval: null,
+    }),
 
-  sendChat: async (sessionId, prompt) => {
-    set({ isRunning: true, error: null });
+  sendChat: async (sessionId, prompt, intent) => {
+    set({ isRunning: true, error: null, planApproval: null });
     try {
-      // Add user message to timeline immediately
       const userMsg: Message = { role: "user", content: prompt };
       set((prev) => ({
         timeline: [...prev.timeline, { source: "message" as const, msg: userMsg }],
       }));
-      // POST returns 202 immediately
       await api.chat(sessionId, prompt);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Chat failed";
@@ -101,11 +146,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const msgs = await api.getMessages(sessionId);
       set({ timeline: msgs.map((m) => ({ source: "message" as const, msg: m })) });
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   },
 
   connectWs: (sessionId) => {
     get().disconnectWs();
+    // Store sessionId for plan approval context
+    set({ planApproval: null }); // clear stale plan state on session switch
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${window.location.host}/api/ws/sessions/${sessionId}`;
     const ws = new WebSocket(url);
@@ -114,10 +163,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const msg = JSON.parse(ev.data) as WsMessage;
         if (msg.type === "pong") return;
         get().handleWsEvent(msg);
-      } catch { /* skip */ }
+      } catch {
+        /* skip */
+      }
     };
     ws.onclose = () => set({ ws: null });
-    set({ ws });
+    set({ ws, _wsSessionId: sessionId });
   },
 
   disconnectWs: () => {
@@ -127,4 +178,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ ws: null });
     }
   },
+
+  approvePlan: async (comment) => {
+    const { planApproval } = get();
+    if (!planApproval) return;
+    const sid = planApproval.sessionId;
+    try {
+      set({ isRunning: true, planApproval: { ...planApproval, isWaiting: false } });
+      await api.approveSession(sid, comment);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Approval failed";
+      set({ error: msg, isRunning: false });
+    }
+  },
+
+  rejectPlan: async (reason) => {
+    const { planApproval } = get();
+    if (!planApproval) return;
+    const sid = planApproval.sessionId;
+    try {
+      set({ isRunning: true, planApproval: { ...planApproval, isWaiting: false } });
+      await api.rejectSession(sid, reason);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Rejection failed";
+      set({ error: msg, isRunning: false });
+    }
+  },
+
+  clearPlanApproval: () => set({ planApproval: null }),
 }));

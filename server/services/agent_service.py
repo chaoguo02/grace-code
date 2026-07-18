@@ -255,12 +255,20 @@ class AgentService:
         EventBus to WebSocket subscribers.  When execution finishes, a
         ``status: completed`` or ``status: failed`` event is pushed.
 
+        For plan sessions (agent_name="plan" or intent="analysis"), a
+        ``plan_ready`` event is emitted on completion so the frontend can
+        show the approve/reject UI.
+
         The caller should ensure the frontend has subscribed to the WS
         before calling this method.
         """
         resolved_intent: TaskIntent | None = None
         if intent is not None:
             resolved_intent = TaskIntent(intent)
+
+        _is_plan = agent_name == "plan" or (
+            resolved_intent is not None and resolved_intent == TaskIntent.ANALYSIS
+        )
 
         def _run_and_notify():
             try:
@@ -272,15 +280,27 @@ class AgentService:
                 )
                 # Push completion event
                 if self._event_bus is not None:
-                    self._event_bus.publish_raw(session_id, {
-                        "type": "status",
-                        "status": "completed",
-                        "result": {
-                            "summary": result.summary,
-                            "steps_taken": result.steps_taken,
-                            "total_tokens": result.total_tokens,
-                        },
-                    })
+                    if _is_plan:
+                        self._event_bus.publish_raw(session_id, {
+                            "type": "plan_ready",
+                            "status": "plan_ready",
+                            "plan_text": result.summary,
+                            "result": {
+                                "summary": result.summary,
+                                "steps_taken": result.steps_taken,
+                                "total_tokens": result.total_tokens,
+                            },
+                        })
+                    else:
+                        self._event_bus.publish_raw(session_id, {
+                            "type": "status",
+                            "status": "completed",
+                            "result": {
+                                "summary": result.summary,
+                                "steps_taken": result.steps_taken,
+                                "total_tokens": result.total_tokens,
+                            },
+                        })
             except Exception as exc:
                 logger.exception("Async chat failed for session %s", session_id)
                 if self._event_bus is not None:

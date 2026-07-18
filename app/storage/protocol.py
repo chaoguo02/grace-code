@@ -91,6 +91,10 @@ class StorageBackend(Protocol):
         """Permanently delete a session and all its messages. Returns True if deleted."""
         ...
 
+    def update_title(self, session_id: str, title: str) -> bool:
+        """Update a session's title. Returns True if updated, False if not found."""
+        ...
+
     # ── Messages ──────────────────────────────────────────────────────────
 
     def append_message(

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { ChatView } from "./components/ChatView";
+import { PlanView } from "./components/PlanView";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
 
@@ -55,7 +56,8 @@ export default function App() {
         </header>
 
         {activeView === "chat" && <ChatView />}
-        {activeView !== "chat" && <PlaceholderView name={activeView} />}
+        {activeView === "plan" && <PlanView />}
+        {activeView !== "chat" && activeView !== "plan" && <PlaceholderView name={activeView} />}
       </main>
 
       {activeView === "chat" && <EventSidebar />}

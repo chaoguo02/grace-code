@@ -1,4 +1,6 @@
 import type { WsMessage } from "../types";
+import { ToolCallCard } from "./ToolCallCard";
+import { ObservationBlock } from "./ObservationBlock";
 
 function escapeHtml(s: string): string {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -21,29 +23,24 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
 
     case "tool_call":
       return (
-        <div className="message" style={{ marginBottom: 4 }}>
-          <div className="message-row">
-            <div className="message-avatar" style={{ background: "var(--tool-soft)", color: "var(--tool)", fontSize: 10 }}>🔧</div>
-            <div className="tool-call-card" style={{ flex: 1, margin: 0 }}>
-              <div className="name">{escapeHtml(event.name || "")}</div>
-              <div className="params">{escapeHtml(JSON.stringify(event.params || {}, null, 2).slice(0, 300))}</div>
-            </div>
-          </div>
-        </div>
+        <ToolCallCard
+          name={event.name || ""}
+          params={event.params || {}}
+          id={event.id}
+          step={event.step}
+        />
       );
 
     case "observation":
       return (
-        <div className="message" style={{ marginBottom: 4 }}>
-          <div className="message-row">
-            <div className="message-avatar" style={{ background: "var(--success-soft)", color: "var(--success)", fontSize: 10 }}>
-              {event.status === "error" ? "⚠" : "✓"}
-            </div>
-            <div className="message-bubble" style={{ background: "var(--code-bg)", fontSize: 12, fontFamily: "var(--font-mono)", padding: "6px 10px" }}>
-              {escapeHtml((event.output || event.error || "").slice(0, 200))}
-            </div>
-          </div>
-        </div>
+        <ObservationBlock
+          tool_name={event.tool_name || ""}
+          output={event.output || ""}
+          status={event.status}
+          error={event.error}
+          id={event.id}
+          step={event.step}
+        />
       );
 
     case "reflection":
@@ -82,6 +79,30 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
         </div>
       );
 
+    case "plan_ready":
+      return (
+        <div className="plan-card">
+          <h2>📋 Plan Ready for Review</h2>
+          <div
+            style={{
+              maxHeight: 300,
+              overflow: "auto",
+              whiteSpace: "pre-wrap",
+              fontSize: 13,
+              color: "var(--text)",
+              lineHeight: 1.6,
+            }}
+            dangerouslySetInnerHTML={{
+              __html: (event.plan_text || "").replace(/\n/g, "<br>"),
+            }}
+          />
+          <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 8 }}>
+            {event.result?.steps_taken != null && `Steps: ${event.result.steps_taken} · `}
+            {event.result?.total_tokens != null && `Tokens: ${event.result.total_tokens}`}
+          </div>
+        </div>
+      );
+
     case "status":
       if (event.status === "finish" || event.status === "gave_up") {
         return (
@@ -93,7 +114,6 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
           </div>
         );
       }
-      // status running/completed/failed — rendered by ChatView
       return null;
 
     default:

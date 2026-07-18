@@ -1,4 +1,5 @@
 import type { Message, ToolCall } from "../types";
+import { ToolCallCard } from "./ToolCallCard";
 
 function escapeHtml(s: string): string {
   return s
@@ -34,22 +35,49 @@ function renderMarkdown(md: string): string {
   return text;
 }
 
-function ToolCallCard({ tc }: { tc: ToolCall }) {
-  const args =
-    typeof tc.params === "string"
-      ? tc.params
-      : JSON.stringify(tc.params || {}, null, 2);
-  return (
-    <div className="tool-call-card">
-      <div className="name">🔧 {escapeHtml(tc.name || tc.id || "")}</div>
-      <div className="params">{escapeHtml(args.slice(0, 200))}</div>
-    </div>
-  );
+interface Props {
+  message: Message;
+  /** Optional map of tool_call_id → result content for pairing with tool messages */
+  toolResults?: Map<string, string>;
 }
 
-export function MessageBubble({ message }: { message: Message }) {
+export function MessageBubble({ message, toolResults }: Props) {
   const avatar =
     message.role === "user" ? "U" : message.role === "assistant" ? "GC" : "T";
+
+  // Tool result messages: show paired observation
+  if (message.role === "tool") {
+    const tcId = message.tool_call_id || null;
+    const isError = message.content.toLowerCase().includes("error");
+    return (
+      <div className="message tool">
+        <div className="message-row">
+          <div
+            className="message-avatar"
+            style={{
+              background: isError ? "var(--error-soft)" : "var(--success-soft)",
+              color: isError ? "var(--error)" : "var(--success)",
+            }}
+          >
+            {isError ? "⚠" : "✓"}
+          </div>
+          <div
+            className="observation-block"
+            style={{ flex: 1 }}
+          >
+            <div className="obs-header">
+              {tcId && <span className="obs-id" title={tcId}>{tcId.slice(0, 8)}</span>}
+              <span className="obs-status-tag">{isError ? "error" : "success"}</span>
+            </div>
+            <pre className="obs-output" style={{ maxHeight: 200, overflow: "auto" }}>
+              {escapeHtml(message.content.slice(0, 500))}
+            </pre>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`message ${message.role}`}>
       <div className="message-row">
@@ -61,9 +89,29 @@ export function MessageBubble({ message }: { message: Message }) {
           }}
         />
       </div>
-      {message.tool_calls?.map((tc, i) => (
-        <ToolCallCard key={i} tc={tc} />
-      ))}
+      {message.tool_calls?.map((tc, i) => {
+        // Look up paired result by tool_call_id in next messages
+        const obsContent = toolResults?.get(tc.id || "");
+        const obsError = obsContent?.toLowerCase().includes("error");
+        return (
+          <ToolCallCard
+            key={i}
+            name={tc.name}
+            params={tc.params}
+            id={tc.id}
+            observation={
+              obsContent != null
+                ? {
+                    type: "observation",
+                    tool_name: tc.name,
+                    output: obsContent,
+                    status: obsError ? "error" : "success",
+                  }
+                : undefined
+            }
+          />
+        );
+      })}
     </div>
   );
 }

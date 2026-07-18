@@ -1,4 +1,4 @@
-import { apiGet, apiPost } from "./client";
+import { apiGet, apiPost, apiDelete } from "./client";
 import type {
   SessionSummary,
   SessionDetail,
@@ -47,6 +47,12 @@ export function chat(
   return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
     prompt,
   });
+}
+
+export function deleteSession(
+  sessionId: string
+): Promise<{ deleted: boolean }> {
+  return apiDelete(`/api/sessions/${encodeURIComponent(sessionId)}`);
 }
 
 export function cancelSession(

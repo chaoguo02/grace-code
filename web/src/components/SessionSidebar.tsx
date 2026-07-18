@@ -1,13 +1,30 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
+import { useChatStore } from "../stores/chatStore";
 
 export function SessionSidebar() {
-  const { sessions, activeId, isLoading, loadSessions, openSession, createSession } =
+  const { sessions, activeId, isLoading, loadSessions, openSession, createSession, deleteSession } =
     useSessionStore();
+  const { clear } = useChatStore();
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     loadSessions();
   }, [loadSessions]);
+
+  const handleOpen = async (id: string) => {
+    clear(); // reset timeline + events
+    await openSession(id);
+  };
+
+  const handleDelete = async (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    if (!confirm("Delete this session?")) return;
+    setDeletingId(id);
+    if (id === activeId) clear();
+    await deleteSession(id);
+    setDeletingId(null);
+  };
 
   return (
     <aside className="sidebar">
@@ -30,11 +47,11 @@ export function SessionSidebar() {
             <div className="empty-state">No sessions yet.</div>
           )}
           {sessions.map((s) => (
-            <button
+            <div
               key={s.id}
-              type="button"
               className={`session-item ${s.id === activeId ? "active" : ""}`}
-              onClick={() => openSession(s.id)}
+              onClick={() => handleOpen(s.id)}
+              style={{ position: "relative" }}
             >
               <div className="session-preview">
                 {s.summary
@@ -43,8 +60,23 @@ export function SessionSidebar() {
               </div>
               <div className="session-meta">
                 {s.agent_name} · {s.status}
+                {s.message_count != null && ` · ${s.message_count} msgs`}
               </div>
-            </button>
+              <button
+                onClick={(e) => handleDelete(e, s.id)}
+                style={{
+                  position: "absolute", right: 4, top: 4,
+                  background: "none", border: "none",
+                  color: "var(--text-muted)", cursor: "pointer",
+                  fontSize: 14, padding: "2px 6px", borderRadius: 4,
+                  lineHeight: 1, display: activeId === s.id ? "block" : "none",
+                }}
+                title="Delete session"
+                disabled={deletingId === s.id}
+              >
+                ×
+              </button>
+            </div>
           ))}
         </div>
       </div>

@@ -81,17 +81,42 @@ class SessionService:
 
     def list_sessions(
         self, limit: int = 50, offset: int = 0,
-    ) -> list[SessionRecord]:
-        """List all sessions ordered by most recently updated.
-
-        Args:
-            limit: Max sessions to return (default 50).
-            offset: Pagination offset (default 0).
+    ) -> list[dict]:
+        """List sessions with enriched summary data.
 
         Returns:
-            list[SessionRecord]: Sessions ordered by ``updated_at DESC``.
+            list[dict]: Each session with ``id``, ``agent_name``, ``title``,
+            ``status``, ``mode``, ``summary``, ``error``, ``parent_id``,
+            ``created_at``, ``updated_at``, ``completed_at``, ``message_count``,
+            ``total_tokens_estimate``.
         """
-        return self._storage.list_sessions(limit=limit, offset=offset)
+        records = self._storage.list_sessions(limit=limit, offset=offset)
+        results: list[dict] = []
+        for rec in records:
+            msg_count = 0
+            tok_est = 0
+            try:
+                msgs = self._storage.list_messages(rec.id)
+                msg_count = len(msgs)
+                tok_est = sum(len(str(m.content or "")) // 2 for m in msgs)
+            except Exception:
+                pass
+            results.append({
+                "id": rec.id,
+                "agent_name": rec.agent_name,
+                "title": rec.title,
+                "status": rec.status.value if hasattr(rec.status, "value") else rec.status,
+                "mode": rec.mode.value if hasattr(rec.mode, "value") else rec.mode,
+                "summary": rec.summary,
+                "error": rec.error,
+                "parent_id": rec.parent_id,
+                "created_at": rec.created_at,
+                "updated_at": rec.updated_at,
+                "completed_at": rec.completed_at,
+                "message_count": msg_count,
+                "total_tokens_estimate": tok_est,
+            })
+        return results
 
     def get_session(self, session_id: str) -> SessionRecord | None:
         """Get a single session by ID.
@@ -100,6 +125,22 @@ class SessionService:
             SessionRecord or None if not found.
         """
         return self._storage.get_session(session_id)
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session and all its messages.
+
+        Returns:
+            bool: True if deleted, False if not found.
+        """
+        return self._storage.delete_session(session_id)
+
+    def update_title(self, session_id: str, title: str) -> bool:
+        """Update a session's title.
+
+        Returns:
+            bool: True if updated, False if not found.
+        """
+        return self._storage.update_title(session_id, title)
 
     def get_session_detail(self, session_id: str) -> dict | None:
         """Get session detail with computed stats.
