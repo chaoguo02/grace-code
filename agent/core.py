@@ -295,56 +295,7 @@ def _advance_child_turn_phase(
         return _ChildTurnPhase.NONE
     return current
 
-# ---------------------------------------------------------------------------
-# 配置
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AgentConfig:
-    """Agent 运行时配置，从 config/default.yaml 加载后传入。"""
-    max_steps: int = 40
-    budget_tokens: int = 160_000            # task spend 上限（billable tokens）
-    request_budget_tokens: int = 110_000   # 单次 request 输入上下文预算 (85% of 128K)
-    artifact_threshold_tokens: int = 2_000 # 工具输出超过此值时 artifact 化
-    artifact_storage_dir: str = ""  # optional absolute override; default is isolated state root
-    missing_test_target_max_followups: int = 2  # pytest 路径缺失后最多允许的确认性探索步数
-    max_parallel_tool_calls: int = 3  # Runtime cap; model guidance is not enforcement
-    history_max_messages: int = 200        # 历史最大条数
-    llm_max_retries: int = 3               # LLM 调用失败最大重试次数
-    llm_retry_delay: float = 2.0           # 重试间隔（秒，指数退避）
-    stream: bool = False                   # 是否启用流式输出
-    stream_callback: object = None         # StreamCallback，最终回答流式回调
-    thought_callback: object = None        # StreamCallback，推理过程流式回调（推理模型专用）
-    token_callback: Callable[[int], None] | None = None
-    """Receives cumulative billable token usage after each model response."""
-    cancellation_token: "CancellationToken | None" = None
-    """Runtime-owned cooperative cancellation shared with delegated runs."""
-    completion_fact_check: "Callable[[], CompletionCheckResult] | None" = None
-    """Runtime-injected objective completion check; no LLM interpretation."""
-    verify_callback: "Callable[[], CompletionCheckResult] | None" = None
-    """Per-task verify callback. Runs after completion_fact_check. Can return
-    RETRY(feedback) or ABORT(reason) to override a DONE verdict. forge build-mode."""
-    runtime_message_source: Callable[[], list[LLMMessage]] | None = None
-    """Pulls typed Runtime events into history before each model request."""
-    stop_hook_event: HookEvent = HookEvent.STOP
-    """Typed terminal hook for this agent role (Stop or SubagentStop)."""
-    hook_session_id: str = ""
-    hook_agent_id: str = ""
-    hook_agent_type: str = ""
-    hook_dispatcher: object = None
-    """Runtime-owned lifecycle dispatcher; registry remains the fallback."""
-    confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
-    effort: str = ""                       # reasoning effort (low/medium/high/xhigh/max)
-    confirm_callback: object = None        # ConfirmCallback，None=跳过确认
-    compact_history: bool = True           # 是否启用历史压缩
-    is_subagent: bool = False              # True=使用精简 system prompt
-    circuit_breaker: object = None         # CircuitBreaker | None — 代码级熔断器
-    streaming_tool_execution: bool = False
-    """CC-aligned: dispatch tool_use blocks during LLM streaming (Phase 1b)."""
-    token_budget_continuation: bool = False
-    """CC-aligned: nudge model to continue when token budget has room (Phase 2)."""
-    session_notes: bool = False
-    """CC-aligned: enable session memory notes (sessionMemory.ts)."""
+from agent.agent_config import AgentConfig
 
 
 # ---------------------------------------------------------------------------
