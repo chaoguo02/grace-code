@@ -251,6 +251,34 @@ class AgentService:
         logger.info("Loaded %d permission rules for session", len(rules))
         return rules
 
+    def _maybe_reload_rules(self) -> None:
+        """Re-read settings files if any have changed on disk (mtime polling).
+
+        Called before each run — lightweight (just stat() calls), no
+        external dependencies needed.
+        """
+        if not hasattr(self, '_settings_mtimes'):
+            self._settings_mtimes: dict[str, float] = {}
+
+        _paths = [
+            Path.home() / ".forge-agent" / "settings.json",
+            Path(self.repo_path) / ".forge-agent" / "settings.json",
+            Path(self.repo_path) / ".forge-agent" / "settings.local.json",
+        ]
+        _changed = False
+        for p in _paths:
+            try:
+                _mtime = p.stat().st_mtime
+                if self._settings_mtimes.get(str(p)) != _mtime:
+                    self._settings_mtimes[str(p)] = _mtime
+                    _changed = True
+            except OSError:
+                continue
+
+        if _changed:
+            logger.info("Settings file(s) changed — reloading permission rules")
+            self._loaded_rules = self._load_permission_rules()
+
     # ── Web headless approval callback (CC control_request equivalent) ────
 
     def _build_web_confirm_callback(self, session_id: str):
@@ -477,6 +505,9 @@ class AgentService:
             return _AT_RE.sub(_resolve_one, text)
 
         def _run_and_notify():
+            # ── Hot-reload: re-read settings if they changed on disk ──
+            self._maybe_reload_rules()
+
             # ── Resolve @mentions in the prompt ──
             _resolved_prompt = _resolve_mentions(prompt, self.repo_path)
 
