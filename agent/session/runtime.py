@@ -566,6 +566,19 @@ class SessionRuntime:
         execution_error: BaseException | None = None
 
         try:
+            # ── Session memory tracker ──
+            session_memory_tracker = None
+            if self._root_agent_config is not None and self._root_agent_config.session_notes:
+                from memory.session_memory import SessionMemoryTracker
+                _notes_dir = Path(session.repo_path) / ".forge-agent" / "v2" / "sessions" / session_id
+                _notes_dir.mkdir(parents=True, exist_ok=True)
+                _notes_path = _notes_dir / "session_notes.md"
+                session_memory_tracker = SessionMemoryTracker(
+                    backend=self._backend,
+                    notes_path=_notes_path,
+                    session_title=f"Session {session_id[:8]}",
+                )
+
             from agent.session.agent_factory import AgentFactory
             _assembly = AgentFactory.create(
                 agent_name=_effective_agent,
@@ -580,6 +593,7 @@ class SessionRuntime:
                 mcp_tool_names=self._mcp_tool_names_for_spec(
                     self._agent_registry.get(_effective_agent)
                 ),
+                session_memory_tracker=session_memory_tracker,
             )
             spec = _assembly.spec
             effective_intent = TaskIntent(intent) if intent is not None else spec.intent

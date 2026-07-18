@@ -85,6 +85,7 @@ class AgentFactory:
         runtime=None,
         repo_path: str | None = None,
         mcp_tool_names: frozenset[str] = frozenset(),
+        session_memory_tracker=None,
     ) -> AgentAssembly:
         """Create a fully configured agent for the given agent_name.
 
@@ -204,6 +205,7 @@ class AgentFactory:
         agent = ReActAgent(
             backend, registry, agent_cfg,
             memory_context=memory_context if spec.mode == SessionMode.PRIMARY else None,
+            session_memory_tracker=session_memory_tracker,
             controller_factory=RuntimeController,  # DI: swap for custom controllers
             state_machine=_tsm,
         )

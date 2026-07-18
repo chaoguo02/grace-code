@@ -340,6 +340,8 @@ class AgentConfig:
     """CC-aligned: dispatch tool_use blocks during LLM streaming (Phase 1b)."""
     token_budget_continuation: bool = False
     """CC-aligned: nudge model to continue when token budget has room (Phase 2)."""
+    session_notes: bool = False
+    """CC-aligned: enable session memory notes (sessionMemory.ts)."""
 
 
 # ---------------------------------------------------------------------------
