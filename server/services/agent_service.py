@@ -534,6 +534,61 @@ class AgentService:
         thread = threading.Thread(target=_run_and_notify, daemon=True)
         thread.start()
 
+    # ── Compression recovery helper (module-level) ──────────────────────
+
+    @staticmethod
+    def _build_recovery_context(repo_path: str) -> str:
+        """Build recovery context to re-inject after compaction.
+
+        Returns CLAUDE.md content (if present) and a list of recently
+        modified files so the agent can re-orient after compression.
+        CC equivalent: post-AutoCompact context restoration.
+        """
+        import os as _os
+        parts: list[str] = []
+        root = Path(repo_path)
+
+        # 1. CLAUDE.md / AGENTS.md
+        for md_name in ("CLAUDE.md", "AGENTS.md", "AGENT.md"):
+            md_path = root / md_name
+            if md_path.is_file():
+                try:
+                    content = md_path.read_text(encoding="utf-8")[:3000]
+                    parts.append(f"## Project Instructions ({md_name})\n{content}")
+                except Exception:
+                    pass
+                break
+
+        # 2. Recently modified files (last 5, capped at 1K chars each)
+        try:
+            recent: list[tuple[str, float]] = []
+            for dirpath, _dirnames, filenames in _os.walk(str(root)):
+                for fn in filenames:
+                    if fn.startswith(".") or "/." in dirpath:
+                        continue
+                    fp = _os.path.join(dirpath, fn)
+                    try:
+                        mtime = _os.stat(fp).st_mtime
+                        recent.append((fp, mtime))
+                    except OSError:
+                        continue
+            recent.sort(key=lambda x: x[1], reverse=True)
+            shown = 0
+            for fp, _ in recent:
+                if shown >= 5:
+                    break
+                rel = str(Path(fp).relative_to(root))
+                try:
+                    content = Path(fp).read_text(encoding="utf-8")[:1000]
+                    parts.append(f"## Recent file: {rel}\n```\n{content}\n```")
+                except Exception:
+                    parts.append(f"## Recent file: {rel}\n[Binary or unreadable]")
+                shown += 1
+        except Exception:
+            pass
+
+        return "\n\n".join(parts) if parts else ""
+
     def compact_session_async(self, session_id: str) -> None:
         """Trigger context compression in a background thread.
 
@@ -560,6 +615,15 @@ class AgentService:
                     "Compacted session %s: %d → %d messages",
                     session_id, len(msgs), len(compacted),
                 )
+
+                # ── Recovery: re-inject critical context after compaction ──
+                _recovery = AgentService._build_recovery_context(self.repo_path)
+                if _recovery:
+                    from llm.base import LLMMessage as _LLMMsg
+                    self._storage.append_message(session_id, _LLMMsg(
+                        role="user",
+                        content=f"[AUTOCOMPACT RECOVERY]\n{_recovery}",
+                    ))
 
                 if self._event_bus is not None:
                     self._event_bus.publish_raw(session_id, {
