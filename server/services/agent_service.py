@@ -230,14 +230,15 @@ class AgentService:
         Returns:
             list[PermissionRule]: Merged rules from all sources.
         """
-        from hitl.settings_loader import load_permission_settings, _builtin_defaults
+        from hitl.settings_loader import load_permission_settings
         from hitl.permission_rule import PermissionRule
 
         rules: list[PermissionRule] = []
         repo = self.repo_path
 
-        # Start with builtin defaults (lowest priority)
-        rules.extend(_builtin_defaults())
+        # Builtin defaults are already loaded by build_registry() →
+        # load_permission_settings() when the pipeline is constructed.
+        # Only load user/project/local overrides here.
 
         # Load user-level settings
         _load_json_file(Path.home() / ".forge-agent" / "settings.json", rules, "user")
@@ -271,15 +272,6 @@ class AgentService:
         broker = self._runtime._ensure_approval_broker(session_id)
         event_bus = self._event_bus
         from server.services.approval_broker import ApprovalRequest
-
-        def _on_pending(req_id: str) -> None:
-            """Push approval_required WS event (CC control_request equivalent)."""
-            if event_bus is None:
-                return
-            # The ApprovalRequest's fields are available via the closure
-            # but we need to capture the request data.  We pass it through
-            # the _pending_info dict below.
-            pass  # Handled inline
 
         def _confirm(request) -> "PromptDecision":
             from hitl.pipeline import PromptDecision, PromptAction
