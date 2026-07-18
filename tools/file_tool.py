@@ -82,6 +82,10 @@ class FileReadCache:
 
     # ── Public API ──
 
+    def get(self, normalized_path: str) -> str | None:
+        """Alias for check() — returns cached content if mtime matches."""
+        return self.check(normalized_path, offset=None, limit=None)
+
     def check(self, normalized_path: str, offset: int | None, limit: int | None) -> str | None:
         """Return cached content if mtime matches and range is fully covered.
 
@@ -549,10 +553,13 @@ class FileWriteTool(BaseTool):
 
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
 
-        # ── Invalidate read cache for this path ──
+        # ── Store written content in read cache ──
+        # After writing, the agent knows the file contents without needing
+        # a separate Read.  Store the written content so that a subsequent
+        # Edit can pass the Read-before-Edit check.
         if self._read_cache is not None:
             from core.base import sanitize_path
-            self._read_cache.invalidate(str(target_path))
+            self._read_cache.store(str(target_path), offset=None, limit=None, content=content)
 
         return ToolResult(
             success=True,

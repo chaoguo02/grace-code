@@ -165,7 +165,8 @@ class FileEditTool(BaseTool):
                     return ToolResult(success=False, output="", error=str(e))
             line_count = new_str.count("\n") + (1 if new_str and not new_str.endswith("\n") else 0)
             if self._read_cache is not None:
-                self._read_cache.invalidate(str(path.resolve()) if ws is None else str(path))
+                _resolved = str(path.resolve()) if ws is None else str(path)
+                self._read_cache.store(_resolved, offset=None, limit=None, content=new_str)
             return ToolResult(
                 success=True,
                 output=f"Created new file: {path} ({line_count} lines)",
@@ -252,9 +253,12 @@ class FileEditTool(BaseTool):
                 return ToolResult(success=False, output="", error=str(e))
             write_path = str(path.resolve())
 
-        # ── Invalidate read cache for this path ──
+        # ── Store edited content in read cache ──
+        # The agent now knows the file contents — no need for a separate
+        # Read before the next Edit.  This allows chained edits without
+        # triggering the Read-before-Edit guard.
         if self._read_cache is not None:
-            self._read_cache.invalidate(write_path)
+            self._read_cache.store(write_path, offset=None, limit=None, content=new_content)
 
         old_lines = old_str.count("\n") + 1
         new_lines = new_str.count("\n") + 1
