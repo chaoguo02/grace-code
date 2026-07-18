@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Grace Code Web MVP</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --surface2: #0f3460;
+    --primary: #e94560;
+    --text: #e0e0e0;
+    --text-dim: #8892b0;
+    --success: #64ffda;
+    --warning: #ffd700;
+    --border: #233554;
+    --radius: 8px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  .layout {
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+  /* Sidebar */
+  .sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .sidebar-header {
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sidebar-header h1 { font-size: 16px; color: var(--primary); }
+  .sidebar-header p { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+  .btn-new {
+    width: 100%;
+    margin-top: 10px;
+    padding: 8px;
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .btn-new:hover { opacity: 0.9; }
+  .session-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+  }
+  .session-item {
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    margin-bottom: 4px;
+    transition: background 0.15s;
+  }
+  .session-item:hover { background: var(--surface2); }
+  .session-item.active { background: var(--surface2); border-left: 3px solid var(--primary); }
+  .session-item .title { font-size: 13px; font-weight: 500; }
+  .session-item .meta { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+  .session-item .status {
+    display: inline-block;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    margin-top: 4px;
+  }
+  .status-success { background: #1b4332; color: var(--success); }
+  .status-failed { background: #4a1a1a; color: var(--primary); }
+  .status-running { background: #1a3a4a; color: #64b5f6; }
+  .status-queued { background: #2a2a2a; color: var(--text-dim); }
+  /* Main */
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .main-header {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+  }
+  .main-header .agent-badge {
+    background: var(--surface2);
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+  }
+  .main-header .status-badge {
+    margin-left: auto;
+    padding: 2px 10px;
+    border-radius: 10px;
+    font-size: 11px;
+  }
+  .timeline {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+  }
+  .message { margin-bottom: 16px; }
+  .message .role {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+  .message .content {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    font-size: 14px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .message.user .content { border-color: var(--primary); }
+  .message.assistant .content { border-color: var(--surface2); }
+  .message.tool .content {
+    background: #0d1b2a;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+  }
+  .tool-call {
+    background: #0d1b2a;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    font-size: 12px;
+  }
+  .tool-call .name { color: var(--warning); font-weight: 600; }
+  .tool-call .params { color: var(--text-dim); margin-top: 4px; font-family: monospace; }
+  .event-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 12px;
+    margin-bottom: 4px;
+    border-radius: var(--radius);
+    background: var(--surface);
+    font-size: 12px;
+  }
+  .event-item .step { color: var(--text-dim); min-width: 40px; }
+  .event-item .type { color: var(--success); min-width: 80px; }
+  .event-item .text { color: var(--text); flex: 1; }
+  .input-area {
+    padding: 12px 20px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .input-row {
+    display: flex;
+    gap: 8px;
+  }
+  .input-row textarea {
+    flex: 1;
+    padding: 10px 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 14px;
+    resize: none;
+    min-height: 44px;
+    max-height: 120px;
+  }
+  .input-row textarea:focus { outline: none; border-color: var(--primary); }
+  .input-row button {
+    padding: 10px 20px;
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .input-row button:hover { opacity: 0.9; }
+  .input-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* Right panel */
+  .config-panel {
+    width: 240px;
+    min-width: 240px;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    padding: 16px;
+    font-size: 13px;
+    overflow-y: auto;
+  }
+  .config-panel h3 { font-size: 13px; color: var(--text-dim); margin-bottom: 12px; text-transform: uppercase; }
+  .config-field { margin-bottom: 10px; }
+  .config-field label { display: block; font-size: 11px; color: var(--text-dim); margin-bottom: 2px; }
+  .config-field .value { font-size: 13px; }
+  /* Loading */
+  .loading-dots::after {
+    content: '';
+    animation: dots 1.5s steps(4, end) infinite;
+  }
+  @keyframes dots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
+</style>
+</head>
+<body>
+<div class="layout">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h1>Grace Code</h1>
+      <p>Web MVP — ReAct Agent</p>
+      <button class="btn-new" onclick="createSession()">+ New Session</button>
+    </div>
+    <div class="session-list" id="sessionList">
+      <div style="color: var(--text-dim); padding: 12px; font-size: 13px;">Loading sessions...</div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="main-header" id="mainHeader">
+      <span style="color: var(--text-dim);">Session:</span>
+      <span id="sessionTitle">—</span>
+      <span class="agent-badge" id="agentBadge">build</span>
+      <span class="status-badge" id="statusBadge" style="display: none;">Ready</span>
+    </div>
+    <div class="timeline" id="timeline">
+      <div style="color: var(--text-dim); text-align: center; margin-top: 40px;">
+        <p>Select a session or create a new one to get started.</p>
+        <p style="font-size: 12px; margin-top: 8px;">The timeline shows the ReAct agent's execution flow step by step.</p>
+      </div>
+    </div>
+    <div class="input-area">
+      <div class="input-row">
+        <textarea id="promptInput" placeholder="Enter your task for the agent..." rows="1"
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat();}"></textarea>
+        <button id="sendBtn" onclick="sendChat()">Send</button>
+        <button id="cancelBtn" onclick="cancelSession()" style="display:none; background: #555;">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Config Panel -->
+  <div class="config-panel" id="configPanel">
+    <h3>Run Config</h3>
+    <div class="config-field">
+      <label>Agent</label>
+      <div class="value" id="cfgAgent">build</div>
+    </div>
+    <div class="config-field">
+      <label>Status</label>
+      <div class="value" id="cfgStatus">—</div>
+    </div>
+    <div class="config-field">
+      <label>Steps</label>
+      <div class="value" id="cfgSteps">0</div>
+    </div>
+    <div class="config-field">
+      <label>Tokens</label>
+      <div class="value" id="cfgTokens">0</div>
+    </div>
+    <hr style="border-color: var(--border); margin: 16px 0;">
+    <h3>Events</h3>
+    <div id="eventList" style="font-size: 11px; color: var(--text-dim);"></div>
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+const state = {
+  sessions: [],
+  activeSessionId: null,
+  isRunning: false,
+  ws: null,
+};
+
+// ── API Client ─────────────────────────────────────────────────────────────
+const API = {
+  async request(method, path, body) {
+    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch(path, opts);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  },
+  listSessions: (limit=50) => API.request('GET', `/api/sessions?limit=${limit}`),
+  getSession: (id) => API.request('GET', `/api/sessions/${id}`),
+  getMessages: (id) => API.request('GET', `/api/sessions/${id}/messages`),
+  getEvents: (id) => API.request('GET', `/api/sessions/${id}/events?limit=200`),
+  createSession: (body) => API.request('POST', '/api/sessions', body),
+  chat: (id, body) => API.request('POST', `/api/sessions/${id}/chat`, body),
+  cancel: (id) => API.request('POST', `/api/sessions/${id}/cancel`, { detail: 'User cancelled' }),
+};
+
+// ── WebSocket ──────────────────────────────────────────────────────────────
+function connectWS(sessionId) {
+  if (state.ws) { state.ws.close(); state.ws = null; }
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${proto}//${window.location.host}/api/ws/sessions/${sessionId}`;
+  const ws = new WebSocket(wsUrl);
+  ws.onopen = () => { console.log('WS connected', sessionId); };
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      handleWSEvent(msg);
+    } catch(e) { console.warn('WS parse error', e); }
+  };
+  ws.onclose = () => { console.log('WS disconnected'); state.ws = null; };
+  ws.onerror = (e) => { console.warn('WS error', e); };
+  state.ws = ws;
+}
+
+function handleWSEvent(msg) {
+  if (msg.type === 'complete') {
+    state.isRunning = false;
+    updateButtons();
+    updateStatusBadge('completed');
+    // Reload messages after completion
+    if (state.activeSessionId) loadMessages(state.activeSessionId);
+    return;
+  }
+  if (msg.type === 'task_complete' || msg.type === 'task_failed') {
+    addEventItem(msg);
+    // Reload after a brief delay for persistence
+    setTimeout(() => { if (state.activeSessionId) loadSessionDetail(state.activeSessionId); }, 500);
+    return;
+  }
+  if (msg.type === 'action') {
+    addEventItem(msg);
+    updateConfigSteps(msg.payload?.step || 0);
+    return;
+  }
+  if (msg.type === 'observation') {
+    addEventItem(msg);
+    return;
+  }
+  if (msg.type === 'reflection') {
+    addEventItem(msg);
+    return;
+  }
+  addEventItem(msg);
+}
+
+// ── UI Rendering ───────────────────────────────────────────────────────────
+function renderSessionList() {
+  const el = document.getElementById('sessionList');
+  if (!state.sessions.length) {
+    el.innerHTML = '<div style="color: var(--text-dim); padding: 12px; font-size: 13px;">No sessions yet. Create one!</div>';
+    return;
+  }
+  el.innerHTML = state.sessions.map(s => `
+    <div class="session-item ${s.id === state.activeSessionId ? 'active' : ''}"
+         onclick="selectSession('${s.id}')">
+      <div class="title">${escapeHtml(s.title || s.id)}</div>
+      <div class="meta">${s.agent_name} · ${formatTime(s.updated_at)}</div>
+      <span class="status status-${s.status}">${s.status}</span>
+      <span style="font-size: 10px; color: var(--text-dim); margin-left: 6px;">${s.summary ? escapeHtml(s.summary.slice(0, 60)) : ''}</span>
+    </div>
+  `).join('');
+}
+
+function renderTimeline(messages) {
+  const el = document.getElementById('timeline');
+  if (!messages || !messages.length) {
+    el.innerHTML = '<div style="color: var(--text-dim); text-align: center; margin-top: 40px;">No messages yet. Send a task to the agent.</div>';
+    return;
+  }
+  el.innerHTML = messages.map(m => {
+    const cls = m.role === 'user' ? 'user' : m.role === 'assistant' ? 'assistant' : 'tool';
+    let extra = '';
+    if (m.tool_calls && m.tool_calls.length) {
+      extra = m.tool_calls.map(tc => `
+        <div class="tool-call">
+          <div class="name">🔧 ${escapeHtml(tc.name)}</div>
+          <div class="params">${escapeHtml(JSON.stringify(tc.params, null, 2))}</div>
+        </div>
+      `).join('');
+    }
+    return `
+      <div class="message ${cls}">
+        <div class="role">${escapeHtml(m.role)}</div>
+        <div class="content">${escapeHtml(m.content)}</div>
+        ${extra}
+      </div>
+    `;
+  }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+function addEventItem(msg) {
+  const el = document.getElementById('eventList');
+  const step = msg.payload?.step || '';
+  const type = msg.type || '';
+  const text = msg.payload?.action?.thought?.slice(0, 60) || msg.payload?.observation?.output?.slice(0, 60) || '';
+  const item = document.createElement('div');
+  item.className = 'event-item';
+  item.innerHTML = `<span class="step">${step}</span><span class="type">${type}</span><span class="text">${escapeHtml(text)}</span>`;
+  el.prepend(item);
+  // Keep last 20 events
+  while (el.children.length > 20) el.removeChild(el.lastChild);
+}
+
+function updateStatusBadge(status) {
+  const el = document.getElementById('statusBadge');
+  if (status) {
+    el.style.display = 'inline-block';
+    el.textContent = status;
+    el.className = 'status-badge status-' + status;
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+function updateConfigSteps(step) {
+  document.getElementById('cfgSteps').textContent = step || '0';
+}
+
+function updateButtons() {
+  document.getElementById('sendBtn').style.display = state.isRunning ? 'none' : '';
+  document.getElementById('cancelBtn').style.display = state.isRunning ? '' : 'none';
+  document.getElementById('promptInput').disabled = state.isRunning;
+}
+
+// ── Actions ────────────────────────────────────────────────────────────────
+async function loadSessions() {
+  try {
+    state.sessions = await API.listSessions();
+    renderSessionList();
+  } catch(e) { console.warn('loadSessions error', e); }
+}
+
+async function selectSession(id) {
+  state.activeSessionId = id;
+  const detail = await API.getSession(id);
+  document.getElementById('sessionTitle').textContent = detail.title || id;
+  document.getElementById('agentBadge').textContent = detail.agent_name;
+  document.getElementById('cfgAgent').textContent = detail.agent_name;
+  document.getElementById('cfgStatus').textContent = detail.status;
+  updateStatusBadge(detail.status);
+  renderSessionList();
+  await loadMessages(id);
+  await loadEvents(id);
+  connectWS(id);
+}
+
+async function loadMessages(id) {
+  try {
+    const msgs = await API.getMessages(id);
+    renderTimeline(msgs);
+  } catch(e) { console.warn('loadMessages error', e); }
+}
+
+async function loadEvents(id) {
+  try {
+    const data = await API.getEvents(id);
+    document.getElementById('eventList').innerHTML = '';
+    if (data.events) {
+      data.events.slice(-20).forEach(addEventItem);
+    }
+  } catch(e) { /* ignore */ }
+}
+
+async function loadSessionDetail(id) {
+  try {
+    const detail = await API.getSession(id);
+    document.getElementById('cfgStatus').textContent = detail.status;
+    updateStatusBadge(detail.status);
+    document.getElementById('cfgSteps').textContent = detail.generation || '0';
+    // Refresh session list
+    await loadSessions();
+  } catch(e) { /* ignore */ }
+}
+
+async function createSession() {
+  const repoPath = window.location.pathname.replace('/server/static', '') || '.';
+  try {
+    const resp = await API.createSession({
+      agent_name: 'build',
+      repo_path: repoPath,
+      title: 'Session ' + new Date().toLocaleTimeString(),
+    });
+    await loadSessions();
+    await selectSession(resp.session_id);
+  } catch(e) {
+    alert('Failed to create session: ' + e.message);
+  }
+}
+
+async function sendChat() {
+  const input = document.getElementById('promptInput');
+  const prompt = input.value.trim();
+  if (!prompt || !state.activeSessionId) return;
+  input.value = '';
+  state.isRunning = true;
+  updateButtons();
+  updateStatusBadge('running');
+
+  // Add user message to timeline immediately
+  const placeholder = document.getElementById('timeline');
+  const userMsg = document.createElement('div');
+  userMsg.className = 'message user';
+  userMsg.innerHTML = `<div class="role">user</div><div class="content">${escapeHtml(prompt)}</div>`;
+  placeholder.insertBefore(userMsg, placeholder.firstChild);
+
+  // Also add to events panel
+  document.getElementById('eventList').innerHTML =
+    '<div style="color: var(--success); font-size: 11px;">Running...</div>';
+
+  try {
+    const result = await API.chat(state.activeSessionId, { prompt });
+    state.isRunning = false;
+    updateButtons();
+    updateStatusBadge(result.status);
+    document.getElementById('cfgSteps').textContent = result.steps_taken || '0';
+    document.getElementById('cfgTokens').textContent = result.total_tokens || '0';
+    // Reload messages
+    await loadMessages(state.activeSessionId);
+    await loadSessions();
+  } catch(e) {
+    state.isRunning = false;
+    updateButtons();
+    updateStatusBadge('failed');
+    const errEl = document.getElementById('eventList');
+    errEl.innerHTML = `<div style="color: var(--primary); font-size: 11px;">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function cancelSession() {
+  if (!state.activeSessionId) return;
+  try {
+    await API.cancel(state.activeSessionId);
+    state.isRunning = false;
+    updateButtons();
+    updateStatusBadge('cancelled');
+  } catch(e) {
+    console.warn('cancel error', e);
+  }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function formatTime(iso) {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleTimeString();
+  } catch(e) { return iso; }
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', async () => {
+  await loadSessions();
+  // Auto-select first session if exists
+  if (state.sessions.length > 0) {
+    await selectSession(state.sessions[0].id);
+  }
+});
+</script>
+</body>
+</html>

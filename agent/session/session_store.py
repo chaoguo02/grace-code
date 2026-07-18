@@ -358,6 +358,25 @@ class SessionStore:
             )
         ]
 
+    def list_sessions(
+        self, limit: int = 50, offset: int = 0,
+    ) -> list[SessionRecord]:
+        """List all sessions ordered by most recently updated, with pagination.
+
+        Args:
+            limit: Maximum number of sessions to return (default 50).
+            offset: Number of sessions to skip (default 0).
+
+        Returns:
+            list[SessionRecord]: Ordered by ``updated_at`` descending.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [self._row_to_session(row) for row in rows]
+
     def append_message(self, session_id: str, message: LLMMessage) -> None:
         if self.get_session(session_id) is None:
             raise ValueError(f"Unknown v2 session: {session_id}")
