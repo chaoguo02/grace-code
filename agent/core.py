@@ -343,24 +343,34 @@ def _capture_git_state(repo_path: str) -> _GitState:
     return state
 
 
-def _refresh_git_state(state: _GitState) -> None:
+def _refresh_git_state(state: _GitState, repo_path: str) -> None:
     """Refresh git state against the captured baseline.
 
     Must be called after any tool execution that may have modified files.
-    Computes the diff only when the revision has changed.
+    Uses ``repo_path`` to open the git repository and diffs against the
+    baseline revision captured at run start — so prior worktree dirt is
+    never attributed to this run.
+
+    When the working tree was already dirty at baseline (e.g. uncommitted
+    changes from a previous run), the diff still picks up new edits because
+    it compares the current working tree against the baseline commit, not
+    against the last-refreshed state.
     """
     if not state.is_git_repo:
         return
     try:
         import git
-        repo = git.Repo(state._baseline_revision)
-        new_revision = repo.head.commit.hexsha
-        if new_revision != state._baseline_revision:
-            diff = repo.git.diff(state._baseline_revision, stat=True, name_only=True)
-            files = {line.strip() for line in diff.split("\n") if line.strip()}
-            state.files_changed = files
-            state.current_diff = repo.git.diff(state._baseline_revision) or ""
-            state.has_changes = bool(files) or bool(state.current_diff)
+        repo = git.Repo(repo_path)
+        # Diff working tree against the baseline commit (not HEAD).
+        # This catches ALL uncommitted changes including files that were
+        # already dirty when the run started — the completion guard's
+        # ctx.had_any_write filter ensures we only care about files the
+        # agent actually touched.
+        diff = repo.git.diff(state._baseline_revision, name_only=True) or ""
+        files = {line.strip() for line in diff.split("\n") if line.strip()}
+        state.files_changed = files
+        state.current_diff = repo.git.diff(state._baseline_revision) or ""
+        state.has_changes = bool(files) or bool(state.current_diff)
     except Exception:
         pass
 
@@ -657,7 +667,7 @@ class ReActAgent:
             nonlocal task_obs_closed
 
             # ── Refresh objective workspace facts for the completion record ──
-            _refresh_git_state(_git_state)
+            _refresh_git_state(_git_state, task.repo_path)
             if _git_state.has_changes:
                 _patch_text = (
                     f"\n{_git_state.current_diff[:3000]}"
@@ -1319,7 +1329,7 @@ class ReActAgent:
                 # The model cannot unilaterally declare "done" — the Runtime must
                 # verify all completion conditions.
                 # Git diff is the only fact that matters for completion
-                _refresh_git_state(_git_state)
+                _refresh_git_state(_git_state, task.repo_path)
                 guard_result = completion_guard.check(
                     ctx=completion_ctx,
                     task_intent=task.intent,
@@ -1329,6 +1339,24 @@ class ReActAgent:
                     logger.warning(
                         "Completion blocked: %s", guard_result.blocked_reason
                     )
+                    # Track consecutive blocks with the same reason.
+                    # After 3 blocks the agent is likely stuck in a loop;
+                    # force give_up instead of burning tokens.
+                    _prev_reason = getattr(_git_state, '_last_block_reason', '')
+                    _block_count = getattr(_git_state, '_block_count', 0)
+                    if guard_result.blocked_reason == _prev_reason:
+                        _block_count += 1
+                    else:
+                        _block_count = 1
+                    _git_state._last_block_reason = guard_result.blocked_reason
+                    _git_state._block_count = _block_count
+                    if _block_count >= 3:
+                        logger.warning(
+                            "Completion blocked %d times with same reason — forcing give_up",
+                            _block_count,
+                        )
+                        action.action_type = ActionType.GIVE_UP
+                        break
                     _state = _state.with_updates(transition=Transition.completion_blocked())
                     _tsm.transition(TSMState.RUNNING, f"completion blocked: {guard_result.blocked_reason}")
                     history.add(LLMMessage(
@@ -1635,7 +1663,7 @@ class ReActAgent:
                             if self._is_missing_test_target_observation(observation):
                                 missing_test_target_observation = observation
 
-                    log.log_observation(step=step, observation=observation)
+                    log.log_observation(step=step, observation=observation, tool_call_id=getattr(tc, 'id', None))
 
                     if missing_test_target_observation is not None:
                         missing_test_target_message = self._format_missing_test_target_summary(
