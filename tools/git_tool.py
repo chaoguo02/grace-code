@@ -31,11 +31,22 @@ def _run_git(
     cwd: str | None = None,
     runtime: "Runtime | None" = None,
 ) -> tuple[bool, str, Any | None]:
-    """运行 git 命令，返回 (success, output, tool_error)。"""
+    """运行 git 命令，返回 (success, output, tool_error)。
+
+    CC-aligned: worktree subagents pin cwd to workspace_root.
+    If the caller provides a cwd outside the runtime's workspace,
+    fall back to workspace root to prevent cross-repo contamination.
+    """
     from executor.process import LocalRuntime
     rt = runtime or LocalRuntime()
-    # Use parameterized execute() — shell=False, no string concatenation
-    result = rt.execute("git", args=args, cwd=cwd, timeout=30)
+    # Validate cwd against workspace root; fall back to workspace root if invalid.
+    _final_cwd = cwd
+    if cwd is not None and hasattr(rt, '_resolve_cwd'):
+        try:
+            rt._resolve_cwd(cwd)
+        except ValueError:
+            _final_cwd = None  # use workspace root
+    result = rt.execute("git", args=args, cwd=_final_cwd, timeout=30)
     output = result.output.strip()
     if not result.success:
         from core.base import classify_runtime_error

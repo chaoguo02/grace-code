@@ -795,11 +795,11 @@ class SessionRuntime:
             definition = request.definition
             if definition is None:
                 raise ValueError("Named spawn requires a definition")
-            allowed = {
-                child.name: child
+            allowed_names = {
+                child.name
                 for child in self._agent_registry.delegatable_by(parent_definition)
             }
-            if allowed.get(definition.name) != definition:
+            if definition.name not in allowed_names:
                 raise ValueError(
                     f"Agent {definition.name!r} is not delegatable by "
                     f"{parent.agent_name!r}"
