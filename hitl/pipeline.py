@@ -85,6 +85,8 @@ class PermissionRequest:
     params: dict[str, Any]
     thought: str = ""
     agent_name: str = ""
+    decision_reason: str = ""   # why approval is needed (CC control_request)
+    tool_use_id: str = ""       # LLM tool_use block id (CC dedup)
 
 
 @dataclass
@@ -414,8 +416,14 @@ class PermissionPipeline:
         if tier is PermissionRuleTier.ASK:
             # ASK rules always require interactive confirmation —
             # approval_mode AUTO is ignored for these tools.
+            _ask_reason = ""
+            for rule in self._ask_rules:
+                if rule.matches(tool_name, params):
+                    _ask_reason = f"Matched ask rule: {rule.raw}"
+                    break
             result = self._layer6_callback(
                 tool_name, params, thought, force_interactive=True,
+                decision_reason=_ask_reason or "Matched ask rule",
             )
             self._stats.record(result)
             return self._apply_tool_check(result, tool, params)
@@ -458,7 +466,10 @@ class PermissionPipeline:
                 return self._apply_tool_check(result, tool, params)
 
         # Step 6: canUseTool Callback
-        result = self._layer6_callback(tool_name, params, thought)
+        result = self._layer6_callback(
+            tool_name, params, thought,
+            decision_reason="No allow rule matched — requires interactive approval",
+        )
         self._stats.record(result)
         # Apply stashed hook updates to the final allow result
         if (result.decision is PermissionDecision.ALLOW
@@ -792,6 +803,7 @@ class PermissionPipeline:
     def _layer6_callback(
         self, tool_name: str, params: dict[str, Any], thought: str,
         force_interactive: bool = False,
+        decision_reason: str = "",
     ) -> PermissionResult:
         """CC-aligned interactive approval.
 
@@ -819,6 +831,7 @@ class PermissionPipeline:
             params=params,
             thought=thought,
             agent_name=self._requesting_agent,
+            decision_reason=decision_reason,
         )
 
         # Path 2: Web headless callback (blocks on threading.Event internally)

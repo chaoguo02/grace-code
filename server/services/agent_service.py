@@ -284,6 +284,8 @@ class AgentService:
                 "tool_name": request.tool_name,
                 "params": dict(request.params),
                 "thought": request.thought or "",
+                "decision_reason": getattr(request, 'decision_reason', ""),
+                "tool_use_id": getattr(request, 'tool_use_id', ""),
             }
 
             def push_event(req_id: str) -> None:
@@ -295,6 +297,8 @@ class AgentService:
                         "tool_name": _req_info["tool_name"],
                         "params": _req_info["params"],
                         "thought": _req_info["thought"],
+                        "decision_reason": _req_info.get("decision_reason", ""),
+                        "tool_use_id": _req_info.get("tool_use_id", ""),
                     })
 
             # Block until decision or timeout
