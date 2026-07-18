@@ -34,6 +34,44 @@ from server.services.session_service import SessionService
 logger = logging.getLogger(__name__)
 
 
+def _load_json_file(path: Path, rules: list, label: str) -> None:
+    """Load permission rules from a settings.json file.
+
+    Appends parsed rules from *path* to *rules* in-place.
+    Silently skips if the file doesn't exist or is malformed.
+    """
+    if not path.is_file():
+        return
+    try:
+        import json
+        from hitl.permission_rule import PermissionRule, PermissionRuleTier
+        data = json.loads(path.read_text(encoding="utf-8"))
+        perms = data.get("permissions", {})
+        count = 0
+        for raw in perms.get("deny", []):
+            try:
+                rules.append(PermissionRule.parse(str(raw), tier=PermissionRuleTier.DENY, source=label))
+                count += 1
+            except ValueError:
+                continue
+        for raw in perms.get("ask", []):
+            try:
+                rules.append(PermissionRule.parse(str(raw), tier=PermissionRuleTier.ASK, source=label))
+                count += 1
+            except ValueError:
+                continue
+        for raw in perms.get("allow", []):
+            try:
+                rules.append(PermissionRule.parse(str(raw), tier=PermissionRuleTier.ALLOW, source=label))
+                count += 1
+            except ValueError:
+                continue
+        if count:
+            logger.info("Loaded %d rules from %s", count, path)
+    except Exception:
+        logger.debug("Failed to load rules from %s", path, exc_info=True)
+
+
 class AgentService:
     """Web-facing SessionRuntime wrapper.
 
@@ -79,12 +117,20 @@ class AgentService:
         # ── 3. Build ToolRegistry ──
         from entry.bootstrap.registry_factory import build_registry
 
-        # For web MVP we use PROMPT approval mode (user sees tool calls in UI)
+        # CC-aligned: use PROMPT mode with a web_confirm_callback.
+        # The callback blocks the agent thread on threading.Event while
+        # waiting for a frontend decision — the exact equivalent of CC's
+        # stdin-blocking control_request / control_response protocol.
+        # When no callback is injected (CLI mode), the pipeline falls
+        # back to TTY terminal_confirm.
         self._registry = build_registry(
             self._config,
             repo_path=self.repo_path,
             approval_mode="prompt",
         )
+
+        # ── Load permission rules from settings.json ──
+        self._loaded_rules = self._load_permission_rules()
 
         # ── 4. Agent registry ──
         from agent.session.agent_registry import AgentRegistryV2
@@ -166,27 +212,152 @@ class AgentService:
             history_max_messages=self._config.context.history_window * 2,
             llm_max_retries=3,
             llm_retry_delay=1.0,
-            stream=False,  # Web MVP: non-streaming for simplicity
+            stream=True,  # Web MVP: streaming for real-time step-by-step display
             confirm_dangerous=False,
         )
+
+    # ── Permission rule loading ────────────────────────────────────────────
+
+    def _load_permission_rules(self) -> list:
+        """Load deny/ask/allow permission rules from settings files.
+
+        CC-aligned configuration hierarchy (latter overrides former):
+        1. Builtin defaults (read-only tools allowed, destructive blocked)
+        2. ~/.forge-agent/settings.json (user-level)
+        3. .forge-agent/settings.json (project-level, version-controlled)
+        4. .forge-agent/settings.local.json (local, git-ignored)
+
+        Returns:
+            list[PermissionRule]: Merged rules from all sources.
+        """
+        from hitl.settings_loader import load_permission_settings, _builtin_defaults
+        from hitl.permission_rule import PermissionRule
+
+        rules: list[PermissionRule] = []
+        repo = self.repo_path
+
+        # Start with builtin defaults (lowest priority)
+        rules.extend(_builtin_defaults())
+
+        # Load user-level settings
+        _load_json_file(Path.home() / ".forge-agent" / "settings.json", rules, "user")
+
+        # Load project-level settings
+        _load_json_file(Path(repo) / ".forge-agent" / "settings.json", rules, "project")
+
+        # Load local settings (highest priority)
+        _load_json_file(Path(repo) / ".forge-agent" / "settings.local.json", rules, "local")
+
+        logger.info("Loaded %d permission rules for session", len(rules))
+        return rules
+
+    # ── Web headless approval callback (CC control_request equivalent) ────
+
+    def _build_web_confirm_callback(self, session_id: str):
+        """Build a synchronous blocking callback for Web headless approval.
+
+        CC equivalent::
+
+            stdout → {"type":"control_request","request_id":"...","tool":"..."}
+            stdin  ← {"type":"control_response","request_id":"...","decision":"allow"}
+
+        Forge equivalent::
+
+            WS push → {"type":"approval_required","request_id":"...","tool_name":"..."}
+            Agent thread blocks on threading.Event
+            HTTP POST → broker.resolve(request_id, decision)
+            Event.set() → Agent thread continues
+        """
+        broker = self._runtime._ensure_approval_broker(session_id)
+        event_bus = self._event_bus
+        from server.services.approval_broker import ApprovalRequest
+
+        def _on_pending(req_id: str) -> None:
+            """Push approval_required WS event (CC control_request equivalent)."""
+            if event_bus is None:
+                return
+            # The ApprovalRequest's fields are available via the closure
+            # but we need to capture the request data.  We pass it through
+            # the _pending_info dict below.
+            pass  # Handled inline
+
+        def _confirm(request) -> "PromptDecision":
+            from hitl.pipeline import PromptDecision, PromptAction
+            ar = ApprovalRequest(
+                tool_name=request.tool_name,
+                params=dict(request.params),
+                thought=request.thought or "",
+            )
+
+            _req_info = {
+                "tool_name": request.tool_name,
+                "params": dict(request.params),
+                "thought": request.thought or "",
+            }
+
+            def push_event(req_id: str) -> None:
+                """Push approval_required WS event (CC control_request equivalent)."""
+                if event_bus is not None:
+                    event_bus.publish_raw(session_id, {
+                        "type": "approval_required",
+                        "request_id": req_id,
+                        "tool_name": _req_info["tool_name"],
+                        "params": _req_info["params"],
+                        "thought": _req_info["thought"],
+                    })
+
+            # Block until decision or timeout
+            decision = broker.wait_for_decision(ar, on_pending=push_event)
+
+            # If timed out, push a cleanup event so the frontend removes the card
+            if decision.action is PromptAction.DENY and "timed out" in (decision.note or ""):
+                if event_bus is not None:
+                    event_bus.publish_raw(session_id, {
+                        "type": "approval_timeout",
+                        "request_id": ar.request_id or "",
+                    })
+
+            return decision
+
+        return _confirm
 
     # ── Session management ────────────────────────────────────────────────
 
     def ensure_root_session(self) -> str:
-        """Lazily create a root session if one doesn't exist.
+        """Reuse or create a root session.
+
+        On first start, creates a new root session in the DB.
+        On subsequent restarts, reuses the most recent session to avoid
+        inflating the session count with dead root sessions.
 
         Returns:
             str: The root session ID.
         """
-        if self._root_session_id is None:
-            self._root_session = self._runtime.create_root_session(
-                agent_name="build",
-                repo_path=self.repo_path,
-                title="Web MVP Root Session",
-                metadata={"entrypoint": "web", "source": "server"},
-            )
-            self._root_session_id = self._root_session.id
-            logger.info("Created root session: %s", self._root_session_id)
+        if self._root_session_id is not None:
+            existing = self._session_service.get_session(self._root_session_id)
+            if existing is not None:
+                return self._root_session_id
+
+        # Reuse the most recent non-child session in the DB
+        try:
+            sessions = self._session_service.list_sessions(limit=1)
+            if sessions:
+                sid = sessions[0]["id"]
+                self._root_session_id = sid
+                logger.info("Reusing existing session as root: %s", sid)
+                return sid
+        except Exception:
+            pass
+
+        # No existing sessions — create a fresh root
+        self._root_session = self._runtime.create_root_session(
+            agent_name="build",
+            repo_path=self.repo_path,
+            title="Web MVP Root Session",
+            metadata={"entrypoint": "web", "source": "server"},
+        )
+        self._root_session_id = self._root_session.id
+        logger.info("Created root session: %s", self._root_session_id)
         return self._root_session_id
 
     def create_session(
@@ -271,6 +442,19 @@ class AgentService:
         )
 
         def _run_and_notify():
+            # ── Inject web_confirm_callback + rules for this session ──
+            # CC-aligned: in headless Web mode, the pipeline's Layer 6
+            # blocks on threading.Event instead of stdin.
+            _web_cb = self._build_web_confirm_callback(session_id)
+            self._runtime.set_web_confirm_callback(session_id, _web_cb)
+            # Push loaded permission rules so the pipeline picks them up
+            self._runtime._pending_rules = list(self._loaded_rules)
+            # Default to "default" mode: Layer 4 returns None (no decision),
+            # allowing the flow to continue to Layer 6 callback for
+            # interactive Web approval.  "dontAsk" would deny non-approved
+            # tools at Layer 4 without showing an approval card.
+            self._runtime._pending_permission_mode = "default"
+
             try:
                 result = self._runtime.run_session(
                     session_id=session_id,
@@ -312,6 +496,52 @@ class AgentService:
 
         import threading
         thread = threading.Thread(target=_run_and_notify, daemon=True)
+        thread.start()
+
+    def compact_session_async(self, session_id: str) -> None:
+        """Trigger context compression in a background thread.
+
+        Runs the Snip → MicroCompact → AutoCompact pipeline.
+        Pushes a ``compacted`` status event via EventBus when done.
+        """
+        def _compact():
+            try:
+                # Get session messages
+                msgs = self._session_service.get_messages(session_id)
+                if not msgs:
+                    if self._event_bus is not None:
+                        self._event_bus.publish_raw(session_id, {
+                            "type": "status", "status": "compacted",
+                            "message": "No messages to compact",
+                        })
+                    return
+
+                # Run compaction via runtime
+                from context.compaction import ConversationCompactor
+                compactor = ConversationCompactor(backend=self._backend)
+                compacted = compactor.compact_history(msgs)
+                logger.info(
+                    "Compacted session %s: %d → %d messages",
+                    session_id, len(msgs), len(compacted),
+                )
+
+                if self._event_bus is not None:
+                    self._event_bus.publish_raw(session_id, {
+                        "type": "status",
+                        "status": "compacted",
+                        "message": f"Compressed {len(msgs)} → {len(compacted)} messages",
+                    })
+            except Exception as exc:
+                logger.exception("Compact failed for session %s", session_id)
+                if self._event_bus is not None:
+                    self._event_bus.publish_raw(session_id, {
+                        "type": "status",
+                        "status": "failed",
+                        "error": str(exc),
+                    })
+
+        import threading
+        thread = threading.Thread(target=_compact, daemon=True)
         thread.start()
 
     # ── Cancel ────────────────────────────────────────────────────────────
