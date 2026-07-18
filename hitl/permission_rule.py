@@ -28,6 +28,13 @@ from typing import Any
 
 _RULE_RE = re.compile(r"^(\w+)(?:\((.+)\))?$")
 
+# Map from actual tool name (lowercase) → rule DSL tool name.
+# When a rule is written as "shell(ls *)" but the tool's canonical name
+# is "Bash", this map lets matches() route the alias correctly.
+_TOOL_ALIAS_MAP: dict[str, str] = {
+    "bash": "shell",
+}
+
 
 class PermissionRuleTier(str, Enum):
     DENY = "deny"
@@ -69,18 +76,25 @@ class PermissionRule:
         )
 
     def matches(self, tool_name: str, params: dict[str, Any]) -> bool:
-        if self.tool_name != tool_name.lower() and self.tool_name != "*":
+        name = tool_name.lower()
+        # Direct match: rule tool_name == actual tool name, or wildcard
+        if self.tool_name == name or self.tool_name == "*":
+            pass
+        # Alias match: e.g. rule "shell(...)" matches tool "Bash"
+        elif _TOOL_ALIAS_MAP.get(name) == self.tool_name:
+            pass
+        else:
             return False
         if self.pattern is None:
             return True
-        target = _extract_match_target(tool_name, params)
+        target = _extract_match_target(name, params)
         return _glob_match(self.pattern, target)
 
 
 def _extract_match_target(tool_name: str, params: dict[str, Any]) -> str:
     name = tool_name.lower()
-    if name == "shell":
-        return params.get("cmd", "")
+    if name in ("shell", "bash"):
+        return params.get("command", "") or params.get("cmd", "")
     if name in ("file_write", "file_edit", "file_read", "file_view", "read", "write", "edit"):
         return params.get("path", "") or params.get("file_path", "")
     if name in ("git_add", "git_commit"):
