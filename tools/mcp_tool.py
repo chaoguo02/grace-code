@@ -92,18 +92,24 @@ class McpToolWrapper(BaseTool):
         )
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        """Delegate to the MCP server via tools/call."""
+        """Delegate to the MCP server via tools/call.
+
+        CC pattern: MCP tool execution is always async (server round-trip).
+        We detect the calling context and use the appropriate sync bridge.
+        """
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Running in async context — use run_coroutine_threadsafe
+            try:
+                loop = asyncio.get_running_loop()
+                # Async context (e.g. inside an async HTTP handler) —
+                # use run_coroutine_threadsafe to avoid deadlock
                 future = asyncio.run_coroutine_threadsafe(
                     self._client.call_tool(self._tool_def["name"], params),
                     loop,
                 )
                 result = future.result(timeout=60)
-            else:
-                # No running loop — create one
+            except RuntimeError:
+                # No running loop (synchronous context, e.g. agent thread) —
+                # create a new loop for this call
                 result = asyncio.run(
                     self._client.call_tool(self._tool_def["name"], params)
                 )

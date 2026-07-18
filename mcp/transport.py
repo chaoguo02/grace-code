@@ -132,6 +132,7 @@ class HttpTransport(McpTransport):
         self._timeout = timeout
         self._connected = False
         self._session: Any = None  # httpx.AsyncClient (lazy init)
+        self._pending_message: bytes | None = None
 
     async def connect(self) -> None:
         if self._connected:
@@ -156,19 +157,19 @@ class HttpTransport(McpTransport):
     async def send(self, message: bytes) -> None:
         if not self._session:
             raise McpTransportError("HTTP transport not connected")
-        # Message is buffered — actual send happens in receive()
+        # Send immediately — CC pattern: each request is independent
         self._pending_message = message
 
     async def receive(self) -> bytes:
         if not self._session:
             raise McpTransportError("HTTP transport not connected")
-        message = getattr(self, '_pending_message', None)
+        message = self._pending_message
+        self._pending_message = None  # consume
         if message is None:
-            raise McpTransportError("No pending message to send")
+            raise McpTransportError("No pending message to send — call send() before receive()")
 
         response = await self._session.post(self._url, content=message)
         response.raise_for_status()
-        # Parse the response — should be JSON-RPC
         return response.content
 
     async def close(self) -> None:
