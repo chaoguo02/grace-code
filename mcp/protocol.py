@@ -8,6 +8,7 @@ CC-aligned: implements the core MCP lifecycle:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -138,8 +139,12 @@ class McpClient:
 
     # ── JSON-RPC core ────────────────────────────────────────────────
 
-    async def _request(self, method: str, params: dict[str, Any]) -> Any:
-        """Send a JSON-RPC request and return the result."""
+    async def _request(self, method: str, params: dict[str, Any],
+                       timeout: float = 60.0) -> Any:
+        """Send a JSON-RPC request and return the result.
+
+        CC-aligned: 60s default timeout matches CC's headless mode timeout.
+        """
         self._request_id += 1
         req = {
             "jsonrpc": "2.0",
@@ -151,7 +156,12 @@ class McpClient:
         raw = json.dumps(req, ensure_ascii=False)
         await self._transport.send(raw.encode("utf-8"))
 
-        response_bytes = await self._transport.receive()
+        try:
+            response_bytes = await asyncio.wait_for(
+                self._transport.receive(), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise McpError(-32000, f"MCP request '{method}' timed out after {timeout:.0f}s")
         response = json.loads(response_bytes.decode("utf-8"))
 
         if "error" in response:

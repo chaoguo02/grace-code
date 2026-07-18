@@ -149,6 +149,7 @@ class McpRegistry:
             except Exception:
                 pass
         self._clients.clear()
+        self._tools_cache.clear()  # invalidate stale tool definitions
         self._connected = False
 
     def _build_transport(self, cfg: McpServerConfig) -> McpTransport:
