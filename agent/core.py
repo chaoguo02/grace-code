@@ -1802,6 +1802,22 @@ class ReActAgent:
                             cache_stats=cumulative_cache,
                         )
 
+                # ── Circuit breaker termination check ──────────────────
+                # CC-aligned: if the permission pipeline's circuit breaker
+                # tripped (3 consecutive denials or 20 total), force
+                # GIVE_UP instead of letting the agent loop indefinitely.
+                _pipeline = getattr(getattr(self, '_full_registry', None), '_base', None)
+                _pipeline = getattr(_pipeline, '_permission_pipeline', None) if _pipeline else None
+                if _pipeline is not None and getattr(_pipeline, '_terminate_session', False):
+                    logger.warning("Circuit breaker tripped — forcing GIVE_UP")
+                    return _finish_run(
+                        status=RunStatus.GAVE_UP,
+                        summary="Session terminated: permission circuit breaker tripped.",
+                        steps_taken=step,
+                        total_tokens_used=total_tokens,
+                        cache_stats=cumulative_cache,
+                    )
+
                 # ── 6. Reflection 触发判断 ──────────────────────────────
 
                 # Task anchor 用于 reflection，防止 LLM 在反射后丢失当前任务

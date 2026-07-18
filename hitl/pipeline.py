@@ -175,6 +175,8 @@ class PermissionPipeline:
         self._pre_plan_mode: str = ""
         self._denial_counters: dict[str, int] = {}
         self._total_denials: int = 0
+        self._terminate_session: bool = False
+        """Set to True when circuit breaker trips — agent loop should exit."""
         # CC-aligned prompt-based permissions: model-declared prompts approved during
         # plan exit, auto-allowed in the subsequent build session.
         self._approved_prompts: list[dict[str, str]] = []
@@ -399,17 +401,27 @@ class PermissionPipeline:
         tier = self._layer3_rules(tool_name, params)
         if tier is PermissionRuleTier.DENY:
             consecutive = self._denial_counters.get(tool_name, 0) + 1
+            _terminate = False
             reason = f"denied by rule"
             if consecutive >= 3:
                 reason += (
                     f" — Tool '{tool_name}' has been denied {consecutive} "
                     "consecutive times. You MUST change your approach."
                 )
+                # CC-aligned: headless mode termination on circuit breaker trip
+                if self._web_confirm_callback is not None:
+                    _terminate = True
+                    self._terminate_session = True
             if self._total_denials + 1 >= 20:
                 reason += " Total denials have reached the session limit."
+                _terminate = True
+                self._terminate_session = True
             result = PermissionResult(
                 decision=PermissionDecision.DENY,
                 layer=PermissionLayer.RULE,
+                reason=reason,
+                feedback="CIRCUIT_BREAKER_TERMINATE" if _terminate else "",
+            )
                 reason=reason,
             )
             self._stats.record(result)
@@ -678,6 +690,7 @@ class PermissionPipeline:
     # CC acceptEdits: "common filesystem commands such as mkdir, touch, mv, cp"
     _FILESYSTEM_SAFE_COMMANDS: frozenset[str] = frozenset({
         "mkdir", "touch", "mv", "cp",
+        "rm", "rmdir", "sed",       # CC-aligned additions
     })
 
     # CC bypassPermissions: root/home removal still prompts as circuit breaker
