@@ -625,7 +625,7 @@ class SessionRuntime:
                             "plan with a JSON contract before finishing."
                         )))
                     elif _step % 25 == 0:
-                        from agent.prompt import get_plan_mode_injection
+                        from prompts.builder import get_plan_mode_injection
                         _msgs.append(LLMMessage(
                             role="user", content=get_plan_mode_injection(),
                         ))

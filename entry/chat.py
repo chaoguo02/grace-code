@@ -27,7 +27,7 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from agent.prompt import reset_prompt_usage, set_project_dir
+from prompts.builder import reset_prompt_usage, set_project_dir
 from entry.renderer import InlineRenderer, create_renderer
 from observability import flush_observability
 

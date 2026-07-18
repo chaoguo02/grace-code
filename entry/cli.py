@@ -53,7 +53,7 @@ load_dotenv(_ROOT / ".env")
 from config.schema import load_config, merge_cli_overrides   # noqa: E402
 from llm.router import create_backend_from_config            # noqa: E402
 from observability import configure_observability, flush_observability  # noqa: E402
-from agent.prompt import reset_prompt_usage, set_project_dir, set_prompt_config  # noqa: E402
+from prompts.builder import reset_prompt_usage, set_project_dir, set_prompt_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

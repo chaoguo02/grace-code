@@ -1,4 +1,4 @@
-from agent.prompt import get_plan_mode_injection
+from prompts.builder import get_plan_mode_injection
 
 
 def test_plan_prompt_treats_runtime_as_capability_fact_source() -> None:

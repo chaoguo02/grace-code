@@ -9,7 +9,7 @@ from __future__ import annotations
 
 def test_analysis_prompt_keeps_evidence_within_allowed_files():
     """Read-only analysis prompts prevent citing memory or unread files as proof."""
-    from agent.prompt import build_task_prompt
+    from prompts.builder import build_task_prompt
 
     prompt = build_task_prompt(
         "只阅读 agent/core.py 和 agent/event_log.py，说明 Action.thought 是否仍会写入内部日志。",
@@ -25,7 +25,7 @@ def test_analysis_prompt_keeps_evidence_within_allowed_files():
 
 def test_analysis_prompt_teaches_phased_broad_analysis():
     """Broad read-only analysis prompts teach phased information gathering."""
-    from agent.prompt import build_task_prompt
+    from prompts.builder import build_task_prompt
 
     prompt = build_task_prompt(
         "梳理当前 tools、MCP 和 skills 的架构、主要问题和优化路线图。不要改代码。",

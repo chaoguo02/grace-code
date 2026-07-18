@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.prompt import (
+from prompts.builder import (
     build_task_prompt,
     consume_prompt_usage_metadata,
     get_prompt_usage_metadata,

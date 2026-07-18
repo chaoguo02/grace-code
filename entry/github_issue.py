@@ -189,7 +189,7 @@ def run_on_issue(
     from config.schema import load_config
     from agent.core import AgentConfig
     from agent.event_log import EventLog
-    from agent.prompt import reset_prompt_usage, set_project_dir, set_prompt_config
+    from prompts.builder import reset_prompt_usage, set_project_dir, set_prompt_config
     from agent.task import Task
     from agent.session.agent_factory import AgentFactory as _AgentFactoryForCompat; create_agent = _AgentFactoryForCompat.create
     from llm.router import create_backend_from_config

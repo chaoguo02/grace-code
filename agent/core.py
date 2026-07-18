@@ -34,7 +34,7 @@ from context.evidence import EvidenceLedger
 from context.history import ConversationHistory, ConversationSnapshot
 from context.repo_map import RepoMap
 from context.token_budget import TokenBudget
-from agent.prompt import (
+from prompts.builder import (
     build_system_prompt,
     build_system_prompt_core,
     build_system_prompt_variable,
@@ -470,7 +470,7 @@ class ReActAgent:
         else:
             history = ConversationHistory(max_messages=self._cfg.history_max_messages)
             # 单次模式：把任务描述作为第一条 user 消息
-            from agent.prompt import build_task_prompt
+            from prompts.builder import build_task_prompt
             history.add(LLMMessage(
                 role="user",
                 content=build_task_prompt(
@@ -1958,7 +1958,7 @@ class ReActAgent:
 
         # Sub-agent 模式：精简 system prompt
         if self._cfg.is_subagent:
-            from agent.prompt import build_sub_agent_system_prompt
+            from prompts.builder import build_sub_agent_system_prompt
             system_content = build_sub_agent_system_prompt(schemas)
             ctx = self._context_manager.build_sub_agent_messages(history, system_content)
             self._last_context_stats = ctx.stats
@@ -2252,7 +2252,7 @@ class ReActAgent:
     ):
         """委托给 LLMInvoker。prompt_metadata 在此层消费后传入 llm/。"""
         from llm.invoker import LLMInvoker
-        from agent.prompt import consume_prompt_usage_metadata
+        from prompts.builder import consume_prompt_usage_metadata
         _invoker = getattr(self, "_llm_invoker", None)
         if _invoker is None:
             _invoker = LLMInvoker(backend=self._backend, config=self._cfg)
