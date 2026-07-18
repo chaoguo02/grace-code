@@ -30,6 +30,7 @@ from server.schemas.session import (
     BatchDeleteResponse,
     UpdateSessionRequest,
     UpdateSessionResponse,
+    ModelSwitchRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -534,6 +535,28 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
         deleted = service.session_service.delete_session(session_id)
         return {"deleted": deleted}
+
+    # ── POST /api/sessions/{session_id}/model ──────────────────────────
+    # Switch the LLM model mid-session.  Takes effect on the next message.
+
+    @router.post("/{session_id}/model")
+    async def switch_model(
+        session_id: str,
+        body: "ModelSwitchRequest",
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Switch the LLM model for an active session (next-message effective)."""
+
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        # Store pending model switch — applied in run_chat_async before next run
+        service._runtime.set_pending_model(session_id, body.model, body.provider)
+        logger.info("Model switch queued — session=%s model=%s provider=%s",
+                     session_id[:8], body.model, body.provider)
+
+        return {"switched": True, "session_id": session_id, "model": body.model}
 
     # ── POST /api/sessions/{session_id}/tool-approve ────────────────────
     # CC control_response equivalent.  Moved here (sessions router with

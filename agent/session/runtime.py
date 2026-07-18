@@ -1754,6 +1754,22 @@ class SessionRuntime:
         """
         self._web_confirm_callbacks[session_id] = callback
 
+    # ── Model switching (mid-session) ────────────────────────────────────
+
+    def set_pending_model(self, session_id: str, model: str, provider: str = "") -> None:
+        """Queue a model switch for the next run of *session_id*.
+
+        The switch takes effect on the next call to run_session() —
+        the backend is rebuilt before the agent starts.
+        """
+        if not hasattr(self, '_pending_model_switches'):
+            self._pending_model_switches: dict[str, tuple[str, str]] = {}
+        self._pending_model_switches[session_id] = (model, provider)
+
+    def pop_pending_model(self, session_id: str) -> tuple[str, str] | None:
+        """Pop and return a queued model switch, or None."""
+        return getattr(self, '_pending_model_switches', {}).pop(session_id, None)
+
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()

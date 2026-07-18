@@ -433,6 +433,22 @@ class AgentService:
         )
 
         def _run_and_notify():
+            # ── Apply pending model switch ──
+            _pending = self._runtime.pop_pending_model(session_id)
+            if _pending:
+                _model, _provider = _pending
+                logger.info("Applying model switch — session=%s model=%s provider=%s",
+                            session_id[:8], _model, _provider)
+                from llm.router import create_backend_from_config
+                self._backend = create_backend_from_config({
+                    "provider": _provider or self._config.llm.provider,
+                    "model": _model,
+                    "api_key": self._config.llm.api_key or None,
+                    "base_url": self._config.llm.base_url or None,
+                    "max_tokens": self._config.llm.max_tokens,
+                    "timeout_seconds": self._config.llm.timeout_seconds,
+                })
+
             # ── Build web_confirm_callback for this session ──
             _web_cb = self._build_web_confirm_callback(session_id)
             self._runtime.set_web_confirm_callback(session_id, _web_cb)

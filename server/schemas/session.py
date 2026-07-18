@@ -267,3 +267,17 @@ class UpdateSessionResponse(BaseModel):
 
     updated: bool = Field(description="True if session was updated.")
     agent_name: str | None = Field(description="The new agent name, if changed.")
+
+
+# ── Model switch ─────────────────────────────────────────────────────────────
+
+
+class ModelSwitchRequest(BaseModel):
+    """Request body for ``POST /api/sessions/{id}/model``.
+
+    Switches the LLM model mid-session.  Takes effect on the next
+    user message — the current agent run is not interrupted.
+    """
+
+    model: str = Field(description="Model identifier (e.g. 'deepseek-v4', 'gpt-5-codex').")
+    provider: str = Field(default="", description="Optional provider override.")
