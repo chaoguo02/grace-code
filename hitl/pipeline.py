@@ -398,8 +398,16 @@ class PermissionPipeline:
             self._stats.record(result)
             return self._apply_tool_check(result, tool, params)
 
-        tier = self._layer3_rules(tool_name, params)
+        # ── CC-aligned Phase 1: resolve rule tier + matched rule ──
+        # _layer3_rules returns (tier, matched_raw) or (None, None).
+        # Phase 1 rules (deny/ask) are bypass-immune.
+        # Phase 2 rules (allow) can be overridden by permission mode.
+        self._force_interactive = False
+        self._decision_reason = ""
+        tier, _matched_raw = self._layer3_rules(tool_name, params)
+
         if tier is PermissionRuleTier.DENY:
+            # Phase 1: Deny — absolute safety floor.  No mode can override.
             consecutive = self._denial_counters.get(tool_name, 0) + 1
             _terminate = False
             reason = f"denied by rule"
@@ -408,7 +416,6 @@ class PermissionPipeline:
                     f" — Tool '{tool_name}' has been denied {consecutive} "
                     "consecutive times. You MUST change your approach."
                 )
-                # CC-aligned: headless mode termination on circuit breaker trip
                 if self._web_confirm_callback is not None:
                     _terminate = True
                     self._terminate_session = True
@@ -422,42 +429,19 @@ class PermissionPipeline:
                 reason=reason,
                 feedback="CIRCUIT_BREAKER_TERMINATE" if _terminate else "",
             )
-                reason=reason,
-            )
-            self._stats.record(result)
-            return self._apply_tool_check(result, tool, params)
-
-        if tier is PermissionRuleTier.ALLOW:
-            # Session rule ("Always Allow") or static allow rule matched.
-            # These take precedence over ask rules (checked in _layer3_rules).
-            result = PermissionResult(
-                decision=PermissionDecision.ALLOW,
-                layer=PermissionLayer.RULE,
-                reason="allowed by rule",
-            )
             self._stats.record(result)
             return self._apply_tool_check(result, tool, params)
 
         if tier is PermissionRuleTier.ASK:
-            # ASK rules always require interactive confirmation —
-            # approval_mode AUTO is ignored for these tools.
-            _ask_reason = ""
-            for rule in self._ask_rules:
-                if rule.matches(tool_name, params):
-                    _ask_reason = f"Matched ask rule: {rule.raw}"
-                    break
-            result = self._layer6_callback(
-                tool_name, params, thought, force_interactive=True,
-                decision_reason=_ask_reason or "Matched ask rule",
-            )
-            self._stats.record(result)
-            return self._apply_tool_check(result, tool, params)
+            # Phase 1: Ask — bypass-immune.  Always requires interactive
+            # confirmation.  Does NOT short-circuit here; continues through
+            # Layer 4 so plan/dontAsk can still block it.
+            self._force_interactive = True
+            self._decision_reason = f"Matched ask rule: {_matched_raw}" if _matched_raw else "Matched ask rule"
+            # Fall through to Layer 4
 
-        # tier is None — no rule matched at Layer 3.
-        # Continue to Layer 4 (Permission Mode).
-        # This path is reached for tools that have no deny/allow/ask
-        # rule defined, e.g. Bash commands when shell rules are
-        # not yet fixed (see Finding 6).
+        # ── Phase 2: Permission Mode + Allow Rules ──
+        # tier is ALLOW, ASK (with _force_interactive), or None
 
         # Step 4: Permission Mode
         mode_result = self._layer4_permission_mode(tool_name, params)
@@ -465,7 +449,7 @@ class PermissionPipeline:
             self._stats.record(mode_result)
             return self._apply_tool_check(mode_result, tool, params)
 
-        # Step 4.5: Prompt-based Permissions (CC-aligned ExitPlanMode allowedPrompts)
+        # Step 4.5: Prompt-based Permissions
         if self._approved_prompts:
             match = self._match_approved_prompt(tool_name, params)
             if match is not None:
@@ -477,23 +461,24 @@ class PermissionPipeline:
                 self._stats.record(result)
                 return self._apply_tool_check(result, tool, params)
 
-        # Step 5: Allow Rules + Session Rules
-        # (session rules — Always Allow — are checked first in _layer3_rules,
-        #  so reaching here means no session rule matched)
-        for rule in self._allow_rules:
-            if rule.matches(tool_name, params):
-                result = PermissionResult(
-                    decision=PermissionDecision.ALLOW,
-                    layer=PermissionLayer.RULE,
-                    reason=f"allowed by rule: {rule.raw}",
-                )
-                self._stats.record(result)
-                return self._apply_tool_check(result, tool, params)
+        # Step 5: Allow Rules (Phase 2 — mode may have already resolved)
+        if tier is not PermissionRuleTier.ASK:
+            # Only check allow rules if no ask rule forced interactive
+            for rule in self._allow_rules:
+                if rule.matches(tool_name, params):
+                    result = PermissionResult(
+                        decision=PermissionDecision.ALLOW,
+                        layer=PermissionLayer.RULE,
+                        reason=f"allowed by rule: {rule.raw}",
+                    )
+                    self._stats.record(result)
+                    return self._apply_tool_check(result, tool, params)
 
         # Step 6: canUseTool Callback
         result = self._layer6_callback(
             tool_name, params, thought,
-            decision_reason="No allow rule matched — requires interactive approval",
+            force_interactive=self._force_interactive,
+            decision_reason=self._decision_reason or "No allow rule matched — requires interactive approval",
         )
         self._stats.record(result)
         # Apply stashed hook updates to the final allow result
@@ -614,42 +599,44 @@ class PermissionPipeline:
 
     def _layer3_rules(
         self, tool_name: str, params: dict[str, Any]
-    ) -> PermissionRuleTier | None:
+    ) -> "tuple[PermissionRuleTier | None, str | None]":
         """
-        Match rules with CC-aligned priority: deny > session_allow > allow > ask.
+        CC-aligned Phase 1 rule evaluation: deny → ask → allow → session_allow.
 
-        Session rules (from "Always Allow") take precedence over static ask rules
-        because they represent explicit user confirmation during this session.
-        Static deny rules always win (safety invariant).
+        Deny and ask rules are bypass-immune (Phase 1).
+        Allow rules are mode-sensitive (Phase 2).
+        Session rules ("Always Allow") have the highest allow priority
+        but are evaluated AFTER static allow — they can override a
+        static allow but not a deny or ask.
 
-        Allow rules are checked BEFORE ask rules so that users can override
-        builtin ask defaults by adding tools to their settings.json allow list.
-
-        Returns None when no rule matches, so the pipeline can continue to
-        Layer 4 (permission mode) instead of forcing the ASK path.
+        Returns (tier, matched_rule_raw) tuple, or (None, None).
+        The matched_rule_raw string is used for decision_reason
+        attribution in the approval card.
         """
-        # 1. Deny rules (highest priority, absolute safety floor)
+        # 1. Deny rules — absolute safety floor, Phase 1 bypass-immune
         for rule in self._deny_rules:
             if rule.matches(tool_name, params):
-                return PermissionRuleTier.DENY
+                return (PermissionRuleTier.DENY, rule.raw)
 
-        # 2. Session rules from "Always Allow" override everything below
-        for rule in self._session_rules:
-            if rule.matches(tool_name, params):
-                return PermissionRuleTier.ALLOW
-
-        # 3. Static allow rules (before ask — user can override builtin asks)
-        for rule in self._allow_rules:
-            if rule.matches(tool_name, params):
-                return PermissionRuleTier.ALLOW
-
-        # 4. Ask rules (soft default — prompts for interactive approval)
+        # 2. Ask rules — Phase 1 bypass-immune, always prompts
+        #    CC: ask rules are checked BEFORE allow rules so that
+        #    they cannot be overridden by user-added allow entries.
         for rule in self._ask_rules:
             if rule.matches(tool_name, params):
-                return PermissionRuleTier.ASK
+                return (PermissionRuleTier.ASK, rule.raw)
 
-        # 5. No rule matched — continue to Layer 4 (permission mode)
-        return None
+        # 3. Static allow rules — Phase 2, may be overridden by mode
+        for rule in self._allow_rules:
+            if rule.matches(tool_name, params):
+                return (PermissionRuleTier.ALLOW, rule.raw)
+
+        # 4. Session rules ("Always Allow") — highest priority allow
+        for rule in self._session_rules:
+            if rule.matches(tool_name, params):
+                return (PermissionRuleTier.ALLOW, rule.raw)
+
+        # 5. No rule matched — continue to Layer 4
+        return (None, None)
 
     def _apply_tool_check(self, result, tool, params):
         if result.decision is PermissionDecision.ALLOW:
@@ -705,17 +692,15 @@ class PermissionPipeline:
             return None
 
         if mode == "bypassPermissions":
-            # CC: bypassPermissions skips prompts EXCEPT:
-            #  - explicit ask rules (checked in Layer 3 before reaching here)
-            #  - MCP tools with requiresUserInteraction (checked by tool metadata)
-            #  - root/home removal — circuit breaker
+            # CC: bypassPermissions skips prompts EXCEPT when _force_interactive
+            # is set (ask rule matched at Layer 3 — bypass-immune).
+            if self._force_interactive:
+                return None  # fall through to Layer 6
             if tool_name == "Bash" and params:
                 cmd = str(params.get("command", "")).strip()
                 for pattern in self._ROOT_REMOVAL_PATTERNS:
                     if cmd.startswith(pattern) or pattern in cmd:
                         return None  # fall through to Layer 6 for approval
-            # Check for MCP requiresUserInteraction
-            # (tool metadata check — handled in _layer1_validate if set)
             return PermissionResult(
                 decision=PermissionDecision.ALLOW,
                 layer=PermissionLayer.RULE,
@@ -742,24 +727,34 @@ class PermissionPipeline:
             return None
 
         if mode == "plan":
+            # Plan mode: read-only.  Write/Edit/Bash always denied,
+            # even if an ask rule matched (plan overrides ask).
             if tool_name in {"Write", "Edit", "Bash"}:
                 return PermissionResult(
                     decision=PermissionDecision.DENY,
                     layer=PermissionLayer.RULE,
-                    reason="plan mode: %s is read-only" % tool_name,
+                    reason=f"plan mode: {tool_name} is read-only",
                 )
+            # No decision for read-only tools → fall through
             return None
 
         if mode == "dontAsk":
-            # CC-aligned: "Auto-denies tools unless pre-approved."
-            # 1. Read-only tools always pass (CC default behaviour)
+            # CC: if _force_interactive (ask rule matched), deny immediately —
+            # dontAsk mode never prompts and ask rules require interaction.
+            if self._force_interactive:
+                return PermissionResult(
+                    decision=PermissionDecision.DENY,
+                    layer=PermissionLayer.RULE,
+                    reason="dontAsk mode: ask rule requires interaction (blocked in non-interactive mode)",
+                )
+            # 1. Read-only tools always pass
             if tool_name in self._READONLY_SAFE_TOOLS:
                 return PermissionResult(
                     decision=PermissionDecision.ALLOW,
                     layer=PermissionLayer.RULE,
                     reason="dontAsk: read-only tool auto-approved",
                 )
-            # 2. Check allow rules + session rules (use full pattern matching)
+            # 2. Check allow rules + session rules
             for rule in self._allow_rules + self._session_rules:
                 if rule.matches(tool_name, params):
                     return PermissionResult(
@@ -767,7 +762,7 @@ class PermissionPipeline:
                         layer=PermissionLayer.RULE,
                         reason=f"dontAsk: allowed by rule '{rule.raw}'",
                     )
-            # 3. Everything else → deny at Layer 4 (never reaches Layer 6)
+            # 3. Everything else → deny (never reaches Layer 6)
             return PermissionResult(
                 decision=PermissionDecision.DENY,
                 layer=PermissionLayer.RULE,
