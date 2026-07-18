@@ -396,25 +396,20 @@ class PermissionPipeline:
 
         # Step 3: Permission Rules (deny → session_allow → allow → ask)
 
-        # CC-aligned: tools with requires_user_interaction ALWAYS go to
-        # Layer 6 for interactive confirmation, even when an allow rule
-        # matches or bypassPermissions mode is active.
+        # CC-aligned: tools with requires_user_interaction ALWAYS require
+        # interactive confirmation.  Set _force_interactive and fall through
+        # to Layer 4 so plan/dontAsk can still block them.
+        # Otherwise, reset flags and run Layer 3 rule evaluation.
         _tool_meta = tool.metadata if hasattr(tool, 'metadata') else None
         if getattr(_tool_meta, 'requires_user_interaction', False):
-            result = self._layer6_callback(
-                tool_name, params, thought, force_interactive=True,
-                decision_reason="Tool requires user interaction (bypass-immune)",
-            )
-            self._stats.record(result)
-            return self._apply_tool_check(result, tool, params)
-
-        # ── CC-aligned Phase 1: resolve rule tier + matched rule ──
-        # _layer3_rules returns (tier, matched_raw) or (None, None).
-        # Phase 1 rules (deny/ask) are bypass-immune.
-        # Phase 2 rules (allow) can be overridden by permission mode.
-        self._force_interactive = False
-        self._decision_reason = ""
-        tier, _matched_raw = self._layer3_rules(tool_name, params)
+            self._force_interactive = True
+            self._decision_reason = "Tool requires user interaction (bypass-immune)"
+            tier, _matched_raw = (None, None)  # skip Layer 3, fall through to Layer 4
+        else:
+            self._force_interactive = False
+            self._decision_reason = ""
+            # ── CC-aligned Phase 1: resolve rule tier + matched rule ──
+            tier, _matched_raw = self._layer3_rules(tool_name, params)
 
         if tier is PermissionRuleTier.DENY:
             # Phase 1: Deny — absolute safety floor.  No mode can override.
@@ -610,6 +605,8 @@ class PermissionPipeline:
     def _layer3_rules(
         self, tool_name: str, params: dict[str, Any]
     ) -> "tuple[PermissionRuleTier | None, str | None]":
+        # Return type is quoted because Python <3.10 doesn't support | in types
+        # without from __future__ import annotations (already present at top of file)
         """
         CC-aligned Phase 1 rule evaluation: deny → ask → allow → session_allow.
 
