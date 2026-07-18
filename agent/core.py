@@ -882,6 +882,21 @@ class ReActAgent:
             self._trim_tokens_freed = _trim_tokens_freed
 
             # ── 2.5. Context Collapse: read-time projection (CC: CollapseStore) ──
+            # ── Auto-compact: monitor token usage, warn when near limit ──
+            _budget_total = self._cfg.request_budget_tokens or 200_000
+            _budget_pct = (total_tokens / _budget_total * 100) if _budget_total else 0
+            if step > 3 and _budget_pct > 80:
+                logger.warning(
+                    "Token budget at %.0f%% (%d/%d) — consider /compact",
+                    _budget_pct, total_tokens, _budget_total,
+                )
+                history.add(LLMMessage(role="user", content=(
+                    f"[SYSTEM] Context window usage: {_budget_pct:.0f}%. "
+                    "If you can finish the task now, call finish. "
+                    "Otherwise, focus on the most important remaining work "
+                    "and avoid reading large files unnecessarily."
+                )))
+
             # Runs between MicroCompact and AutoCompact.  CollapseStore persists
             # across turns — collapses are recorded, NOT applied in-place.
             # projectView() generates the compressed view at read time.
