@@ -1713,3 +1713,8 @@ def memory_freshness_text(name: str, store) -> str:
         return f"{age_days} days ago — verify against current code"
     except Exception:
         return ""
+
+# ── spawn_agent / _execute_child_session (extracted to runtime_spawn.py) ──
+from agent.session.runtime_spawn import spawn_agent, _execute_child_session
+SessionRuntime.spawn_agent = spawn_agent
+SessionRuntime._execute_child_session = _execute_child_session
