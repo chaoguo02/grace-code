@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from executor.mcp.tool_adapter import deferred_mcp_tool
+from agent.mcp.tool_adapter import deferred_mcp_tool
 from executor.tool import ToolUseContext
 
 

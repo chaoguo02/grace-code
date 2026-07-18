@@ -10,8 +10,8 @@ from agent.session.mcp_integration import MCPRuntimeToolProxy, MCPToolIntegratio
 from agent.session.runtime import SessionRuntime
 from agent.session.session_store import SessionStore
 from llm.base import MockBackend
-from executor.mcp import MCPServerConfig
-from executor.mcp.types import MCPToolProps
+from agent.mcp import MCPServerConfig
+from agent.mcp.types import MCPToolProps
 from executor.tool import ToolResult as RuntimeToolResult, ToolUseContext, build_tool
 from core.base import (
     NoopTool,
@@ -188,8 +188,8 @@ class TestSseNotificationDispatch:
     @staticmethod
     def _make_sse_bridge():
         """Create a minimal SSE bridge for testing dispatch methods."""
-        from executor.mcp.client import SseMCPBridge
-        from executor.mcp.types import MCPServerConfig
+        from agent.mcp.client import SseMCPBridge
+        from agent.mcp.types import MCPServerConfig
 
         config = MCPServerConfig(
             name="test-sse-server",

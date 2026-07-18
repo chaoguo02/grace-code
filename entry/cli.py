@@ -227,7 +227,7 @@ def mcp_add(ctx, name, target, transport, scope, env, headers, timeout):
 @click.pass_context
 def mcp_list(ctx, transport):
     """List configured MCP servers."""
-    from executor.mcp.config import load_mcp_config
+    from agent.mcp.config import load_mcp_config
     result = load_mcp_config(project_dir=".")
     servers = result.servers
     if transport:
@@ -246,7 +246,7 @@ def mcp_list(ctx, transport):
 @click.pass_context
 def mcp_get(ctx, name):
     """Show details for one MCP server."""
-    from executor.mcp.config import load_mcp_config
+    from agent.mcp.config import load_mcp_config
     result = load_mcp_config(project_dir=".")
     for s in result.servers:
         if s.name == name:

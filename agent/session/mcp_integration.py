@@ -7,7 +7,7 @@ import logging
 from fnmatch import fnmatch
 from typing import Any, Iterable
 
-from executor.mcp import MCPServerConfig, SyncMCPToolManager, assemble_tool_pool
+from agent.mcp import MCPServerConfig, SyncMCPToolManager, assemble_tool_pool
 from executor.tool import ToolResult as RuntimeToolResult, ToolUseContext
 from core.base import BaseTool, RiskLevel, ToolRegistry, ToolResult
 

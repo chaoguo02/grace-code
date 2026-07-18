@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from executor.mcp import (
+from agent.mcp import (
     MCPCallResult,
     MCPServerConfig,
     MCPToolBridge,
@@ -151,7 +151,7 @@ def test_bridge_call_tool_success_normalizes_result():
 
 def test_create_mcp_bridge_dispatches_by_type():
     """MCP-01: create_mcp_bridge returns correct bridge for each transport."""
-    from executor.mcp.client import HttpMCPBridge, MCPToolBridge, create_mcp_bridge
+    from agent.mcp.client import HttpMCPBridge, MCPToolBridge, create_mcp_bridge
 
     stdio_config = MCPServerConfig(name="s", type="stdio", command="echo")
     http_config = MCPServerConfig(name="h", type="http", url="https://example.com")
@@ -167,7 +167,7 @@ def test_create_mcp_bridge_dispatches_by_type():
 
 def test_http_bridge_transport_type_reflects_config():
     """MCP-01: HttpMCPBridge.transport_type returns the config type."""
-    from executor.mcp.client import HttpMCPBridge
+    from agent.mcp.client import HttpMCPBridge
 
     http_bridge = HttpMCPBridge(MCPServerConfig(
         name="h", type="http", url="https://example.com",
@@ -182,7 +182,7 @@ def test_http_bridge_transport_type_reflects_config():
 
 def test_http_bridge_initial_state_not_connected():
     """MCP-01: HttpMCPBridge starts with is_connected == False."""
-    from executor.mcp.client import HttpMCPBridge
+    from agent.mcp.client import HttpMCPBridge
 
     bridge = HttpMCPBridge(MCPServerConfig(
         name="h", type="http", url="https://example.com",
@@ -193,7 +193,7 @@ def test_http_bridge_initial_state_not_connected():
 
 def test_http_bridge_close_when_not_connected_is_safe():
     """MCP-01: Closing an unconnected HTTP bridge is a no-op."""
-    from executor.mcp.client import HttpMCPBridge
+    from agent.mcp.client import HttpMCPBridge
 
     bridge = HttpMCPBridge(MCPServerConfig(
         name="h", type="http", url="https://example.com",
@@ -208,7 +208,7 @@ def test_http_bridge_close_when_not_connected_is_safe():
 
 def test_create_mcp_bridge_rejects_unknown_transport():
     """MCP-E1: Unknown transport type raises ValueError."""
-    from executor.mcp.client import create_mcp_bridge
+    from agent.mcp.client import create_mcp_bridge
 
     with pytest.raises(ValueError, match="Unsupported MCP transport type"):
         create_mcp_bridge(MCPServerConfig(name="bad", type="grpc"))

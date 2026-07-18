@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from executor.mcp.types import MCPServerConfig, MCPToolInfo
+from agent.mcp.types import MCPServerConfig, MCPToolInfo
 
 try:
     from mcp.client.session import ClientSession
@@ -462,7 +462,7 @@ class HttpMCPBridge(MCPToolBridge):
             response.raise_for_status()
             ct = response.headers.get("content-type", "")
             if not ct.startswith("application/json") and not ct.startswith("text/plain"):
-                from executor.mcp.client import _logger as _mcp_logger
+                from agent.mcp.client import _logger as _mcp_logger
                 import logging as _logging
                 _mcp_log = _logging.getLogger(__name__)
                 _mcp_log.warning(

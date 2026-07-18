@@ -31,7 +31,7 @@ pytestmark = [
 
 def _make_real_runtime(tmp_path: Path, *, max_steps: int = 5):
     from agent.core import AgentConfig
-    from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore
+    from agent.session import AgentRegistryV2, SessionRuntime, SessionStore
     from llm.router import create_backend
     from core.base import NoopTool, ToolRegistry
 

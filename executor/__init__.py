@@ -19,7 +19,7 @@ from executor.tool import (
     ToolUseContext,
     build_tool,
 )
-from executor.mcp import (
+from agent.mcp import (
     ExecutionPolicy,
     MCPCallResult,
     MCPConfigLoadResult,

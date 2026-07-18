@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from executor.mcp import (
+from agent.mcp import (
     MCPToolProps,
     assemble_tool_pool,
     filter_built_in_tools,

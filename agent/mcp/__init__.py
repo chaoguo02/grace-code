@@ -1,20 +1,20 @@
 """Runtime MCP bridge."""
 
-from executor.mcp.allowlist import MCPServerPolicy, is_mcp_server_allowed
-from executor.mcp.client import (
+from agent.mcp.allowlist import MCPServerPolicy, is_mcp_server_allowed
+from agent.mcp.client import (
     HAS_MCP,
     MCPCallResult,
     MCPNotInstalledError,
     MCPToolBridge,
     MCPToolCallError,
 )
-from executor.mcp.config import (
+from agent.mcp.config import (
     MCPConfigLoadResult,
     expand_mcp_env_vars,
     load_allowed_mcp_server_configs,
     load_mcp_config,
 )
-from executor.mcp.registry import (
+from agent.mcp.registry import (
     assemble_tool_pool,
     filter_built_in_tools,
     filter_mcp_tools,
@@ -22,14 +22,14 @@ from executor.mcp.registry import (
     is_deferred_tool,
     tools_to_api_schemas,
 )
-from executor.mcp.sync_bridge import (
+from agent.mcp.sync_bridge import (
     ExecutionPolicy,
     MCPToolExhaustedError,
     MCPToolTimeoutError,
     SyncMCPToolManager,
 )
-from executor.mcp.tool_adapter import adapt_mcp_tools, deferred_mcp_tool, mcp_tool_to_runtime_tool
-from executor.mcp.types import MCPServerConfig, MCPServerConnection, MCPToolInfo, MCPToolProps, slugify_mcp_name
+from agent.mcp.tool_adapter import adapt_mcp_tools, deferred_mcp_tool, mcp_tool_to_runtime_tool
+from agent.mcp.types import MCPServerConfig, MCPServerConnection, MCPToolInfo, MCPToolProps, slugify_mcp_name
 
 __all__ = [
     "ExecutionPolicy",

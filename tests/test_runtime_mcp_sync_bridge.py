@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from executor.mcp import MCPServerConfig, SyncMCPToolManager
+from agent.mcp import MCPServerConfig, SyncMCPToolManager
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("mcp") is None,

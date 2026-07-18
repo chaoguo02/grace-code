@@ -7,8 +7,8 @@ import json
 import threading
 from typing import Any, Callable
 
-from executor.mcp.client import MCPToolBridge, MCPToolCallError
-from executor.mcp.types import MCPToolInfo, MCPToolProps
+from agent.mcp.client import MCPToolBridge, MCPToolCallError
+from agent.mcp.types import MCPToolInfo, MCPToolProps
 from executor.tool import ToolResult, ToolUseContext, build_tool
 
 

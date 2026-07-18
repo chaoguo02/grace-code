@@ -11,9 +11,9 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any
 
-from executor.mcp.client import MCPCallResult, MCPToolBridge, create_mcp_bridge
-from executor.mcp.tool_adapter import mcp_tool_to_runtime_tool
-from executor.mcp.types import MCPServerConfig
+from agent.mcp.client import MCPCallResult, MCPToolBridge, create_mcp_bridge
+from agent.mcp.tool_adapter import mcp_tool_to_runtime_tool
+from agent.mcp.types import MCPServerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ class SyncMCPToolManager:
                 runtime_tools.append(runtime_tool)
                 self._tool_map[runtime_tool.name] = (config.name, tool_info.name)
             # MCP Resources: also register resource list/read tools
-            from executor.mcp.tool_adapter import create_resource_list_tool, create_resource_read_tool
+            from agent.mcp.tool_adapter import create_resource_list_tool, create_resource_read_tool
             resource_list_tool = create_resource_list_tool(bridge)
             runtime_tools.append(resource_list_tool)
             resource_read_tool = create_resource_read_tool(bridge)

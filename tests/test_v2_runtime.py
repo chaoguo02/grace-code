@@ -39,7 +39,7 @@ from agent.task import (
     TaskIntent,
     ToolCall,
 )
-from agent.v2 import (
+from agent.session import (
     AgentCancelOutcome,
     AgentCompletionNotification,
     AgentSpawnContext,

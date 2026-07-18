@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from executor.mcp.allowlist import MCPServerPolicy, is_mcp_server_allowed
-from executor.mcp.types import (
+from agent.mcp.allowlist import MCPServerPolicy, is_mcp_server_allowed
+from agent.mcp.types import (
     DEFAULT_IDLE_TIMEOUT_HTTP,
     DEFAULT_IDLE_TIMEOUT_STDIO,
     MCPServerConfig,

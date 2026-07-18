@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 
-from executor.mcp.types import MCPServerConfig
+from agent.mcp.types import MCPServerConfig
 
 
 @dataclass(frozen=True)
