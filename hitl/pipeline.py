@@ -469,16 +469,65 @@ class PermissionPipeline:
 
     # --- Layer 1: validateInput ----------------------------------------
 
+    # CC-aligned: protected paths that ALWAYS require interactive
+    # confirmation, even in bypassPermissions mode.  These are
+    # bypass-immune — no mode, hook, or rule can override them.
+    _PROTECTED_DIRS: frozenset[str] = frozenset({
+        ".git", ".forge-agent", ".grace", ".claude",
+        ".vscode", ".idea",
+    })
+
+    _PROTECTED_FILES: frozenset[str] = frozenset({
+        ".gitconfig", ".gitmodules",
+        ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".profile",
+        ".ripgreprc", ".mcp.json", ".claude.json",
+        "settings.json", "settings.local.json",
+    })
+
+    @staticmethod
+    def _is_protected_path(tool_name: str, params: dict[str, Any]) -> str | None:
+        """Check if a file operation targets a protected path.
+
+        Returns the protected component string if so, None otherwise.
+        Only applies to Write/Edit tools — Read is always safe.
+        """
+        if tool_name not in ("Write", "Edit"):
+            return None
+        path = params.get("file_path") or params.get("path") or ""
+        if not path:
+            return None
+        import os as _os
+        parts = _os.path.normpath(str(path)).replace("\\", "/").split("/")
+        for part in parts:
+            part_lower = part.lower()
+            if part_lower in PermissionPipeline._PROTECTED_DIRS:
+                return f"Protected directory: {part}/"
+            if part_lower in PermissionPipeline._PROTECTED_FILES:
+                return f"Protected file: {part}"
+        return None
+
     def _layer1_validate(
         self, tool: "BaseTool", params: dict[str, Any]
     ) -> PermissionResult | None:
         """Absolute safety floor. Cannot be overridden by rules or hooks."""
+        # 1. Tool's own blacklist check
         reason = tool.permission_denial_reason(params)
         if reason:
             return PermissionResult(
                 decision=PermissionDecision.DENY,
                 layer=PermissionLayer.INPUT_VALIDATION,
                 reason=reason,
+            )
+        # 2. CC-aligned: protected path check (bypass-immune)
+        # Protected paths are DENIED at Layer 1 — no mode/hook/rule can override.
+        # To edit these files, use an external editor or temporarily comment out
+        # the protected paths list.
+        protected = self._is_protected_path(tool.name, params)
+        if protected:
+            return PermissionResult(
+                decision=PermissionDecision.DENY,
+                layer=PermissionLayer.INPUT_VALIDATION,
+                reason=f"Protected path blocked (bypass-immune): {protected}",
             )
         return None
 
