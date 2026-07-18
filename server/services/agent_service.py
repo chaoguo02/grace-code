@@ -432,7 +432,43 @@ class AgentService:
             resolved_intent is not None and resolved_intent == TaskIntent.ANALYSIS
         )
 
+        def _resolve_mentions(text: str, repo: str) -> str:
+            """Resolve @path mentions in *text* to file content blocks.
+
+            Scans for @<path> tokens, reads the referenced files from *repo*,
+            and wraps them in [FILE: ...] [/FILE] blocks so the model sees
+            the file content as part of the user prompt.
+            """
+            import re as _re
+            _AT_RE = _re.compile(r"(?:^|\s)@(\S+)")
+            _repo_root = Path(repo).resolve()
+
+            def _resolve_one(match: _re.Match) -> str:
+                _ref = match.group(1).rstrip(".,;:!?")
+                _full = (_repo_root / _ref).resolve()
+                try:
+                    _full.relative_to(_repo_root)
+                except ValueError:
+                    return match.group(0)  # outside repo — keep as-is
+                if _full.is_file():
+                    try:
+                        _content = _full.read_text(encoding="utf-8")[:5000]
+                        _lines = _content.count("\n") + 1
+                        return (
+                            f"\n[FILE: {_ref} ({_lines} lines)]\n"
+                            f"{_content}\n"
+                            f"[/FILE]\n"
+                        )
+                    except Exception:
+                        return match.group(0)
+                return match.group(0)  # dir / not found / binary → keep as-is
+
+            return _AT_RE.sub(_resolve_one, text)
+
         def _run_and_notify():
+            # ── Resolve @mentions in the prompt ──
+            _resolved_prompt = _resolve_mentions(prompt, self.repo_path)
+
             # ── Apply pending model switch ──
             _pending = self._runtime.pop_pending_model(session_id)
             if _pending:
@@ -457,7 +493,7 @@ class AgentService:
                 result = self._runtime.run_session(
                     session_id=session_id,
                     agent_name=agent_name,
-                    task_description=prompt,
+                    task_description=_resolved_prompt,
                     intent=resolved_intent,
                     inject_rules=list(self._loaded_rules),
                     inject_permission_mode="acceptEdits",

@@ -86,4 +86,77 @@ def create_attachments_router(get_service: Any) -> APIRouter:
             "path": str(dest.relative_to(state.root)),
         }
 
+    # ── POST /api/sessions/{session_id}/attachments/resolve ──────────────
+
+    @router.post("/{session_id}/attachments/resolve")
+    async def resolve_attachment(
+        session_id: str,
+        body: dict[str, Any],
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Resolve an @mention path to file content.
+
+        Supports:
+        - ``@path/to/file`` → full file content (capped at 10K chars)
+        - ``@path/to/dir/`` → directory listing
+        - ``@*.py`` → glob match results
+
+        The resolved content is injected into the conversation context
+        before the agent sees the prompt.
+        """
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        path = (body.get("path") or "").strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="'path' is required")
+
+        repo = Path(service.repo_path).resolve()
+        full_path = (repo / path).resolve()
+
+        # Security: path must be inside repo
+        try:
+            full_path.relative_to(repo)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Path outside repository")
+
+        if not full_path.exists():
+            # Try glob
+            import glob as glob_mod
+            pattern = str(repo / path)
+            matches = [str(Path(m).relative_to(repo)) for m in glob_mod.glob(pattern, recursive=True)]
+            if matches:
+                return {
+                    "type": "glob",
+                    "path": path,
+                    "matches": matches[:20],
+                }
+            raise HTTPException(status_code=404, detail=f"Path not found: {path}")
+
+        if full_path.is_file():
+            MAX_CHARS = 10000
+            try:
+                content = full_path.read_text(encoding="utf-8")
+                truncated = len(content) > MAX_CHARS
+                return {
+                    "type": "file",
+                    "path": path,
+                    "content": content[:MAX_CHARS],
+                    "lines": content.count("\n") + 1,
+                    "truncated": truncated,
+                }
+            except UnicodeDecodeError:
+                return {"type": "file", "path": path, "content": "[Binary file — not displayable]", "lines": 0}
+
+        if full_path.is_dir():
+            files = [
+                str(p.relative_to(full_path))
+                for p in sorted(full_path.iterdir())
+                if not p.name.startswith(".")
+            ]
+            return {"type": "directory", "path": path, "files": files[:50]}
+
+        raise HTTPException(status_code=404, detail=f"Unsupported path type: {path}")
+
     return router
