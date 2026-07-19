@@ -456,6 +456,86 @@ class SessionRuntime:
             self._completion_verifiers: list = []
         self._completion_verifiers.append(verifier)
 
+    # ── Worktree resolution (Gap 15) ───────────────────────────────────
+
+    def resolve_worktree(
+        self, parent_session_id: str, child_session_id: str,
+        action: str,  # "apply" | "discard" | "retain"
+    ) -> dict:
+        """Resolve a preserved child worktree with the given action.
+
+        CC-aligned: worktree operations are Runtime-mediated to ensure
+        thread safety and proper filesystem access.
+
+        Returns a status dict with:
+          - resolved: bool
+          - action: str
+          - child_session_id: str
+          - status: "applied" | "discarded" | "retained" | "error"
+          - message: str
+        """
+        child = self._store.get_session(child_session_id)
+        if child is None:
+            return {"resolved": False, "action": action,
+                    "child_session_id": child_session_id,
+                    "status": "error", "message": "Child session not found"}
+
+        result = child.agent_result
+        if result is None or result.worktree is None:
+            return {"resolved": False, "action": action,
+                    "child_session_id": child_session_id,
+                    "status": "error", "message": "No worktree to resolve"}
+
+        from agent.session.models import WorktreeDisposition
+        if result.worktree_disposition is not WorktreeDisposition.PRESERVED:
+            return {"resolved": False, "action": action,
+                    "child_session_id": child_session_id,
+                    "status": "error", "message": "Worktree already resolved"}
+
+        worktree = result.worktree
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
+
+        try:
+            if action == "apply":
+                from agent.session.worktree_service import apply_worktree
+                apply_worktree(worktree, parent_session_id)
+                result.worktree_disposition = WorktreeDisposition.APPLIED
+                _logger.info("Worktree applied: %s → %s", child_session_id[:8], parent_session_id[:8])
+                return {"resolved": True, "action": "apply",
+                        "child_session_id": child_session_id,
+                        "status": "applied",
+                        "message": f"Worktree changes merged to parent workspace"}
+
+            elif action == "discard":
+                from agent.session.worktree_service import discard_worktree
+                discard_worktree(worktree)
+                result.worktree_disposition = WorktreeDisposition.DISCARDED
+                _logger.info("Worktree discarded: %s", child_session_id[:8])
+                return {"resolved": True, "action": "discard",
+                        "child_session_id": child_session_id,
+                        "status": "discarded",
+                        "message": "Worktree discarded"}
+
+            elif action == "retain":
+                result.worktree_disposition = WorktreeDisposition.RETAINED
+                _logger.info("Worktree retained: %s", child_session_id[:8])
+                return {"resolved": True, "action": "retain",
+                        "child_session_id": child_session_id,
+                        "status": "retained",
+                        "message": "Worktree retained for manual handling"}
+
+            else:
+                return {"resolved": False, "action": action,
+                        "child_session_id": child_session_id,
+                        "status": "error", "message": f"Unknown action: {action}"}
+
+        except Exception as e:
+            _logger.exception("Worktree %s failed for %s", action, child_session_id[:8])
+            return {"resolved": False, "action": action,
+                    "child_session_id": child_session_id,
+                    "status": "error", "message": str(e)}
+
     # ── Root session ──
 
     def create_root_session(

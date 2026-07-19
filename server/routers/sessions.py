@@ -761,4 +761,40 @@ def create_sessions_router(get_service: Any) -> APIRouter:
                 })
         return pending
 
+    # ── POST /api/sessions/{session_id}/worktrees/{child_id}/{action} ───
+    # Resolve a preserved child worktree (apply/discard/retain).
+
+    @router.post("/{session_id}/worktrees/{child_id}/{action}")
+    async def resolve_worktree(
+        session_id: str,
+        child_id: str,
+        action: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Apply, discard, or retain a child session's preserved worktree.
+
+        *action* must be one of: apply, discard, retain.
+
+        Runtime-mediated to ensure thread safety — the parent session's
+        Runtime handles filesystem access.
+        """
+        if action not in ("apply", "discard", "retain"):
+            raise HTTPException(status_code=400, detail=f"Invalid action: {action}. Use apply/discard/retain")
+
+        result = service._runtime.resolve_worktree(session_id, child_id, action)
+        if not result["resolved"]:
+            raise HTTPException(status_code=409, detail=result["message"])
+
+        # Push WS event so frontend updates worktree status in real time
+        if service._event_bus is not None:
+            service._event_bus.publish_raw(session_id, {
+                "type": "worktree_resolved",
+                "child_session_id": child_id,
+                "action": action,
+                "status": result["status"],
+                "message": result["message"],
+            })
+
+        return result
+
     return router
