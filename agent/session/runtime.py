@@ -424,18 +424,22 @@ class SessionRuntime:
             return CompletionCheckResult(can_complete=True)
 
         facts = "\n".join(
-            f"- child_session_id={child_id}; path={evidence.path}; "
-            f"revision={evidence.revision}"
+            f"- {child_id}: path={evidence.path}, rev={evidence.revision}"
             for child_id, evidence in pending
         )
+        child_list = ", ".join(cid for cid, _ in pending)
         return CompletionCheckResult(
             can_complete=False,
             blocked_reason="Unresolved preserved subagent worktree",
             inject_message=(
-                "[RUNTIME BLOCK] One or more child worktrees are still preserved. "
-                "Their changes are not present in the parent workspace. Inspect each "
-                "child, then explicitly apply, discard, or retain it before finishing.\n"
-                f"{facts}"
+                "[RUNTIME BLOCK] You have subagent worktree(s) with unmerged changes:\n"
+                f"{facts}\n\n"
+                "These changes are NOT yet in the parent workspace. "
+                "You must resolve EACH worktree before finishing:\n"
+                "- To review a child's work: open its session and inspect the diff\n"
+                "- To accept changes: use the worktree apply operation\n"
+                "- To discard changes: use the worktree discard operation\n"
+                f"Child sessions needing resolution: {child_list}"
             ),
         )
 

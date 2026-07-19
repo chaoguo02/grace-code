@@ -734,4 +734,31 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
         return tree
 
+    # ── GET /api/sessions/{session_id}/worktrees ────────────────────────
+    # List unresolved worktrees from child sessions that need attention.
+
+    @router.get("/{session_id}/worktrees")
+    async def get_pending_worktrees(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> list[dict[str, Any]]:
+        """Return child worktrees awaiting apply/discard for a session."""
+        pending = []
+        for child in service._store.list_child_sessions(session_id):
+            result = getattr(child, "agent_result", None)
+            if result is None:
+                continue
+            from agent.session.models import WorktreeDisposition
+            if (getattr(result, "worktree_disposition", None) is WorktreeDisposition.PRESERVED
+                    and getattr(result, "worktree", None) is not None):
+                wt = result.worktree
+                pending.append({
+                    "child_session_id": child.id,
+                    "agent_name": child.agent_name,
+                    "path": getattr(wt, "path", ""),
+                    "revision": getattr(wt, "revision", ""),
+                    "summary": getattr(result, "summary", "")[:200],
+                })
+        return pending
+
     return router
