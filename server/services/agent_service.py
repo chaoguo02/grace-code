@@ -192,7 +192,7 @@ class AgentService:
         from memory.store import MemoryStore
 
         try:
-            self._memory_store = MemoryStore(repo_path=self.repo_path)
+            self._memory_store = MemoryStore(repo_path=self.repo_path, db_path=db_path)
         except Exception:
             logger.warning("Failed to initialize MemoryStore", exc_info=True)
             self._memory_store = None

@@ -456,7 +456,71 @@ class SessionRuntime:
             self._completion_verifiers: list = []
         self._completion_verifiers.append(verifier)
 
-    # ── Worktree resolution (Gap 15) ───────────────────────────────────
+    # ── Worktree resolution (Gap 15, async queue) ─────────────────────
+
+    def _ensure_worktree_worker(self) -> None:
+        """Start the background worktree resolution worker if not running."""
+        if getattr(self, '_worktree_worker_started', False):
+            return
+        import queue as _q
+        import threading as _th
+        self._worktree_queue: _q.Queue = _q.Queue()
+        self._worktree_results: dict[str, dict] = {}
+        self._worktree_worker_started = True
+
+        def _worker():
+            _logger = logging.getLogger(__name__)
+            while True:
+                try:
+                    cmd = self._worktree_queue.get()
+                    if cmd is None:  # sentinel
+                        break
+                    parent_id, child_id, action = cmd
+                    cmd_key = f"{child_id}_{action}"
+                    self._worktree_results[cmd_key] = {
+                        "status": "processing", "child_session_id": child_id,
+                        "action": action,
+                    }
+                    result = self._resolve_worktree_sync(parent_id, child_id, action)
+                    self._worktree_results[cmd_key] = result
+                    # Push WS event via event callback
+                    _cb = getattr(self, '_event_callback', None)
+                    if _cb is not None:
+                        try:
+                            from agent.task import Event, EventType
+                            _ev = Event(
+                                event_type=EventType.CUSTOM if hasattr(EventType, 'CUSTOM') else "worktree_resolved",
+                                payload=result, timestamp="",
+                            )
+                            _cb(_ev)
+                        except Exception:
+                            _logger.debug("Worktree WS push failed", exc_info=True)
+                except Exception:
+                    _logger.exception("Worktree worker error")
+
+        _t = _th.Thread(target=_worker, daemon=True, name="worktree-worker")
+        _t.start()
+
+    def enqueue_worktree_command(
+        self, parent_session_id: str, child_session_id: str, action: str,
+    ) -> str:
+        """Enqueue a worktree command for async processing. Returns command_key."""
+        self._ensure_worktree_worker()
+        self._worktree_queue.put((parent_session_id, child_session_id, action))
+        cmd_key = f"{child_session_id}_{action}"
+        self._worktree_results[cmd_key] = {
+            "status": "queued", "child_session_id": child_session_id,
+            "action": action,
+        }
+        return cmd_key
+
+    def get_worktree_command_status(self, child_session_id: str, action: str) -> dict | None:
+        return getattr(self, '_worktree_results', {}).get(f"{child_session_id}_{action}")
+
+    def _resolve_worktree_sync(self, parent_session_id: str, child_session_id: str,
+                                action: str) -> dict:
+        """Internal: perform the actual worktree operation (called from worker thread)."""
+        return self.resolve_worktree(parent_session_id, child_session_id, action)
 
     def resolve_worktree(
         self, parent_session_id: str, child_session_id: str,

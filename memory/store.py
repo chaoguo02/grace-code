@@ -118,6 +118,12 @@ class MemoryStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _db_conn(self):
+        import sqlite3
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
     # ------------------------------------------------------------------
     # 属性
     # ------------------------------------------------------------------
@@ -142,15 +148,8 @@ class MemoryStore:
     # ------------------------------------------------------------------
 
     def read_memory(self, name: str) -> Memory | None:
-        """
-        读取一条记忆。
-
-        Args:
-            name: 记忆名称（slug），对应 {name}.md
-
-        Returns:
-            Memory 对象，不存在时返回 None
-        """
+        if self._db_path:
+            return self._db_read_memory(name)
         path = self._file_path(name)
         if not path.exists():
             return None
@@ -225,7 +224,9 @@ class MemoryStore:
                 pass
         return memory
 
-    def write_memory(self, memory: Memory) -> bool:
+    def write_memory(self, memory: Memory, source: str = "") -> bool:
+        if self._db_path:
+            return self._db_write_memory(memory, source=source)
         """
         写入一条记忆（创建或覆盖）。
 
@@ -290,15 +291,18 @@ class MemoryStore:
         return counts
 
     def delete_memory(self, name: str) -> bool:
-        """
-        删除一条记忆。
-
-        Args:
-            name: 记忆名称（slug）
-
-        Returns:
-            True 表示成功（文件不存在也返回 True）
-        """
+        if self._db_path:
+            try:
+                with self._db_conn() as conn:
+                    conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (name,))
+                    conn.execute("DELETE FROM memory_entries WHERE name=?", (name,))
+                if self._indexer is not None:
+                    try: self._indexer.remove_memory(name)
+                    except Exception: pass
+                return True
+            except Exception as exc:
+                logger.error("DB delete_memory %s failed: %s", name, exc)
+                return False
         path = self._file_path(name)
         if not path.exists():
             return True
@@ -319,6 +323,35 @@ class MemoryStore:
             except Exception as exc:
                 logger.warning("Indexer remove failed for %s: %s", name, exc)
         return True
+
+    def _db_read_memory(self, name: str) -> Memory | None:
+        try:
+            with self._db_conn() as conn:
+                row = conn.execute("SELECT * FROM memory_entries WHERE name=?", (name,)).fetchone()
+                if row is None:
+                    return None
+                anchors = []
+                for a in conn.execute("SELECT * FROM memory_anchors WHERE memory_name=?", (name,)).fetchall():
+                    anchor = Anchor(kind=a["kind"])
+                    if a["path"]: anchor.path = a["path"]
+                    if a["symbol_name"]: anchor.name = a["symbol_name"]
+                    if a["task_value"]: anchor.value = a["task_value"]
+                    if a["content_hash"]: anchor.content_hash = a["content_hash"]
+                    anchors.append(anchor)
+                return Memory(
+                    name=row["name"], description=row["description"],
+                    content=row["content"],
+                    metadata=MemoryMetadata(
+                        type=MemoryType(row["type"]) if row["type"] in ("user","feedback","project","reference") else MemoryType.PROJECT,
+                        status=MemoryStatus(row["status"]) if row["status"] in ("active","deprecated") else MemoryStatus.ACTIVE,
+                        scope=MemoryScope(row["scope"]) if row["scope"] in ("session","project","global") else MemoryScope.PROJECT,
+                        confidence=row["confidence"], access_count=row["access_count"],
+                    ),
+                    updated_at=row["updated_at"], anchors=anchors,
+                )
+        except Exception as exc:
+            logger.warning("DB read_memory %s failed: %s", name, exc)
+            return None
 
     # ------------------------------------------------------------------
     # 生命周期管理
@@ -910,6 +943,7 @@ class TwoTierMemoryStore(MemoryStore):
     def __init__(
         self,
         repo_path: str,
+        db_path: str | None = None,
         base_dir: str | None = None,
         memory_dir: str | None = None,
         global_dir: str | None = None,

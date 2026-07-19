@@ -764,37 +764,48 @@ def create_sessions_router(get_service: Any) -> APIRouter:
     # ── POST /api/sessions/{session_id}/worktrees/{child_id}/{action} ───
     # Resolve a preserved child worktree (apply/discard/retain).
 
-    @router.post("/{session_id}/worktrees/{child_id}/{action}")
+    @router.post("/{session_id}/worktrees/{child_id}/{action}", status_code=202)
     async def resolve_worktree(
         session_id: str,
         child_id: str,
         action: str,
         service=Depends(get_service),
     ) -> dict[str, Any]:
-        """Apply, discard, or retain a child session's preserved worktree.
+        """Enqueue a worktree command for async processing.
+
+        Returns 202 Accepted immediately. The Runtime worker thread
+        processes the command and pushes a worktree_resolved WS event
+        when complete.
 
         *action* must be one of: apply, discard, retain.
-
-        Runtime-mediated to ensure thread safety — the parent session's
-        Runtime handles filesystem access.
         """
         if action not in ("apply", "discard", "retain"):
             raise HTTPException(status_code=400, detail=f"Invalid action: {action}. Use apply/discard/retain")
 
-        result = service._runtime.resolve_worktree(session_id, child_id, action)
-        if not result["resolved"]:
-            raise HTTPException(status_code=409, detail=result["message"])
+        # Validate child session exists and worktree is PRESERVED
+        child = service._store.get_session(child_id)
+        if child is None:
+            raise HTTPException(status_code=404, detail="Child session not found")
+        result = child.agent_result
+        if result is None or result.worktree is None:
+            raise HTTPException(status_code=409, detail="No worktree to resolve")
 
-        # Push WS event so frontend updates worktree status in real time
-        if service._event_bus is not None:
-            service._event_bus.publish_raw(session_id, {
-                "type": "worktree_resolved",
-                "child_session_id": child_id,
-                "action": action,
-                "status": result["status"],
-                "message": result["message"],
-            })
+        # Enqueue async command
+        cmd_key = service._runtime.enqueue_worktree_command(session_id, child_id, action)
+        return {"accepted": True, "command_key": cmd_key, "child_session_id": child_id,
+                "action": action, "status": "queued"}
 
-        return result
+    @router.get("/{session_id}/worktrees/{child_id}/{action}/status")
+    async def get_worktree_command_status(
+        session_id: str,
+        child_id: str,
+        action: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Get the status of a queued worktree command."""
+        status = service._runtime.get_worktree_command_status(child_id, action)
+        if status is None:
+            raise HTTPException(status_code=404, detail="Command not found")
+        return status
 
     return router
