@@ -586,4 +586,5 @@ class FileWriteTool(BaseTool):
         return ToolResult(
             success=True,
             output=f"Written {line_count} lines to {path}",
+            modified_files=[str(target_path)],
         )

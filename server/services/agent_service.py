@@ -191,12 +191,26 @@ class AgentService:
             logger.info("ExternalMemoryStore not available (install fastembed for semantic search)")
             self._external_store = None
 
-        # ── Decay low-confidence memories ───────────────────────────────
-        try:
-            if self._memory_store is not None and hasattr(self._memory_store._backend, 'decay_confidences'):
-                self._memory_store._backend.decay_confidences()
-        except Exception:
-            logger.warning("Failed to decay confidences", exc_info=True)
+        # ── Memory maintenance daemon ────────────────────────────────────
+        # Runs decay periodically in background — independent of session
+        # lifecycle, so memories decay even when no sessions are active.
+        if self._memory_store is not None:
+            _store = self._memory_store
+            def _memory_maintenance():
+                import time as _time
+                while True:
+                    _time.sleep(600)  # every 10 minutes
+                    try:
+                        backend = getattr(_store, '_backend', None)
+                        if backend is not None and hasattr(backend, 'decay_confidences'):
+                            decayed = backend.decay_confidences()
+                            if decayed:
+                                logger.debug("Memory decay: %d entries updated", decayed)
+                    except Exception:
+                        pass
+            import threading as _th
+            _t = _th.Thread(target=_memory_maintenance, daemon=True, name="memory-decay")
+            _t.start()
 
         # ── 5. Agent registry ──
         from agent.session.agent_registry import AgentRegistryV2
@@ -622,6 +636,10 @@ class AgentService:
             _web_cb = self._build_web_confirm_callback(session_id)
             self._runtime.set_web_confirm_callback(session_id, _web_cb)
 
+            # Register agent name for stats tracking
+            if self._event_bus is not None and self._event_bus.recorder is not None:
+                self._event_bus.recorder.set_session_agent(session_id, agent_name)
+
             try:
                 result = self._runtime.run_session(
                     session_id=session_id,
@@ -683,17 +701,6 @@ class AgentService:
                         "status": "failed",
                         "error": str(exc),
                     })
-            finally:
-                # Run memory maintenance after each session
-                try:
-                    if self._memory_store is not None:
-                        backend = getattr(self._memory_store, '_backend', None)
-                        if backend is not None:
-                            if hasattr(backend, 'decay_confidences'):
-                                backend.decay_confidences()
-                except Exception:
-                    pass
-
         import threading
         thread = threading.Thread(target=_run_and_notify, daemon=True)
         thread.start()

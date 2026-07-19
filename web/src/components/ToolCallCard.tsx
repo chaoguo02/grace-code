@@ -89,7 +89,7 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
             </div>
             {expanded ? (
               <pre className="paired-run-observation-detail">
-                {escapeHtml(observation.output || observation.error || "")}
+                {escapeHtml(obs?.output || obs?.error || "")}
               </pre>
             ) : null}
           </div>

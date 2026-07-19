@@ -291,14 +291,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     // Add to timeline (for thought, tool_call, observation, reflection, etc.)
+    const _t = (ev as { type: string }).type;
     if (
-      ev.type === "thought" ||
-      ev.type === "tool_call" ||
-      ev.type === "observation" ||
-      ev.type === "reflection" ||
-      ev.type === "subagent_start" ||
-      ev.type === "subagent_stop" ||
-      ev.type === "worktree_resolved"
+      _t === "thought" || _t === "tool_call" || _t === "observation" ||
+      _t === "reflection" || _t === "subagent_start" || _t === "subagent_stop" ||
+      _t === "worktree_resolved"
     ) {
       set((prev) => ({
         timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],

@@ -279,12 +279,12 @@ class EventBus:
                 if sub is not None and sub.has_subscribers:
                     for msg in msgs:
                         # Compute git diff for file-modifying observations.
-                        # Covers Edit/Write + Bash (sed, echo >, python -c, etc.)
+                        # Uses ToolResult.modified_files metadata when available,
+                        # falls back to regex on tool output text.
                         if msg.get("type") == "observation" and not msg.get("error"):
                             _tool = msg.get("tool_name", "")
-                            _output = msg.get("output", "")
-                            if _tool in ("Edit", "Write", "file_edit", "file_write", "Bash"):
-                                diff = self._compute_diff(_tool, _output)
+                            if _tool in _DIFF_TOOLS:
+                                diff = self._compute_diff(_tool, msg.get("output", ""))
                                 if diff:
                                     msg["diff"] = diff
                         logger.info("EVENT → %s | type=%s step=%s",

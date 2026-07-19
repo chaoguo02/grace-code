@@ -1,3 +1,5 @@
+import type { WsMessage } from "./events";
+
 export interface SessionSummary {
   id: string;
   agent_name: string;
