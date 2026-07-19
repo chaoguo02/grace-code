@@ -191,33 +191,47 @@ class AgentService:
             logger.info("ExternalMemoryStore not available (install fastembed for semantic search)")
             self._external_store = None
 
-        # ── Memory maintenance (asyncio task, graceful shutdown) ─────────
-        if self._memory_store is not None:
-            self._memory_stop_event: asyncio.Event | None = asyncio.Event()
-            _store = self._memory_store
-            _stop = self._memory_stop_event
-            _interval = 600  # 10 minutes, configurable
+        # ── Memory maintenance (lazy start on first access) ─────────────
+        self._memory_stop_event: asyncio.Event | None = None
+        self._memory_maintenance_task: asyncio.Task | None = None
+        self._memory_maintenance_started = False
 
-            async def _memory_maintenance():
-                while not _stop.is_set():
-                    try:
-                        await asyncio.wait_for(_stop.wait(), timeout=_interval)
-                        break  # stop signaled
-                    except asyncio.TimeoutError:
-                        pass  # time to decay
-                    try:
-                        backend = getattr(_store, '_backend', None)
-                        if backend is not None and hasattr(backend, 'decay_confidences'):
-                            decayed = backend.decay_confidences()
-                            if decayed:
-                                logger.debug("Memory decay: %d entries updated", decayed)
-                    except Exception:
-                        pass
+    def _ensure_memory_maintenance(self) -> None:
+        """Start the memory decay background task on first access.
+        Lazy init avoids requiring an event loop at AgentService construction.
+        """
+        if self._memory_maintenance_started or self._memory_store is None:
+            return
+        self._memory_maintenance_started = True
 
-            self._memory_maintenance_task = asyncio.ensure_future(_memory_maintenance())
-        else:
-            self._memory_stop_event = None
-            self._memory_maintenance_task = None
+        import asyncio as _aio
+        _store = self._memory_store
+        self._memory_stop_event = _aio.Event()
+        _stop = self._memory_stop_event
+        _interval = 600
+
+        async def _maintain():
+            while not _stop.is_set():
+                try:
+                    await _aio.wait_for(_stop.wait(), timeout=_interval)
+                    break
+                except _aio.TimeoutError:
+                    pass
+                try:
+                    backend = getattr(_store, '_backend', None)
+                    if backend is not None and hasattr(backend, 'decay_confidences'):
+                        decayed = backend.decay_confidences()
+                        if decayed:
+                            logger.debug("Memory decay: %d entries updated", decayed)
+                except Exception:
+                    pass
+
+        try:
+            loop = _aio.get_running_loop()
+            self._memory_maintenance_task = loop.create_task(_maintain())
+        except RuntimeError:
+            # No running loop (e.g., CLI mode) — skip maintenance
+            logger.debug("Memory maintenance skipped: no running event loop")
 
         # ── 5. Agent registry ──
         from agent.session.agent_registry import AgentRegistryV2
@@ -275,6 +289,10 @@ class AgentService:
         # Root session created lazily on first chat()
         self._root_session = None
         self._root_session_id: str | None = None
+
+        # Start memory maintenance (lazy — waits for running event loop)
+        self._ensure_memory_maintenance()
+
         logger.info(
             "AgentService initialized — repo=%s, model=%s",
             self.repo_path, self._config.llm.model,

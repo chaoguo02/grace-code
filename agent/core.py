@@ -778,6 +778,7 @@ class ReActAgent:
                 try:
                     _sc2.record_session_end(
                         self._cfg.stats_session_id,
+                        agent_name=self._cfg.stats_agent_name,
                         total_steps=steps_taken,
                         total_tokens=total_tokens_used,
                         status=status.value if hasattr(status, 'value') else str(status),

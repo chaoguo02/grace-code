@@ -248,6 +248,22 @@ class EventBus:
         except Exception:
             return None
 
+    def _git_diff_for_file(self, filepath: str) -> str | None:
+        """Compute git diff for a known file path (no regex needed)."""
+        if not self._repo_path or not filepath:
+            return None
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "diff", "--", filepath],
+                capture_output=True, text=True,
+                cwd=self._repo_path, timeout=5,
+            )
+            diff = result.stdout.strip()
+            return diff if diff else None
+        except Exception:
+            return None
+
     # ── Publish (called from SessionRuntime thread) ────────────────────────
 
     def publish(self, event: Any) -> None:
@@ -279,14 +295,24 @@ class EventBus:
                 if sub is not None and sub.has_subscribers:
                     for msg in msgs:
                         # Compute git diff for file-modifying observations.
-                        # Priority: 1) observation.modified_files metadata
-                        #           2) regex on tool output (fallback)
+                        # Uses Observation.modified_files from tool metadata,
+                        # falls back to regex on output text.
                         if msg.get("type") == "observation" and not msg.get("error"):
                             _tool = msg.get("tool_name", "")
                             if _tool in _DIFF_TOOLS:
-                                diff = self._compute_diff(_tool, msg.get("output", ""))
-                                if diff:
-                                    msg["diff"] = diff
+                                # Priority 1: explicit modified_files list
+                                _modified = payload.get("observation", {}).get("modified_files", [])
+                                if _modified:
+                                    for _fp in _modified:
+                                        diff = self._git_diff_for_file(_fp)
+                                        if diff:
+                                            msg["diff"] = diff
+                                            break
+                                # Priority 2: regex fallback
+                                if not msg.get("diff"):
+                                    diff = self._compute_diff(_tool, msg.get("output", ""))
+                                    if diff:
+                                        msg["diff"] = diff
                         logger.info("EVENT → %s | type=%s step=%s",
                                      target_session_id[:8], msg.get("type"), msg.get("step", ""))
                         sub.publish(msg)

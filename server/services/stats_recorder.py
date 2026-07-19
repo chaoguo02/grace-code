@@ -53,10 +53,11 @@ class StatsRecorder:
 
     def record_session_end(
         self, session_id: str, *,
+        agent_name: str,
         total_steps: int, total_tokens: int,
         status: str = "completed",
     ) -> None:
-        """Called when the agent finishes (success or failure)."""
+        """Called when the agent finishes. agent_name comes from the agent loop."""
         start = self._session_start.pop(session_id, None)
         duration_ms = int((time.time() - start) * 1000) if start else 0
 
@@ -67,11 +68,9 @@ class StatsRecorder:
             if tn:
                 tool_summary[tn] = tool_summary.get(tn, 0) + 1
 
-        # Agent name unknown here — the caller (agent loop) doesn't pass it.
-        # Stored as empty; the session detail API can fill it from session record.
         self._stats.record_session_complete(
             session_id,
-            agent_name="",  # filled by session detail API
+            agent_name=agent_name,
             total_steps=total_steps or len(steps),
             total_tokens=total_tokens,
             total_duration_ms=duration_ms,
@@ -83,8 +82,3 @@ class StatsRecorder:
             "Stats finalized — session=%s steps=%d tokens=%d duration=%dms",
             session_id[:8], total_steps, total_tokens, duration_ms,
         )
-
-    # Backward compat — called from EventBus.publish(). No-op: first-party
-    # recording is handled by the agent loop now. Kept for interface compat.
-    def set_session_agent(self, session_id: str, agent_name: str) -> None:
-        pass
