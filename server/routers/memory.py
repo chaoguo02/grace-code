@@ -261,22 +261,6 @@ def create_memory_router(get_service: Any) -> APIRouter:
         ok = store.delete_memory(name)
         if not ok:
             raise HTTPException(status_code=404, detail=f"Memory not found: {name}")
-        db = _db(service)
-        if db:
-            db.delete_memory_entry(name)
         return {"name": name, "deleted": True}
-
-    # ── POST /api/memory/sync ─────────────────────────────────────────
-
-    @router.post("/sync")
-    async def sync_memories(
-        service=Depends(get_service),
-    ) -> dict:
-        """Manually trigger file→DB sync."""
-        db = _db(service)
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage not available")
-        count = db.sync_memory_from_files(service.repo_path)
-        return {"synced": count}
 
     return router

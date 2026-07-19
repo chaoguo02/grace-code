@@ -25,11 +25,16 @@ class SqliteMemoryBackend:
         self._indexer = indexer
 
     def _conn(self):
-        conn = sqlite3.connect(self._db_path)
+        conn = sqlite3.connect(self._db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA busy_timeout=10000")
         return conn
+
+    @staticmethod
+    def _val(val):
+        """Extract string value from enum or plain string."""
+        return val.value if hasattr(val, 'value') else str(val) if val else ""
 
     # ── CRUD ────────────────────────────────────────────────────────────
 
@@ -63,6 +68,9 @@ class SqliteMemoryBackend:
 
     def write_memory(self, memory: Memory, source: str = "") -> bool:
         now = datetime.now(timezone.utc).isoformat()
+        _t = self._val(memory.metadata.type)
+        _s = self._val(memory.metadata.status)
+        _sc = self._val(memory.metadata.scope)
         try:
             with self._conn() as conn:
                 conn.execute("BEGIN")
@@ -73,10 +81,7 @@ class SqliteMemoryBackend:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                COALESCE((SELECT created_at FROM memory_entries WHERE name=?), ?), ?)""",
                     (memory.name, memory.description, memory.content,
-                     memory.metadata.type.value if hasattr(memory.metadata.type, 'value') else memory.metadata.type,
-                     memory.metadata.status.value if hasattr(memory.metadata.status, 'value') else memory.metadata.status,
-                     memory.metadata.scope.value if hasattr(memory.metadata.scope, 'value') else memory.metadata.scope,
-                     memory.metadata.confidence, memory.metadata.access_count,
+                     _t, _s, _sc, memory.metadata.confidence, memory.metadata.access_count,
                      source, "", memory.name, now, now),
                 )
                 conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (memory.name,))
@@ -97,8 +102,10 @@ class SqliteMemoryBackend:
     def delete_memory(self, name: str) -> bool:
         try:
             with self._conn() as conn:
+                conn.execute("BEGIN")
                 conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (name,))
                 conn.execute("DELETE FROM memory_entries WHERE name=?", (name,))
+                conn.execute("COMMIT")
             if self._indexer is not None:
                 try: self._indexer.remove_memory(name)
                 except Exception: pass
@@ -133,7 +140,12 @@ class SqliteMemoryBackend:
                     "SELECT name FROM memory_entries WHERE scope=? AND confidence>=? ORDER BY confidence DESC",
                     (scope, min_confidence),
                 ).fetchall()
-                return [self.read_memory(r["name"]) for r in rows if self.read_memory(r["name"])]
+                result = []
+                for r in rows:
+                    mem = self.read_memory(r["name"])
+                    if mem:
+                        result.append(mem)
+                return result
         except Exception:
             return []
 
@@ -150,9 +162,10 @@ class SqliteMemoryBackend:
     def get_index_content(self, max_lines: int | None = None) -> str:
         try:
             with self._conn() as conn:
+                limit = max_lines or 200
                 rows = conn.execute(
-                    "SELECT name, description, type, updated_at FROM memory_entries WHERE status='active' ORDER BY updated_at DESC LIMIT ?",
-                    (max_lines or 200,),
+                    "SELECT name, description, type, updated_at FROM memory_entries ORDER BY updated_at DESC LIMIT ?",
+                    (limit,),
                 ).fetchall()
                 lines = ["# Memory Index\n"]
                 for r in rows:

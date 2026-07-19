@@ -197,12 +197,11 @@ class AgentService:
             logger.warning("Failed to initialize MemoryStore", exc_info=True)
             self._memory_store = None
 
-        # ── Sync file-based memories to DB + decay ─────────────────────
+        # ── Decay low-confidence memories ───────────────────────────────
         try:
-            self._storage.sync_memory_from_files(self.repo_path)
             self._storage.decay_confidences()
         except Exception:
-            logger.warning("Failed to sync memories to DB", exc_info=True)
+            logger.warning("Failed to decay confidences", exc_info=True)
 
         # ── ExternalMemoryStore (semantic search) ───────────────────────
         try:
