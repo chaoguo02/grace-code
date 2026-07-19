@@ -81,6 +81,7 @@ export function PlanView() {
                     await api.chat(
                       activeId,
                       "Analyze the codebase and produce a structured implementation plan.",
+                      "analysis",  // triggers plan mode agent + permission_mode="plan"
                     );
                   } catch {
                     /* ignore */
