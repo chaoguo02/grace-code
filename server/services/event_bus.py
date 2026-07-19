@@ -104,119 +104,86 @@ class SessionSubscriber:
 # ─── Event translation ───────────────────────────────────────────────────────
 
 def _translate_event(event: Any) -> list[dict[str, Any]]:
-    """Translate ``agent.task.Event`` → list of standardized WS messages.
+    """Translate ``agent.task.Event`` → list of typed WS messages.
 
     One Event can produce multiple messages (e.g. ACTION → thought + tool_call).
+    Uses server.events dataclasses as the single source of truth for shapes.
     """
     from agent.task import EventType
+    from server.events import (
+        WsStatus, WsThought, WsToolCall, WsObservation, WsReflection,
+        WsSubagentStart, WsSubagentStop,
+    )
 
     ev_type = getattr(event, "event_type", "")
     if hasattr(ev_type, "value"):
         ev_type = ev_type.value
     payload = getattr(event, "payload", {}) or {}
     ts = getattr(event, "timestamp", "")
+    child_id = getattr(event, "child_session_id", "")
 
     if ev_type == "task_start":
-        return [{"type": "status", "status": "running", "timestamp": ts}]
+        return [WsStatus(status="running", timestamp=ts).to_dict()]
 
     if ev_type == "task_complete":
-        return [{
-            "type": "status", "status": "completed",
-            "result": {
-                "summary": payload.get("summary", ""),
-                "steps_taken": payload.get("steps", 0),
-            },
-            "timestamp": ts,
-        }]
+        return [WsStatus(status="completed", result={
+            "summary": payload.get("summary", ""),
+            "steps_taken": payload.get("steps", 0),
+        }, timestamp=ts).to_dict()]
 
     if ev_type == "task_failed":
-        return [{
-            "type": "status", "status": "failed",
-            "error": payload.get("error", str(payload.get("reason", "unknown"))),
-            "timestamp": ts,
-        }]
+        return [WsStatus(status="failed",
+            error=payload.get("error", str(payload.get("reason", "unknown"))),
+            timestamp=ts).to_dict()]
 
     if ev_type == "action":
         action = payload.get("action", {}) or {}
         step = payload.get("step", 0)
-        child_id = getattr(event, "child_session_id", None)
-        msgs: list[dict[str, Any]] = []
+        msgs: list[dict] = []
 
         thought = action.get("thought", "")
         if thought and thought.strip():
-            _msg: dict = {"type": "thought", "content": thought, "step": step, "timestamp": ts}
-            if child_id:
-                _msg["child_session_id"] = child_id
-            msgs.append(_msg)
+            msgs.append(WsThought(content=thought, step=step,
+                child_session_id=child_id, timestamp=ts).to_dict())
 
-        tool_calls = action.get("tool_calls") or []
-        for tc in tool_calls:
-            _tc_msg: dict = {
-                "type": "tool_call",
-                "step": step,
-                "name": tc.get("name", ""),
-                "params": tc.get("params", {}),
-                "id": tc.get("id", ""),
-                "timestamp": ts,
-            }
-            if child_id:
-                _tc_msg["child_session_id"] = child_id
-            msgs.append(_tc_msg)
+        for tc in (action.get("tool_calls") or []):
+            msgs.append(WsToolCall(
+                name=tc.get("name", ""), params=tc.get("params", {}),
+                step=step, id=tc.get("id", ""),
+                child_session_id=child_id, timestamp=ts).to_dict())
 
-        # finish / give_up have a message
         atype = action.get("action_type", "")
         msg_text = action.get("message", "")
         if atype in ("finish", "give_up") and msg_text:
-            msgs.append({"type": "status", "status": atype, "message": msg_text, "timestamp": ts})
+            msgs.append(WsStatus(status=atype, message=msg_text, timestamp=ts).to_dict())
 
         return msgs
 
     if ev_type == "observation":
         obs = payload.get("observation", {}) or {}
-        child_id = getattr(event, "child_session_id", None)
-        _obs_msg: dict = {
-            "type": "observation",
-            "step": payload.get("step", 0),
-            "tool_name": obs.get("tool_name", ""),
-            "status": obs.get("status", ""),
-            "output": obs.get("output", ""),
-            "error": obs.get("error"),
-            "id": payload.get("tool_call_id"),
-            "timestamp": ts,
-        }
-        if child_id:
-            _obs_msg["child_session_id"] = child_id
-        return [_obs_msg]
+        return [WsObservation(
+            tool_name=obs.get("tool_name", ""), output=obs.get("output", ""),
+            error=obs.get("error"), status=obs.get("status", ""),
+            step=payload.get("step", 0), id=payload.get("tool_call_id"),
+            child_session_id=child_id, timestamp=ts).to_dict()]
 
     if ev_type == "reflection":
-        return [{
-            "type": "reflection",
-            "content": payload.get("reason", "") or str(payload.get("reflection", "")),
-            "timestamp": ts,
-        }]
+        return [WsReflection(
+            content=payload.get("reason", "") or str(payload.get("reflection", "")),
+            timestamp=ts).to_dict()]
 
     if ev_type in ("subagent_start",):
-        return [{
-            "type": "subagent_start",
-            "child_session_id": payload.get("child_session_id", ""),
-            "agent_name": payload.get("agent_name", ""),
-            "timestamp": ts,
-        }]
+        return [WsSubagentStart(
+            child_session_id=payload.get("child_session_id", ""),
+            agent_name=payload.get("agent_name", ""), timestamp=ts).to_dict()]
 
     if ev_type in ("subagent_stop", "subagent_complete"):
-        return [{
-            "type": "subagent_stop",
-            "child_session_id": payload.get("child_session_id", ""),
-            "status": payload.get("status", "completed"),
-            "timestamp": ts,
-        }]
+        return [WsSubagentStop(
+            child_session_id=payload.get("child_session_id", ""),
+            status=payload.get("status", "completed"), timestamp=ts).to_dict()]
 
     # Fallback: send raw event as-is
-    return [{
-        "type": ev_type,
-        "payload": payload,
-        "timestamp": ts,
-    }]
+    return [{"type": ev_type, "payload": payload, "timestamp": ts}]
 
 
 class EventBus:
