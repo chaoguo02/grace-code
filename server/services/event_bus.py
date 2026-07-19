@@ -279,8 +279,8 @@ class EventBus:
                 if sub is not None and sub.has_subscribers:
                     for msg in msgs:
                         # Compute git diff for file-modifying observations.
-                        # Uses ToolResult.modified_files metadata when available,
-                        # falls back to regex on tool output text.
+                        # Priority: 1) observation.modified_files metadata
+                        #           2) regex on tool output (fallback)
                         if msg.get("type") == "observation" and not msg.get("error"):
                             _tool = msg.get("tool_name", "")
                             if _tool in _DIFF_TOOLS:

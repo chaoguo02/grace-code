@@ -191,15 +191,20 @@ class AgentService:
             logger.info("ExternalMemoryStore not available (install fastembed for semantic search)")
             self._external_store = None
 
-        # ── Memory maintenance daemon ────────────────────────────────────
-        # Runs decay periodically in background — independent of session
-        # lifecycle, so memories decay even when no sessions are active.
+        # ── Memory maintenance (asyncio task, graceful shutdown) ─────────
         if self._memory_store is not None:
+            self._memory_stop_event: asyncio.Event | None = asyncio.Event()
             _store = self._memory_store
-            def _memory_maintenance():
-                import time as _time
-                while True:
-                    _time.sleep(600)  # every 10 minutes
+            _stop = self._memory_stop_event
+            _interval = 600  # 10 minutes, configurable
+
+            async def _memory_maintenance():
+                while not _stop.is_set():
+                    try:
+                        await asyncio.wait_for(_stop.wait(), timeout=_interval)
+                        break  # stop signaled
+                    except asyncio.TimeoutError:
+                        pass  # time to decay
                     try:
                         backend = getattr(_store, '_backend', None)
                         if backend is not None and hasattr(backend, 'decay_confidences'):
@@ -208,9 +213,11 @@ class AgentService:
                                 logger.debug("Memory decay: %d entries updated", decayed)
                     except Exception:
                         pass
-            import threading as _th
-            _t = _th.Thread(target=_memory_maintenance, daemon=True, name="memory-decay")
-            _t.start()
+
+            self._memory_maintenance_task = asyncio.ensure_future(_memory_maintenance())
+        else:
+            self._memory_stop_event = None
+            self._memory_maintenance_task = None
 
         # ── 5. Agent registry ──
         from agent.session.agent_registry import AgentRegistryV2
@@ -859,6 +866,15 @@ class AgentService:
     async def shutdown(self) -> None:
         """Release resources. Called on app shutdown."""
         logger.info("AgentService shutting down")
+        # Cancel memory maintenance
+        if self._memory_stop_event is not None:
+            self._memory_stop_event.set()
+        if self._memory_maintenance_task is not None:
+            self._memory_maintenance_task.cancel()
+            try:
+                await self._memory_maintenance_task
+            except asyncio.CancelledError:
+                pass
         # Disconnect MCP servers
         if self._mcp_registry is not None:
             try:

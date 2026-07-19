@@ -81,6 +81,7 @@ class ToolResult:
             output=self.output,
             tool_name=tool_name,
             error=self._format_error_for_observation(),
+            modified_files=list(self.modified_files),
             metadata=metadata,
             outcome=self.outcome,
         )

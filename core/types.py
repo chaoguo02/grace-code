@@ -35,6 +35,7 @@ class Observation:
     error: str | None = None
     metadata: dict[str, Any] | None = None
     outcome: ToolOutcome = ToolOutcome.NONE
+    modified_files: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v.value if isinstance(v, Enum) else v
