@@ -22,6 +22,7 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
   const [events, setEvents] = useState<WsMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
   const [worktreeAction, setWorktreeAction] = useState<string | null>(null);
   const activeId = useSessionStore((s) => s.activeId);
   // Subscribe to WS-pushed worktree resolution state
@@ -73,7 +74,7 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
     }
     load();
     return () => { cancelled = true; };
-  }, [childSessionId]);
+  }, [childSessionId, retryKey]);
 
   const statusIcon: Record<string, string> = {
     running: "◎", completed: "✓", failed: "✗", queued: "○", cancelled: "◼",
@@ -134,7 +135,7 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
         ) : loadError ? (
           <div style={{ textAlign: "center", color: "var(--red, #f44336)", padding: 40 }}>
             Failed to load subagent data.{" "}
-            <button type="button" onClick={() => { setLoading(true); setLoadError(false); }}
+            <button type="button" onClick={() => { setLoading(true); setLoadError(false); setRetryKey(k => k + 1); }}
               style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", textDecoration: "underline", fontSize: "inherit" }}>
               Retry
             </button>

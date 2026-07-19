@@ -79,7 +79,11 @@ interface ChatState {
   /** Set the child session to view in SubagentDetail overlay */
   setViewingChild: (id: string | null) => void;
   /** Background subagent progress entries */
-  backgroundAgents: Record<string, { childSessionId: string; agentName: string; status: string; toolCount: number; lastAction: string }>;
+  backgroundAgents: Record<string, {
+    childSessionId: string; agentName: string; status: string;
+    toolCount: number; lastAction: string;
+    _completedAt?: number;  // timestamp for pruning completed entries
+  }>;
   /** Worktree resolution states: key="{childId}_{action}" → "applied"|"discarded"|"error" */
   _worktreeStates: Record<string, string>;
 }
@@ -239,7 +243,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // Prune completed entries after 5 minutes to prevent memory leak
         const now = Date.now();
         for (const key of Object.keys(next)) {
-          if (next[key].status !== "running" && (now - (next[key] as any)._completedAt || 0) > 300000) {
+          if (next[key].status !== "running" && (now - (next[key]._completedAt || 0)) > 300000) {
             delete next[key];
           }
         }
@@ -250,7 +254,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         set((prev) => {
           const next = { ...prev.backgroundAgents };
           if (next[csid]) {
-            next[csid] = { ...next[csid], _completedAt: Date.now() } as any;
+            next[csid] = { ...next[csid], _completedAt: Date.now() };
           }
           return { backgroundAgents: next };
         });
@@ -452,10 +456,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     ws.onclose = (ev) => {
       const info = `code=${ev.code}${ev.reason ? " reason=" + ev.reason : ""}`;
       console.log("[WS] Closed —", info);
-      set({ ws: null, wsConnected: false, wsCloseInfo: info });
-      if (ev.code !== 1000 && ev.code !== 1001) {
-        set({ error: `WS closed: ${info}` });
-      }
+      set((prev) => {
+        // Keep onerror's message if it's more specific (connection failure).
+        // Only set close error for abnormal codes when no prior error exists.
+        const isAbnormal = ev.code !== 1000 && ev.code !== 1001;
+        return {
+          ws: null, wsConnected: false, wsCloseInfo: info,
+          error: isAbnormal && !prev.error ? `WS closed: ${info}` : prev.error,
+        };
+      });
     };
     set({ ws, _wsSessionId: sessionId });
   },
