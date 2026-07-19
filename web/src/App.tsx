@@ -117,7 +117,9 @@ export default function App() {
             </div>
           </header>
 
-          {activeView === "chat" && <ChatView />}
+          <div style={{ display: activeView === "chat" ? "flex" : "none", flex: 1, flexDirection: "column" }}>
+            <ChatView />
+          </div>
           {activeView === "plan" && <PlanView />}
           {activeView === "reviews" && <DiffReviewView />}
           {activeView === "stats" && <StatsDashboard />}

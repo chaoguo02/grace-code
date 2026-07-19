@@ -363,7 +363,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadMessages: async (sessionId) => {
     try {
       const msgs = await api.getMessages(sessionId);
-      set({ timeline: msgs.map((m) => ({ source: "message" as const, msg: m })) });
+      const msgItems = msgs.map((m) => ({ source: "message" as const, msg: m }));
+      // Merge with existing trace events — don't replace.
+      // loadTraceEvents may have already loaded trace data.
+      set((prev) => {
+        const traces = prev.timeline.filter((item) => item.source === "ws");
+        return { timeline: [...traces, ...msgItems] };
+      });
     } catch {
       /* ignore */
     }
@@ -373,7 +379,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const events = await api.getTraceEvents(sessionId);
       if (events.length === 0) return;
-      // Prepend historical events before messages (they happened before)
       const wsItems = events.map((ws) => ({ source: "ws" as const, ws }));
       set((prev) => {
         const msgs = prev.timeline.filter((item) => item.source === "message");
@@ -401,7 +406,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const ws = new WebSocket(url);
     ws.onopen = () => {
       console.log("[WS] Connected — session:", sessionId);
-      set({ wsConnected: true, wsCloseInfo: "", error: null });
+      set({ wsConnected: true, wsCloseInfo: "", error: null });  // clear stale close info
     };
     ws.onmessage = (ev) => {
       try {
