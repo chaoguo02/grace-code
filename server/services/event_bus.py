@@ -300,12 +300,8 @@ class EventBus:
                     if sub.has_subscribers:
                         for msg in msgs:
                             sub.publish(msg)
-            # Record stats (passive observer — never raises)
-            if self.recorder is not None:
-                try:
-                    self.recorder.record(event, msgs)
-                except Exception:
-                    logger.exception("StatsRecorder.record failed")
+            # Stats recording moved to first-party instrumentation in agent/core.py.
+            # The recorder field is kept for backward compat but no longer called here.
         except Exception:
             logger.exception("EventBus.publish failed")
 

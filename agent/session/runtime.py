@@ -867,6 +867,8 @@ class SessionRuntime:
             agent_cfg.hook_agent_id = ""
             agent_cfg.hook_agent_type = spec.name
             agent_cfg.hook_dispatcher = self._hook_dispatcher
+            agent_cfg.stats_session_id = session_id
+            agent_cfg.stats_agent_name = _effective_agent
 
             persisted_messages = self._store.list_messages(session_id)
             had_persisted_messages = bool(persisted_messages)

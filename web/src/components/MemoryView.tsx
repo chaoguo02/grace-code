@@ -37,6 +37,30 @@ function toneClass(value: MemoryType | MemoryStatus | MemoryScope | MemoryLayer)
   return `tone-${value}`;
 }
 
+/** Minimal Markdown renderer — converts basic Markdown to HTML. */
+function renderMarkdown(text: string): string {
+  let html = text
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    // Code blocks
+    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+    // Inline code
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    // Bold
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    // Italic
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    // Headings
+    .replace(/^### (.+)$/gm, '<h4>$1</h4>')
+    .replace(/^## (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^# (.+)$/gm, '<h2>$1</h2>')
+    // Unordered lists
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    // Line breaks
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n/g, '<br>');
+  return `<p>${html}</p>`;
+}
+
 function MemoryMetric({
   label,
   value,
@@ -89,6 +113,14 @@ export function MemoryView() {
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const [selectedDetail, setSelectedDetail] = useState<Record<string, unknown> | null>(null);
 
+  // Derived detail fields (typed)
+  const detailAnchors = selectedDetail && Array.isArray((selectedDetail as Record<string, unknown>).anchors)
+    ? (selectedDetail as Record<string, unknown>).anchors as Array<Record<string, unknown>>
+    : null;
+  const detailContent = selectedDetail?.content as string | undefined;
+  const detailSource = selectedDetail?.source as string | undefined;
+  const detailSessionId = selectedDetail?.source_session_id as string | undefined;
+
   // Fetch full detail when a memory is selected
   useEffect(() => {
     if (!selectedName) { setSelectedDetail(null); return; }
@@ -116,7 +148,7 @@ export function MemoryView() {
     const items = snapshot?.items ?? [];
     return items.filter((item) => {
       const matchesType = typeFilter === "all" || item.type === typeFilter;
-      const text = `${item.name} ${item.description} ${item.preview ?? ""}`.toLowerCase();
+      const text = `${item.name} ${item.description}`.toLowerCase();
       const matchesQuery = !query.trim() || text.includes(query.trim().toLowerCase());
       return matchesType && matchesQuery;
     });
@@ -255,7 +287,6 @@ export function MemoryView() {
                   <div className="memory-list-description">{item.description}</div>
                   <div className="memory-list-meta">
                     <span>{item.scope}</span>
-                    <span>{item.layer}</span>
                     <span>{item.access_count} reads</span>
                   </div>
                 </button>
@@ -299,12 +330,30 @@ export function MemoryView() {
 
                 <div className="memory-preview-card">
                   <div className="memory-preview-label">Content</div>
-                  <div className="memory-preview-body" style={{ whiteSpace: "pre-wrap", fontFamily: "var(--font-mono)", fontSize: 13 }}>
-                    {selectedDetail?.content
-                      ? (selectedDetail.content as string)
-                      : selected.preview || "Loading..."}
-                  </div>
+                  <div className="memory-preview-body" style={{ fontSize: 14, lineHeight: 1.6 }}
+                    dangerouslySetInnerHTML={{
+                      __html: detailContent
+                        ? renderMarkdown(detailContent)
+                        : "<p>Loading...</p>"
+                    }}
+                  />
                 </div>
+
+                {detailAnchors && detailAnchors.length > 0 && (
+                  <div className="memory-preview-card" style={{ marginTop: 8 }}>
+                    <div className="memory-preview-label">Anchors ({detailAnchors.length})</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+                      {detailAnchors.map((a, i) => (
+                        <div key={i} style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--font-mono)" }}>
+                          <span style={{ color: "var(--accent)" }}>{String(a.kind || "")}</span>
+                          {!!a.path && <span>: {String(a.path)}</span>}
+                          {!!a.name && <span>: {String(a.name)}</span>}
+                          {!!a.content_hash && <span style={{ color: "var(--text-muted)", marginLeft: 8 }}>hash:{String(a.content_hash).slice(0, 12)}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
                   <button className="btn-ghost" type="button"
@@ -324,6 +373,20 @@ export function MemoryView() {
                     <div className="memory-meta-label">Updated</div>
                     <div className="memory-meta-value">{formatDate(selected.updated_at)}</div>
                   </div>
+                  {!!detailSource && (
+                    <div className="memory-meta-card">
+                      <div className="memory-meta-label">Source</div>
+                      <div className="memory-meta-value">{detailSource}</div>
+                    </div>
+                  )}
+                  {!!detailSessionId && (
+                    <div className="memory-meta-card">
+                      <div className="memory-meta-label">Session</div>
+                      <div className="memory-meta-value" style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>
+                        {detailSessionId.slice(0, 12)}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </>
             )}

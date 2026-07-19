@@ -578,6 +578,14 @@ class ReActAgent:
         # _GitState dataclass (which would break if slots are added).
         _block_tracker: dict[str, int] = {}
 
+        # First-party stats: record session start
+        _sc = self._cfg.stats_collector
+        if _sc is not None:
+            try:
+                _sc.record_session_start(self._cfg.stats_session_id, self._cfg.stats_agent_name)
+            except Exception:
+                pass
+
         total_tokens = 0
         # Verification is an observed fact. Missing tooling is UNAVAILABLE,
         # never equivalent to a successful validation.
@@ -764,6 +772,18 @@ class ReActAgent:
             if not task_obs_closed:
                 task_context.__exit__(None, None, None)
                 task_obs_closed = True
+            # First-party stats: record session end
+            _sc2 = self._cfg.stats_collector
+            if _sc2 is not None:
+                try:
+                    _sc2.record_session_end(
+                        self._cfg.stats_session_id,
+                        total_steps=steps_taken,
+                        total_tokens=total_tokens_used,
+                        status=status.value if hasattr(status, 'value') else str(status),
+                    )
+                except Exception:
+                    pass
             return result
 
         # ── Workspace setup: ensure isolated environment before RUNNING ──
@@ -1606,6 +1626,20 @@ class ReActAgent:
                             },
                         )
                     observation = result.to_observation(tc.name)
+
+                    # First-party stats: record directly from agent loop
+                    _sc = self._cfg.stats_collector
+                    if _sc is not None:
+                        try:
+                            _sc.record_tool_call(
+                                session_id=self._cfg.stats_session_id,
+                                agent_name=self._cfg.stats_agent_name,
+                                step=step, tool_name=tc.name,
+                                success=result.success,
+                                duration_ms=getattr(result, 'duration_ms', 0),
+                            )
+                        except Exception:
+                            pass
 
                     # Runtime intercepts typed environment failures before the LLM sees them.
                     if not observation.is_success():

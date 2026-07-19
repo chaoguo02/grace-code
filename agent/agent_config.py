@@ -41,6 +41,8 @@ class AgentConfig:
     hook_session_id: str = ""
     hook_agent_id: str = ""
     hook_agent_type: str = ""
+    stats_session_id: str = ""
+    stats_agent_name: str = ""
     hook_dispatcher: object = None
     confirm_dangerous: bool = False
     effort: str = ""
@@ -51,3 +53,7 @@ class AgentConfig:
     streaming_tool_execution: bool = False
     token_budget_continuation: bool = False
     session_notes: bool = False
+    stats_collector: object = None
+    """First-party stats collector — called directly from agent loop.
+    Records tool calls, session lifecycle, and LLM token usage.
+    NOT an EventBus side effect."""
