@@ -39,6 +39,8 @@ interface ChatState {
   wsCloseInfo: string;
   /** Internal: the session ID the current WS is connected to */
   _wsSessionId: string;
+  /** Internal: WS reconnect retry count */
+  _wsRetries: number;
   /** Plan approval state (set when plan_ready event arrives) */
   planApproval: PlanApproval | null;
   /** Pending tool approvals keyed by request_id (supports concurrent batch) */
@@ -99,6 +101,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   wsConnected: false,
   wsCloseInfo: "",
   _wsSessionId: "",
+  _wsRetries: 0,
   planApproval: null,
   toolApprovals: {},
   currentMode: "build",
@@ -450,22 +453,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
     };
     ws.onerror = () => {
       console.error("[WS] Connection error for session", sessionId);
-      set({ wsConnected: false, error: "WebSocket connection failed — check server" });
+      set({ wsConnected: false });
     };
     ws.onclose = (ev) => {
       const info = `code=${ev.code}${ev.reason ? " reason=" + ev.reason : ""}`;
       console.log("[WS] Closed —", info);
-      set((prev) => {
-        // Keep onerror's message if it's more specific (connection failure).
-        // Only set close error for abnormal codes when no prior error exists.
-        const isAbnormal = ev.code !== 1000 && ev.code !== 1001;
-        return {
-          ws: null, wsConnected: false, wsCloseInfo: info,
-          error: isAbnormal && !prev.error ? `WS closed: ${info}` : prev.error,
-        };
-      });
+      const isAbnormal = ev.code !== 1000 && ev.code !== 1001;
+      set((prev) => ({
+        ws: null, wsConnected: false, wsCloseInfo: info,
+        error: isAbnormal && !prev.error ? `WS closed: ${info}` : prev.error,
+      }));
+      // Reconnect on abnormal close with exponential backoff
+      if (isAbnormal) {
+        const retries = get()._wsRetries || 0;
+        if (retries < 5) {
+          const delay = Math.min(1000 * Math.pow(2, retries), 16000);
+          console.log("[WS] Reconnecting in %dms (attempt %d/5)", delay, retries + 1);
+          set({ _wsRetries: retries + 1, error: `Reconnecting in ${delay / 1000}s…` });
+          setTimeout(() => get().connectWs(sessionId), delay);
+        } else {
+          set({ error: "WebSocket connection lost — please refresh", _wsRetries: 0 });
+        }
+      } else {
+        set({ _wsRetries: 0 });
+      }
     };
-    set({ ws, _wsSessionId: sessionId });
+    set({ ws, _wsSessionId: sessionId, _wsRetries: 0 });
   },
 
   disconnectWs: () => {
