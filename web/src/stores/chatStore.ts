@@ -125,8 +125,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       } else if (ev.status === "failed") {
         set({ isRunning: false, error: ev.error || "Execution failed", planApproval: null });
         return;
-        set({ isRunning: false, error: ev.error || "Execution failed" });
-        return;
       } else if (ev.status === "finish" || ev.status === "gave_up") {
         set({ isRunning: false });
         // Render the agent's final response in the timeline
@@ -304,7 +302,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isRunning: false,
       _wsSessionId: "",
       planApproval: null,
-      toolApprovals: {},  // clear stale approval cards
+      toolApprovals: {},
+      backgroundAgents: {},
+      _worktreeStates: {},
+      viewingChildSessionId: null,
     }),
 
   sendChat: async (sessionId, prompt, intent) => {
@@ -385,8 +386,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   connectWs: (sessionId) => {
     get().disconnectWs();
-    // Store sessionId for plan approval context
-    set({ planApproval: null, error: null }); // clear stale plan state on session switch
+    // Clear all session-scoped state on switch
+    set({
+      planApproval: null,
+      error: null,
+      toolApprovals: {},
+      backgroundAgents: {},
+      _worktreeStates: {},
+      viewingChildSessionId: null,
+    });
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${window.location.host}/api/ws/sessions/${sessionId}`;
     console.log("[WS] Connecting to", url);
