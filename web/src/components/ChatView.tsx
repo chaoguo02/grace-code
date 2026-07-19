@@ -766,6 +766,32 @@ export function ChatView() {
             </div>
           )}
 
+          {/* Plan mode progress indicator */}
+          {isRunning && mode === "plan" && (
+            <div style={{
+              margin: "0 20px 12px",
+              padding: "10px 16px",
+              background: "var(--accent-soft)",
+              border: "1px solid var(--accent)",
+              borderRadius: 8,
+              fontSize: 13,
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+            }}>
+              <span style={{
+                color: "var(--accent)",
+                fontSize: 14,
+              }}>◎</span>
+              <span style={{ color: "var(--accent)", fontWeight: 600 }}>
+                Planning in progress…
+              </span>
+              <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                Step {steps} · {tokens.toLocaleString()} tokens
+              </span>
+            </div>
+          )}
+
           <div id="messages">
             {timeline.map((item, i) =>
               item.source === "message" ? (
