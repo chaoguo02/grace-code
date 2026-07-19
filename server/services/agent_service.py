@@ -683,6 +683,16 @@ class AgentService:
                         "status": "failed",
                         "error": str(exc),
                     })
+            finally:
+                # Run memory maintenance after each session
+                try:
+                    if self._memory_store is not None:
+                        backend = getattr(self._memory_store, '_backend', None)
+                        if backend is not None:
+                            if hasattr(backend, 'decay_confidences'):
+                                backend.decay_confidences()
+                except Exception:
+                    pass
 
         import threading
         thread = threading.Thread(target=_run_and_notify, daemon=True)

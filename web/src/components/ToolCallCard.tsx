@@ -45,11 +45,12 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
   const [expanded, setExpanded] = useState(false);
   const paramsStr = formatJson(params, expanded ? Infinity : 220);
   const summary = summarizeTarget(params);
-  const observationPreview = (observation?.output || observation?.error || "").replace(/\s+/g, " ").slice(0, 160);
+  const obs = observation as { output?: string; error?: string; status?: string; tool_name?: string } | null;
+  const observationPreview = (obs?.output || obs?.error || "").replace(/\s+/g, " ").slice(0, 160);
 
   return (
     <div
-      className={`tool-call-card timeline-action-card paired-run-card${className ? ` ${className}` : ""}${observation ? " has-observation" : ""}${observation?.status === "error" ? " observation-error" : ""}`}
+      className={`tool-call-card timeline-action-card paired-run-card${className ? ` ${className}` : ""}${observation ? " has-observation" : ""}${obs?.status === "error" ? " observation-error" : ""}`}
       onClick={() => setExpanded((v) => !v)}
       title="Click to expand or collapse"
     >
@@ -79,11 +80,11 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
         </div>
 
         {observation && (
-          <div className={`paired-run-stage paired-run-stage-observation ${observation.status === "error" ? "error" : "success"}`}>
+          <div className={`paired-run-stage paired-run-stage-observation ${obs?.status === "error" ? "error" : "success"}`}>
             <div className="paired-run-stage-label">Result</div>
             <div className="tc-observation-summary">
-              <span className="obs-status-icon">{observation.status === "error" ? "!" : "OK"}</span>
-              <span className="obs-tool-name">{escapeHtml(observation.tool_name || name)}</span>
+              <span className="obs-status-icon">{obs?.status === "error" ? "!" : "OK"}</span>
+              <span className="obs-tool-name">{escapeHtml(obs?.tool_name || name)}</span>
               <span className="obs-output-preview">{escapeHtml(observationPreview)}</span>
             </div>
             {expanded ? (

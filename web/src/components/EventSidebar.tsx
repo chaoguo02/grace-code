@@ -106,11 +106,11 @@ export function EventSidebar() {
   };
 
   const renderPreview = (ev: (typeof events)[number]) =>
-    ev.content?.slice(0, 72) ||
-    ev.name?.slice(0, 72) ||
-    ev.output?.slice(0, 72) ||
-    ev.error?.slice(0, 72) ||
-    ev.message?.slice(0, 72) ||
+    (ev as { content?: string }).content?.slice(0, 72) ||
+    (ev as { name?: string }).name?.slice(0, 72) ||
+    (ev as { output?: string }).output?.slice(0, 72) ||
+    (ev as { error?: string }).error?.slice(0, 72) ||
+    (ev as { message?: string }).message?.slice(0, 72) ||
     "Waiting for details";
 
   const toolCounts = sessionStats?.tools && Object.keys(sessionStats.tools).length

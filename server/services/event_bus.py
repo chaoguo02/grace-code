@@ -278,11 +278,15 @@ class EventBus:
                 sub = self._sessions.get(target_session_id)
                 if sub is not None and sub.has_subscribers:
                     for msg in msgs:
-                        # Compute git diff for Edit/Write observations
-                        if msg.get("type") == "observation" and msg.get("tool_name") in ("Edit", "Write", "file_edit", "file_write"):
-                            diff = self._compute_diff(msg["tool_name"], msg.get("output", ""))
-                            if diff:
-                                msg["diff"] = diff
+                        # Compute git diff for file-modifying observations.
+                        # Covers Edit/Write + Bash (sed, echo >, python -c, etc.)
+                        if msg.get("type") == "observation" and not msg.get("error"):
+                            _tool = msg.get("tool_name", "")
+                            _output = msg.get("output", "")
+                            if _tool in ("Edit", "Write", "file_edit", "file_write", "Bash"):
+                                diff = self._compute_diff(_tool, _output)
+                                if diff:
+                                    msg["diff"] = diff
                         logger.info("EVENT → %s | type=%s step=%s",
                                      target_session_id[:8], msg.get("type"), msg.get("step", ""))
                         sub.publish(msg)

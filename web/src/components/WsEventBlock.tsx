@@ -59,7 +59,7 @@ function titleFor(event: WsMessage): string {
     case "reflection":
       return "Reassessing the run";
     case "approval_required":
-      return `Approval required for ${event.tool_name || event.name || "tool"}`;
+      return `Approval required for ${event.tool_name || "tool"}`;
     case "subagent_start":
       return `Spawned ${event.agent_name || "subagent"}`.trim();
     case "subagent_stop":
@@ -93,7 +93,7 @@ function formatValue(value: unknown): string {
 }
 
 function summarizeToolTarget(event: WsMessage): string {
-  const params = event.params || {};
+  const params = (event as { params?: Record<string, unknown> }).params || {};
   const keys = ["path", "file_path", "target_file", "command", "pattern", "url"];
   for (const key of keys) {
     const value = (params as Record<string, unknown>)[key];
@@ -118,7 +118,7 @@ function summaryFor(event: WsMessage): string {
     case "status":
       return (event.message || event.result?.summary || event.error || "").slice(0, 180) || "No final content";
     default:
-      return (event.message || event.content || "").slice(0, 140) || "No summary";
+      return ((event as { message?: string; content?: string }).message || (event as { content?: string }).content || "").slice(0, 140) || "No summary";
   }
 }
 
@@ -126,11 +126,11 @@ function detailFor(event: WsMessage): string {
   if (event.type === "thought" || event.type === "reflection") return event.content || "";
   if (event.type === "tool_call") return formatValue(event.params || {});
   if (event.type === "observation") return event.output || event.error || "";
-  if (event.type === "approval_required") return formatValue(event.params || {});
+  if (event.type === "approval_required") return formatValue((event.params || {}));
   if (event.type === "subagent_start") return `Child session ${event.child_session_id || ""}`.trim();
   if (event.type === "subagent_stop") return event.status || "";
   if (event.type === "status") return event.message || event.result?.summary || event.error || "";
-  return formatValue(event.payload || {});
+  return JSON.stringify(event, null, 2);
 }
 
 function cardClass(event: WsMessage): string {
@@ -159,26 +159,26 @@ function supportsExpansion(event: WsMessage): boolean {
 export function WsEventBlock({ event }: { event: WsMessage }) {
   const [expanded, setExpanded] = useState(event.type === "approval_required");
   const [reviewState, setReviewState] = useState<"idle" | "approved" | "rejected">("idle");
-  const diffId = Number((event.payload as Record<string, unknown> | undefined)?.diff_id ?? 0) || null;
 
   if (event.type === "status" && !["finish", "gave_up", "completed", "failed"].includes(event.status || "")) {
     return null;
   }
 
-  const duration = formatDuration(event.duration_ms);
-  const tokens = formatTokens(event.token_estimate);
+  const ev = event as { duration_ms?: number; token_estimate?: number; child_session_id?: string; step?: number; status?: string; diff?: string };
+  const duration = formatDuration(event.type === "tool_call" || event.type === "observation" ? ev.duration_ms : undefined);
+  const tokens = formatTokens(ev.token_estimate);
   const summary = useMemo(() => summaryFor(event), [event]);
   const detail = useMemo(() => detailFor(event), [event]);
   const expandable = supportsExpansion(event);
 
-  const isChildEvent = !!event.child_session_id;
+  const isChildEvent = !!ev.child_session_id;
 
   return (
     <div className={`trace-block trace-block-${event.type}`}
       style={isChildEvent ? { marginLeft: 20, borderLeft: "2px solid var(--accent-soft)", paddingLeft: 10 } : undefined}>
       {isChildEvent && (
         <div style={{ fontSize: 9, color: "var(--accent)", marginBottom: 2, textTransform: "uppercase", letterSpacing: "0.5px" }}>
-          subagent · {event.child_session_id!.slice(0, 8)}
+          subagent · {ev.child_session_id!.slice(0, 8)}
         </div>
       )}
       <div className="trace-rail-node" />
@@ -193,10 +193,10 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
             </div>
           </div>
           <div className="trace-meta">
-            {event.step != null && <span className="trace-pill">Step {event.step}</span>}
+            {ev.step != null && <span className="trace-pill">Step {ev.step}</span>}
             {duration && <span className="trace-pill trace-pill-metric">⚡ {duration}</span>}
             {tokens && <span className="trace-pill trace-pill-metric">{tokens}</span>}
-            {event.status && event.type !== "status" && <span className="trace-pill">{event.status}</span>}
+            {ev.status && event.type !== "status" && <span className="trace-pill">{ev.status}</span>}
             {expandable && (
               <button
                 type="button"
@@ -217,38 +217,12 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
             {(event.type === "thought" || event.type === "reflection" || event.type === "status") && (
               <div className="trace-body-copy">{detail}</div>
             )}
-            {event.type === "observation" && !event.diff && <pre>{detail}</pre>}
+            {event.type === "observation" && !ev.diff && <pre>{detail}</pre>}
 
-            {event.diff && event.type === "observation" && (
+            {ev.diff && event.type === "observation" && (
               <div className="trace-diff-panel">
                 <div className="trace-diff-header">Diff review</div>
-                <DiffBlock diff={event.diff} compact />
-                <div className="trace-diff-actions">
-                  <button
-                    className="btn-approve"
-                    type="button"
-                    disabled={!diffId || reviewState !== "idle"}
-                    onClick={async () => {
-                      if (!diffId) return;
-                      await updateDiffStatus(diffId, "approved");
-                      setReviewState("approved");
-                    }}
-                  >
-                    {reviewState === "approved" ? "Approved" : "Approve"}
-                  </button>
-                  <button
-                    className="btn-reject"
-                    type="button"
-                    disabled={!diffId || reviewState !== "idle"}
-                    onClick={async () => {
-                      if (!diffId) return;
-                      await updateDiffStatus(diffId, "rejected");
-                      setReviewState("rejected");
-                    }}
-                  >
-                    {reviewState === "rejected" ? "Rejected" : "Reject"}
-                  </button>
-                </div>
+                <DiffBlock diff={ev.diff} compact />
               </div>
             )}
           </div>

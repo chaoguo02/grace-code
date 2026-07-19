@@ -112,7 +112,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   handleWsEvent: (ev) => {
     const s = get();
-    console.log("[WS] handleWsEvent:", ev.type, ev.status || ev.name || ev.tool_name || "");
+    const _ev = ev as { status?: string; name?: string; tool_name?: string; content?: string };
+    console.log("[WS] handleWsEvent:", ev.type, _ev.status || _ev.name || _ev.tool_name || "");
 
     if (ev.type === "status") {
       if (ev.status === "running") {
@@ -148,9 +149,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ...prev.toolApprovals,
           [rid]: {
             requestId: rid,
-            toolName: ev.tool_name || ev.name || "",
+            toolName: ev.tool_name || "",
             params: (ev.params || {}) as Record<string, unknown>,
-            thought: ev.thought || ev.content,
+            thought: ev.thought || "",
             decisionReason: ev.decision_reason,
             toolUseId: ev.tool_use_id,
             permissionMode: ev.permission_mode,
@@ -263,14 +264,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Update tool count + last action for running background agents.
     // Only count tool_call — observation is the result of that same call.
     if (ev.type === "tool_call") {
+      const _csid = (ev as { child_session_id?: string }).child_session_id || "";
       set((prev) => {
         const updated = { ...prev.backgroundAgents };
-        const csid = ev.child_session_id || "";
-        if (csid && updated[csid]?.status === "running") {
-          updated[csid] = {
-            ...updated[csid],
-            toolCount: updated[csid].toolCount + 1,
-            lastAction: ev.name || ev.tool_name || "",
+        if (_csid && updated[_csid]?.status === "running") {
+          updated[_csid] = {
+            ...updated[_csid],
+            toolCount: updated[_csid].toolCount + 1,
+            lastAction: ev.name || "",
           };
           return { backgroundAgents: updated };
         }
@@ -280,9 +281,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
             updated[key] = {
               ...updated[key],
               toolCount: updated[key].toolCount + 1,
-              lastAction: ev.name || ev.tool_name || "",
+              lastAction: ev.name || "",
             };
-            break;  // only one — don't broadcast
+            break;
           }
         }
         return { backgroundAgents: updated };
@@ -297,7 +298,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ev.type === "reflection" ||
       ev.type === "subagent_start" ||
       ev.type === "subagent_stop" ||
-      ev.type === "status" ||
       ev.type === "worktree_resolved"
     ) {
       set((prev) => ({
@@ -441,9 +441,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     };
     ws.onmessage = (ev) => {
       try {
-        const msg = JSON.parse(ev.data) as WsMessage;
-        if (msg.type === "pong") return;
-        console.log("[WS] ←", msg.type, msg.status || msg.name || "");
+        const raw = JSON.parse(ev.data) as Record<string, unknown>;
+        if (raw.type === "pong") return;
+        const msg = raw as unknown as WsMessage;
+        const _m = msg as { status?: string; name?: string; tool_name?: string };
+        console.log("[WS] ←", msg.type, _m.status || _m.name || "");
         get().handleWsEvent(msg);
       } catch (err) {
         console.warn("[WS] Failed to parse message:", ev.data.slice(0, 100), err);

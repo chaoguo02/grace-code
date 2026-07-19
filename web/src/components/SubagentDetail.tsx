@@ -119,7 +119,7 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
             childSessionId.slice(0, 8)
           )}
         </span>
-        {detail?.metadata?.worktree_path && (
+        {(detail?.metadata as Record<string, unknown> | undefined)?.worktree_path && (
           <span style={{ fontSize: 11, color: "var(--accent)", marginLeft: "auto" }}>
             Worktree
           </span>

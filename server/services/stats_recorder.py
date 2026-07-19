@@ -111,17 +111,23 @@ class StatsRecorder:
         start = self._session_start.pop(session_id, None)
         duration_ms = int((time.time() - start) * 1000) if start else 0
 
-        # Get agent name from session detail
+        # Get agent name from the session record
         agent_name = "unknown"
         try:
-            stats = self._stats.get_session_stats(session_id)
-            # We don't have it yet, read from session
+            from agent.session.session_store import SessionStore
+            # Access via StatsService's storage backend
+            store = getattr(self._stats, '_storage', None)
+            if store is not None:
+                rec = store.get_session(session_id)
+                if rec is not None:
+                    agent_name = rec.agent_name
         except Exception:
             pass
 
         result = msg.get("result", {}) or {}
         total_steps = result.get("steps_taken", 0)
-        total_tokens = result.get("total_tokens", 0)
+        # Use actual token count from the event payload when available
+        total_tokens = result.get("total_tokens", 0) or self._step_tokens.get(session_id, 0)
         status = msg.get("status", "completed")
 
         # Build tool_summary from step_log
@@ -143,6 +149,6 @@ class StatsRecorder:
 
         self._step_tokens.pop(session_id, None)
         logger.info(
-            "Stats recorded — session=%s steps=%d tokens=%d duration=%dms",
-            session_id[:8], total_steps, total_tokens, duration_ms,
+            "Stats recorded — session=%s agent=%s steps=%d tokens=%d duration=%dms",
+            session_id[:8], agent_name, total_steps, total_tokens, duration_ms,
         )

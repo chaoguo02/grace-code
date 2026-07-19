@@ -456,7 +456,89 @@ class TestEventTyping:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Test 7: Cancellation Token
+# Test 7: Stats Pipeline
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestStatsPipeline:
+    """Verify stats recording → storage → API chain."""
+
+    def test_record_step_and_complete_session(self):
+        """StatsRecorder should record steps and finalize session stats."""
+        from app.storage.sqlite import SqliteStorageBackend
+        from server.services.stats_service import StatsService
+        from agent.session.session_store import SessionStore
+        from agent.session.models import SessionMode
+
+        tmp = tempfile.mkdtemp()
+        try:
+            db = str(Path(tmp) / "test.db")
+            store = SessionStore(db)
+            rec = store.create_session(agent_name="build", mode=SessionMode.PRIMARY,
+                                       repo_path=tmp, title="Stats Test")
+            sid = rec.id
+
+            storage = SqliteStorageBackend(db)
+            svc = StatsService(storage)
+
+            # Record a step
+            svc.record_step(sid, step_number=1, tool_name="Read",
+                            tool_params={"file_path": "test.py"},
+                            status="success", duration_ms=100, tokens=50,
+                            timestamp="2024-01-01T00:00:00")
+
+            # Complete the session
+            svc.record_session_complete(
+                sid, agent_name="build", total_steps=5,
+                total_tokens=200, total_duration_ms=5000,
+                status="completed", tool_summary={"Read": 3, "Write": 2},
+            )
+
+            # Verify stats are retrievable
+            stats = svc.get_session_stats(sid)
+            assert stats is not None
+            assert stats["agent_name"] == "build"
+            assert stats["total_steps"] == 5
+
+            steps = svc.get_session_steps(sid)
+            assert len(steps) >= 1
+            assert steps[0]["tool_name"] == "Read"
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_record_diff(self):
+        """Diff recording should persist diff content."""
+        from app.storage.sqlite import SqliteStorageBackend
+        from server.services.stats_service import StatsService
+        from agent.session.session_store import SessionStore
+        from agent.session.models import SessionMode
+
+        tmp = tempfile.mkdtemp()
+        try:
+            db = str(Path(tmp) / "test.db")
+            store = SessionStore(db)
+            rec = store.create_session(agent_name="build", mode=SessionMode.PRIMARY,
+                                       repo_path=tmp, title="Diff Test")
+            sid = rec.id
+
+            storage = SqliteStorageBackend(db)
+            svc = StatsService(storage)
+
+            diff = "+hello world\n-old line"
+            svc.record_diff(sid, step_number=1, file_path="test.txt", diff_content=diff)
+
+            diffs = svc.get_session_diffs(sid)
+            assert len(diffs) >= 1
+            assert diffs[0]["file_path"] == "test.txt"
+            assert "hello world" in diffs[0]["diff_content"]
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Test 8: Cancellation Token
 # ────────────────────────────────────────────────────────────────────────────
 
 

@@ -20,14 +20,6 @@ export interface WsStatusEvent {
   step?: number;
   duration_ms?: number;
   token_estimate?: number;
-}
-
-// Common metadata fields shared across event types
-interface WsMeta {
-  timestamp?: string;
-  step?: number;
-  duration_ms?: number;
-  token_estimate?: number;
   child_session_id?: string;
 }
 
@@ -36,15 +28,20 @@ interface WsMeta {
 export interface WsThoughtEvent {
   type: "thought";
   content: string;
-  step?: number;
-  child_session_id?: string;
   timestamp?: string;
+  step?: number;
+  duration_ms?: number;
+  token_estimate?: number;
+  child_session_id?: string;
 }
 
 export interface WsReflectionEvent {
   type: "reflection";
   content: string;
   timestamp?: string;
+  step?: number;
+  duration_ms?: number;
+  token_estimate?: number;
 }
 
 // ── Tool call / Observation ─────────────────────────────────────────────
@@ -53,10 +50,12 @@ export interface WsToolCallEvent {
   type: "tool_call";
   name: string;
   params?: Record<string, unknown>;
-  step?: number;
   id?: string;
-  child_session_id?: string;
   timestamp?: string;
+  step?: number;
+  duration_ms?: number;
+  token_estimate?: number;
+  child_session_id?: string;
 }
 
 export interface WsObservationEvent {
@@ -65,11 +64,13 @@ export interface WsObservationEvent {
   output?: string;
   error?: string;
   status?: string;
-  step?: number;
   id?: string;
   diff?: string;
-  child_session_id?: string;
   timestamp?: string;
+  step?: number;
+  duration_ms?: number;
+  token_estimate?: number;
+  child_session_id?: string;
 }
 
 // ── Subagent ────────────────────────────────────────────────────────────
@@ -79,6 +80,7 @@ export interface WsSubagentStartEvent {
   child_session_id: string;
   agent_name?: string;
   timestamp?: string;
+  step?: number;
 }
 
 export interface WsSubagentStopEvent {
@@ -86,6 +88,7 @@ export interface WsSubagentStopEvent {
   child_session_id: string;
   status?: string;
   timestamp?: string;
+  step?: number;
 }
 
 // ── Approval ────────────────────────────────────────────────────────────
@@ -101,6 +104,7 @@ export interface WsApprovalRequiredEvent {
   permission_mode?: string;
   risk_level?: string;
   timestamp?: string;
+  step?: number;
 }
 
 export interface WsApprovalTimeoutEvent {
@@ -119,6 +123,7 @@ export interface WsPlanReadyEvent {
   max_revisions?: number;
   result?: { summary?: string; steps_taken?: number; total_tokens?: number };
   timestamp?: string;
+  step?: number;
 }
 
 // ── Worktree ────────────────────────────────────────────────────────────
@@ -130,6 +135,7 @@ export interface WsWorktreeResolvedEvent {
   status: string;
   message?: string;
   timestamp?: string;
+  step?: number;
 }
 
 // ── Discriminated union ─────────────────────────────────────────────────

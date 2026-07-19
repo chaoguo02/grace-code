@@ -10,7 +10,7 @@ import { useEffect, useState } from "react";
 interface AgentProgress {
   childSessionId: string;
   agentName: string;
-  status: "running" | "completed" | "failed";
+  status: string;
   toolCount: number;
   lastAction: string;
 }
