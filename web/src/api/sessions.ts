@@ -4,6 +4,7 @@ import type {
   SessionDetail,
   Message,
   EventsResponse,
+  WsMessage,
 } from "../types";
 
 export function listSessions(limit = 50): Promise<SessionSummary[]> {
@@ -25,6 +26,16 @@ export function getEvents(
 ): Promise<EventsResponse> {
   return apiGet(
     `/api/sessions/${encodeURIComponent(id)}/events?after=${after}&limit=${limit}`
+  );
+}
+
+export function getTraceEvents(
+  id: string,
+  after = 0,
+  limit = 200
+): Promise<WsMessage[]> {
+  return apiGet(
+    `/api/sessions/${encodeURIComponent(id)}/trace/events?after=${after}&limit=${limit}`
   );
 }
 
@@ -114,4 +125,20 @@ export interface SkillInfo {
 
 export function fetchSkills(): Promise<SkillInfo[]> {
   return apiGet("/api/skills");
+}
+
+export interface SessionTreeNode {
+  id: string;
+  agent_name: string;
+  title: string;
+  status: string;
+  depth: number;
+  parent_id: string | null;
+  created_at: string;
+  children: SessionTreeNode[];
+  child_count: number;
+}
+
+export function fetchSessionTree(id: string): Promise<SessionTreeNode> {
+  return apiGet(`/api/sessions/${encodeURIComponent(id)}/tree`);
 }

@@ -1,7 +1,10 @@
 import { useState } from "react";
 import { SessionSidebar } from "./components/SessionSidebar";
+import { SessionTree } from "./components/SessionTree";
 import { ChatView } from "./components/ChatView";
 import { PlanView } from "./components/PlanView";
+import { DiffReviewView } from "./components/DiffReviewView";
+import { StatsDashboard } from "./components/StatsDashboard";
 import { MemoryView } from "./components/MemoryView";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
@@ -12,6 +15,8 @@ const TABS = [
   { key: "chat", label: "Chat" },
   { key: "tasks", label: "Tasks" },
   { key: "plan", label: "Plan" },
+  { key: "reviews", label: "Reviews" },
+  { key: "stats", label: "Stats" },
   { key: "memory", label: "Memory" },
   { key: "events", label: "Events" },
 ] as const;
@@ -22,6 +27,8 @@ function TabIcon({ name }: { name: ViewName }) {
   if (name === "chat") return <span className="tab-icon">C</span>;
   if (name === "tasks") return <span className="tab-icon">T</span>;
   if (name === "plan") return <span className="tab-icon">P</span>;
+  if (name === "reviews") return <span className="tab-icon">R</span>;
+  if (name === "stats") return <span className="tab-icon">S</span>;
   if (name === "memory") return <span className="tab-icon">M</span>;
   return <span className="tab-icon">E</span>;
 }
@@ -78,6 +85,7 @@ export default function App() {
     <div id="app-shell">
       <div id="app" className={activeView === "chat" ? "has-event-sidebar" : ""}>
         <SessionSidebar />
+        <SessionTree />
 
         <main className="main">
           <header className="topbar">
@@ -111,8 +119,10 @@ export default function App() {
 
           {activeView === "chat" && <ChatView />}
           {activeView === "plan" && <PlanView />}
+          {activeView === "reviews" && <DiffReviewView />}
+          {activeView === "stats" && <StatsDashboard />}
           {activeView === "memory" && <MemoryView />}
-          {activeView !== "chat" && activeView !== "plan" && activeView !== "memory" && (
+          {activeView !== "chat" && activeView !== "plan" && activeView !== "reviews" && activeView !== "stats" && activeView !== "memory" && (
             <PlaceholderView name={activeView} />
           )}
         </main>

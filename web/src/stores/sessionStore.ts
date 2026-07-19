@@ -8,11 +8,13 @@ interface SessionState {
   activeDetail: SessionDetail | null;
   isLoading: boolean;
   error: string | null;
+  sessionTree: api.SessionTreeNode | null;
 
   loadSessions: () => Promise<void>;
   openSession: (id: string) => Promise<void>;
   createSession: (agentName?: string, repoPath?: string) => Promise<string | null>;
   deleteSession: (id: string) => Promise<boolean>;
+  fetchSessionTree: (id: string) => Promise<void>;
   deleteSessionsBatch: (ids: string[]) => Promise<number>;
   refreshActive: () => Promise<void>;
 }
@@ -23,6 +25,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   activeDetail: null,
   isLoading: false,
   error: null,
+  sessionTree: null,
 
   loadSessions: async () => {
     set({ isLoading: true, error: null });
@@ -97,6 +100,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const detail = await api.getSession(activeId);
         set({ activeDetail: detail });
       } catch { /* ignore */ }
+    }
+  },
+
+  fetchSessionTree: async (id: string) => {
+    try {
+      const tree = await api.fetchSessionTree(id);
+      set({ sessionTree: tree });
+    } catch {
+      set({ sessionTree: null });
     }
   },
 }));
