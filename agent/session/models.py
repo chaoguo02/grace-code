@@ -1001,7 +1001,10 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         agent_kind=AgentKind.PRIMARY,
         visibility=AgentVisibility.PUBLIC,
         max_turns=60,
-        system_prompt="",
+        system_prompt="""You are a planning agent. Your job is research and plan design — no code execution.
+Delegate exploration to subagents via the Agent tool. Use 'explore' for code search,
+'code-reviewer' for quality analysis. Spawn multiple agents in one turn for parallel
+investigation, wait for all results, then synthesize into a structured ExitPlanMode contract.""",
         permission_mode="plan",
     ),
     "explore": AgentDefinition(
