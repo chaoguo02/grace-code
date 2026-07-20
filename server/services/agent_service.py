@@ -634,6 +634,9 @@ class AgentService:
             _pending_perm = self._runtime.pop_pending_permission_mode_override(session_id)
             _effective_perm = _pending_perm or "acceptEdits"
 
+            # ── Inject previous session summary (CLI ChatSession pattern) ──
+            _summary_injected = self._inject_session_context(session_id)
+
             # ── Build web_confirm_callback for this session ──
             _web_cb = self._build_web_confirm_callback(session_id)
             self._runtime.set_web_confirm_callback(session_id, _web_cb)
@@ -869,6 +872,56 @@ class AgentService:
         import threading
         thread = threading.Thread(target=_compact, daemon=True)
         thread.start()
+
+    # ── Session context injection ────────────────────────────────────────
+
+    def _inject_session_context(self, session_id: str) -> bool:
+        """Inject previous session summary once per root session.
+
+        CLI ChatSession does this on startup (chat.py:130-138).
+        Web mode injects on the first round, then sets a metadata flag
+        to prevent duplicate injection on subsequent rounds.
+        """
+        # Guard: only inject once per session
+        rec = self.session_service.get_session(session_id)
+        if rec is None:
+            return False
+        already_injected = rec.metadata.get("session_context_injected")
+        if already_injected:
+            return False
+
+        injected = False
+        try:
+            from context.compaction import load_session_summary
+            summary_path = Path(self.repo_path) / ".grace" / "session_summary.md"
+            summary = load_session_summary(str(summary_path))
+            if summary:
+                from llm.base import LLMMessage
+                self._storage.append_message(session_id, LLMMessage(
+                    role="user",
+                    content=f"[Previous Session Context]\n{summary}",
+                ))
+                self._storage.append_message(session_id, LLMMessage(
+                    role="assistant", content="Understood.",
+                ))
+                injected = True
+        except Exception:
+            logger.debug("Session summary injection skipped", exc_info=True)
+
+        # Mark as injected regardless of success (don't retry every round)
+        try:
+            store = self._storage.store
+            with store._connect() as conn:
+                meta = dict(rec.metadata)
+                meta["session_context_injected"] = True
+                conn.execute(
+                    "UPDATE sessions SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(meta, ensure_ascii=True), session_id),
+                )
+        except Exception:
+            pass
+
+        return injected
 
     # ── Cross-round stats ─────────────────────────────────────────────────
 
