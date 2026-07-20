@@ -959,9 +959,9 @@ class ReActAgent:
                         _budget_pct, total_tokens, _budget_total,
                     )
                     # Tier 1: zero-cost drain (SnipCompact + MicroCompact)
+                    # (imported at module level — line 308)
                     _drained = 0
                     try:
-                        from agent.context_trimming import _snip_history, _micro_compact
                         _drained += _snip_history(history)
                         _drained += _micro_compact(history)
                         if _drained > 0:
@@ -979,7 +979,7 @@ class ReActAgent:
                         logger.debug("Auto-compact drain failed: %s", _dexc)
                     # Tier 2: full LLM compact (ConversationCompactor)
                     try:
-                        self.compactor.compact(history, total_tokens)
+                        self.compactor.compact_history(history, total_tokens)
                         self._auto_compacted = True
                         logger.info("Auto-compact: full LLM compact completed")
                         continue  # retry LLM call with compacted history
@@ -1095,7 +1095,7 @@ class ReActAgent:
                         except Exception:
                             pass
                         try:
-                            self.compactor.compact(history, total_tokens)
+                            self.compactor.compact_history(history, total_tokens)
                             continue
                         except Exception as _cexc:
                             logger.warning("Reactive compact failed: %s", _cexc)
@@ -1146,7 +1146,7 @@ class ReActAgent:
                             logger.debug("Drain failed: %s", _dexc)
                         # Tier 2: full LLM compact
                         try:
-                            self.compactor.compact(history, total_tokens)
+                            self.compactor.compact_history(history, total_tokens)
                             _state = _state.with_updates(transition=Transition.reactive_compact())
                             logger.info("Reactive compact succeeded — retrying LLM call")
                             continue
