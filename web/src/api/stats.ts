@@ -16,3 +16,7 @@ export function getDailyRollups(days = 30): Promise<DailyRollup[]> {
 export function getToolRankings(days = 7): Promise<Record<string, number>> {
   return apiGet(`/api/stats/tools?days=${days}`);
 }
+
+export function getRecentSessionStats(days = 30): Promise<SessionStats[]> {
+  return apiGet(`/api/stats/sessions?days=${days}`);
+}

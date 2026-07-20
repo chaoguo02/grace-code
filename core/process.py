@@ -41,6 +41,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from core.utf8 import DEFAULT_TEXT_ENCODING, DEFAULT_TEXT_ERRORS, text_decode_kwargs, with_utf8_env
+
 logger = logging.getLogger(__name__)
 
 
@@ -130,7 +132,7 @@ class ShellProvider(ABC):
         with replacement. The LLM never sees raw bytes or encoding errors.
         """
         primary = self._primary_encoding()
-        fallbacks = ["utf-8", "latin-1"]
+        fallbacks = [DEFAULT_TEXT_ENCODING, "latin-1"]
 
         def _decode(data: bytes) -> str:
             if not data:
@@ -162,8 +164,7 @@ class UnixBashProvider(ShellProvider):
 
 class WindowsPowerShellProvider(ShellProvider):
     def _primary_encoding(self) -> str:
-        import locale
-        return locale.getpreferredencoding(do_setlocale=False) or "utf-8"
+        return DEFAULT_TEXT_ENCODING
 
 
 def _auto_shell_provider() -> ShellProvider:
@@ -447,6 +448,7 @@ class LocalRuntime(Runtime):
                 "stdin": subprocess.PIPE if stdin_data is not None else None,
                 "text": False,  # binary mode — Runtime handles encoding
                 "cwd": self._resolve_cwd(cwd),
+                "env": with_utf8_env(),
             }
             # Windows: bash is opt-in only. Default: native system shell.
             if os.name == "nt" and self._bash_path and self._shell_mode == "bash":
@@ -531,9 +533,9 @@ class LocalRuntime(Runtime):
                 "cwd": self._resolve_cwd(cwd),
             }
             if env:
-                full_env = os.environ.copy()
-                full_env.update(env)
-                popen_kwargs["env"] = full_env
+                popen_kwargs["env"] = with_utf8_env(env)
+            else:
+                popen_kwargs["env"] = with_utf8_env()
             # Unix: create new session for clean process-tree kill
             if os.name != "nt":
                 popen_kwargs["preexec_fn"] = os.setsid
@@ -935,6 +937,7 @@ class DockerRuntime(Runtime):
                 run_args,
                 capture_output=True,
                 text=True,
+                **text_decode_kwargs(),
                 timeout=60,  # 拉镜像可能需要时间
             )
         except subprocess.TimeoutExpired:

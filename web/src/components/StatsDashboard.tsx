@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { getDailyRollups, getToolRankings } from "../api/stats";
-import { listSessions } from "../api/sessions";
-import type { DailyRollup } from "../types/stats";
-import type { SessionSummary } from "../types";
+import { getDailyRollups, getToolRankings, getRecentSessionStats } from "../api/stats";
+import type { DailyRollup, SessionStats } from "../types/stats";
 
 function formatDuration(ms?: number) {
   if (!ms || ms <= 0) return "0s";
@@ -28,13 +26,13 @@ function dayLabel(date: string) {
 export function StatsDashboard() {
   const [daily, setDaily] = useState<DailyRollup[]>([]);
   const [toolRankings, setToolRankings] = useState<Record<string, number>>({});
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [sessions, setSessions] = useState<SessionStats[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    Promise.all([getDailyRollups(30), getToolRankings(7), listSessions(12)])
+    Promise.all([getDailyRollups(30), getToolRankings(7), getRecentSessionStats(30)])
       .then(([dailyData, toolData, sessionData]) => {
         if (cancelled) return;
         setDaily(dailyData);
@@ -147,14 +145,15 @@ export function StatsDashboard() {
             {loading && <div className="empty-state">Loading sessions...</div>}
             {!loading && sessions.length === 0 && <div className="empty-state">No recent sessions.</div>}
             {sessions.map((session) => (
-              <div key={session.id} className="stats-session-row">
+              <div key={session.session_id} className="stats-session-row">
                 <div className="stats-session-main">
                   <strong>{session.agent_name}</strong>
                   <span>{session.status}</span>
-                  <span>{session.message_count ?? 0} steps</span>
-                  <span>{formatTokens(session.total_tokens_estimate)} tok</span>
+                  <span>{session.total_steps ?? 0} steps</span>
+                  <span>{formatTokens(session.total_tokens)} tok</span>
+                  <span>{formatDuration(session.total_duration_ms)}</span>
                 </div>
-                <div className="stats-session-subtle">{session.title || session.summary || session.id}</div>
+                <div className="stats-session-subtle">{session.session_id}</div>
               </div>
             ))}
           </div>
