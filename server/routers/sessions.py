@@ -556,6 +556,34 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         except Exception as exc:
             return {"diff": "", "has_diff": False, "error": str(exc)}
 
+    # ── GET /api/sessions/{session_id}/plan ──────────────────────────────
+
+    @router.get("/{session_id}/plan")
+    async def get_session_plan(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """
+        Get the plan file for a session (CC-aligned plan file).
+
+        Reads the plan from ``.grace/plans/{session_id}.md`` if it exists.
+        Returns empty content if no plan file has been written yet.
+
+        **Response (200):**
+        - ``session_id`` (string): The session ID.
+        - ``content`` (string): Plan file content (markdown with YAML frontmatter).
+        - ``has_plan`` (bool): True if a plan file exists.
+        """
+        plan_dir = Path(service.repo_path) / ".grace" / "plans"
+        plan_file = plan_dir / f"{session_id}.md"
+        if plan_file.is_file():
+            try:
+                content = plan_file.read_text(encoding="utf-8")
+                return {"session_id": session_id, "content": content, "has_plan": True}
+            except Exception:
+                pass
+        return {"session_id": session_id, "content": "", "has_plan": False}
+
     # ── POST /api/sessions/batch-delete ────────────────────────────────────
     # POST (not DELETE) because some HTTP clients strip DELETE request bodies.
 

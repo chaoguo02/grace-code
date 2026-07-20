@@ -138,6 +138,12 @@ export function abortPlan(
   return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/abort-plan`);
 }
 
+export function getSessionPlan(
+  sessionId: string,
+): Promise<{ session_id: string; content: string; has_plan: boolean }> {
+  return apiGet(`/api/sessions/${encodeURIComponent(sessionId)}/plan`);
+}
+
 export function resolveToolApproval(
   sessionId: string,
   data: {

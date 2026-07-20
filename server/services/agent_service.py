@@ -705,6 +705,29 @@ class AgentService:
                                 "total_tokens": result.total_tokens,
                             },
                         ))
+                        # Write plan file (CC-aligned: ~/.claude/plans/{slug}.md)
+                        if result.summary:
+                            try:
+                                _plan_dir = Path(self.repo_path) / ".grace" / "plans"
+                                _plan_dir.mkdir(parents=True, exist_ok=True)
+                                _plan_file = _plan_dir / f"{session_id}.md"
+                                _plan_content = result.summary
+                                if _contract:
+                                    _plan_content = (
+                                        f"---\n"
+                                        f"goal: {_contract.get('goal', '')}\n"
+                                        f"steps:\n"
+                                        + "".join(f"  - {s}\n" for s in _contract.get('steps', []))
+                                        + f"target_files:\n"
+                                        + "".join(f"  - {f}\n" for f in _contract.get('target_files', []))
+                                        + f"verification: {_contract.get('verification', '')}\n"
+                                        + f"---\n\n"
+                                        + result.summary
+                                    )
+                                _plan_file.write_text(_plan_content, encoding="utf-8")
+                                logger.info("Plan file written: %s", _plan_file)
+                            except Exception:
+                                logger.debug("Plan file write skipped", exc_info=True)
                         # If the LLM produced a plan in a non-plan session,
                         # update DB so PlanView shows correct state on reload.
                         if not _is_plan and _contract:

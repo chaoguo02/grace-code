@@ -1,6 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
+import { getSessionPlan } from "../api/sessions";
 
 function PlanEmptyState({
   title,
@@ -25,10 +26,17 @@ export function PlanView() {
   const { activeId, activeDetail } = useSessionStore();
   const { planApproval, isRunning } = useChatStore((s) => selectSessionUi(s, activeId));
   const { approvePlan, rejectPlan, savePlan, abortPlan } = useChatStore();
+  const [planFile, setPlanFile] = useState<string | null>(null);
 
   useEffect(() => {
     if (activeId) {
       useSessionStore.getState().refreshActive();
+      // Load plan file (CC-aligned: .grace/plans/{session_id}.md)
+      getSessionPlan(activeId).then((plan) => {
+        setPlanFile(plan.has_plan ? plan.content : null);
+      }).catch(() => setPlanFile(null));
+    } else {
+      setPlanFile(null);
     }
   }, [activeId]);
 
@@ -111,12 +119,14 @@ export function PlanView() {
             </div>
 
             <div className="plan-scroll">
-              <pre className="plan-pre">{planApproval.planText}</pre>
+              <pre className="plan-pre">{planFile || planApproval.planText}</pre>
             </div>
 
             <div className="plan-card-footer">
               <div className="summary-subtle">
-                Approve to continue into build execution, or reject to request a revised plan.
+                {planFile
+                  ? "Plan file loaded from .grace/plans/. Approve to execute."
+                  : "Approve to continue into build execution, or reject to request a revised plan."}
               </div>
               <div className="plan-actions">
                 <button
@@ -166,11 +176,13 @@ export function PlanView() {
               <span className="trace-pill">completed</span>
             </div>
             <div className="plan-scroll">
-              <pre className="plan-pre">{activeDetail.summary}</pre>
+              <pre className="plan-pre">{planFile || activeDetail.summary}</pre>
             </div>
             <div className="plan-card-footer">
               <div className="summary-subtle">
-                This plan was generated previously. Approve to execute it, or send a message to revise.
+                {planFile
+                  ? "Plan file loaded from .grace/plans/. Approve to execute."
+                  : "This plan was generated previously. Approve to execute it, or send a message to revise."}
               </div>
               <div className="plan-actions">
                 <button
