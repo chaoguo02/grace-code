@@ -1058,9 +1058,11 @@ class ReActAgent:
                     )
                 except ConversationSnapshotError as exc:
                     # Named subagents remain fresh-context in this batch.
-                    # A future inherited-context request must fail closed
-                    # when this typed boundary is unavailable.
-                    logger.warning(
+                    # The snapshot may fail when trimming has removed messages
+                    # in a way that breaks tool_call/tool_result pairing.
+                    # This is expected in long-running sessions; fresh-context
+                    # delegation is a valid and intentional fallback.
+                    logger.debug(
                         "Live conversation snapshot unavailable for delegation: %s",
                         exc,
                     )

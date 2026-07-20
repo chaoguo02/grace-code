@@ -1073,27 +1073,74 @@ class SnipCompactor:
         if not messages:
             return messages
 
-        # Walk backward to find tool_result + preceding assistant pairs
+        # Walk backward to find tool_result + preceding assistant pairs.
+        # When an assistant has multiple tool_calls, snip all its tool_results
+        # together to avoid orphaning: if one tool_result is empty, all results
+        # for that assistant are candidates.  Otherwise the surviving results
+        # lose their preceding assistant and break snapshot pairing.
         to_remove: set[int] = set()
-        for i in range(len(messages) - 1, 0, -1):
+        i = len(messages) - 1
+        while i > 0:
             if i in to_remove:
+                i -= 1
                 continue
             msg = messages[i]
             if msg.get("role") != "tool":
+                i -= 1
                 continue
             if not self._is_snippable(msg):
+                i -= 1
                 continue
-            # Find preceding assistant message with matching tool_calls
-            prev = messages[i - 1]
-            if prev.get("role") == "assistant" and prev.get("tool_calls"):
-                to_remove.add(i)       # tool_result
-                to_remove.add(i - 1)   # assistant with tool_calls
+            # Find the assistant message that produced this tool call.
+            # It may be immediately before this result (single call) or several
+            # positions back (parallel calls: assistant → result_A → result_B).
+            assistant_idx = -1
+            for j in range(i - 1, -1, -1):
+                prev = messages[j]
+                if prev.get("role") == "assistant" and prev.get("tool_calls"):
+                    assistant_idx = j
+                    break
+                # Stop at user/system messages — can't pair across turn boundary
+                if prev.get("role") in ("user", "system"):
+                    break
+
+            if assistant_idx < 0:
+                i -= 1
+                continue
+
+            # Count how many tool_results belong to this assistant
+            tool_call_count = len(messages[assistant_idx].get("tool_calls") or [])
+            if tool_call_count == 0:
+                i -= 1
+                continue
+
+            # Find all tool_results after this assistant (consecutive tool role messages)
+            result_indices = []
+            for k in range(assistant_idx + 1, len(messages)):
+                if messages[k].get("role") == "tool":
+                    result_indices.append(k)
+                else:
+                    break  # next non-tool message ends the result block
+
+            # Only snip if ALL results for this assistant are snippable.
+            # If any result has useful content, keep everything (don't orphan).
+            if all(
+                self._is_snippable(messages[k])
+                for k in result_indices
+                if k not in to_remove
+            ):
+                to_remove.add(assistant_idx)
+                for k in result_indices:
+                    to_remove.add(k)
+                # Skip past this entire block
+                i = assistant_idx - 1
+            else:
+                i = assistant_idx - 1 if assistant_idx > 0 else 0
 
         if not to_remove:
             return messages
 
         kept = [m for idx, m in enumerate(messages) if idx not in to_remove]
-        # Estimate freed tokens
         removed_content = " ".join(
             str(m.get("content", "")) for i, m in enumerate(messages) if i in to_remove
         )
