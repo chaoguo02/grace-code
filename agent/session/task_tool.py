@@ -41,12 +41,40 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 
 _SUBAGENT_PROTOCOL = """
-[SUBAGENT ANALYSIS PROTOCOL]
+[SUBAGENT ANALYSIS PROTOCOL — CC-aligned]
 You are a subagent running in a FRESH context — you see NONE of the parent's
-conversation history.
+conversation history. Your final message IS your return value.
 
-Read before you claim. Cite concrete files and lines for important conclusions.
-Stop as soon as you have enough evidence to answer the assigned task.
+## OUTPUT CONTRACT
+- Target output: 1,000–2,000 tokens unless the parent explicitly asks for more.
+- Be concise. The parent pays for every token you return. Prefer structured
+  summaries over prose. If using ReportFindings/submit_findings, use it.
+- If you could NOT complete the task: say so clearly, state what's missing,
+  and provide whatever partial results you have. Do NOT fabricate completion.
+
+## CONTEXT (what the parent already knows)
+- The parent has already explored the codebase and formed an initial plan.
+  Do NOT re-discover what the task description already states as known.
+- Focus on the SPECIFIC gap the parent assigned to you — not the whole problem.
+
+## TOOL DISCIPLINE
+- Use Read/Grep/Glob BEFORE shell. Shell is ONLY for tests, builds, git,
+  and package managers. NEVER use shell to read or search files.
+- Respect rate limits on external APIs.
+
+## BOUNDARIES
+- Only report findings with concrete evidence (file paths, line numbers,
+  actual code). Label unverified claims as "[unverified]".
+- Do NOT expand scope beyond the assigned task.
+- Do NOT edit code unless the parent explicitly asked you to — your job is
+  to ANALYZE and REPORT.
+- If your tool set does NOT include Write/Edit: you are READ-ONLY.
+
+## PARALLEL DISPATCH (if you are one of several agents)
+- Stay strictly within your assigned scope. Do NOT investigate what other
+  agents were assigned — overlap wastes tokens and creates conflicts.
+- If you discover something another agent should know: note it in your
+  output so the parent can relay it. Do NOT try to coordinate yourself.
 
 ## Deliverable contract
 """
@@ -446,9 +474,12 @@ class AgentTool(BaseTool):
             "",
             "Guidelines:",
             "- Select only from the Runtime-derived subagent list above.",
-            "- Named subagents start fresh; include the context they need in the prompt.",
+            "- Named subagents start fresh; include FULL context in the prompt:",
+            "  what you already know, what you already tried, what failed.",
+            "  Without this, the subagent will re-discover facts you already have.",
             "- fork inherits this conversation; in fork mode, include only the delta or specific ask.",
             "- The subagent's final summary is the only thing returned to you.",
+            "  Ask for structured output (~1-2K tokens) — you pay for every token.",
             "- Use foreground when you need the result before continuing.",
             "- Use background only for independent work; completion arrives later.",
             "- Use for independent, clearly-scoped work. Do simple tasks directly.",
@@ -485,9 +516,12 @@ class AgentTool(BaseTool):
                 "prompt": {
                     "type": "string",
                     "description": (
-                        "Task for the subagent. For named subagents, include the "
-                        "needed context and constraints. For fork, include only the "
-                        "specific delta or ask because conversation context is inherited."
+                        "The task for the subagent. For named subagents, structure as: "
+                        "1) OBJECTIVE — the outcome and how the result will be used. "
+                        "2) CONTEXT — what you already know, already tried, what failed. "
+                        "3) OUTPUT — exact deliverable shape and size (~1-2K tokens). "
+                        "4) BOUNDARIES — scope limits, paths, what NOT to do. "
+                        "For fork, include only the delta (conversation context is inherited)."
                     ),
                 },
                 "execution_placement": {
