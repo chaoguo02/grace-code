@@ -30,23 +30,46 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from core.policy import PhasePolicy
+    from hitl.pipeline import PermissionPipeline
     from agent.session.models import SessionRecord, WorktreeEvidence
     from agent.session.runtime import SessionRuntime
     from agent.session.task_contract import TaskContract
 
-_SUBAGENT_SUMMARY_RULE = """Your final answer is returned to the parent as a tool result.
-The parent only sees your final message, not your full reasoning or tool history.
-Make the final summary standalone and directly useful.
+_SUBAGENT_SUMMARY_RULE = """[Subagent Contract — CC-aligned delegation protocol]
 
-Use dedicated tools before shell. Shell is only for operations that have no
-dedicated tool, such as tests, builds, git, and package managers.
+Your final message IS your return value to the parent agent. The parent sees
+ONLY your final message — not your reasoning, not your tool history, not your
+intermediate thoughts. Make it standalone and directly usable.
 
-Only state findings you can support with concrete evidence. If something is not
-verified, label it clearly as unverified instead of stating it as fact.
+## OUTPUT (required)
+- State what you found / did in a self-contained summary.
+- Keep output within ~1,000-2,000 tokens unless the parent explicitly asks for more.
+- If using ReportFindings / submit_findings: use the structured format.
+- If you could NOT complete the task: state exactly what's missing and why.
 
-If your tool set includes ReportFindings / submit_findings, use it for the
-structured result. Runtime validation, completion requirements, and evidence
-checks are enforced outside this prompt.
+## TOOLS
+- Use dedicated tools BEFORE shell. Shell is ONLY for tests, builds, git,
+  and package managers. NEVER use shell to read files (cat/type) or search
+  (grep/find) — use Read and Grep instead.
+- Respect rate limits on external APIs (WebFetch, WebSearch).
+
+## BOUNDARIES
+- Only state findings backed by concrete evidence (file paths, line numbers,
+  actual code read).  Label unverified claims as "[unverified]".
+- Stay within the scope the parent gave you. Do NOT expand the investigation
+  beyond the stated task unless discovering a critical blocking issue.
+- Do NOT edit code or leave follow-up work for the parent — your job is to
+  ANALYZE and REPORT, not to fix.
+- If your tool set DOES NOT include Write/Edit: you are read-only. Do not
+  attempt to modify files.
+
+## FOR CHAINED / MULTI-DISPATCH
+- If the parent gave you context about what was already tried: do not repeat it.
+- If you are one of several parallel agents: stay strictly within your assigned
+  scope. Overlap wastes tokens and creates conflicting results.
+
+Runtime validation, completion requirements, and evidence checks are enforced
+outside this prompt.
 """
 
 
@@ -168,14 +191,37 @@ def run_child_agent(
         if parent_pipeline_state:
             _child_mode = parent_pipeline_state.get("permission_mode", "")
             if session_runtime is not None:
+                # Resolve the correct parent AgentDefinition.
+                # For forks, source_definition IS the parent definition.
+                # For named subagents, source_definition is the child's own
+                # definition — we must look up the parent's definition via the
+                # parent session's agent_name.
+                _parent_def = source_definition
+                if request.agent_kind is AgentKind.NAMED_SUBAGENT and session_record is not None:
+                    _parent_session = session_runtime._store.get_session(
+                        session_record.parent_id
+                    ) if session_record.parent_id else None
+                    if _parent_session is not None:
+                        try:
+                            _parent_def = session_runtime._agent_registry.get(
+                                _parent_session.agent_name
+                            )
+                        except Exception:
+                            pass  # fall back to source_definition
                 _child_mode = session_runtime._resolve_child_permission_mode(
-                    source_definition, definition
-                    if request.agent_kind is AgentKind.NAMED_SUBAGENT else None
+                    _parent_def,
+                    definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,
                 )
             _child_pipeline.apply_inherited_state(
                 parent_pipeline_state,
                 child_permission_mode=_child_mode or "dontAsk",
             )
+
+        # CC-aligned: background subagents auto-deny permission prompts.
+        # There is no user to approve them, and blocking on threading.Event
+        # for 60 seconds wastes time and creates confusing timeouts.
+        if request.execution_placement is ExecutionPlacement.BACKGROUND:
+            _child_pipeline.set_permission_mode("dontAsk")
 
         # 2. Inject web_confirm_callback for child's own tool approvals.
         #    CC bubble mode: child's permission prompts bubble up to the
@@ -184,7 +230,11 @@ def run_child_agent(
         if session_runtime is not None and getattr(session_runtime, '_is_web_mode', False):
             # Reuse parent's pattern: child gets its own broker, parent gets the WS event
             _child_broker = session_runtime._ensure_approval_broker(agent_id)
-            _parent_session = parent_session_id
+            _parent_session = (
+                session_record.parent_id
+                if session_record is not None and session_record.parent_id is not None
+                else agent_id
+            )
             _event_bus = getattr(session_runtime, '_event_bus', None)
 
             from server.services.approval_broker import ApprovalRequest as _AR
@@ -301,6 +351,7 @@ def run_child_agent(
 
     # Run
     task = Task(
+        task_id=agent_id,
         description=prompt,
         repo_path=_effective_repo_path,
         intent=definition.intent,
