@@ -15,6 +15,7 @@ Tracked metrics (all configurable):
 from __future__ import annotations
 
 import logging
+import threading
 import time as _time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -93,8 +94,11 @@ class CircuitBreaker:
     _state: CircuitBreakerState = CircuitBreakerState.CLOSED
     _trip_reason: str = ""
 
+    _counter_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, init=False)
+
     def __post_init__(self) -> None:
         self._started_at = _time.time()
+        object.__setattr__(self, "_counter_lock", threading.Lock())
 
     # ── Properties ──
 
@@ -115,43 +119,37 @@ class CircuitBreaker:
 
     def record_denial(self) -> None:
         """Record a tool permission denial. Auto-checks thresholds."""
-        self._consecutive_denials += 1
-        self._session_denials += 1
-        logger.debug(
-            "CircuitBreaker denial #%d (consecutive=%d, session=%d)",
-            self._consecutive_denials, self._consecutive_denials, self._session_denials,
-        )
-        self.check()
+        with self._counter_lock:
+            self._consecutive_denials += 1
+            self._session_denials += 1
+            self.check()
 
     def record_approval(self) -> None:
         """Record a tool permission approval — resets consecutive denial counter."""
-        self._consecutive_denials = 0
+        with self._counter_lock:
+            self._consecutive_denials = 0
 
     def record_subagent_failure(self) -> None:
         """Record a subagent failure. Auto-checks thresholds."""
-        self._consecutive_subagent_failures += 1
-        logger.debug(
-            "CircuitBreaker subagent failure #%d",
-            self._consecutive_subagent_failures,
-        )
-        self.check()
+        with self._counter_lock:
+            self._consecutive_subagent_failures += 1
+            self.check()
 
     def record_subagent_success(self) -> None:
         """Record a subagent success — resets consecutive failure counter."""
-        self._consecutive_subagent_failures = 0
+        with self._counter_lock:
+            self._consecutive_subagent_failures = 0
 
     def record_tool_error(self) -> None:
         """Record a turn where ALL tool calls failed. Auto-checks thresholds."""
-        self._consecutive_tool_errors += 1
-        logger.debug(
-            "CircuitBreaker tool error turn #%d",
-            self._consecutive_tool_errors,
-        )
-        self.check()
+        with self._counter_lock:
+            self._consecutive_tool_errors += 1
+            self.check()
 
     def record_tool_success(self) -> None:
         """Record a turn where at least one tool succeeded — resets error counter."""
-        self._consecutive_tool_errors = 0
+        with self._counter_lock:
+            self._consecutive_tool_errors = 0
 
     @property
     def elapsed_seconds(self) -> float:

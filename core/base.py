@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import field, dataclass
@@ -83,14 +84,17 @@ class ToolResult:
             status=ObservationStatus.SUCCESS if self.success else ObservationStatus.ERROR,
             output=self.output,
             tool_name=tool_name,
-            error=self._format_error_for_observation(),
+            error=self.format_error_for_observation(),
             modified_files=list(self.modified_files),
             metadata=metadata,
             outcome=self.outcome,
         )
 
-    def _format_error_for_observation(self) -> str | None:
-        """Build error message, preferring structured tool_error over raw string."""
+    def format_error_for_observation(self) -> str | None:
+        """Build error message, preferring structured tool_error over raw string.
+
+        Called from ``to_observation()`` — not private despite the former
+        ``_format_error_for_observation`` name (P2-11)."""
         if self.tool_error is not None:
             return self.tool_error.to_message()
         return self.error
@@ -495,16 +499,18 @@ class ToolRegistry:
     ) -> None:
         """Create a tool registry with optional Runtime-owned intercept layers.
 
-        All parameters are Protocol-typed in the type stubs; ``Any`` at runtime
-        avoids circular imports from hitl/hooks packages.
+        All parameters use ``Any`` at runtime to avoid circular imports from
+        hitl/hooks packages (P2-10).
         """
         self._tools: dict[str, BaseTool] = {}
-        self._tool_aliases: dict[str, str] = {}  # alias → canonical name
+        self._tool_aliases: dict[str, str] = {}
         self._permission_pipeline = permission_pipeline
-        # Backward compat: hitl_manager still accepted, pipeline takes precedence
         self._hitl_manager = hitl_manager
         self._hook_dispatcher = hook_dispatcher
-        self._capability_registry = capability_registry  # dynamic capability check
+        self._capability_registry = capability_registry
+        self._stats_lock = threading.Lock()
+        """Protects ``_timing_stats`` — multiple threads call ``execute_tool``
+        concurrently in Web mode (ACC-4a)."""
         self._timing_stats: dict[str, dict[str, float | int]] = {}
 
     def register(self, tool: BaseTool) -> "ToolRegistry":
@@ -757,22 +763,23 @@ class ToolRegistry:
     def _record_timing(self, name: str, start: float, result: ToolResult) -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000
         result.duration_ms = elapsed_ms
-        stats = self._timing_stats.setdefault(
-            name,
-            {
-                "calls": 0,
-                "failures": 0,
-                "total_duration_ms": 0.0,
-                "min_duration_ms": 0.0,
-                "max_duration_ms": 0.0,
-            },
-        )
-        calls = int(stats["calls"])
-        stats["calls"] = calls + 1
-        stats["failures"] = int(stats["failures"]) + (0 if result.success else 1)
-        stats["total_duration_ms"] = float(stats["total_duration_ms"]) + elapsed_ms
-        stats["min_duration_ms"] = elapsed_ms if calls == 0 else min(float(stats["min_duration_ms"]), elapsed_ms)
-        stats["max_duration_ms"] = elapsed_ms if calls == 0 else max(float(stats["max_duration_ms"]), elapsed_ms)
+        with self._stats_lock:
+            stats = self._timing_stats.setdefault(
+                name,
+                {
+                    "calls": 0,
+                    "failures": 0,
+                    "total_duration_ms": 0.0,
+                    "min_duration_ms": 0.0,
+                    "max_duration_ms": 0.0,
+                },
+            )
+            calls = int(stats["calls"])
+            stats["calls"] = calls + 1
+            stats["failures"] = int(stats["failures"]) + (0 if result.success else 1)
+            stats["total_duration_ms"] = float(stats["total_duration_ms"]) + elapsed_ms
+            stats["min_duration_ms"] = elapsed_ms if calls == 0 else min(float(stats["min_duration_ms"]), elapsed_ms)
+            stats["max_duration_ms"] = elapsed_ms if calls == 0 else max(float(stats["max_duration_ms"]), elapsed_ms)
 
     # ── 统计接口 ──────────────────────────────────────────────────────
 
@@ -782,22 +789,24 @@ class ToolRegistry:
         格式：{tool_name: {calls, failures, total/avg/min/max_duration_ms}}
         """
         snapshot: dict[str, dict[str, float | int]] = {}
-        for name, stats in self._timing_stats.items():
-            calls = int(stats["calls"])
-            total = float(stats["total_duration_ms"])
-            snapshot[name] = {
-                "calls": calls,
-                "failures": int(stats["failures"]),
-                "total_duration_ms": total,
-                "avg_duration_ms": total / calls if calls else 0.0,
-                "min_duration_ms": float(stats["min_duration_ms"]),
-                "max_duration_ms": float(stats["max_duration_ms"]),
-            }
+        with self._stats_lock:
+            for name, stats in self._timing_stats.items():
+                calls = int(stats["calls"])
+                total = float(stats["total_duration_ms"])
+                snapshot[name] = {
+                    "calls": calls,
+                    "failures": int(stats["failures"]),
+                    "total_duration_ms": total,
+                    "avg_duration_ms": total / calls if calls else 0.0,
+                    "min_duration_ms": float(stats["min_duration_ms"]),
+                    "max_duration_ms": float(stats["max_duration_ms"]),
+                }
         return snapshot
 
     def reset_timing_stats(self) -> None:
         """清空所有工具执行耗时统计。"""
-        self._timing_stats.clear()
+        with self._stats_lock:
+            self._timing_stats.clear()
 
 
 # ---------------------------------------------------------------------------
