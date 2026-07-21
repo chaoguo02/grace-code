@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +59,9 @@ def build_memory_file(memory: Memory) -> str:
 def atomic_write_text(path: Path, content: str) -> None:
     """Write text via temp file + os.replace() to avoid torn reads."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    tmp_path = path.with_name(
+        f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )  # P2-42: include thread ID to prevent intra-process collision
     tmp_path.write_text(content, encoding="utf-8")
     os.replace(tmp_path, path)
 

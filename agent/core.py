@@ -100,7 +100,12 @@ from agent.context_trimming import (
 )
 from agent.loop.types import CompletionBlockTracker
 
+# Prefix for errors injected when V2 delegation policy blocks a child agent
+# spawn.  The agent loop checks tool-result errors for this prefix and marks
+# them as expected blocks rather than real failures (P2-1).
 _V2_DELEGATION_BLOCK_PREFIX = "BLOCKED_BY_DELEGATION_POLICY:"
+# Maximum number of stop-hook retries before the agent loop force-terminates.
+# Uses COMPLETION_BLOCK_THRESHOLD (3) from agent.constants (P2-1).
 _MAX_STOP_HOOK_RETRIES = COMPLETION_BLOCK_THRESHOLD
 
 
@@ -2287,8 +2292,10 @@ class ReActAgent:
 
         return ctx.messages
 
-    def _build_recovery_messages(self) -> list:
+    def _build_recovery_messages(self) -> list["LLMMessage"]:
         """Post-compaction context re-injection (CC-aligned).
+
+        Returns a list of LLMMessage objects to re-inject after compaction (P2-5).
 
         Re-injects: file cache, skill buffer, CLAUDE.md, AND memory section.
         CC also re-injects memory after compaction — we previously only did

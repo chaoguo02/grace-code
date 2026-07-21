@@ -32,6 +32,34 @@ class SqliteMemoryBackend:
         self._index_error_count: int = 0
         self._init_tables()
 
+    @staticmethod
+    def _rows_to_memories(rows: list) -> list[Memory]:
+        """Convert JOIN query rows to Memory objects (P2-43)."""
+        from memory.models import Anchor, Memory, MemoryMetadata, MemoryScope, MemoryStatus, MemoryType
+        mem_map: dict[str, Memory] = {}
+        for r in rows:
+            name = r["name"]
+            if name not in mem_map:
+                mem_map[name] = Memory(
+                    name=name,
+                    description=r["description"],
+                    content=r["content"],
+                    metadata=MemoryMetadata(
+                        type=MemoryType(r["type"]),
+                        status=MemoryStatus(r["status"]),
+                        scope=MemoryScope(r["scope"]),
+                        confidence=float(r["confidence"]),
+                        access_count=int(r["access_count"]),
+                    ),
+                )
+            if r.get("a_kind"):
+                mem_map[name].anchors.append(Anchor(
+                    kind=r["a_kind"], path=r.get("a_path") or "",
+                    name=r.get("a_name"), value=r.get("a_value"),
+                    content_hash=r.get("a_hash") or "",
+                ))
+        return list(mem_map.values())
+
     def _init_tables(self) -> None:
         """Ensure memory tables exist (idempotent). Called once at init."""
         try:
@@ -180,18 +208,20 @@ class SqliteMemoryBackend:
             return {}
 
     def list_by_scope(self, scope: str = "project", min_confidence: float = 0.0) -> list[Memory]:
+        """List memories by scope in a single connection (P2-43)."""
         try:
             with self._conn() as conn:
                 rows = conn.execute(
-                    "SELECT name FROM memory_entries WHERE scope=? AND confidence>=? ORDER BY confidence DESC",
+                    """SELECT m.*, a.kind AS a_kind, a.path AS a_path,
+                              a.symbol_name AS a_name, a.task_value AS a_value,
+                              a.content_hash AS a_hash
+                       FROM memory_entries m
+                       LEFT JOIN memory_anchors a ON a.memory_name = m.name
+                       WHERE m.scope=? AND m.confidence>=?
+                       ORDER BY m.confidence DESC""",
                     (scope, min_confidence),
                 ).fetchall()
-                result = []
-                for r in rows:
-                    mem = self.read_memory(r["name"])
-                    if mem:
-                        result.append(mem)
-                return result
+                return self._rows_to_memories(rows)
         except Exception:
             return []
 

@@ -14,6 +14,7 @@ Flow:
 from __future__ import annotations
 
 import logging
+import time as _time
 from pathlib import Path
 from typing import Any
 
@@ -92,8 +93,17 @@ class HookDispatcher:
         collected_warnings: list[str] = []
         updated_input: dict[str, Any] | None = None
         is_blockable = event in BLOCKABLE_EVENTS
+        _hook_start = _time.time()
+        _MAX_TOTAL = 30.0  # total hook execution budget (P2-19)
 
         for hook_config in external_hooks:
+            _elapsed = _time.time() - _hook_start
+            if _elapsed > _MAX_TOTAL:
+                logger.warning(
+                    "Hook total time cap (%.0fs) exceeded — skipping remaining %d hooks",
+                    _MAX_TOTAL, len(external_hooks),
+                )
+                break
             result = execute_hook(
                 command=hook_config.command,
                 context=context,

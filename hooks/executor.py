@@ -21,7 +21,7 @@ from core.process import LocalRuntime, ProcessTermination, Runtime
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = 60
+DEFAULT_TIMEOUT = 10  # hook timeout in seconds (was 60, P2-39)
 
 
 def execute_hook(
