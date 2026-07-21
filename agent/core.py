@@ -86,8 +86,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+from agent.constants import COMPLETION_BLOCK_THRESHOLD
+
 _V2_DELEGATION_BLOCK_PREFIX = "BLOCKED_BY_DELEGATION_POLICY:"
-_MAX_STOP_HOOK_RETRIES = 3
+_MAX_STOP_HOOK_RETRIES = COMPLETION_BLOCK_THRESHOLD
 
 
 class _ChildTurnPhase(str, Enum):
@@ -305,6 +307,16 @@ from agent.recovery import (
 )
 
 
+from agent.constants import (
+    BUDGET_COMPACT_PCT, BUDGET_WARNING_PCT, COMPLETION_BLOCK_THRESHOLD,
+    DEFAULT_HISTORY_BUDGET_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_REQUEST_BUDGET_TOKENS, DEFAULT_TRUNCATE_OUTPUT_CHARS,
+    DIFF_PREVIEW_MAX_CHARS, FINDING_DESC_CHARS, MAX_TOOL_RESULTS_EXTRACT,
+    NO_THOUGHT_SENTINEL, RECENT_FILES_WINDOW, RECOVERY_MAX_FINDINGS,
+    SESSION_MEMORY_MSG_WINDOW, SUMMARY_TRUNCATION_CHARS,
+    TEST_FAILURE_REFLECTION_LIMIT, TOOL_EXTRACT_CHARS,
+    TRUNCATION_BUFFER_TOKENS,
+)
 from agent.context_trimming import _snip_history, _ToolResultBudgetState, _tool_result_key, _apply_tool_result_budget, _apply_context_collapse, _micro_compact
 
 
@@ -581,10 +593,9 @@ class ReActAgent:
         # Track file names (not raw diff) for true incremental diff at finish.
         # This prevents prior worktree dirt from being reported as "this run's changes."
         _git_state = _capture_git_state(task.repo_path)
-        # Completion-block retry tracker: reason → consecutive count.
-        # Kept as a plain dict rather than hanging attributes on the
-        # _GitState dataclass (which would break if slots are added).
-        _block_tracker: dict[str, int] = {}
+        # Completion-block retry tracker — replaced raw dict (P1-5).
+        from agent.loop.types import CompletionBlockTracker
+        _block_tracker = CompletionBlockTracker(threshold=COMPLETION_BLOCK_THRESHOLD)
         _completion_blocked: int = 0
 
         # First-party stats: record session start
@@ -705,7 +716,7 @@ class ReActAgent:
             _refresh_git_state(_git_state, task.repo_path)
             if _git_state.has_changes:
                 _patch_text = (
-                    f"\n{_git_state.current_diff[:3000]}"
+                    f"\n{_git_state.current_diff[:DIFF_PREVIEW_MAX_CHARS]}"
                     if _git_state.current_diff else
                     "\nRaw incremental patch is not attributable; the workspace revision changed."
                 )
@@ -945,7 +956,7 @@ class ReActAgent:
 
             # ── 2.5. Context Collapse: read-time projection (CC: CollapseStore) ──
             # ── Auto-compact: monitor token usage, warn when near limit ──
-            _budget_total = self._cfg.request_budget_tokens or 200_000
+            _budget_total = self._cfg.request_budget_tokens or DEFAULT_REQUEST_BUDGET_TOKENS
             _budget_pct = (total_tokens / _budget_total * 100) if _budget_total else 0
             if step > 3 and _budget_pct > 80:
                 logger.warning(
@@ -1005,7 +1016,7 @@ class ReActAgent:
             if step > 1 and self._cfg.compact_history:
                 _collapse_freed, self._collapse_store = _apply_context_collapse(
                     history, self.compactor,
-                    history_budget=(self._cfg.request_budget_tokens or 110_000),
+                    history_budget=(self._cfg.request_budget_tokens or DEFAULT_HISTORY_BUDGET_TOKENS),
                     collapse_store=getattr(self, "_collapse_store", None),
                 )
                 if _collapse_freed > 0:
@@ -1097,21 +1108,10 @@ class ReActAgent:
                 except Exception as exc:
                     _exc_str = str(exc).lower()
                     if (any(kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length")) and _state.recovery.can_reactive_compact() and self.compactor is not None):
-                        _state = _state.with_recovery_update(has_attempted_reactive_compact=True)
                         logger.warning("Stream failed (prompt too long) — drain + compact")
-                        _drained = 0
-                        try:
-                            _drained += _snip_history(history)
-                            _drained += _micro_compact(history)
-                            if _drained > 0:
-                                continue
-                        except Exception:
-                            pass
-                        try:
-                            self.compactor.compact_history(history, total_tokens)
+                        _state, _ok = self._attempt_reactive_compact(history, total_tokens, _state)
+                        if _ok:
                             continue
-                        except Exception as _cexc:
-                            logger.warning("Reactive compact failed: %s", _cexc)
                     logger.error("LLM stream failed at step %d: %s", step, exc)
                     _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
                     log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
@@ -1140,31 +1140,10 @@ class ReActAgent:
                         and _state.recovery.can_reactive_compact()
                         and self.compactor is not None
                     ):
-                        _state = _state.with_recovery_update(has_attempted_reactive_compact=True)
-                        logger.warning(
-                            "Prompt too long — attempting recovery (CC: 3-tier waterfall)"
-                        )
-                        # Tier 1: drain — zero-cost SnipCompact + MicroCompact
-                        _drained = 0
-                        try:
-                            _drained += _snip_history(history)
-                            _drained += _micro_compact(history)
-                            if _drained > 0:
-                                logger.info(
-                                    "Drain freed ~%d tokens — retrying LLM call", _drained,
-                                )
-                                _state = _state.with_updates(transition=Transition.reactive_compact())
-                                continue
-                        except Exception as _dexc:
-                            logger.debug("Drain failed: %s", _dexc)
-                        # Tier 2: full LLM compact
-                        try:
-                            self.compactor.compact_history(history, total_tokens)
-                            _state = _state.with_updates(transition=Transition.reactive_compact())
-                            logger.info("Reactive compact succeeded — retrying LLM call")
+                        logger.warning("Prompt too long — attempting recovery (CC: 3-tier waterfall)")
+                        _state, _ok = self._attempt_reactive_compact(history, total_tokens, _state)
+                        if _ok:
                             continue
-                        except Exception as _cexc:
-                            logger.warning("Reactive compact failed: %s", _cexc)
                     _exc_str = str(exc).lower()
                     _is_prompt_too_long = any(
                         kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length")
@@ -1200,17 +1179,17 @@ class ReActAgent:
             if response is not None:
                 _truncated = (
                     getattr(response, "finish_reason", "") == "length"
-                    or response.output_tokens >= getattr(self._cfg, "max_tokens", 32000) - 100
+                    or response.output_tokens >= getattr(self._cfg, "max_tokens", DEFAULT_MAX_OUTPUT_TOKENS) - TRUNCATION_BUFFER_TOKENS
                 )
             else:
                 # Streaming path uses estimated tokens for truncation detection
                 _truncated = (
                     action.action_type == ActionType.FINISH
                     and not action.message
-                    and _output_est >= getattr(self._cfg, "max_tokens", 32000)
+                    and _output_est >= getattr(self._cfg, "max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
                 )
             if _truncated and action.action_type != ActionType.TOOL_CALL:
-                if _state.recovery.can_escalate(getattr(self._cfg, "max_tokens", 32000)):
+                if _state.recovery.can_escalate(getattr(self._cfg, "max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)):
                     _state = _state.with_recovery_update(escalation_applied=True)
                     logger.info("Output truncated — escalating max_tokens 8k→64k (CC: max_output_tokens_escalate)")
                     self._cfg.max_tokens = RecoveryState._ESCALATED_MAX_TOKENS
@@ -1330,7 +1309,7 @@ class ReActAgent:
                 if history:
                     context_for_extraction = self._build_session_memory_context(history)
                 # M6: pass recent files + commands for richer extraction context
-                _recent_files = sorted(self._accessed_files)[-20:] if self._accessed_files else []
+                _recent_files = sorted(self._accessed_files)[-RECENT_FILES_WINDOW:] if self._accessed_files else []
                 self._session_memory_tracker.tick(
                     current_tokens=total_tokens,
                     current_tool_calls=_cumulative_tool_calls,
@@ -1486,24 +1465,19 @@ class ReActAgent:
                     logger.warning(
                         "Completion blocked (%d): %s", _completion_blocked, guard_result.blocked_reason
                     )
-                    # Track consecutive blocks with the same reason.
-                    # After 3 blocks the agent is likely stuck in a loop;
-                    # force give_up instead of burning tokens.
-                    _prev_reason = _block_tracker.get('_last_reason', '')
-                    _block_count = _block_tracker.get(_prev_reason, 0)
-                    if guard_result.blocked_reason == _prev_reason:
-                        _block_count += 1
-                    else:
-                        _block_count = 1
-                    _block_tracker['_last_reason'] = guard_result.blocked_reason
-                    _block_tracker[guard_result.blocked_reason] = _block_count
-                    if _block_count >= 3:
+                    # CompletionBlockTracker counts consecutive same-reason
+                    # blocks and signals give_up at threshold (P1-5).
+                    _should_give_up = _block_tracker.should_block(
+                        guard_result.blocked_reason,
+                    )
+                    if _should_give_up:
                         logger.warning(
                             "Completion blocked %d times with same reason — forcing give_up",
-                            _block_count,
+                            COMPLETION_BLOCK_THRESHOLD,
                         )
                         reason = (
-                            f"Agent gave up: completion blocked {_block_count} "
+                            f"Agent gave up: completion blocked "
+                            f"{COMPLETION_BLOCK_THRESHOLD} "
                             f"times for reason: {guard_result.blocked_reason}"
                         )
                         _tsm.fail(TerminationReason.AGENT_GAVE_UP, reason)
@@ -1908,7 +1882,7 @@ class ReActAgent:
                 if _cf >= _max_consecutive_failures:
                     reason = (
                         f"Aborting: {_cf} consecutive tool failures. "
-                        f"Last error: {observations[-1].error or observations[-1].output[:200]}"
+                        f"Last error: {observations[-1].error or observations[-1].output[:FINDING_DESC_CHARS]}"
                     )
                     logger.warning(reason)
                     log.log_task_failed(steps=step, reason=reason)
@@ -1924,7 +1898,7 @@ class ReActAgent:
                 if self._backend.supports_function_calling:
                     # Native tool_use mode: structured messages
                     thought_content = action.thought or ""
-                    if thought_content == "(no thought)":
+                    if thought_content == NO_THOUGHT_SENTINEL:
                         thought_content = ""
                     history.add(LLMMessage(
                         role="assistant",
@@ -2050,11 +2024,11 @@ class ReActAgent:
         """Build a concise context summary for session memory extraction."""
         messages = history.get_messages()
         parts: list[str] = []
-        for msg in messages[-20:]:
+        for msg in messages[-SESSION_MEMORY_MSG_WINDOW:]:
             role = msg.role
             content = msg.content or ""
-            if len(content) > 2000:
-                content = content[:2000] + "..."
+            if len(content) > SUMMARY_TRUNCATION_CHARS:
+                content = content[:SUMMARY_TRUNCATION_CHARS] + "..."
             if content.strip():
                 parts.append(f"[{role}] {content}")
         return "\n\n".join(parts)
@@ -2198,7 +2172,7 @@ class ReActAgent:
                     continue
                 if any(content.startswith(p) for p in _PLANNING_PREFIXES):
                     continue
-                return content[:2000]
+                return content[:SUMMARY_TRUNCATION_CHARS]
 
         # Pass 2: 提取 tool results（原始工具返回数据，不依赖模型总结）
         tool_contents = []
@@ -2206,8 +2180,8 @@ class ReActAgent:
             if msg.get("role") == "tool":
                 content = msg.get("content", "").strip()
                 if content and len(content) > 10:
-                    tool_contents.append(content[:500])
-                    if len(tool_contents) >= 5:
+                    tool_contents.append(content[:TOOL_EXTRACT_CHARS])
+                    if len(tool_contents) >= MAX_TOOL_RESULTS_EXTRACT:
                         break
 
         if tool_contents:
@@ -2306,8 +2280,8 @@ class ReActAgent:
                     "role": "user",
                     "kind": "runtime_notice",
                     "content": "[Accumulated findings]\n" + "\n".join(
-                        f"- {f.get('title','')}: {f.get('description','')[:200]}"
-                        for f in findings[-10:]  # last 10 findings
+                        f"- {f.get('title','')}: {f.get('description','')[:FINDING_DESC_CHARS]}"
+                        for f in findings[-RECOVERY_MAX_FINDINGS:]  # last 10 findings
                     ),
                 })
             if recovery_msgs:
@@ -2507,7 +2481,7 @@ class ReActAgent:
         )
 
     @staticmethod
-    def _truncate_output(text: str, max_chars: int = 8000) -> str:
+    def _truncate_output(text: str, max_chars: int = DEFAULT_TRUNCATE_OUTPUT_CHARS) -> str:
         """委托给 observation_rendering。"""
         from agent.observation_rendering import truncate_output
         return truncate_output(text, max_chars)
@@ -2653,6 +2627,40 @@ class ReActAgent:
                 persist_compaction_summary(summary_text, store_dir)
 
         return compacted
+
+    def _attempt_reactive_compact(
+        self, history, total_tokens, state: "AgentTurnState",
+    ) -> "tuple[AgentTurnState, bool]":
+        """3-tier waterfall recovery for prompt-too-long (P1-3).
+
+        Returns (new_state, should_continue).  When should_continue is True
+        the caller must ``continue`` back to the top of the for-step loop.
+        """
+        state = state.with_recovery_update(has_attempted_reactive_compact=True)
+        # Tier 1: drain — zero-cost SnipCompact + MicroCompact
+        drained = 0
+        try:
+            drained += _snip_history(history)
+            drained += _micro_compact(history)
+            if drained > 0:
+                logger.info(
+                    "Drain freed ~%d tokens — retrying LLM call", drained,
+                )
+                return state.with_updates(
+                    transition=Transition.reactive_compact(),
+                ), True
+        except Exception as dexc:
+            logger.debug("Drain failed: %s", dexc)
+        # Tier 2: full LLM compact
+        try:
+            self.compactor.compact_history(history, total_tokens)
+            logger.info("Reactive compact succeeded — retrying LLM call")
+            return state.with_updates(
+                transition=Transition.reactive_compact(),
+            ), True
+        except Exception as cexc:
+            logger.warning("Reactive compact failed: %s", cexc)
+        return state, False
 
 
 # ---------------------------------------------------------------------------
