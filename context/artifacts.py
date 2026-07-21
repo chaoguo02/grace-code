@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from context.token_budget import estimate_tokens
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -83,13 +86,19 @@ class ArtifactStore:
         summary_lines: int = 15,
         summary_tail_lines: int = 5,
         storage_dir: str | Path | None = None,
+        max_total_bytes: int = 10_000_000,
+        max_content_bytes: int = 1_000_000,
     ) -> None:
         self._threshold_tokens = threshold_tokens
         self._max_artifacts = max_artifacts
         self._summary_lines = summary_lines
         self._summary_tail_lines = summary_tail_lines
+        self._max_total_bytes = max_total_bytes
+        self._max_content_bytes = max_content_bytes
+        self._total_bytes: int = 0
         self._store: OrderedDict[str, Artifact] = OrderedDict()
         self._storage_dir: Path | None = None
+        self._evicted_ids: set[str] = set()
         if storage_dir is not None:
             self.set_storage_dir(storage_dir)
 
@@ -199,13 +208,15 @@ class ArtifactStore:
         content_hash = hashlib.sha256(output[:1000].encode(errors="replace")).hexdigest()[:8]
         artifact_id = f"art_{content_hash}"
 
+        # Cap per-artifact content at 1 MB to prevent OOM from single large output
+        capped_output = output[:self._max_content_bytes]
         return Artifact(
             artifact_id=artifact_id,
             tool_name=tool_name,
-            full_content=output,
+            full_content=capped_output,
             summary=summary,
             token_count=token_count,
-            char_count=len(output),
+            char_count=len(capped_output),
             line_count=line_count,
         )
 
@@ -241,18 +252,38 @@ class ArtifactStore:
         return "\n".join(parts)
 
     def _add(self, artifact: Artifact) -> None:
-        """添加 artifact，执行 LRU 淘汰。"""
+        """添加 artifact，执行 LRU 淘汰（数量 + 内存双重限制）。"""
+        content_len = len(artifact.full_content)
         if artifact.artifact_id in self._store:
+            self._total_bytes -= len(self._store[artifact.artifact_id].full_content)
             self._store.move_to_end(artifact.artifact_id)
             self._store[artifact.artifact_id] = artifact
+            self._total_bytes += content_len
         else:
             self._store[artifact.artifact_id] = artifact
+            self._total_bytes += content_len
 
         self._persist_artifact(artifact)
 
+        # Limit 1: count-based LRU
+        evicted = 0
         while len(self._store) > self._max_artifacts:
-            removed_id, _removed = self._store.popitem(last=False)
+            removed_id, removed = self._store.popitem(last=False)
+            self._total_bytes -= len(removed.full_content)
+            self._evicted_ids.add(removed_id)
             self._delete_artifact_file(removed_id)
+            evicted += 1
+        # Limit 2: total bytes (10 MB default)
+        while self._total_bytes > self._max_total_bytes and self._store:
+            removed_id, removed = self._store.popitem(last=False)
+            self._total_bytes -= len(removed.full_content)
+            self._evicted_ids.add(removed_id)
+            self._delete_artifact_file(removed_id)
+            evicted += 1
+        if evicted:
+            evicted_ids = ",".join(list(self._evicted_ids)[-3:])
+            logger.debug("ArtifactStore evicted %d artifacts (total_bytes=%d, evicted=%s)",
+                         evicted, self._total_bytes, evicted_ids)
 
     def _artifact_path(self, artifact_id: str) -> Path | None:
         if self._storage_dir is None:

@@ -38,6 +38,7 @@ export function SessionSidebar() {
     sessions,
     activeId,
     isLoading,
+    error: storeError,
     loadSessions,
     openSession,
     createSession,
@@ -143,6 +144,12 @@ export function SessionSidebar() {
           <span>{selectedIds.size > 0 ? `${selectedIds.size} selected` : ""}</span>
         </div>
 
+        {storeError && (
+          <div className="session-error-banner" role="alert" style={{ padding: 8, background: "var(--error)", color: "#fff", borderRadius: 6, margin: 8 }}>
+            <span style={{ fontSize: 12 }}>{storeError}</span>
+            <button onClick={() => loadSessions()} style={{ marginLeft: 8, fontSize: 11, background: "rgba(255,255,255,0.2)", border: "none", borderRadius: 3, color: "#fff", cursor: "pointer", padding: "2px 8px" }}>Retry</button>
+          </div>
+        )}
         <div id="session-list" className="session-list">
           {isLoading && sessions.length === 0 && <div className="empty-state">Loading…</div>}
           {!isLoading && sessions.length === 0 && <div className="empty-state">No sessions yet.</div>}
@@ -150,8 +157,11 @@ export function SessionSidebar() {
           {sessions.map((s) => (
             <div
               key={s.id}
+              role="button"
+              tabIndex={0}
               className={`session-item ${s.id === activeId ? "active" : ""}`}
               onClick={() => handleOpen(s.id)}
+              onKeyDown={(e: React.KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleOpen(s.id); } }}
             >
               <div className="session-mainline">
                 <input

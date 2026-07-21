@@ -28,6 +28,7 @@ function formatDuration(ms?: number) {
 export function SessionStatsDrawer({ session, onClose }: SessionStatsDrawerProps) {
   const [stats, setStats] = useState<StatsType | null>(null);
   const [steps, setSteps] = useState<StepLog[]>([]);
+  const [err, setErr] = useState<string | null>(null);
   const [diffs, setDiffs] = useState<SessionDiff[]>([]);
 
   useEffect(() => {

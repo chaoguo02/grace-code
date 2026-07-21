@@ -24,7 +24,7 @@ export function MessageBubble({ message, toolResults }: Props) {
               <span className="obs-status-tag">{isError ? "error" : "success"}</span>
             </div>
             <pre className="obs-output" style={{ maxHeight: 200, overflow: "auto" }}>
-              {escapeHtml(message.content.slice(0, 500))}
+              {message.content.slice(0, 500)}
             </pre>
           </div>
         </div>

@@ -77,8 +77,10 @@ export default function App() {
     <div id="app-shell">
       <div id="app" className={activeView === "chat" ? "has-event-sidebar" : ""}>
         <div className="left-rail">
-          <SessionSidebar />
-          <SessionTree />
+          <ErrorBoundary>
+            <SessionSidebar />
+            <SessionTree />
+          </ErrorBoundary>
         </div>
 
         <ErrorBoundary>
@@ -122,7 +124,7 @@ export default function App() {
           </main>
         </ErrorBoundary>
 
-        {activeView === "chat" && <EventSidebar key={activeId ?? "no-session"} />}
+        {activeView === "chat" && <ErrorBoundary><EventSidebar key={activeId ?? "no-session"} /></ErrorBoundary>}
       </div>
     </div>
   );

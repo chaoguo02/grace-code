@@ -29,18 +29,24 @@ export function StatsDashboard() {
   const [toolRankings, setToolRankings] = useState<Record<string, number>>({});
   const [sessions, setSessions] = useState<SessionStats[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const activeId = useSessionStore((s) => s.activeId);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
+    setError(null);
     Promise.all([getDailyRollups(30), getToolRankings(7), getRecentSessionStats(30)])
       .then(([dailyData, toolData, sessionData]) => {
         if (cancelled) return;
         setDaily(dailyData);
         setToolRankings(toolData);
         setSessions(sessionData);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : 'Failed to load statistics');
       })
       .finally(() => {
         if (!cancelled) setLoading(false);

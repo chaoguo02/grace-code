@@ -20,6 +20,7 @@ export function DiffReviewView() {
   const [diffs, setDiffs] = useState<SessionDiff[]>([]);
   const [loading, setLoading] = useState(true);
   const [submittingId, setSubmittingId] = useState<number | null>(null);
+  const [submittingAny, setSubmittingAny] = useState(false);
   const [comments, setComments] = useState<Record<number, string>>({});
 
   useEffect(() => {
@@ -52,11 +53,14 @@ export function DiffReviewView() {
   );
 
   const handleDecision = async (diff: SessionDiff, status: "approved" | "rejected") => {
+    if (submittingAny) return;
+    setSubmittingAny(true);
     setSubmittingId(diff.id);
     try {
       await updateDiffStatus(diff.id, status, comments[diff.id] || "");
       setDiffs((prev) => prev.filter((item) => item.id !== diff.id));
     } finally {
+      setSubmittingAny(false);
       setSubmittingId(null);
     }
   };

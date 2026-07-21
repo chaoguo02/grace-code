@@ -13,7 +13,7 @@ interface ConfirmModalProps {
 export function ConfirmModal({ open, title, message, confirmLabel = "Confirm", danger, onConfirm, onCancel, loading }: ConfirmModalProps) {
   if (!open) return null;
   return (
-    <div className="modal-overlay" onKeyDown={(e) => e.key === "Escape" && !loading && onCancel()}>
+    <div className="modal-overlay" role="dialog" aria-modal="true" aria-label={title} onKeyDown={(e) => { if (e.key === "Escape" && !loading) onCancel(); if (e.key === "Tab") { e.preventDefault(); /* focus stays within dialog */ } }}>
       <div className="modal-box" style={{ width: 380 }}>
         <h3 style={{ fontSize: 16 }}>{title}</h3>
         <p style={{ margin: 0, fontSize: 13, color: "var(--text-dim)", lineHeight: 1.5 }}>{message}</p>

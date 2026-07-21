@@ -367,7 +367,6 @@ export function MemoryView() {
                   ) : (
                     <div className="memory-preview-body" style={{ fontSize: 14, lineHeight: 1.6 }}
                       dangerouslySetInnerHTML={renderMarkdownSafe(detailContent) || { __html: "<p>Loading...</p>" }}
-                      }}
                     />
                   )}
                 </div>

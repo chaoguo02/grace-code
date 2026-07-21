@@ -608,7 +608,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     loadTraceEvents: async (sessionId, signal) => {
       try {
         ensureSession(sessionId);
-        const events = await api.getTraceEvents(sessionId, signal);
+        const events = await api.getTraceEvents(sessionId, 0, 200, signal);
         patchSession(sessionId, (prev) => {
           const msgs = prev.timeline.filter((item) => item.source === "message");
           const wsItems = events.map((ws) => ({ source: "ws" as const, ws }));
