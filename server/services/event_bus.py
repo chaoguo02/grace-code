@@ -126,15 +126,11 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
         return [WsStatus(status="running", timestamp=ts).to_dict()]
 
     if ev_type == "task_complete":
-        msgs: list[dict] = [WsStatus(status="completed", result={
-            "summary": payload.get("summary", ""),
-            "steps_taken": payload.get("steps", 0),
-        }, timestamp=ts).to_dict()]
-        # If the agent produced a plan contract (ExitPlanMode), also emit plan_ready
+        # When a plan contract was produced (ExitPlanMode), emit plan_ready
         # so it can be recovered from /trace/events after page refresh.
         _contract = payload.get("contract")
         if _contract:
-            msgs.append(WsPlanReady(
+            return [WsPlanReady(
                 plan_text=payload.get("summary", ""),
                 contract=_contract,
                 result={
@@ -142,8 +138,10 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
                     "steps_taken": payload.get("steps", 0),
                 },
                 timestamp=ts,
-            ).to_dict())
-        return msgs
+            ).to_dict()]
+        # Non-plan completion: the model's last assistant message IS the
+        # completion notification — no redundant WsStatus needed.
+        return []
 
     if ev_type == "task_failed":
         return [WsStatus(status="failed",
