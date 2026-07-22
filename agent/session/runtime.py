@@ -1078,7 +1078,9 @@ class SessionRuntime:
                                  "[AGENT MEMORY]", "[TASK MODE]", "[ACTIVE POLICY]",
                                  "[FEEDBACK]", "[PREVIOUS SESSION CONTEXT]",
                                  "[SYSTEM]", "[MEMORY RESTORED]",
-                                 "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]")
+                                 "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]",
+                                 "[Conversation compacted",
+                                 "[Earlier conversation summarized")
             for message in history.to_list():
                 if id(message) in _known_ids:
                     continue

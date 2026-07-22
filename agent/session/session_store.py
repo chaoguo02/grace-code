@@ -424,6 +424,7 @@ class SessionStore:
         "[AGENT MEMORY]", "[TASK MODE]", "[ACTIVE POLICY]",
         "[FEEDBACK]", "[PREVIOUS SESSION CONTEXT]", "[SYSTEM]",
         "[MEMORY RESTORED]", "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]",
+        "[Conversation compacted", "[Earlier conversation summarized",
     )
 
     def list_messages(self, session_id: str) -> list[LLMMessage]:

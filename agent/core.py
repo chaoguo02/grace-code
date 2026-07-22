@@ -979,6 +979,7 @@ class ReActAgent:
             # CLI ChatSession does this after every round; the Web agent loop must
             # self-trigger since it has no round-based wrapper.
             if step > 3 and _budget_pct > 100 and self.compactor is not None:
+                from context.token_budget import estimate_tokens
                 if not getattr(self, '_auto_compacted', False):
                     logger.warning(
                         "Auto-compact triggered at %.0f%% budget (%d/%d)",
@@ -994,13 +995,9 @@ class ReActAgent:
                             logger.info(
                                 "Auto-compact drain freed ~%d tokens", _drained,
                             )
-                            # Recompute budget after drain so next iteration
-                            # sees the reduced token count.
-                            total_tokens = sum(
-                                getattr(m, "token_count", 0) or 0
-                                for m in history.messages
-                            )
-                            continue  # retry LLM call with compacted history
+                            total_tokens = estimate_tokens(history.to_dicts())
+                            self._auto_compacted = True
+                            continue
                     except Exception as _dexc:
                         logger.debug("Auto-compact drain failed: %s", _dexc)
                     # Tier 2: full LLM compact (ConversationCompactor)
@@ -1008,18 +1005,20 @@ class ReActAgent:
                         compacted = self.compactor.compact_history(
                             history.to_dicts(), total_tokens,
                         )
-                        # Rebuild history from the compacted result so the
-                        # next LLM call sees the compressed context.
+                        # Rebuild history from compacted result.  Preserve
+                        # only the compacted messages — Runtime-injected
+                        # prompts are already the first entries and survive.
                         history._messages.clear()
                         history._messages.extend(
                             history.from_dicts(compacted, history._max)._messages,
                         )
+                        total_tokens = estimate_tokens(compacted)
                         self._auto_compacted = True
                         logger.info(
-                            "Auto-compact: full LLM compact completed — %d messages",
-                            len(compacted),
+                            "Auto-compact: full compact done — %d msgs, ~%d tokens",
+                            len(compacted), total_tokens,
                         )
-                        continue  # retry LLM call with compacted history
+                        continue
                     except Exception as _cexc:
                         logger.warning(
                             "Auto-compact full compact failed: %s", _cexc,
