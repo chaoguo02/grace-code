@@ -147,6 +147,15 @@ export function MemoryView() {
 
   const selected = filteredItems.find((item) => item.name === selectedName) ?? filteredItems[0] ?? null;
 
+  // Group by type for catalog display (when no type filter is active)
+  const groupedByType = useMemo(() => {
+    if (typeFilter !== "all") return null; // already filtered, no grouping needed
+    const types: MemoryType[] = ["user", "feedback", "project", "reference"];
+    return types
+      .map((t) => ({ type: t, items: filteredItems.filter((item) => item.type === t) }))
+      .filter((g) => g.items.length > 0);
+  }, [filteredItems, typeFilter]);
+
   useEffect(() => {
     if (!selected && filteredItems[0]) setSelectedName(filteredItems[0].name);
   }, [filteredItems, selected]);
@@ -291,27 +300,62 @@ export function MemoryView() {
                 <div className="memory-empty">No memories match the current filters. Try a different search or filter.</div>
               )}
 
-              {filteredItems.map((item) => (
-                <button
-                  key={item.name}
-                  type="button"
-                  className={`memory-list-item ${selected?.name === item.name ? "active" : ""}`}
-                  onClick={() => setSelectedName(item.name)}
-                >
-                  <div className="memory-list-top">
-                    <span className={`memory-badge ${toneClass(item.type)}`}>{item.type}</span>
-                    <span className={`memory-badge subtle ${toneClass(item.status)}`}>{item.status}</span>
-                    <span className="summary-subtle">{formatRelative(item.updated_at)}</span>
-                  </div>
-                  <div className="memory-list-name">{item.name}</div>
-                  <div className="memory-list-description">{item.description}</div>
-                  <div className="memory-list-meta">
-                    <span>{item.scope}</span>
-                    <span>{item.created_at ? formatRelative(item.created_at) : ""}</span>
-                    <span>{item.access_count} reads</span>
-                  </div>
-                </button>
-              ))}
+              {/* Grouped by type (when no filter) or flat list */}
+              {groupedByType
+                ? groupedByType.map((group) => (
+                    <div key={group.type} style={{ marginBottom: 4 }}>
+                      <div className="memory-group-header" style={{
+                        padding: "6px 10px", fontSize: 11, fontWeight: 700,
+                        color: "var(--text-muted)", textTransform: "uppercase",
+                        letterSpacing: "0.5px", borderBottom: "1px solid var(--border)",
+                        background: "var(--bg-elev)", position: "sticky", top: 0, zIndex: 1,
+                      }}>
+                        <span className={`memory-tone-dot ${toneClass(group.type)}`} style={{ marginRight: 6 }} />
+                        {group.type} · {group.items.length}
+                      </div>
+                      {group.items.map((item) => (
+                        <button
+                          key={item.name}
+                          type="button"
+                          className={`memory-list-item ${selected?.name === item.name ? "active" : ""}`}
+                          onClick={() => setSelectedName(item.name)}
+                        >
+                          <div className="memory-list-top">
+                            <span className={`memory-badge subtle ${toneClass(item.status)}`}>{item.status}</span>
+                            <span className="summary-subtle">{formatRelative(item.updated_at)}</span>
+                          </div>
+                          <div className="memory-list-name">{item.name}</div>
+                          <div className="memory-list-description">{item.description}</div>
+                          <div className="memory-list-meta">
+                            <span>{item.scope}</span>
+                            <span>{item.created_at ? formatRelative(item.created_at) : ""}</span>
+                            <span>{item.access_count} reads</span>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  ))
+                : filteredItems.map((item) => (
+                    <button
+                      key={item.name}
+                      type="button"
+                      className={`memory-list-item ${selected?.name === item.name ? "active" : ""}`}
+                      onClick={() => setSelectedName(item.name)}
+                    >
+                      <div className="memory-list-top">
+                        <span className={`memory-badge ${toneClass(item.type)}`}>{item.type}</span>
+                        <span className={`memory-badge subtle ${toneClass(item.status)}`}>{item.status}</span>
+                        <span className="summary-subtle">{formatRelative(item.updated_at)}</span>
+                      </div>
+                      <div className="memory-list-name">{item.name}</div>
+                      <div className="memory-list-description">{item.description}</div>
+                      <div className="memory-list-meta">
+                        <span>{item.scope}</span>
+                        <span>{item.created_at ? formatRelative(item.created_at) : ""}</span>
+                        <span>{item.access_count} reads</span>
+                      </div>
+                    </button>
+                  ))}
             </div>
           </div>
 
