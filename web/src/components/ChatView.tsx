@@ -844,7 +844,7 @@ export function ChatView() {
                   </div>
                   <div className="trace-content">
                     {streamingThought ? (
-                      <span style={{ whiteSpace: "pre-wrap" }}>{streamingThought}</span>
+                      <MarkdownRenderer content={streamingThought} />
                     ) : (
                       <span className="loading-dots">Reasoning through the next move</span>
                     )}
