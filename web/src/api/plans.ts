@@ -1,11 +1,11 @@
 import { apiGet, apiPatch, apiDelete } from "./client";
 
+/** Plan summary returned by list endpoint — no full content. */
 export interface PlanEntry {
   filename: string;
   session_id: string | null;
   title: string;
   preview: string;
-  content: string;
   size_bytes: number;
   created_at: string;
   session: {
@@ -14,6 +14,11 @@ export interface PlanEntry {
     title: string;
     status: string;
   } | null;
+}
+
+/** Plan detail returned by get endpoint — includes full content. */
+export interface PlanDetail extends PlanEntry {
+  content: string;
 }
 
 export interface PlanListResponse {
@@ -26,7 +31,7 @@ export function listPlans(limit = 50, offset = 0): Promise<PlanListResponse> {
   return apiGet(`/api/plans?limit=${limit}&offset=${offset}`);
 }
 
-export function getPlan(filename: string): Promise<PlanEntry> {
+export function getPlan(filename: string): Promise<PlanDetail> {
   return apiGet(`/api/plans/${encodeURIComponent(filename)}`);
 }
 

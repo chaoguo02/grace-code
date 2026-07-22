@@ -17,6 +17,21 @@ from fastapi import APIRouter, Depends, HTTPException
 logger = logging.getLogger(__name__)
 
 
+def _resolve_plan_file(repo_path: str, filename: str) -> Path:
+    """Resolve and validate a plan file path safely.
+
+    Returns the resolved Path if *filename* is inside .grace/plans/.
+    Raises HTTPException(400) on path traversal attempts.
+    """
+    plan_dir = Path(repo_path) / ".grace" / "plans"
+    plan_file = (plan_dir / filename).resolve()
+    try:
+        plan_file.relative_to(plan_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return plan_file
+
+
 def create_plans_router(get_service: Any) -> APIRouter:
     """Create the plans router with dependency injection."""
     router = APIRouter(prefix="/api/plans", tags=["plans"])
@@ -93,7 +108,6 @@ def create_plans_router(get_service: Any) -> APIRouter:
                     "session_id": raw_name if session_info else None,
                     "title": goal or (session_info["title"] if session_info else raw_name),
                     "preview": preview[:200],
-                    "content": content,
                     "size_bytes": stat.st_size,
                     "created_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
                     "session": session_info,
@@ -122,8 +136,7 @@ def create_plans_router(get_service: Any) -> APIRouter:
         **Response (200):**
         - ``filename``, ``content``, ``session_id``, ``created_at``, ``size_bytes``.
         """
-        plan_dir = Path(service.repo_path) / ".grace" / "plans"
-        plan_file = plan_dir / filename
+        plan_file = _resolve_plan_file(service.repo_path, filename)
         if not plan_file.is_file():
             raise HTTPException(status_code=404, detail=f"Plan file not found: {filename}")
 
@@ -171,20 +184,13 @@ def create_plans_router(get_service: Any) -> APIRouter:
         **Response (200):**
         - ``filename``, ``updated`` (bool), ``size_bytes``.
         """
-        plan_dir = Path(service.repo_path) / ".grace" / "plans"
-        plan_file = plan_dir / filename
+        plan_file = _resolve_plan_file(service.repo_path, filename)
         if not plan_file.is_file():
             raise HTTPException(status_code=404, detail=f"Plan file not found: {filename}")
 
         content = body.get("content")
         if content is None:
             raise HTTPException(status_code=422, detail="Missing required field: content")
-
-        # Path traversal guard
-        try:
-            plan_file.resolve().relative_to(plan_dir.resolve())
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid filename")
 
         try:
             plan_file.write_text(str(content), encoding="utf-8")
@@ -208,16 +214,9 @@ def create_plans_router(get_service: Any) -> APIRouter:
         **Response (200):**
         - ``filename``, ``deleted`` (bool).
         """
-        plan_dir = Path(service.repo_path) / ".grace" / "plans"
-        plan_file = plan_dir / filename
+        plan_file = _resolve_plan_file(service.repo_path, filename)
         if not plan_file.is_file():
             raise HTTPException(status_code=404, detail=f"Plan file not found: {filename}")
-
-        # Path traversal guard
-        try:
-            plan_file.resolve().relative_to(plan_dir.resolve())
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid filename")
 
         try:
             plan_file.unlink()

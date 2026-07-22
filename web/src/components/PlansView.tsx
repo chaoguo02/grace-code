@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { listPlans, updatePlan, deletePlan, type PlanEntry } from "../api/plans";
+import { listPlans, getPlan, updatePlan, deletePlan, type PlanEntry, type PlanDetail } from "../api/plans";
 import { useSessionStore } from "../stores/sessionStore";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ConfirmModal } from "./ConfirmModal";
@@ -32,7 +32,8 @@ export function PlansView() {
   const [loading, setLoading] = useState(true);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<PlanEntry | null>(null);
+  const [selected, setSelected] = useState<PlanDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState("");
   const [saving, setSaving] = useState(false);
@@ -56,6 +57,15 @@ export function PlansView() {
   };
 
   useEffect(() => { load(); }, [activeId]);
+
+  const openPlan = (entry: PlanEntry) => {
+    setDetailLoading(true);
+    setEditing(false);
+    getPlan(entry.filename)
+      .then((detail) => setSelected(detail))
+      .catch(() => showToast("Failed to load plan detail"))
+      .finally(() => setDetailLoading(false));
+  };
 
   const sorted = useMemo(
     () => [...plans].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()),
@@ -111,7 +121,7 @@ export function PlansView() {
                 key={plan.filename}
                 type="button"
                 className={`plans-list-item ${selected?.filename === plan.filename ? "active" : ""}`}
-                onClick={() => setSelected(plan)}
+                onClick={() => openPlan(plan)}
               >
                 <div className="plans-item-top">
                   <span className={`plans-status-badge ${plan.session?.status || "unknown"}`}>
@@ -135,7 +145,10 @@ export function PlansView() {
 
           {/* Detail */}
           <div className="plans-detail">
-            {!selected && (
+            {detailLoading && (
+              <div style={{ padding: 40, textAlign: "center", color: "var(--text-muted)" }}>Loading plan…</div>
+            )}
+            {!detailLoading && !selected && (
               <div className="plan-empty">
                 <div className="plan-empty-icon">◇</div>
                 <div className="plan-empty-title">Select a plan</div>
@@ -191,7 +204,7 @@ export function PlansView() {
                             setSaving(true);
                             try {
                               await updatePlan(selected.filename, editContent);
-                              setSelected({ ...selected, content: editContent, size_bytes: new Blob([editContent]).size });
+                              setSelected({ ...selected, content: editContent, size_bytes: new TextEncoder().encode(editContent).length });
                               setEditing(false);
                               showToast("Plan updated");
                               load();
