@@ -46,13 +46,17 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
   const paramsStr = formatJson(params, expanded ? Number.MAX_SAFE_INTEGER : 220);
   const summary = summarizeTarget(params);
   const obs = observation as { output?: string; error?: string; status?: string; tool_name?: string } | null;
-  const observationPreview = (obs?.output || obs?.error || "").replace(/\s+/g, " ").slice(0, 160);
+  const observationPreview = (obs?.output || obs?.error || "").replace(/\s+/g, " ").slice(0, 280);
 
   return (
     <div
       className={`tool-call-card timeline-action-card paired-run-card${className ? ` ${className}` : ""}${observation ? " has-observation" : ""}${obs?.status === "error" ? " observation-error" : ""}`}
       onClick={() => setExpanded((v) => !v)}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpanded((v) => !v); } }}
+      role="button"
+      tabIndex={0}
       title="Click to expand or collapse"
+      aria-expanded={expanded}
     >
       <div className="timeline-card-topline">
         <span className="timeline-card-label">Action</span>
@@ -66,7 +70,12 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
           <span className="timeline-card-subtitle">{summary}</span>
         </div>
         {id && <span className="tc-id" title={id}>{id.slice(0, 8)}</span>}
-        <button type="button" className="trace-expand-btn tc-expand-btn">
+        <button
+          type="button"
+          className="trace-expand-btn tc-expand-btn"
+          onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v); }}
+          aria-expanded={expanded}
+        >
           {expanded ? "Hide" : "Details"}
         </button>
       </div>
@@ -74,7 +83,7 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
       <div className="paired-run-flow">
         <div className="paired-run-stage paired-run-stage-action">
           <div className="paired-run-stage-label">Input</div>
-          <pre className="tc-params" style={{ maxHeight: expanded ? "none" : "92px" }}>
+          <pre className="tc-params" style={{ maxHeight: expanded ? "none" : "200px" }}>
             {paramsStr}
           </pre>
         </div>

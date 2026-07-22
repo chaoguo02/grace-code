@@ -92,6 +92,21 @@ export function StatsDashboard() {
           </div>
         </div>
 
+        {error && (
+          <div className="stats-error-banner">
+            <span>⚠ {error}</span>
+            <button className="btn-ghost" type="button" onClick={() => {
+              setLoading(true); setError(null);
+              Promise.all([getDailyRollups(30), getToolRankings(7), getRecentSessionStats(30)])
+                .then(([dailyData, toolData, sessionData]) => {
+                  setDaily(dailyData); setToolRankings(toolData); setSessions(sessionData);
+                })
+                .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Failed to load statistics'))
+                .finally(() => setLoading(false));
+            }}>Retry</button>
+          </div>
+        )}
+
         <div className="stats-grid">
           <div className="stats-card">
             <div className="stats-card-header">

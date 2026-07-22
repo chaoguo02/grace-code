@@ -29,11 +29,14 @@ export function SessionStatsDrawer({ session, onClose }: SessionStatsDrawerProps
   const [stats, setStats] = useState<StatsType | null>(null);
   const [steps, setSteps] = useState<StepLog[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [diffs, setDiffs] = useState<SessionDiff[]>([]);
 
   useEffect(() => {
     let cancelled = false;
     if (!session) return;
+    setLoading(true);
+    setErr(null);
     Promise.all([
       getSessionStats(session.id).catch(() => null),
       getSessionSteps(session.id).catch(() => []),
@@ -43,6 +46,10 @@ export function SessionStatsDrawer({ session, onClose }: SessionStatsDrawerProps
       setStats(statsData);
       setSteps((stepsData || []) as StepLog[]);
       setDiffs((diffsData || []) as SessionDiff[]);
+    }).catch(() => {
+      if (!cancelled) setErr("Failed to load session stats");
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
     });
     return () => {
       cancelled = true;
@@ -70,6 +77,10 @@ export function SessionStatsDrawer({ session, onClose }: SessionStatsDrawerProps
           <button className="drawer-close" type="button" onClick={onClose}>×</button>
         </div>
 
+        {loading && <div className="session-drawer-loading">Loading stats…</div>}
+        {err && <div className="session-drawer-error">⚠ {err}</div>}
+
+        {!loading && !err && (<>
         <div className="session-drawer-grid">
           <div className="session-drawer-stat"><span>Status</span><strong>{stats?.status || session.status}</strong></div>
           <div className="session-drawer-stat"><span>Steps</span><strong>{stats?.total_steps ?? session.message_count ?? 0} / 10</strong></div>
@@ -105,6 +116,7 @@ export function SessionStatsDrawer({ session, onClose }: SessionStatsDrawerProps
             <span>{diffs.length} total</span>
           </div>
         </div>
+        </>)}
       </div>
     </div>
   );

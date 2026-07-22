@@ -13,7 +13,7 @@ export function MessageBubble({ message, toolResults }: Props) {
 
   if (message.role === "tool") {
     const tcId = message.tool_call_id || null;
-    const isError = message.content.toLowerCase().includes("error");
+    const isError = /^(Error|Traceback|Fatal|Exception|FAILED)\b/im.test(message.content.trimStart());
     return (
       <div className="message tool">
         <div className="message-row">
@@ -23,8 +23,8 @@ export function MessageBubble({ message, toolResults }: Props) {
               {tcId && <span className="obs-id" title={tcId}>{tcId.slice(0, 8)}</span>}
               <span className="obs-status-tag">{isError ? "error" : "success"}</span>
             </div>
-            <pre className="obs-output" style={{ maxHeight: 200, overflow: "auto" }}>
-              {message.content.slice(0, 500)}
+            <pre className="obs-output" style={{ maxHeight: 320, overflow: "auto" }}>
+              {message.content}
             </pre>
           </div>
         </div>
@@ -49,11 +49,13 @@ export function MessageBubble({ message, toolResults }: Props) {
         </div>
       </div>
       {message.tool_calls?.map((tc, i) => {
-        const obsContent = toolResults?.get(tc.id || "");
-        const obsError = obsContent?.toLowerCase().includes("error");
+        const obsContent = tc.id ? toolResults?.get(tc.id) : undefined;
+        const obsError = obsContent != null
+          ? /^(Error|Traceback|Fatal|Exception|FAILED)\b/i.test(obsContent.trimStart())
+          : false;
         return (
           <ToolCallCard
-            key={i}
+            key={tc.id || i}
             name={tc.name}
             params={tc.params}
             id={tc.id}

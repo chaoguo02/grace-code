@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ExpandableText } from "./ExpandableText";
 
 interface ToolApprovalCardProps {
   requestId: string;
@@ -23,7 +24,7 @@ const TOOL_ICONS: Record<string, string> = {
   Glob: "G",
   Grep: "S",
   Agent: "A",
-  WebFetch: "W",
+  WebFetch: "F",
 };
 
 function toolIcon(name: string): string {
@@ -122,7 +123,13 @@ export function ToolApprovalCard({
           {thought ? (
             <div className="permission-section">
               <div className="permission-panel-label">Agent rationale</div>
-              <div className="permission-rationale">{thought.slice(0, 300)}</div>
+              <ExpandableText
+                text={thought}
+                maxLength={200}
+                className="permission-rationale"
+                expandLabel="Show full rationale"
+                collapseLabel="Collapse"
+              />
             </div>
           ) : null}
 
@@ -133,7 +140,7 @@ export function ToolApprovalCard({
                 {paramEntries.slice(0, 6).map(([key, value]) => (
                   <div key={key} className="permission-arg-row">
                     <span className="permission-arg-key">{key}</span>
-                    <span className="permission-arg-value">{formatValue(value).slice(0, 140)}</span>
+                    <span className="permission-arg-value">{formatValue(value)}</span>
                   </div>
                 ))}
               </div>

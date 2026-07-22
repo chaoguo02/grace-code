@@ -21,7 +21,14 @@ interface SessionStats {
   tools?: Record<string, number>;
 }
 
-function formatTimeLabel(index: number) {
+function formatTimeLabel(ev: { timestamp?: string }, index: number) {
+  if (ev.timestamp) {
+    const d = new Date(ev.timestamp);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    }
+  }
+  // Fallback: synthetic relative label
   const now = new Date();
   now.setSeconds(now.getSeconds() - index * 28);
   return now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -107,11 +114,11 @@ export function EventSidebar() {
   };
 
   const renderPreview = (ev: (typeof events)[number]) =>
-    (ev as { content?: string }).content?.slice(0, 72) ||
-    (ev as { name?: string }).name?.slice(0, 72) ||
-    (ev as { output?: string }).output?.slice(0, 72) ||
-    (ev as { error?: string }).error?.slice(0, 72) ||
-    (ev as { message?: string }).message?.slice(0, 72) ||
+    (ev as { content?: string }).content ||
+    (ev as { name?: string }).name ||
+    (ev as { output?: string }).output ||
+    (ev as { error?: string }).error ||
+    (ev as { message?: string }).message ||
     "Waiting for details";
 
   const toolCounts = sessionStats?.tools && Object.keys(sessionStats.tools).length
@@ -220,7 +227,7 @@ export function EventSidebar() {
           .map((ev, i) => {
           return (
             <div key={i} className="timeline-row">
-              <div className="timeline-time">{formatTimeLabel(i)}</div>
+              <div className="timeline-time">{formatTimeLabel(ev, i)}</div>
               <div className="timeline-node" />
               <div className="timeline-card">
                 <div className="timeline-card-head">

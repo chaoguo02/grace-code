@@ -260,7 +260,7 @@
 
 ### agent/session/
 
-- [ ] **P1-16** [agent/session/session_store.py:42-45] 缺少 WAL 模式 — 见 P0-1（严重性 P0，同时在 P1 记录架构改进）
+- [x] **P1-16** [agent/session/session_store.py:42-45] 缺少 WAL 模式 — ✅ 已在 P0-1 (批次 A) 修复
   所有 SQLite 连接应统一使用 WAL 模式。`memory/sqlite_backend.py` 已正确设置但 `SessionStore` 未设。
 
 - [ ] **P1-17** [agent/core.py:2609] 文件长度 2609 行 — 超过 Clean Code 建议的 600 行上限 4.3 倍

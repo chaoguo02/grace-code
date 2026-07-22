@@ -140,6 +140,14 @@ export function registerSessionMissingHandler(
 }
 
 const CHAT_TIMEOUT_MS = 30 * 60 * 1000;  // 30 minutes
+let _watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearWatchdog() {
+  if (_watchdogTimer) {
+    clearTimeout(_watchdogTimer);
+    _watchdogTimer = null;
+  }
+}
 
 export const useChatStore = create<ChatState>((set, get) => {
   const resolveSessionId = (sessionId?: string | null): string | null => {
@@ -224,6 +232,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (ev.status === "running") {
           patchSession(sid, (prev) => ({ ...prev, isRunning: true, error: null }));
         } else if (ev.status === "completed") {
+          clearWatchdog();
           patchSession(sid, (prev) => ({
             ...prev,
             isRunning: false,
@@ -234,6 +243,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           }));
           return;
         } else if (ev.status === "failed") {
+          clearWatchdog();
           patchSession(sid, (prev) => ({
             ...prev,
             isRunning: false,
@@ -243,6 +253,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           }));
           return;
         } else if (ev.status === "finish" || ev.status === "gave_up") {
+          clearWatchdog();
           patchSession(sid, (prev) => ({
             ...prev,
             isRunning: false,
@@ -479,7 +490,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         // Preserve it when user is sending feedback while plan is still pending.
         planApproval: prev.planApproval?.isWaiting ? prev.planApproval : null,
       }));
-      const watchdog = setTimeout(() => {
+      clearWatchdog();  // clear any stale timer from a previous run
+      _watchdogTimer = setTimeout(() => {
         const current = selectSessionUi(get(), sessionId);
         if (current.isRunning) {
           patchSession(sessionId, (prev) => ({
@@ -499,15 +511,15 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (get()._wsSessionId !== sessionId) return;
         const { currentMode } = selectSessionUi(get(), sessionId);
         await api.chat(sessionId, prompt, intent, currentMode);
+        // api.chat() returned OK — keep watchdog alive; WS events will clear it on completion
       } catch (e: unknown) {
+        clearWatchdog();  // network error — no WS events will follow
         if (e instanceof ApiError && e.status === 404) {
           invalidateSession(sessionId);
           return;
         }
         const msg = e instanceof Error ? e.message : "Chat failed";
         patchSession(sessionId, (prev) => ({ ...prev, error: msg, isRunning: false }));
-      } finally {
-        clearTimeout(watchdog);
       }
     },
 
@@ -728,6 +740,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     disconnectWs: () => {
+      clearWatchdog();
       disconnectWebSocket();
       set({ ws: null, wsConnected: false });
     },

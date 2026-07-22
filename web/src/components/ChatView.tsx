@@ -173,12 +173,14 @@ export function ChatView() {
   const composerRef = useRef<HTMLDivElement>(null);
 
   const [draft, setLocalDraft] = useState(storedDraft);
+  const latestDraftRef = useRef(draft);
+  latestDraftRef.current = draft;
 
   // Sync local draft changes back to store so they survive tab switches
   const updateDraft = (value: string | ((prev: string) => string)) => {
     setLocalDraft(value);
-    // Resolve the final value for store persistence
-    const resolved = typeof value === "function" ? value(draft) : value;
+    // Use ref to get the latest draft, avoiding stale closure
+    const resolved = typeof value === "function" ? value(latestDraftRef.current) : value;
     setStoredDraft(resolved, activeId);
   };
   const [composerMenu, setComposerMenu] = useState<ComposerMenu>("closed");
@@ -191,6 +193,7 @@ export function ChatView() {
   const [contextChips, setContextChips] = useState<ContextChip[]>([]);
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
   const [modelOptions, setModelOptions] = useState(MODEL_FALLBACK);
+  const [planContractExpanded, setPlanContractExpanded] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -903,8 +906,18 @@ export function ChatView() {
               </div>
             )}
             {planApproval.contract && (
-              <div style={{ fontSize: 11, marginBottom: 8, maxHeight: 80, overflow: "hidden" }}>
-                <MarkdownRenderer content={`**Goal:** ${String(planApproval.contract.goal || "")}`} />
+              <div style={{ fontSize: 11, marginBottom: 8 }}>
+                <div style={planContractExpanded ? undefined : { maxHeight: 120, overflow: "hidden" }}>
+                  <MarkdownRenderer content={`**Goal:** ${String(planApproval.contract.goal || "")}`} />
+                </div>
+                <button
+                  type="button"
+                  className="expandable-text-toggle"
+                  onClick={() => setPlanContractExpanded((v) => !v)}
+                  aria-expanded={planContractExpanded}
+                >
+                  {planContractExpanded ? "Collapse" : "Show full contract"}
+                </button>
               </div>
             )}
             <textarea
@@ -1073,6 +1086,7 @@ export function ChatView() {
       {/* Background subagent progress */}
       <SubagentProgress
         agents={Object.values(backgroundAgents)}
+        onViewChild={(childId) => setViewingChild(childId, activeId)}
       />
     </>
   );

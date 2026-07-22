@@ -16,12 +16,25 @@ function EmptyState() {
   );
 }
 
+function countDiffLines(diff: string): { added: number; removed: number; total: number } {
+  const lines = diff.split("\n");
+  let added = 0;
+  let removed = 0;
+  for (const line of lines) {
+    if (line.startsWith("+") && !line.startsWith("+++")) added++;
+    else if (line.startsWith("-") && !line.startsWith("---")) removed++;
+  }
+  return { added, removed, total: lines.length };
+}
+
 export function DiffReviewView() {
   const [diffs, setDiffs] = useState<SessionDiff[]>([]);
   const [loading, setLoading] = useState(true);
   const [submittingId, setSubmittingId] = useState<number | null>(null);
   const [submittingAny, setSubmittingAny] = useState(false);
   const [comments, setComments] = useState<Record<number, string>>({});
+  const [expandedDiffs, setExpandedDiffs] = useState<Set<number>>(new Set());
+  const [errors, setErrors] = useState<Record<number, string>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -52,17 +65,39 @@ export function DiffReviewView() {
     [diffs],
   );
 
+  // Precompute line stats once for all diffs (avoid O(n*m) per render)
+  const diffLineStats = useMemo(() => {
+    const stats = new Map<number, { added: number; removed: number; total: number }>();
+    for (const diff of sortedDiffs) {
+      stats.set(diff.id, countDiffLines(diff.diff_content));
+    }
+    return stats;
+  }, [sortedDiffs]);
+
   const handleDecision = async (diff: SessionDiff, status: "approved" | "rejected") => {
     if (submittingAny) return;
     setSubmittingAny(true);
     setSubmittingId(diff.id);
+    // Clear stale error for this diff
+    setErrors((prev) => { const next = { ...prev }; delete next[diff.id]; return next; });
     try {
       await updateDiffStatus(diff.id, status, comments[diff.id] || "");
       setDiffs((prev) => prev.filter((item) => item.id !== diff.id));
+    } catch {
+      setErrors((prev) => ({ ...prev, [diff.id]: `Failed to ${status} diff — try again` }));
     } finally {
       setSubmittingAny(false);
       setSubmittingId(null);
     }
+  };
+
+  const toggleExpand = (id: number) => {
+    setExpandedDiffs((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   };
 
   return (
@@ -94,63 +129,87 @@ export function DiffReviewView() {
           <EmptyState />
         ) : (
           <div className="review-list">
-            {sortedDiffs.map((diff) => (
-              <div key={diff.id} className="review-card">
-                <div className="review-card-header">
-                  <div>
-                    <div className="summary-label">File review</div>
-                    <h3 className="review-card-title">{diff.file_path}</h3>
-                    <div className="review-card-meta">
+            {sortedDiffs.map((diff) => {
+              const lineStats = diffLineStats.get(diff.id) || { added: 0, removed: 0, total: 0 };
+              const isExpanded = expandedDiffs.has(diff.id);
+              return (
+                <div key={diff.id} className="review-card">
+                  {/* Header row */}
+                  <div className="review-card-header">
+                    <div>
+                      <div className="review-card-file-row">
+                        <span className="review-card-file-icon">F</span>
+                        <h3 className="review-card-title">{diff.file_path}</h3>
+                      </div>
+                      <div className="review-card-meta">
+                        <button
+                          className="review-session-link"
+                          type="button"
+                          onClick={() => useSessionStore.getState().openSession(diff.session_id)}
+                          title="Open session in Chat view"
+                        >
+                          {diff.session_title || diff.session_id.slice(0, 8)}
+                        </button>
+                        <span>Step {diff.step_number}</span>
+                        <span>{diff.session_agent || "agent"}</span>
+                        <span className="review-diff-summary">
+                          +{lineStats.added} / −{lineStats.removed}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="review-card-actions">
                       <button
-                        className="review-session-link"
+                        className="btn-approve"
                         type="button"
-                        onClick={() => useSessionStore.getState().openSession(diff.session_id)}
-                        title="Open session in Chat view"
+                        disabled={submittingId === diff.id}
+                        onClick={() => handleDecision(diff, "approved")}
                       >
-                        {diff.session_title || diff.session_id}
+                        Approve
                       </button>
-                      <span>Step {diff.step_number}</span>
-                      <span>{diff.session_agent || "agent"}</span>
+                      <button
+                        className="btn-reject"
+                        type="button"
+                        disabled={submittingId === diff.id}
+                        onClick={() => handleDecision(diff, "rejected")}
+                      >
+                        Reject
+                      </button>
                     </div>
                   </div>
-                  <div className="review-card-actions">
-                    <button
-                      className="btn-approve"
-                      type="button"
-                      disabled={submittingId === diff.id}
-                      onClick={() => handleDecision(diff, "approved")}
-                    >
-                      Approve
-                    </button>
-                    <button
-                      className="btn-reject"
-                      type="button"
-                      disabled={submittingId === diff.id}
-                      onClick={() => handleDecision(diff, "rejected")}
-                    >
-                      Reject
-                    </button>
+
+                  {/* Inline error feedback */}
+                  {errors[diff.id] && (
+                    <div style={{ marginTop: 8, padding: "6px 12px", borderRadius: 8, background: "var(--red, #f44336)", color: "#fff", fontSize: 12 }}>
+                      {errors[diff.id]}
+                    </div>
+                  )}
+
+                  {/* Diff preview / expand toggle */}
+                  <button type="button" className="review-diff-toggle" onClick={() => toggleExpand(diff.id)}>
+                    <span>
+                      {isExpanded ? "▼ Hide diff" : `▶ Show diff (${lineStats.total} lines, +${lineStats.added}/−${lineStats.removed})`}
+                    </span>
+                  </button>
+
+                  {isExpanded && <DiffBlock diff={diff.diff_content} />}
+
+                  <div className="review-comment-row">
+                    <input
+                      className="review-comment-input"
+                      type="text"
+                      placeholder="Leave an optional review comment..."
+                      value={comments[diff.id] || ""}
+                      onChange={(e) =>
+                        setComments((prev) => ({
+                          ...prev,
+                          [diff.id]: e.target.value,
+                        }))
+                      }
+                    />
                   </div>
                 </div>
-
-                <DiffBlock diff={diff.diff_content} />
-
-                <div className="review-comment-row">
-                  <input
-                    className="review-comment-input"
-                    type="text"
-                    placeholder="Leave an optional review comment..."
-                    value={comments[diff.id] || ""}
-                    onChange={(e) =>
-                      setComments((prev) => ({
-                        ...prev,
-                        [diff.id]: e.target.value,
-                      }))
-                    }
-                  />
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

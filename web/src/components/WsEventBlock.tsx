@@ -116,13 +116,13 @@ function summaryFor(event: WsMessage): string {
   switch (event.type) {
     case "thought":
     case "reflection":
-      return (event.content || "").slice(0, 140) || "No summary";
+      return (event.content || "").slice(0, 300) || "No summary";
     case "tool_call":
       return summarizeToolTarget(event);
     case "observation":
-      return (event.output || event.error || "").replace(/\s+/g, " ").slice(0, 160) || "No observation output";
+      return (event.output || event.error || "").replace(/\s+/g, " ").slice(0, 300) || "No observation output";
     case "approval_required":
-      return (event.decision_reason || event.thought || "This action needs review before execution.").slice(0, 160);
+      return (event.decision_reason || event.thought || "This action needs review before execution.").slice(0, 300);
     case "approval_timeout":
       return `Request ${event.request_id?.slice(0, 8) || "???"} was not resolved in time.`;
     case "subagent_start":
@@ -130,13 +130,13 @@ function summaryFor(event: WsMessage): string {
     case "subagent_stop":
       return `${event.child_session_id?.slice(0, 8) || "???"} finished with ${event.status || "completed"}.`;
     case "plan_ready":
-      return (event.plan_text || event.result?.summary || "The agent paused for plan review.").slice(0, 180);
+      return (event.plan_text || event.result?.summary || "The agent paused for plan review.").slice(0, 500);
     case "worktree_resolved":
-      return (event.message || `${event.action} → ${event.status}`).slice(0, 180);
+      return (event.message || `${event.action} → ${event.status}`).slice(0, 300);
     case "status":
-      return (event.message || event.result?.summary || event.error || "").slice(0, 180) || "No final content";
+      return (event.message || event.result?.summary || event.error || "").slice(0, 300) || "No final content";
     default:
-      return ((event as { message?: string; content?: string }).message || (event as { content?: string }).content || "").slice(0, 140) || "No summary";
+      return ((event as { message?: string; content?: string }).message || (event as { content?: string }).content || "").slice(0, 300) || "No summary";
   }
 }
 

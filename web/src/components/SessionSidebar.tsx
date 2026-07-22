@@ -73,6 +73,10 @@ export function SessionSidebar() {
 
   const toggleSelect = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
+    toggleSelectById(id);
+  };
+
+  const toggleSelectById = (id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -150,7 +154,9 @@ export function SessionSidebar() {
           {sessions.map((s) => (
             <div
               key={s.id}
+              role="button"
               tabIndex={0}
+              aria-current={s.id === activeId ? "true" : undefined}
               className={`session-item ${s.id === activeId ? "active" : ""}`}
               onClick={() => handleOpen(s.id)}
               onKeyDown={(e: React.KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleOpen(s.id); } }}
@@ -161,8 +167,8 @@ export function SessionSidebar() {
                   type="checkbox"
                   aria-label={`Select session ${s.title || s.id}`}
                   checked={selectedIds.has(s.id)}
-                  onChange={() => {}}
-                  onClick={(e) => toggleSelect(e, s.id)}
+                  onChange={() => toggleSelectById(s.id)}
+                  onClick={(e) => e.stopPropagation()}
                 />
 
                 <div className="session-body">
@@ -174,8 +180,8 @@ export function SessionSidebar() {
                     <span className="summary-subtle session-age">{formatRelative(s.updated_at)}</span>
                   </div>
 
-                  <div className="session-preview">
-                    {(s.title || s.summary || s.id).slice(0, 42)}
+                  <div className="session-preview" title={s.title || s.summary || s.id}>
+                    {s.title || s.summary || s.id}
                   </div>
 
                   <div className="session-meta">
