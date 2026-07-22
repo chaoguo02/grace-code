@@ -1,8 +1,9 @@
 # Grace-Code CI 质量门禁
 
-> **版本**: 1.0 | **日期**: 2026-07-22
-> **状态**: 生效中 | **执行方式**: pre-commit hook + CI pipeline `tools/_quality_gate.sh`
-> **粒度**: Per-PR, 全门禁 >= 限速门禁
+> **版本**: 1.1 (Phase 7 Batch C) | **日期**: 2026-07-22
+> **状态**: 生效中 | **执行方式**: `bash tools/_quality_gate.sh`
+> **门禁断言**: 15 (10 base + 2 CSS/E2E + 1 visual + 1 langfuse + 1 ssot)
+> **Phase 7 Batch C key addition**: CSS-LINT, E2E-LIFECYCLE, VISUAL-DIFF, LANGFUSE-HEALTH
 
 ---
 

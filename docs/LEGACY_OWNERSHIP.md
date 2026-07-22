@@ -28,9 +28,10 @@
 |------|-----|
 | **文件** | [llm/invoker.py](../llm/invoker.py) — `RetryMetrics` + `metrics_callback` |
 | **所有者** | guo |
-| **激活里程碑** | ✅ ACTIVATED (Phase 7 Batch A, commit TBD) — `observability/retry_tracer.py` + `AgentConfig.llm_metrics_callback` |
+| **激活里程碑** | ✅ ACTIVATED (Phase 7 Batch A) — `observability/retry_tracer.py` + `AgentConfig.llm_metrics_callback` |
 | **ETA** | ✅ Phase 7 Kickoff (2026-07-22) |
-| **验收标准** | 1. `FORGE_OBSERVE_RETRIES=1` → Langfuse dashboard 可见 retry metrics ✅<br>2. `FORGE_OBSERVE_RETRIES=0` → 零开销 ✅<br>3. 56/56 测试回归通过 ✅ |
+| **验收标准** | 1. `FORGE_OBSERVE_RETRIES=1` → Langfuse dashboard 可见 retry metrics ✅<br>2. `FORGE_OBSERVE_RETRIES=0` → 零开销 ✅<br>3. 56/56 测试回归通过 ✅<br>4. Langfuse health check integrated in CI gate ✅ (Batch C) |
+| **Dashboard** | `LANGFUSE_BASE_URL` env var → `tools/_verify_langfuse_endpoint.sh` (conditionally runs when `FORGE_OBSERVE_RETRIES=1`) |
 | **维护契约** | 新增 LLM backend 时, 必须实现 `metrics_callback` 兼容接口 |
 | **PR Checklist** | `[ ] RetryMetrics callback wired — verify via FORGE_OBSERVE_RETRIES=1` |
 
