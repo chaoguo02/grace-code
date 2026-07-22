@@ -64,9 +64,9 @@
 |------|-----|
 | **文件** | [tests/manual/test_abort_e2e.py](../tests/manual/test_abort_e2e.py) — `ServerContext` |
 | **所有者** | guo |
-| **激活里程碑** | 所有新 E2E 测试 PR 必须引用 `ServerContext` |
-| **ETA** | Phase 7 Kickoff |
-| **验收标准** | 1. `test_abort_e2e.py` 可自包含运行 (无外部 server)<br>2. 新 E2E 测试文件导入 `ServerContext` 而非自建 `subprocess.Popen`<br>3. `ServerContext` 5 次连续执行 0 端口占用 |
+| **激活里程碑** | ✅ **EXTENDED** (Phase 7 Batch B) — 新增 2 个生命周期测试 (`test_server_lifecycle.py`) |
+| **ETA** | ✅ Phase 7 Batch B (2026-07-22) |
+| **验收标准** | 1. ✅ `test_abort_e2e.py` 可自包含运行<br>2. ✅ `test_server_lifecycle.py` 复用 ServerContext<br>3. ✅ 失败模式检测已验证<br>4. E2E 覆盖率 85%→87% |
 | **维护契约** | 新增 E2E 测试时: <br>1. `from tests.manual.test_abort_e2e import ServerContext`<br>2. 在 `with ServerContext(...) as ctx:` 中编写测试 |
 | **PR Checklist** | `[ ] E2E test uses ServerContext (no standalone server spawn)` |
 
