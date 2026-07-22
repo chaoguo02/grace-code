@@ -156,4 +156,73 @@ def create_plans_router(get_service: Any) -> APIRouter:
         except OSError as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
+    @router.patch("/{filename:path}")
+    async def update_plan(
+        filename: str,
+        body: dict[str, Any],
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """
+        Update a plan file's content.
+
+        **Request Body:**
+        - ``content`` (string, required): New plan markdown content.
+
+        **Response (200):**
+        - ``filename``, ``updated`` (bool), ``size_bytes``.
+        """
+        plan_dir = Path(service.repo_path) / ".grace" / "plans"
+        plan_file = plan_dir / filename
+        if not plan_file.is_file():
+            raise HTTPException(status_code=404, detail=f"Plan file not found: {filename}")
+
+        content = body.get("content")
+        if content is None:
+            raise HTTPException(status_code=422, detail="Missing required field: content")
+
+        # Path traversal guard
+        try:
+            plan_file.resolve().relative_to(plan_dir.resolve())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        try:
+            plan_file.write_text(str(content), encoding="utf-8")
+            stat = plan_file.stat()
+            return {
+                "filename": plan_file.name,
+                "updated": True,
+                "size_bytes": stat.st_size,
+            }
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.delete("/{filename:path}")
+    async def delete_plan(
+        filename: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """
+        Delete a plan file permanently.
+
+        **Response (200):**
+        - ``filename``, ``deleted`` (bool).
+        """
+        plan_dir = Path(service.repo_path) / ".grace" / "plans"
+        plan_file = plan_dir / filename
+        if not plan_file.is_file():
+            raise HTTPException(status_code=404, detail=f"Plan file not found: {filename}")
+
+        # Path traversal guard
+        try:
+            plan_file.resolve().relative_to(plan_dir.resolve())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        try:
+            plan_file.unlink()
+            return {"filename": plan_file.name, "deleted": True}
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
     return router

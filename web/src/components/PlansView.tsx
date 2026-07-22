@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { listPlans, type PlanEntry } from "../api/plans";
+import { listPlans, updatePlan, deletePlan, type PlanEntry } from "../api/plans";
 import { useSessionStore } from "../stores/sessionStore";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import { ConfirmModal } from "./ConfirmModal";
 
 function formatDate(ts: string) {
   const d = new Date(ts);
@@ -32,7 +33,15 @@ export function PlansView() {
   const [total, setTotal] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<PlanEntry | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [editContent, setEditContent] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
   const { openSession, activeId } = useSessionStore();
+
+  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
 
   const load = () => {
     setLoading(true);
@@ -141,16 +150,69 @@ export function PlansView() {
                     <div className="summary-label">Plan Detail</div>
                     <h3 className="plans-detail-title">{selected.title || selected.filename}</h3>
                   </div>
-                  {selected.session && (
-                    <button
-                      className="btn-secondary"
-                      type="button"
-                      style={{ fontSize: 12, padding: "4px 12px" }}
-                      onClick={() => openSession(selected.session!.id)}
-                    >
-                      Open Session
-                    </button>
-                  )}
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {selected.session && (
+                      <button
+                        className="btn-secondary"
+                        type="button"
+                        style={{ fontSize: 12, padding: "4px 10px" }}
+                        onClick={() => openSession(selected.session!.id)}
+                      >
+                        Open Session
+                      </button>
+                    )}
+                    {!editing ? (
+                      <>
+                        <button
+                          className="btn-ghost"
+                          type="button"
+                          style={{ fontSize: 12, padding: "4px 10px" }}
+                          onClick={() => { setEditing(true); setEditContent(selected.content); }}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          className="btn-ghost"
+                          type="button"
+                          style={{ fontSize: 12, padding: "4px 10px", color: "var(--error)", borderColor: "var(--error)" }}
+                          onClick={() => setConfirmDelete(true)}
+                        >
+                          Delete
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          className="btn-primary"
+                          type="button"
+                          style={{ fontSize: 12, padding: "4px 10px" }}
+                          disabled={saving}
+                          onClick={async () => {
+                            setSaving(true);
+                            try {
+                              await updatePlan(selected.filename, editContent);
+                              setSelected({ ...selected, content: editContent, size_bytes: new Blob([editContent]).size });
+                              setEditing(false);
+                              showToast("Plan updated");
+                              load();
+                            } catch { showToast("Failed to update"); }
+                            finally { setSaving(false); }
+                          }}
+                        >
+                          {saving ? "Saving…" : "Save"}
+                        </button>
+                        <button
+                          className="btn-ghost"
+                          type="button"
+                          style={{ fontSize: 12, padding: "4px 10px" }}
+                          disabled={saving}
+                          onClick={() => { setEditing(false); setEditContent(""); }}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    )}
+                  </div>
                 </div>
 
                 <div className="plans-detail-meta">
@@ -178,14 +240,52 @@ export function PlansView() {
                   )}
                 </div>
 
-                <div className="plan-scroll" style={{ marginTop: 12, maxHeight: "calc(100vh - 320px)" }}>
-                  <MarkdownRenderer className="plan-pre" content={selected.content} />
+                <div className="plan-scroll" style={{ marginTop: 12, maxHeight: editing ? "calc(100vh - 440px)" : "calc(100vh - 320px)" }}>
+                  {editing ? (
+                    <textarea
+                      style={{
+                        width: "100%", minHeight: 300,
+                        padding: "12px 14px", borderRadius: 6,
+                        border: "1px solid var(--border)",
+                        background: "var(--bg)", color: "var(--text)",
+                        fontFamily: "var(--font-mono)", fontSize: 13,
+                        resize: "vertical",
+                      }}
+                      value={editContent}
+                      onChange={(e) => setEditContent(e.target.value)}
+                    />
+                  ) : (
+                    <MarkdownRenderer className="plan-pre" content={selected.content} />
+                  )}
                 </div>
               </>
             )}
           </div>
         </div>
       </div>
+
+      {toast && <div className="toast">{toast}</div>}
+
+      <ConfirmModal
+        open={confirmDelete}
+        title="Delete plan"
+        message={`Permanently delete "${selected?.title || selected?.filename || ""}"? This cannot be undone.`}
+        confirmLabel="Delete"
+        danger
+        loading={deleting}
+        onConfirm={async () => {
+          if (!selected) return;
+          setDeleting(true);
+          try {
+            await deletePlan(selected.filename);
+            showToast("Plan deleted");
+            setSelected(null);
+            load();
+          } catch { showToast("Failed to delete"); }
+          finally { setDeleting(false); setConfirmDelete(false); }
+        }}
+        onCancel={() => setConfirmDelete(false)}
+      />
     </section>
   );
 }

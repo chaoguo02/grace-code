@@ -1,4 +1,4 @@
-import { apiGet } from "./client";
+import { apiGet, apiPatch, apiDelete } from "./client";
 
 export interface PlanEntry {
   filename: string;
@@ -28,4 +28,12 @@ export function listPlans(limit = 50, offset = 0): Promise<PlanListResponse> {
 
 export function getPlan(filename: string): Promise<PlanEntry> {
   return apiGet(`/api/plans/${encodeURIComponent(filename)}`);
+}
+
+export function updatePlan(filename: string, content: string): Promise<{ filename: string; updated: boolean; size_bytes: number }> {
+  return apiPatch(`/api/plans/${encodeURIComponent(filename)}`, { content });
+}
+
+export function deletePlan(filename: string): Promise<{ filename: string; deleted: boolean }> {
+  return apiDelete(`/api/plans/${encodeURIComponent(filename)}`);
 }
