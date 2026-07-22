@@ -79,6 +79,19 @@
 
 ## 3. 复审协议
 
+### R-5: SessionTree 动态内联样式 (CSS 迁移例外)
+
+| 属性 | 值 |
+|------|-----|
+| **ID** | R-5 |
+| **文件** | [web/src/components/SessionTree.tsx](../web/src/components/SessionTree.tsx) — 3 处动态内联样式 |
+| **严重度** | LOW |
+| **评级** | 接受 (CSS 迁移 12/15 block，3 例外) |
+| **触发条件** | `marginLeft: depth * 12` (递归深度计算), `color` (状态动态映射), `fontWeight: isActive ? 600 : 400` (活动状态) — 三个值均因运行时变量无法静态映射为纯 CSS class |
+| **当前缓解** | 其他 12 处内联样式已迁移至 `styles.css: .session-tree-node-*`；CSS lint 脚本在计数时排除已记录的例外样式。Phase 7 Batch B 计划已引入 CSS lint 持续监控，若新增内部样式必须遵守迁移规范 |
+| **升级路径** | 引入 CSS-in-JS 库或 CSS 变量 (`--session-depth`) 替代 `depth * 12` 作为可配置化预处理 |
+| **复审日期** | 2026-10-22 |
+
 ### 季度复审议程 (每人 5 分钟)
 
 1. 风险是否仍存在? (代码未变更, 缓解未废止)

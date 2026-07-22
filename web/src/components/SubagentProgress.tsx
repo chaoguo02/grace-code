@@ -4,6 +4,8 @@
  * CC-aligned: shows animated spinner, tool count, token usage,
  * and the subagent's last action description.  Appears in the
  * bottom-right corner of ChatView.  Auto-dismisses on completion.
+ *
+ * CSS classes: .subagent-progress-* (Phase 7 Batch B)
  */
 import { useEffect, useState } from "react";
 
@@ -17,6 +19,18 @@ interface AgentProgress {
 
 interface SubagentProgressProps {
   agents: AgentProgress[];
+}
+
+function statusIconClass(status: string): string {
+  if (status === "running") return "subagent-progress-icon running";
+  if (status === "completed") return "subagent-progress-icon success";
+  return "subagent-progress-icon error";
+}
+
+function statusIconGlyph(status: string): string {
+  if (status === "running") return "◎";
+  if (status === "completed") return "✓";
+  return "✗";
 }
 
 export function SubagentProgress({ agents }: SubagentProgressProps) {
@@ -43,43 +57,20 @@ export function SubagentProgress({ agents }: SubagentProgressProps) {
   if (visible.length === 0) return null;
 
   return (
-    <div style={{
-      position: "fixed", bottom: 80, right: 20, zIndex: 100,
-      display: "flex", flexDirection: "column", gap: 8,
-    }}>
+    <div className="subagent-progress-container">
       {visible.map((agent) => (
         <div key={agent.childSessionId}
-          style={{
-            background: "var(--bg-elev)",
-            border: "1px solid var(--border)",
-            borderRadius: 8,
-            padding: "10px 14px",
-            fontSize: 12,
-            minWidth: 240,
-            boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
-            opacity: agent.status !== "running" ? 0.7 : 1,
-          }}
+          className={"subagent-progress-card" + (agent.status !== "running" ? " done" : "")}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-            {agent.status === "running" ? (
-              <span style={{ color: "var(--accent)", animation: "spin 1s linear infinite" }}>◎</span>
-            ) : agent.status === "completed" ? (
-              <span style={{ color: "var(--green, #4caf50)" }}>✓</span>
-            ) : (
-              <span style={{ color: "var(--red, #f44336)" }}>✗</span>
-            )}
-            <span style={{ fontWeight: 600 }}>{agent.agentName}</span>
-            <span style={{ color: "var(--text-muted)", fontSize: 10 }}>
-              {agent.toolCount} tools
+          <div className="subagent-progress-header">
+            <span className={statusIconClass(agent.status)}>
+              {statusIconGlyph(agent.status)}
             </span>
+            <span className="subagent-progress-name">{agent.agentName}</span>
+            <span className="subagent-progress-meta">{agent.toolCount} tools</span>
           </div>
           {agent.lastAction && (
-            <div style={{
-              color: "var(--text-muted)", fontSize: 10,
-              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-            }}>
-              {agent.lastAction}
-            </div>
+            <div className="subagent-progress-action">{agent.lastAction}</div>
           )}
         </div>
       ))}

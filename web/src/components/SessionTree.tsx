@@ -3,6 +3,10 @@
  *
  * Shows parent-child session tree with status icons,
  * descendant counts, and click-to-inspect navigation.
+ *
+ * CSS classes: .session-tree-* (Phase 7 Batch B)
+ * Dynamic inline styles (marginLeft, color, fontWeight) are acceptable
+ * exceptions — see RISK_REGISTER.md for details.
  */
 import { useEffect } from "react";
 import { useSessionStore } from "../stores/sessionStore";
@@ -31,38 +35,24 @@ function TreeNode({ node, depth, activeId, onSelect }: {
   activeId: string | null;
   onSelect: (id: string) => void;
 }) {
-  const icon = STATUS_ICONS[node.status] || "○";
   const color = STATUS_COLORS[node.status] || "inherit";
   const isActive = node.id === activeId;
 
   return (
-    <div style={{ marginLeft: depth * 12 }}>
+    <div style={{ marginLeft: depth * 12 }}>  {/* dynamic — acceptable exception */}
       <button
         type="button"
         onClick={() => onSelect(node.id)}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          padding: "3px 8px",
-          width: "100%",
-          border: "none",
-          borderRadius: 4,
-          background: isActive ? "var(--accent-soft)" : "transparent",
-          cursor: "pointer",
-          fontSize: 12,
-          color: "var(--text)",
-          textAlign: "left" as const,
-        }}
+        className={"session-tree-node-btn" + (isActive ? " active" : "")}
       >
-        <span style={{ color, fontSize: 10 }}>{icon}</span>
-        <span style={{ flex: 1, fontWeight: isActive ? 600 : 400 }}>
+        <span className="session-tree-node-icon" style={{ color }}>
+          {STATUS_ICONS[node.status] || "○"}
+        </span>
+        <span className="session-tree-node-label" style={{ fontWeight: isActive ? 600 : 400 }}>
           {node.agent_name || "agent"}
         </span>
         {node.child_count > 0 && (
-          <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
-            +{node.child_count}
-          </span>
+          <span className="session-tree-node-count">+{node.child_count}</span>
         )}
       </button>
       {node.children.map((child) => (
