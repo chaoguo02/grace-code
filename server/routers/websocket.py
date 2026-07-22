@@ -71,6 +71,9 @@ def create_websocket_router(service: Any) -> APIRouter:
             logger.exception("WS error — session=%s: %s", session_id, exc)
         finally:
             if hasattr(service, "_event_bus") and service._event_bus is not None:
-                await service._event_bus.unsubscribe(session_id, websocket)
+                try:
+                    await service._event_bus.unsubscribe(session_id, websocket)
+                except (ConnectionResetError, OSError):
+                    pass  # client already disconnected — Windows proactor noise
 
     return router

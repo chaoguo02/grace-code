@@ -123,11 +123,11 @@ function summaryFor(event: WsMessage): string {
     case "approval_required":
       return (event.decision_reason || event.thought || "This action needs review before execution.").slice(0, 160);
     case "approval_timeout":
-      return `Request ${event.request_id.slice(0, 8)} was not resolved in time.`;
+      return `Request ${event.request_id?.slice(0, 8) || "???"} was not resolved in time.`;
     case "subagent_start":
-      return `Child session ${event.child_session_id.slice(0, 8)} is now running.`;
+      return `Child session ${event.child_session_id?.slice(0, 8) || "???"} is now running.`;
     case "subagent_stop":
-      return `${event.child_session_id.slice(0, 8)} finished with ${event.status || "completed"}.`;
+      return `${event.child_session_id?.slice(0, 8) || "???"} finished with ${event.status || "completed"}.`;
     case "plan_ready":
       return (event.plan_text || event.result?.summary || "The agent paused for plan review.").slice(0, 180);
     case "worktree_resolved":
@@ -238,7 +238,7 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
     >
       {isChildEvent && (
         <div style={{ fontSize: 9, color: "var(--accent)", marginBottom: 2, textTransform: "uppercase", letterSpacing: "0.5px" }}>
-          subagent lane {ev.child_session_id!.slice(0, 8)}
+          subagent lane {(ev as { child_session_id?: string }).child_session_id?.slice(0, 8) || "???"}
         </div>
       )}
       <div className="trace-rail-node" />
