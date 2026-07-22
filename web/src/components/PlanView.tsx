@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { getSessionPlan } from "../api/sessions";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
 function PlanEmptyState({
   title,
@@ -119,7 +120,7 @@ export function PlanView() {
             </div>
 
             <div className="plan-scroll">
-              <pre className="plan-pre">{planFile || planApproval.planText}</pre>
+              <MarkdownRenderer className="plan-pre" content={planFile || planApproval.planText} />
             </div>
 
             <div className="plan-card-footer">
@@ -176,7 +177,7 @@ export function PlanView() {
               <span className="trace-pill">completed</span>
             </div>
             <div className="plan-scroll">
-              <pre className="plan-pre">{planFile || activeDetail.summary}</pre>
+              <MarkdownRenderer className="plan-pre" content={planFile || activeDetail.summary} />
             </div>
             <div className="plan-card-footer">
               <div className="summary-subtle">
@@ -226,7 +227,7 @@ export function PlanView() {
 
             {activeDetail?.summary ? (
               <div className="plan-scroll">
-                <pre className="plan-pre">{activeDetail.summary}</pre>
+                <MarkdownRenderer className="plan-pre" content={activeDetail.summary} />
               </div>
             ) : (
               <PlanEmptyState

@@ -1,6 +1,6 @@
 import type { Message } from "../types";
 import { ToolCallCard } from "./ToolCallCard";
-import { renderMarkdownSafe } from "../utils/markdown";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
 interface Props {
   message: Message;
@@ -42,9 +42,9 @@ export function MessageBubble({ message, toolResults }: Props) {
               {message.role === "user" ? "Prompt" : "Final answer"}
             </span>
           </div>
-          <div
+          <MarkdownRenderer
             className={`message-bubble ${message.role === "assistant" ? "message-bubble-final" : "message-bubble-prompt"}`}
-            dangerouslySetInnerHTML={renderMarkdownSafe(message.content) || undefined}
+            content={message.content}
           />
         </div>
       </div>

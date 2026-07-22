@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getMemorySnapshot, getMemoryDetail, deleteMemory, createMemory, updateMemory } from "../api/memory";
 import { useSessionStore } from "../stores/sessionStore";
-import { renderMarkdownSafe } from "../utils/markdown";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ConfirmModal } from "./ConfirmModal";
 import type { MemoryItem, MemoryLayer, MemoryResponse, MemoryScope, MemoryStatus, MemoryType } from "../types/memory";
 
@@ -365,9 +365,7 @@ export function MemoryView() {
                     <textarea value={editContent} onChange={(e) => setEditContent(e.target.value)}
                       rows={8} style={{ width: "100%", padding: "8px 12px", borderRadius: 6, border: "1px solid var(--border)", fontSize: 13, fontFamily: "var(--font-mono)", resize: "vertical", marginTop: 6 }} />
                   ) : (
-                    <div className="memory-preview-body" style={{ fontSize: 14, lineHeight: 1.6 }}
-                      dangerouslySetInnerHTML={renderMarkdownSafe(detailContent) || { __html: "<p>Loading...</p>" }}
-                    />
+                    <MarkdownRenderer className="memory-preview-body" content={detailContent || "Loading..."} />
                   )}
                 </div>
 

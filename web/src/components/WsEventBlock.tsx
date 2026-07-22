@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { WsMessage } from "../types";
 import { DiffBlock } from "./DiffBlock";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 import { formatValue } from "../utils/format";
 
 function iconFor(event: WsMessage): string {
@@ -280,9 +281,9 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
               || event.type === "worktree_resolved"
               || event.type === "subagent_start"
               || event.type === "subagent_stop"
-              || event.type === "approval_timeout") && <div className="trace-body-copy">{detail}</div>}
+              || event.type === "approval_timeout") && <MarkdownRenderer className="trace-body-copy" content={detail} />}
 
-            {event.type === "observation" && !ev.diff && <pre>{detail}</pre>}
+            {event.type === "observation" && !ev.diff && <MarkdownRenderer content={detail} />}
 
             {event.type === "plan_ready" && (
               <div className="trace-inline-note">
