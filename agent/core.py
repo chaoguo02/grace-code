@@ -1410,24 +1410,6 @@ class ReActAgent:
                     history.add(LLMMessage(role="user", content=guard_result.inject_message))
                     continue
 
-                # Layer 3: token budget nudge (early-exit warning only).
-                # Only fires when the agent has barely used its budget —
-                # a hint to reconsider, not a block.
-                if (
-                    self._cfg.token_budget_continuation
-                    and _state.recovery.nudge_count == 0
-                    and task.budget_tokens > 0
-                    and total_tokens < task.budget_tokens * 0.2
-                ):
-                    _state = _state.with_recovery_update(nudge_count=1)
-                    _remaining = task.budget_tokens - total_tokens
-                    logger.info("Token budget nudge (remaining=%d)", _remaining)
-                    history.add(LLMMessage(role="user", content=(
-                        f"[SYSTEM] Token budget remaining: {_remaining}. "
-                        "If you believe the task is complete, call finish again."
-                    )))
-                    continue
-
                 # All guards passed — determine verification status from observed facts.
                 if _git_state.has_changes and _verification_ok:
                     _tsm.complete(
