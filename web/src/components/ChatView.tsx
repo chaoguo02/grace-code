@@ -219,8 +219,12 @@ export function ChatView() {
   useEffect(() => {
     const controller = new AbortController();
     if (activeId) {
-      loadMessages(activeId, controller.signal);
-      loadTraceEvents(activeId, controller.signal);
+      // Load messages FIRST, then trace events — serialised to avoid
+      // the parallel race where loadTraceEvents wins and sees an empty
+      // message list, or loadMessages wins and overwrites ws traces.
+      loadMessages(activeId, controller.signal).then(() => {
+        if (!controller.signal.aborted) loadTraceEvents(activeId, controller.signal);
+      });
       connectWs(activeId);
       useSessionStore.getState().refreshActive();
       // Fallback: restore plan approval UI from session detail
