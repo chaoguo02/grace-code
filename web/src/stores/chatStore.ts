@@ -619,15 +619,17 @@ export const useChatStore = create<ChatState>((set, get) => {
           // Restore planApproval from plan_ready events in the trace log.
           // This recovers the approve/reject UI after page refresh.
           const planEvent = events.find((e) => e.type === "plan_ready");
-          const planRaw = planEvent as unknown as Record<string, unknown> | undefined;
-          const restoredPlanApproval = planRaw && !prev.planApproval?.isWaiting
+          const restoredPlanApproval = !prev.planApproval?.isWaiting
+            && planEvent
+            && typeof planEvent === "object"
+            && "plan_text" in planEvent
             ? {
-                planText: (planRaw.plan_text as string) || "",
+                planText: String((planEvent as unknown as Record<string,unknown>).plan_text || ""),
                 isWaiting: true,
                 sessionId,
-                contract: (planRaw.contract || null) as Record<string, unknown> | null,
-                revision: (planRaw.revision as number) ?? 0,
-                maxRevisions: (planRaw.max_revisions as number) ?? 5,
+                contract: ((planEvent as unknown as Record<string,unknown>).contract || null) as Record<string, unknown> | null,
+                revision: Number((planEvent as unknown as Record<string,unknown>).revision) || 0,
+                maxRevisions: Number((planEvent as unknown as Record<string,unknown>).max_revisions) || 5,
               }
             : prev.planApproval;
 

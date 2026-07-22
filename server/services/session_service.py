@@ -96,11 +96,18 @@ class SessionService:
             msg_count = 0
             tok_est = 0
             try:
-                msgs = self._storage.list_messages(rec.id)
-                msg_count = len(msgs)
-                # Token estimate: ~1 token per 3 characters (rough approximation).
-                # English ~1 tok/4 chars; CJK ~1-3 tok/char. Using //3 as midpoint.
-                tok_est = sum(max(1, len(str(m.content or "")) // 3) for m in msgs)
+                # P2-48: use SQL COUNT(*) instead of loading all messages
+                store = getattr(self._storage, "store", None)
+                if store is not None:
+                    with store._connect() as conn:
+                        row = conn.execute(
+                            "SELECT COUNT(*), COALESCE(SUM(LENGTH(content)),0) "
+                            "FROM session_messages WHERE session_id = ?",
+                            (rec.id,),
+                        ).fetchone()
+                        if row:
+                            msg_count = row[0]
+                            tok_est = max(1, row[1] // 3) if row[1] else 0
             except Exception:
                 pass
             results.append({

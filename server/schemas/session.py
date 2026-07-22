@@ -281,3 +281,21 @@ class ModelSwitchRequest(BaseModel):
 
     model: str = Field(description="Model identifier (e.g. 'deepseek-v4', 'gpt-5-codex').")
     provider: str = Field(default="", description="Optional provider override.")
+
+
+class SessionSettingsRequest(BaseModel):
+    """Request body for ``POST /api/sessions/{id}/settings`` (P2-46).
+
+    Replaces the raw ``dict[str, Any]`` body with typed fields so
+    FastAPI validates inputs before they reach the runtime.
+    """
+
+    effort: str | None = Field(
+        default=None, pattern=r"^(low|medium|high)$",
+        description="Reasoning effort level.",
+    )
+    thinking: bool | None = Field(default=None)
+    permission_mode: str | None = Field(
+        default=None,
+        pattern=r"^(default|acceptEdits|bypassPermissions|plan|dontAsk)$",
+    )

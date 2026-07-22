@@ -229,14 +229,6 @@ export function SessionSidebar() {
         </div>
       )}
 
-      <div className="sidebar-user-card">
-        <div className="sidebar-user-avatar">A</div>
-        <div className="sidebar-user-meta">
-          <strong>Alex Morgan</strong>
-          <span>alex@example.com</span>
-        </div>
-      </div>
-
       {statsSession ? (
         <SessionStatsDrawer session={statsSession} onClose={() => setStatsSession(null)} />
       ) : null}

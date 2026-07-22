@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends
+from fastapi import Response
 
 logger = logging.getLogger(__name__)
 
@@ -63,5 +64,36 @@ def create_config_router(get_service: Any) -> APIRouter:
         except Exception as exc:
             logger.exception("Failed to list agents")
             return []
+
+    # ── GET /api/config/models ──────────────────────────────────────────────
+    # SSOT: model metadata is defined here, not in the frontend (P2-13/14).
+
+    _MODEL_CATALOG: list[dict[str, Any]] = [
+        {
+            "key": "deepseek-v4-flash", "family": "Fast",
+            "note": "Quick iteration and lower latency.",
+        },
+        {
+            "key": "deepseek-v4", "family": "Balanced",
+            "note": "General coding and reasoning.",
+        },
+        {
+            "key": "gpt-5-codex", "family": "Strong",
+            "note": "Best for long multi-step tasks.",
+        },
+    ]
+
+    @router.get("/models")
+    async def list_models(
+        service=Depends(get_service),
+        response: Response = None,
+    ) -> list[dict[str, Any]]:
+        """Return the available LLM model catalog (SSOT).
+
+        Cache-Control: max-age=300 (5 min).  Frontend falls back to
+        a built-in default list when this endpoint is unreachable.
+        """
+        response.headers["Cache-Control"] = "max-age=300"
+        return _MODEL_CATALOG
 
     return router

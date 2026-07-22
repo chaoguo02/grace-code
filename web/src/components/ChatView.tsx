@@ -28,10 +28,9 @@ const MODE_OPTIONS: Array<{ key: ModeKey; title: string; description: string; in
   { key: "explore", title: "Explore", description: "Read the repo, inspect files, and report findings.", intent: "analysis" },
 ];
 
-const MODEL_OPTIONS = [
+const MODEL_FALLBACK: Array<{ key: string; family: string; note: string }> = [
   { key: "deepseek-v4-flash", family: "Fast", note: "Quick iteration and lower latency." },
   { key: "deepseek-v4", family: "Balanced", note: "General coding and reasoning." },
-  { key: "gpt-5-codex", family: "Strong", note: "Best for long multi-step tasks." },
 ];
 
 const PROJECT_FILE_SUGGESTIONS = [
@@ -189,6 +188,16 @@ export function ChatView() {
   const [contextQuery, setContextQuery] = useState("");
   const [contextChips, setContextChips] = useState<ContextChip[]>([]);
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
+  const [modelOptions, setModelOptions] = useState(MODEL_FALLBACK);
+
+  useEffect(() => {
+    fetch("/api/config/models", { headers: { Accept: "application/json" } })
+      .then((r) => r.json())
+      .then((models: Array<{ key: string; family: string; note: string }>) => {
+        if (Array.isArray(models) && models.length > 0) setModelOptions(models);
+      })
+      .catch(() => {});  // fallback to hardcoded list
+  }, []);
   const [dynamicSkills, setDynamicSkills] = useState<Array<{ key: string; title: string; description: string }>>([]);
 
   useEffect(() => {
@@ -554,7 +563,7 @@ export function ChatView() {
         <div className="composer-panel">
           <ComposerPanelHeader title="Switch model" detail="UI presets for the current run." onBack={() => setComposerMenu("actions")} />
           <div className="composer-option-list">
-            {MODEL_OPTIONS.map((option) => (
+            {modelOptions.map((option) => (
               <button
                 key={option.key}
                 type="button"
