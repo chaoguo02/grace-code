@@ -325,7 +325,6 @@ class AgentService:
             )
 
         return cfg
-        )
 
     # ── Permission rule loading ────────────────────────────────────────────
 

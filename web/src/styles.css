@@ -4615,3 +4615,78 @@ pre {
   line-height: 1;
 }
 
+/* ── SubagentDetail (Phase 7 Batch B) ────────────────────────────────── */
+
+.subagent-detail-overlay {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--bg); z-index: 10; overflow: auto;
+  display: flex; flex-direction: column;
+}
+.subagent-detail-header {
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg-elev);
+  position: sticky; top: 0; z-index: 1;
+}
+.subagent-detail-header-btn {
+  background: none; border: none; cursor: pointer;
+  font-size: 16px; color: var(--text-muted); padding: 2px 8px;
+}
+.subagent-detail-header-info {
+  font-size: 12px; color: var(--text-muted);
+}
+.subagent-detail-header-accent {
+  color: var(--accent); font-weight: 600;
+}
+.subagent-detail-header-status {
+  color: var(--text);
+}
+.subagent-detail-header-status.muted {
+  color: var(--text-muted);
+}
+.subagent-detail-header-badge {
+  font-size: 11px; color: var(--accent); margin-left: auto;
+}
+.subagent-detail-body {
+  flex: 1; padding: 12px 16px;
+}
+.subagent-detail-empty {
+  text-align: center; color: var(--text-muted); padding: 40px;
+}
+.subagent-detail-empty-error {
+  text-align: center; color: var(--red, #f44336); padding: 40px;
+}
+.subagent-detail-retry-btn {
+  background: none; border: none; color: var(--accent);
+  cursor: pointer; text-decoration: underline; font-size: inherit;
+}
+.subagent-detail-footer {
+  padding: 12px 16px; border-top: 1px solid var(--border);
+  background: var(--bg-elev); display: flex; gap: 8px; align-items: center;
+}
+.subagent-detail-footer-msg {
+  font-size: 12px; color: var(--text-muted); flex: 1;
+}
+.subagent-detail-footer-btn {
+  padding: 6px 14px; font-size: 12px; border-radius: 4px; cursor: pointer;
+}
+.subagent-detail-footer-btn-primary {
+  background: var(--accent); color: #fff; border: none;
+}
+.subagent-detail-footer-btn-danger {
+  background: transparent; color: var(--red, #f44336);
+  border: 1px solid var(--red, #f44336);
+}
+.subagent-detail-footer-btn-default {
+  background: transparent; color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+.subagent-detail-status {
+  padding: 10px 16px; border-top: 1px solid var(--border);
+  background: var(--bg-elev); font-size: 12px; color: var(--text-muted);
+}
+.subagent-detail-status-error {
+  padding: 10px 16px; border-top: 1px solid var(--border);
+  background: var(--bg-elev); font-size: 12px; color: var(--red, #f44336);
+}
+
