@@ -6,6 +6,7 @@ import { WsEventBlock } from "./WsEventBlock";
 import { ToolApprovalCard } from "./ToolApprovalCard";
 import { SubagentDetail } from "./SubagentDetail";
 import { SubagentProgress } from "./SubagentProgress";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 import { apiPost } from "../api/client";
 import { cancelSession, fetchSkills } from "../api/sessions";
 import { getModelCatalog } from "../api/config";
@@ -903,9 +904,7 @@ export function ChatView() {
             )}
             {planApproval.contract && (
               <div style={{ fontSize: 11, marginBottom: 8, maxHeight: 80, overflow: "hidden" }}>
-                {planApproval.contract.goal ? (
-                  <span>Goal: <strong>{String(planApproval.contract.goal).slice(0, 120)}</strong></span>
-                ) : null}
+                <MarkdownRenderer content={`**Goal:** ${String(planApproval.contract.goal || "")}`} />
               </div>
             )}
             <textarea
