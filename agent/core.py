@@ -1326,107 +1326,10 @@ class ReActAgent:
 
             # ── 4. 终止 action ──────────────────────────────────────────
             if action.action_type == ActionType.FINISH:
-                # ── Recovery D: token budget continuation (CC: token_budget_continuation) ──
-                if self._cfg.token_budget_continuation and _state.recovery.should_nudge(total_tokens, task.budget_tokens):
-                    _state = _state.with_recovery_update(last_nudge_tokens=total_tokens)
-                    _state = _state.with_recovery_update(nudge_count=_state.recovery.nudge_count + 1)
-                    _remaining = max(0, task.budget_tokens - total_tokens)
-                    logger.info(
-                        "Token budget nudge %d (remaining=%d, total=%d, budget=%d)",
-                        _state.recovery.nudge_count, _remaining, total_tokens, task.budget_tokens,
-                    )
-                    history.add(LLMMessage(role="user", content=(
-                        f"[SYSTEM] Token budget remaining: {_remaining}. "
-                        "Continue working on the task if there are remaining items. "
-                        "If you believe the task is complete, call finish again."
-                    )))
-                    _state = _state.with_updates(transition=Transition.nudge(max(0, task.budget_tokens - total_tokens)))
-                    continue
-
                 # ── Runtime: transition to COMPLETING before guard evaluation ──
                 _tsm.transition(TSMState.COMPLETING, "model called FINISH")
 
-                fact_check = self._cfg.completion_fact_check
-                if fact_check is not None:
-                    fact_result = fact_check()
-                    if not fact_result.can_complete:
-                        logger.warning(
-                            "Completion blocked: verdict=%s reason=%s",
-                            fact_result.verdict, fact_result.blocked_reason,
-                        )
-                        _state = _state.with_updates(transition=Transition.completion_blocked())
-
-                        if fact_result.verdict == "abort":
-                            # CC-aligned: Abort(reason) — force give_up
-                            _tsm.transition(
-                                TSMState.FAILED,
-                                f"verify abort: {fact_result.blocked_reason}",
-                            )
-                            log.log_task_failed(
-                                steps=step, reason=fact_result.blocked_reason,
-                            )
-                            _final_msg = LLMMessage(
-                                role="user", content=fact_result.inject_message,
-                            )
-                            history.add(_final_msg)
-                            return _finish_run(
-                                status=RunStatus.GAVE_UP,
-                                summary=fact_result.blocked_reason,
-                                steps_taken=step,
-                                total_tokens_used=total_tokens,
-                            )
-
-                        # RETRY: inject feedback, continue
-                        history.add(LLMMessage(
-                            role="user", content=fact_result.inject_message,
-                        ))
-                        _tsm.transition(
-                            TSMState.RUNNING,
-                            f"completion blocked: {fact_result.blocked_reason}",
-                        )
-                        continue
-
-                # ── Per-task verify callback (grace build-mode pattern) ──
-                # Runs after built-in fact_check. Can override DONE with
-                # RETRY(feedback) or ABORT(reason).
-                verify_cb = self._cfg.verify_callback
-                if verify_cb is not None:
-                    verify_result = verify_cb()
-                    if not verify_result.can_complete:
-                        logger.warning(
-                            "Verify callback blocked: verdict=%s reason=%s",
-                            verify_result.verdict, verify_result.blocked_reason,
-                        )
-                        _state = _state.with_updates(transition=Transition.completion_blocked())
-
-                        if verify_result.verdict == "abort":
-                            _tsm.transition(
-                                TSMState.FAILED,
-                                f"verify abort: {verify_result.blocked_reason}",
-                            )
-                            log.log_task_failed(
-                                steps=step, reason=verify_result.blocked_reason,
-                            )
-                            history.add(LLMMessage(
-                                role="user", content=verify_result.inject_message,
-                            ))
-                            return _finish_run(
-                                status=RunStatus.GAVE_UP,
-                                summary=verify_result.blocked_reason,
-                                steps_taken=step,
-                                total_tokens_used=total_tokens,
-                            )
-
-                        # RETRY
-                        history.add(LLMMessage(
-                            role="user", content=verify_result.inject_message,
-                        ))
-                        _tsm.transition(
-                            TSMState.RUNNING,
-                            f"verify callback: {verify_result.blocked_reason}",
-                        )
-                        continue
-
+                # Layer 1: external stop hooks (block with feedback, max 3 retries)
                 stop_message = self._run_stop_hook(
                     history,
                     stop_hook_active=_state.stop_hook_count > 0,
@@ -1440,10 +1343,8 @@ class ReActAgent:
                         log.log_task_failed(steps=step, reason=reason)
                         _tsm.fail(TerminationReason.HOOK_STOPPED, reason)
                         return _finish_run(
-                            status=RunStatus.GAVE_UP,
-                            summary=reason,
-                            steps_taken=step,
-                            total_tokens_used=total_tokens,
+                            status=RunStatus.GAVE_UP, summary=reason,
+                            steps_taken=step, total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
                     _state = _state.with_updates(stop_hook_count=next_count, transition=Transition.stop_hook_blocking())
@@ -1453,108 +1354,74 @@ class ReActAgent:
 
                 _state = _state.with_updates(stop_hook_count=0)
 
-                # ── Completion guard: Runtime validates before accepting FINISH ──
-                # The model cannot unilaterally declare "done" — the Runtime must
-                # verify all completion conditions.
-                # Git diff is the only fact that matters for completion
+                # Layer 2: unified completion check (fact_check + verify_callback + git).
+                # Duplicate check pattern from the old 7-guard pipeline merged into one.
                 _refresh_git_state(_git_state, task.repo_path)
+
+                _should_continue = False
+                for _check_fn in (
+                    self._cfg.completion_fact_check,
+                    self._cfg.verify_callback,
+                ):
+                    if _check_fn is None:
+                        continue
+                    _check_result = _check_fn()
+                    if _check_result.can_complete:
+                        continue
+                    _state = _state.with_updates(transition=Transition.completion_blocked())
+                    if _check_result.verdict == "abort":
+                        _tsm.transition(TSMState.FAILED, f"abort: {_check_result.blocked_reason}")
+                        log.log_task_failed(steps=step, reason=_check_result.blocked_reason)
+                        history.add(LLMMessage(role="user", content=_check_result.inject_message))
+                        return _finish_run(
+                            status=RunStatus.GAVE_UP, summary=_check_result.blocked_reason,
+                            steps_taken=step, total_tokens_used=total_tokens,
+                        )
+                    history.add(LLMMessage(role="user", content=_check_result.inject_message))
+                    _tsm.transition(TSMState.RUNNING, f"completion blocked: {_check_result.blocked_reason}")
+                    _should_continue = True
+                    break
+                if _should_continue:
+                    continue
+
+                # Layer 2b: git-diff guard (workspace facts)
                 guard_result = completion_guard.check(
-                    ctx=completion_ctx,
-                    task_intent=task.intent,
-                    git_state=_git_state,
+                    ctx=completion_ctx, task_intent=task.intent, git_state=_git_state,
                 )
                 if not guard_result.can_complete:
                     _completion_blocked += 1
-                    logger.warning(
-                        "Completion blocked (%d): %s", _completion_blocked, guard_result.blocked_reason
-                    )
-                    # CompletionBlockTracker counts consecutive same-reason
-                    # blocks and signals give_up at threshold (P1-5).
-                    _should_give_up = _block_tracker.should_block(
-                        guard_result.blocked_reason,
-                    )
+                    logger.warning("Completion blocked (%d): %s", _completion_blocked, guard_result.blocked_reason)
+                    _should_give_up = _block_tracker.should_block(guard_result.blocked_reason)
                     if _should_give_up:
-                        logger.warning(
-                            "Completion blocked %d times with same reason — forcing give_up",
-                            COMPLETION_BLOCK_THRESHOLD,
-                        )
-                        reason = (
-                            f"Agent gave up: completion blocked "
-                            f"{COMPLETION_BLOCK_THRESHOLD} "
-                            f"times for reason: {guard_result.blocked_reason}"
-                        )
+                        reason = f"Agent gave up: completion blocked {COMPLETION_BLOCK_THRESHOLD} times for: {guard_result.blocked_reason}"
                         _tsm.fail(TerminationReason.AGENT_GAVE_UP, reason)
                         log.log_task_failed(steps=step, reason=reason)
                         return _finish_run(
-                            status=RunStatus.GAVE_UP,
-                            summary=reason,
-                            steps_taken=step,
-                            total_tokens_used=total_tokens,
+                            status=RunStatus.GAVE_UP, summary=reason,
+                            steps_taken=step, total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
                     _state = _state.with_updates(transition=Transition.completion_blocked())
                     _tsm.transition(TSMState.RUNNING, f"completion blocked: {guard_result.blocked_reason}")
-                    history.add(LLMMessage(
-                        role="user", content=guard_result.inject_message
-                    ))
+                    history.add(LLMMessage(role="user", content=guard_result.inject_message))
                     continue
 
-                # ── Stop Hook: dispatcher-based (CC-aligned) ──
-                # External hooks configured in settings.json fire through the
-                # hook_dispatcher and can block finish with block/reason.
-                # No hardcoded verification — the dispatcher is the only path.
-                _stop_reason = self._run_stop_hook(
-                    history=history,
-                    stop_hook_active=(_state.stop_hook_verify_count > 0),
-                    last_assistant_message=action.message or "",
-                )
-                if _stop_reason is not None:
-                    _state = _state.with_updates(stop_hook_verify_count=_state.stop_hook_verify_count + 1)
-                    _tsm.transition(TSMState.RUNNING, f"stop hook blocked: {_stop_reason}")
+                # Layer 3: token budget nudge (ONLY fires if all guards passed).
+                # Moved here from the top — previously blocked uselessly before any guard check.
+                if self._cfg.token_budget_continuation and _state.recovery.should_nudge(total_tokens, task.budget_tokens):
+                    _state = _state.with_recovery_update(last_nudge_tokens=total_tokens)
+                    _state = _state.with_recovery_update(nudge_count=_state.recovery.nudge_count + 1)
+                    _remaining = max(0, task.budget_tokens - total_tokens)
+                    logger.info("Token budget nudge %d (remaining=%d)", _state.recovery.nudge_count, _remaining)
+                    history.add(LLMMessage(role="user", content=(
+                        f"[SYSTEM] Token budget remaining: {_remaining}. "
+                        "Continue working on the task if there are remaining items. "
+                        "If you believe the task is complete, call finish again."
+                    )))
+                    _state = _state.with_updates(transition=Transition.nudge(_remaining))
                     continue
 
-                # Reflection is a completion guard activity, not a lifecycle state.
-                if not getattr(_tsm, "_reflection_done", False):
-                    _tsm.mark_reflection_done()
-                    _guard_ctx = GuardContext(task_intent=task.intent, tsm=_tsm)
-                    _reflection_msg = ""
-                    _reflection_guards = _tsm.guards.get(
-                        GuardTransition.COMPLETING_TO_RUNNING, []
-                    )
-                    for _guard_fn in _reflection_guards:
-                        try:
-                            _gr = _guard_fn(_guard_ctx)
-                            if _gr.inject_message:
-                                _reflection_msg += _gr.inject_message + "\n\n"
-                        except Exception:
-                            logger.error(
-                                "TSM guard function %s failed — FAIL_CLOSED",
-                                getattr(_guard_fn, '__name__', repr(_guard_fn)),
-                                exc_info=True,
-                            )
-                            # Guard failure → reject the transition (FAIL_CLOSED).
-                            # The agent loop must not proceed when a safety barrier
-                            # has malfunctioned.
-                            _tsm.fail(
-                                TerminationReason.GUARD_REJECTED,
-                                f"Guard function {getattr(_guard_fn, '__name__', 'unknown')} raised an exception",
-                            )
-                            log.log_task_failed(
-                                steps=step, reason="TSM guard exception — FAIL_CLOSED",
-                            )
-                            return _finish_run(
-                                status=RunStatus.GAVE_UP,
-                                summary="Safety guard malfunction — agent halted.",
-                                steps_taken=step, total_tokens_used=total_tokens,
-                                cache_stats=cumulative_cache,
-                            )
-                    if _reflection_msg:
-                        history.add(LLMMessage(role="user", content=_reflection_msg.strip()))
-                        _state = _state.with_updates(transition=Transition.reflection())
-                        _tsm.transition(TSMState.RUNNING, "reflection — back to loop")
-                        continue
-
-                # GitState was refreshed by completion_guard.check() above.
+                # All guards passed — determine verification status from observed facts.
                 if _git_state.has_changes and _verification_ok:
                     _tsm.complete(
                         VerificationStatus.VERIFIED,
