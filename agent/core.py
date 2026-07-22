@@ -1326,8 +1326,12 @@ class ReActAgent:
 
             # ── 4. 终止 action ──────────────────────────────────────────
             if action.action_type == ActionType.FINISH:
-                # ── Runtime: transition to COMPLETING before guard evaluation ──
-                _tsm.transition(TSMState.COMPLETING, "model called FINISH")
+                # Transition to COMPLETING once.  Guards may push back to RUNNING
+                # (stop_hook / completion_check / token_nudge); if the model calls
+                # FINISH again in the NEXT step we will already be in COMPLETING.
+                from agent.session.task_state_machine import TaskState as _TSMState
+                if _tsm.state != _TSMState.COMPLETING:
+                    _tsm.transition(TSMState.COMPLETING, "model called FINISH")
 
                 # Layer 1: external stop hooks (block with feedback, max 3 retries)
                 stop_message = self._run_stop_hook(
