@@ -38,35 +38,6 @@ export async function deleteMemory(name: string): Promise<{ name: string; delete
   return apiDelete(`/api/memory/${encodeURIComponent(name)}`);
 }
 
-function buildOverview(items: MemoryItem[]): MemoryOverview {
-  const byType: Record<string, number> = { user: 0, feedback: 0, project: 0, reference: 0 };
-  const byScope: Record<string, number> = { session: 0, project: 0, global: 0 };
-  const byLayer: Record<string, number> = { project: 0, global: 0, archive: 0 };
-  let active = 0, deprecated = 0, archived = 0, expiring = 0;
-  const now = Date.now();
-
-  for (const item of items) {
-    byType[item.type] = (byType[item.type] || 0) + 1;
-    byScope[item.scope] = (byScope[item.scope] || 0) + 1;
-    const layer = item.status === "deprecated" ? "archive" : "project";
-    byLayer[layer] = (byLayer[layer] || 0) + 1;
-    if (item.status === "active") active++;
-    if (item.status === "deprecated") deprecated++;
-    if (layer === "archive") archived++;
-    if (item.expires_at) {
-      const ms = new Date(item.expires_at).getTime() - now;
-      if (ms > 0 && ms < 7 * 86400000) expiring++;
-    }
-  }
-  return {
-    enabled: true, preview: false, total: items.length,
-    active, deprecated, archived, expiring,
-    by_type: byType as MemoryOverview["by_type"],
-    by_scope: byScope as MemoryOverview["by_scope"],
-    by_layer: byLayer as MemoryOverview["by_layer"],
-  };
-}
-
 function emptyOverview(): MemoryOverview {
   return {
     enabled: true, preview: false, total: 0, active: 0, deprecated: 0,

@@ -8,6 +8,8 @@ import { SubagentDetail } from "./SubagentDetail";
 import { SubagentProgress } from "./SubagentProgress";
 import { apiPost } from "../api/client";
 import { cancelSession, fetchSkills } from "../api/sessions";
+import { formatBytes, formatRuntime, runtimeSeconds } from "../utils/format";
+import { summarizeStatus } from "../utils/status";
 
 type ComposerMenu = "closed" | "actions" | "mode" | "model" | "context" | "settings";
 type ModeKey = "build" | "plan" | "explore";
@@ -96,38 +98,6 @@ const COMPOSER_QUICK_TOOLS = [
   { key: "code", icon: "</>" },
   { key: "more", icon: "+" },
 ] as const;
-
-function summarizeStatus(status?: string) {
-  if (!status) return "Idle";
-  if (status === "completed") return "Completed";
-  if (status === "running") return "Running";
-  if (status === "failed") return "Failed";
-  if (status === "queued") return "Queued";
-  return status;
-}
-
-function formatBytes(size: number) {
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function formatRuntime(createdAt?: string | null) {
-  if (!createdAt) return "00:00";
-  const start = new Date(createdAt).getTime();
-  if (Number.isNaN(start)) return "00:00";
-  const deltaSec = Math.max(0, Math.floor((Date.now() - start) / 1000));
-  const min = Math.floor(deltaSec / 60);
-  const sec = deltaSec % 60;
-  return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
-}
-
-function runtimeSeconds(createdAt?: string | null) {
-  if (!createdAt) return 0;
-  const start = new Date(createdAt).getTime();
-  if (Number.isNaN(start)) return 0;
-  return Math.max(0, Math.floor((Date.now() - start) / 1000));
-}
 
 function intentForMode(mode: ModeKey) {
   return MODE_OPTIONS.find((option) => option.key === mode)?.intent;

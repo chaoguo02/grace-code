@@ -104,12 +104,6 @@ export default function App() {
               </div>
               <div className="topbar-right">
                 <StatusCluster />
-                <button className="topbar-action" type="button">
-                  Share
-                </button>
-                <button className="topbar-icon-action" type="button" aria-label="More actions">
-                  ...
-                </button>
                 <ThemeToggle />
               </div>
             </header>

@@ -3,6 +3,7 @@ import { useSessionStore } from "../stores/sessionStore";
 import { SessionStatsDrawer } from "./SessionStatsDrawer";
 import { ConfirmModal } from "./ConfirmModal";
 import type { SessionSummary } from "../types";
+import { summarizeStatus } from "../utils/status";
 
 function formatRelative(ts?: string | null) {
   if (!ts) return "No activity";
@@ -15,14 +16,6 @@ function formatRelative(ts?: string | null) {
   if (deltaHour < 24) return `${deltaHour}h ago`;
   const deltaDay = Math.round(deltaHour / 24);
   return `${deltaDay}d ago`;
-}
-
-function statusLabel(status: string) {
-  if (status === "running") return "Active";
-  if (status === "completed") return "Completed";
-  if (status === "failed") return "Failed";
-  if (status === "queued") return "Queued";
-  return status;
 }
 
 function statusClass(status: string) {
@@ -176,7 +169,7 @@ export function SessionSidebar() {
                   <div className="session-headline">
                     <span className={`session-status-dot ${statusClass(s.status)}`} />
                     <span className={`session-status-pill ${statusClass(s.status)}`}>
-                      {statusLabel(s.status)}
+                      {summarizeStatus(s.status)}
                     </span>
                     <span className="summary-subtle session-age">{formatRelative(s.updated_at)}</span>
                   </div>

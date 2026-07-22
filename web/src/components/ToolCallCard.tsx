@@ -62,8 +62,8 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
       <div className="tc-header">
         <span className="tc-icon">{getToolIcon(name)}</span>
         <div className="timeline-card-heading-group">
-          <span className="tc-name">{escapeHtml(name)}</span>
-          <span className="timeline-card-subtitle">{escapeHtml(summary)}</span>
+          <span className="tc-name">{name}</span>
+          <span className="timeline-card-subtitle">{summary}</span>
         </div>
         {id && <span className="tc-id" title={id}>{id.slice(0, 8)}</span>}
         <button type="button" className="trace-expand-btn tc-expand-btn">
@@ -75,7 +75,7 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
         <div className="paired-run-stage paired-run-stage-action">
           <div className="paired-run-stage-label">Input</div>
           <pre className="tc-params" style={{ maxHeight: expanded ? "none" : "92px" }}>
-            {escapeHtml(paramsStr)}
+            {paramsStr}
           </pre>
         </div>
 
@@ -84,12 +84,12 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
             <div className="paired-run-stage-label">Result</div>
             <div className="tc-observation-summary">
               <span className="obs-status-icon">{obs?.status === "error" ? "!" : "OK"}</span>
-              <span className="obs-tool-name">{escapeHtml(obs?.tool_name || name)}</span>
-              <span className="obs-output-preview">{escapeHtml(observationPreview)}</span>
+              <span className="obs-tool-name">{obs?.tool_name || name}</span>
+              <span className="obs-output-preview">{observationPreview}</span>
             </div>
             {expanded ? (
               <pre className="paired-run-observation-detail">
-                {escapeHtml(obs?.output || obs?.error || "")}
+                {obs?.output || obs?.error || ""}
               </pre>
             ) : null}
           </div>
@@ -99,9 +99,3 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
   );
 }
 
-function escapeHtml(s: string) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}

@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { WsMessage } from "../types";
 import { DiffBlock } from "./DiffBlock";
+import { formatValue } from "../utils/format";
 
 function iconFor(event: WsMessage): string {
   switch (event.type) {
@@ -96,15 +97,6 @@ function formatTokens(value?: number) {
   if (!value || value <= 0) return null;
   if (value >= 1000) return `~${(value / 1000).toFixed(value >= 10_000 ? 0 : 1)}K tok`;
   return `~${value} tok`;
-}
-
-function formatValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
 }
 
 function summarizeToolTarget(event: WsMessage): string {

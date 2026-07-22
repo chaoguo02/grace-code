@@ -1,11 +1,11 @@
 import { apiGet } from "./client";
-import type { SessionStats, DailyRollup } from "../types/stats";
+import type { SessionStats, DailyRollup, StepLog } from "../types/stats";
 
 export function getSessionStats(id: string): Promise<SessionStats> {
   return apiGet(`/api/sessions/${encodeURIComponent(id)}/stats`);
 }
 
-export function getSessionSteps(id: string): Promise<any[]> {
+export function getSessionSteps(id: string): Promise<StepLog[]> {
   return apiGet(`/api/sessions/${encodeURIComponent(id)}/steps`);
 }
 
