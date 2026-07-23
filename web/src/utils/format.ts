@@ -9,21 +9,31 @@ export function formatBytes(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function formatRuntime(createdAt?: string | null): string {
-  if (!createdAt) return "00:00";
+export function formatRuntime(createdAt?: string | null, completedAt?: string | null): string {
+  if (!createdAt) return "—";
   const start = new Date(createdAt).getTime();
-  if (Number.isNaN(start)) return "00:00";
-  const deltaSec = Math.max(0, Math.floor((Date.now() - start) / 1000));
+  if (Number.isNaN(start)) return "—";
+  // For completed sessions, use the actual duration
+  const end = completedAt ? new Date(completedAt).getTime() : Date.now();
+  if (Number.isNaN(end)) return "—";
+  const deltaSec = Math.max(0, Math.floor((end - start) / 1000));
   const min = Math.floor(deltaSec / 60);
   const sec = deltaSec % 60;
+  if (min >= 60) {
+    const h = Math.floor(min / 60);
+    const m = min % 60;
+    return `${h}h ${m}m`;
+  }
   return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
-export function runtimeSeconds(createdAt?: string | null): number {
+export function runtimeSeconds(createdAt?: string | null, completedAt?: string | null): number {
   if (!createdAt) return 0;
   const start = new Date(createdAt).getTime();
   if (Number.isNaN(start)) return 0;
-  return Math.max(0, Math.floor((Date.now() - start) / 1000));
+  const end = completedAt ? new Date(completedAt).getTime() : Date.now();
+  if (Number.isNaN(end)) return 0;
+  return Math.max(0, Math.floor((end - start) / 1000));
 }
 
 export function formatValue(v: unknown): string {

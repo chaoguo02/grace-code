@@ -8,7 +8,7 @@ import { SubagentDetail } from "./SubagentDetail";
 import { SubagentProgress } from "./SubagentProgress";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { apiPost } from "../api/client";
-import { cancelSession, fetchSkills } from "../api/sessions";
+import { cancelSession, fetchSkills, updateSession } from "../api/sessions";
 import { getModelCatalog } from "../api/config";
 import { formatBytes, formatRuntime, runtimeSeconds } from "../utils/format";
 import { summarizeStatus } from "../utils/status";
@@ -250,6 +250,8 @@ export function ChatView() {
     return () => controller.abort();
   }, []);
   const [dynamicSkills, setDynamicSkills] = useState<Array<{ key: string; title: string; description: string }>>([]);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -386,11 +388,9 @@ export function ChatView() {
     return PROJECT_FILE_SUGGESTIONS.filter((path) => path.toLowerCase().includes(q));
   }, [contextQuery]);
 
-  const progressRatio = steps ? Math.min(100, steps * 10) : isRunning ? 0 : 0;
-  const progressIndeterminate = isRunning && !steps;
-  const runtimeLabel = formatRuntime(activeDetail?.created_at);
+  const runtimeLabel = formatRuntime(activeDetail?.created_at, activeDetail?.completed_at);
   const pendingApprovals = Object.keys(toolApprovals).length;
-  const runtimeSec = runtimeSeconds(activeDetail?.created_at);
+  const runtimeSec = runtimeSeconds(activeDetail?.created_at, activeDetail?.completed_at);
 
   const buildPrompt = () => {
     const trimmed = draft.trim();
@@ -780,16 +780,61 @@ export function ChatView() {
       <div className="chat-shell">
         <div className="chat-summary-bar chat-summary-bar-rich">
           <div className="summary-card summary-card-session">
-            <div className="summary-session-title-row">
-              <div className="summary-session-title">
-                {activeDetail?.title || activeId?.slice(0, 8) || "Session 21:02:47"}
+            {editingTitle ? (
+              <div className="summary-session-title-row">
+                <input
+                  autoFocus
+                  value={titleDraft}
+                  onChange={(e) => setTitleDraft(e.target.value)}
+                  onKeyDown={async (e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      if (titleDraft.trim() && activeId) {
+                        await updateSession(activeId, { title: titleDraft.trim() });
+                        useSessionStore.getState().refreshActive();
+                        useSessionStore.getState().loadSessions();
+                      }
+                      setEditingTitle(false);
+                    } else if (e.key === "Escape") {
+                      setEditingTitle(false);
+                    }
+                  }}
+                  onBlur={async () => {
+                    if (titleDraft.trim() && activeId && titleDraft.trim() !== activeDetail?.title) {
+                      await updateSession(activeId, { title: titleDraft.trim() });
+                      useSessionStore.getState().refreshActive();
+                      useSessionStore.getState().loadSessions();
+                    }
+                    setEditingTitle(false);
+                  }}
+                  style={{
+                    fontSize: 14, fontWeight: 600, border: "1px solid var(--accent)",
+                    borderRadius: 4, padding: "2px 6px", background: "var(--bg)",
+                    color: "var(--text)", width: "100%",
+                  }}
+                />
               </div>
-              <button type="button" className="summary-edit-btn" aria-label="Edit session title">
-                ✎
-              </button>
-            </div>
+            ) : (
+              <div className="summary-session-title-row">
+                <div className="summary-session-title" title="Click ✎ to rename">
+                  {activeDetail?.title || activeId?.slice(0, 8) || "Session"}
+                </div>
+                {activeId && (
+                  <button
+                    type="button"
+                    className="summary-edit-btn"
+                    aria-label="Edit session title"
+                    onClick={() => { setEditingTitle(true); setTitleDraft(activeDetail?.title || ""); }}
+                  >
+                    ✎
+                  </button>
+                )}
+              </div>
+            )}
             <div className="summary-subtle">
-              {activeDetail?.created_at ? "Started recently" : "Create or open a session to begin"}
+              {activeDetail?.created_at
+                ? `${activeDetail.agent_name} · ${new Date(activeDetail.created_at).toLocaleDateString()}`
+                : "Create or open a session to begin"}
             </div>
           </div>
 
@@ -803,7 +848,7 @@ export function ChatView() {
 
           <div className="summary-card">
             <div className="summary-label">Steps</div>
-            <div className="summary-value">{steps ? `${steps}` : "—"}</div>
+            <div className="summary-value">{steps || activeDetail?.message_count || "—"}</div>
           </div>
 
           <div className="summary-card">
@@ -816,47 +861,21 @@ export function ChatView() {
             <div className="summary-value">{runtimeLabel}</div>
           </div>
 
-          <div className="summary-card">
-            <div className="summary-label">Permission</div>
-            <div className="summary-value summary-value-permission">{currentMode || "default"}</div>
-          </div>
-
-          <div className="summary-card summary-card-progress">
-            <div className="summary-label">Progress</div>
-            <div className="summary-progress-row">
-              <div className="summary-progress-track">
-                <div
-                  className={`summary-progress-fill${progressIndeterminate ? " summary-progress-indeterminate" : ""}`}
-                  style={progressIndeterminate ? undefined : { width: `${progressRatio}%` }}
-                />
-              </div>
-              <div className="summary-progress-number">{progressIndeterminate ? "…" : `${progressRatio}%`}</div>
-            </div>
-          </div>
-
           <ContextUsageBar />
         </div>
 
         <section className="chat view active" data-view-name="chat">
-          <div className="permission-mode-banner">
-            <div className="permission-mode-banner-main">
-              <div className="permission-mode-banner-label">Permission Mode</div>
-              <div className="permission-mode-banner-title">{currentMode || "default"}</div>
-              <div className="permission-mode-banner-body">
-                Current approval posture for this session. Pending requests and future policy controls will surface here.
-              </div>
+          {/* Compact permission bar — only visible when there are pending approvals */}
+          {pendingApprovals > 0 && (
+            <div style={{
+              padding: "6px 20px", fontSize: 12, background: "var(--accent-soft)",
+              borderBottom: "1px solid var(--border)", color: "var(--accent)",
+              display: "flex", alignItems: "center", gap: 12,
+            }}>
+              <span>⏳ {pendingApprovals} tool approval{pendingApprovals > 1 ? "s" : ""} pending</span>
+              {planApproval?.isWaiting && <span>· Plan waiting for review</span>}
             </div>
-            <div className="permission-mode-banner-side">
-              <div className="permission-mode-stat">
-                <span>Pending approvals</span>
-                <strong>{pendingApprovals}</strong>
-              </div>
-              <div className="permission-mode-stat">
-                <span>Plan waiting</span>
-                <strong>{planApproval?.isWaiting ? "Yes" : "No"}</strong>
-              </div>
-            </div>
-          </div>
+          )}
 
           {timeline.length === 0 && (
             <div className="welcome welcome-hero">

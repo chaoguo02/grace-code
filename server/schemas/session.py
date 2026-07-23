@@ -260,6 +260,11 @@ class UpdateSessionRequest(BaseModel):
         description="New agent name (mode) to switch to. "
         "Must be a primary agent: 'build', 'plan', etc.",
     )
+    title: str | None = Field(
+        default=None,
+        description="New session title. Max 200 chars.",
+        max_length=200,
+    )
 
 
 class UpdateSessionResponse(BaseModel):

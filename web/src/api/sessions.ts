@@ -67,8 +67,8 @@ export function chat(
 
 export function updateSession(
   sessionId: string,
-  data: { agent_name?: string },
-): Promise<{ updated: boolean; agent_name: string | null }> {
+  data: { agent_name?: string; title?: string },
+): Promise<{ updated: boolean; agent_name: string | null; title?: string }> {
   return apiPatch(`/api/sessions/${encodeURIComponent(sessionId)}`, data);
 }
 

@@ -511,13 +511,22 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         updated = False
         new_agent_name = None
+        new_title = None
         if body.agent_name is not None and body.agent_name != rec.agent_name:
             ok = service.session_service.update_agent_name(session_id, body.agent_name)
             if ok:
                 updated = True
                 new_agent_name = body.agent_name
+        if body.title is not None and body.title.strip() and body.title.strip() != rec.title:
+            ok = service.session_service.update_title(session_id, body.title.strip())
+            if ok:
+                updated = True
+                new_title = body.title.strip()
 
-        return {"updated": updated, "agent_name": new_agent_name}
+        result: dict = {"updated": updated, "agent_name": new_agent_name}
+        if new_title is not None:
+            result["title"] = new_title
+        return result
 
     # ── POST /api/sessions/{session_id}/compact ──────────────────────────
 
