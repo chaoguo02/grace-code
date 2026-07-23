@@ -4627,6 +4627,15 @@ pre {
   color: var(--text);
 }
 
+/* Context usage bar states */
+.summary-progress-fill.context-high {
+  background: var(--accent);
+}
+.summary-progress-fill.context-critical {
+  background: var(--error);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
 /* ── Plans Library ─────────────────────────────────────────────── */
 
 .plans-layout {

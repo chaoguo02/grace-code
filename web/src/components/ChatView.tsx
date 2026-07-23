@@ -109,6 +109,48 @@ function modeTitle(mode: ModeKey) {
   return MODE_OPTIONS.find((option) => option.key === mode)?.title ?? mode;
 }
 
+function ContextUsageBar() {
+  const activeId = useSessionStore((s) => s.activeId);
+  const activeDetail = useSessionStore((s) => s.activeDetail);
+  const contextTotal = useChatStore((s) => selectSessionUi(s, activeId).contextTotal);
+
+  const used = activeDetail?.total_tokens_estimate ?? 0;
+  const ratio = contextTotal > 0 ? Math.min(100, Math.round((used / contextTotal) * 100)) : 0;
+  const isHigh = ratio > 80;
+  const isCritical = ratio > 95;
+  const lastUpdated = activeDetail?.updated_at
+    ? new Date(activeDetail.updated_at).toLocaleTimeString()
+    : null;
+
+  if (!activeId || !activeDetail) return null;
+
+  return (
+    <div className="summary-card summary-card-progress">
+      <div className="summary-label">Context</div>
+      <div className="summary-progress-row">
+        <div className="summary-progress-track">
+          <div
+            className={`summary-progress-fill${isCritical ? " context-critical" : isHigh ? " context-high" : ""}`}
+            style={{ width: `${Math.max(4, ratio)}%` }}
+          />
+        </div>
+        <div
+          className="summary-progress-number"
+          style={{ color: isCritical ? "var(--error)" : isHigh ? "var(--accent)" : "var(--text)" }}
+          title={lastUpdated ? `Updated ${lastUpdated}` : ""}
+        >
+          {used.toLocaleString()} / {(contextTotal / 1000).toFixed(0)}K
+        </div>
+      </div>
+      {lastUpdated && (
+        <div style={{ fontSize: 9, color: "var(--text-dim)", marginTop: 2 }}>
+          Updated {lastUpdated}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ComposerPanelHeader({
   title,
   detail,
@@ -251,6 +293,17 @@ export function ChatView() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [timeline, isRunning, error]);
+
+  // Refresh session detail after round completes or compaction finishes,
+  // so the context usage bar always reflects the latest token estimate.
+  const prevRunning = useRef(isRunning);
+  useEffect(() => {
+    if (prevRunning.current && !isRunning && activeId) {
+      const timer = setTimeout(() => useSessionStore.getState().refreshActive(), 600);
+      return () => clearTimeout(timer);
+    }
+    prevRunning.current = isRunning;
+  }, [isRunning, activeId]);
 
   useEffect(() => {
     const nextMode = activeDetail?.agent_name;
@@ -762,6 +815,8 @@ export function ChatView() {
               <div className="summary-progress-number">{progressIndeterminate ? "…" : `${progressRatio}%`}</div>
             </div>
           </div>
+
+          <ContextUsageBar />
         </div>
 
         <section className="chat view active" data-view-name="chat">

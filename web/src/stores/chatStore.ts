@@ -53,6 +53,8 @@ export interface SessionUiState {
   draft: string;
   /** Accumulated thought_delta text during live streaming. Cleared on full thought. */
   streamingThought: string;
+  /** Context window max tokens (from model config). Updated on session load. */
+  contextTotal: number;
 }
 
 interface ChatState {
@@ -109,6 +111,7 @@ export function createEmptySessionUiState(): SessionUiState {
     worktreeStates: {},
     draft: "",
     streamingThought: "",
+    contextTotal: 200000,  // default for deepseek-v4 / large models
   };
 }
 
