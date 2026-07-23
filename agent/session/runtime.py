@@ -996,7 +996,11 @@ class SessionRuntime:
                 for message in messages:
                     self._store.append_message(session_id, message)
                 persisted_messages = self._store.list_messages(session_id)
-            elif not persisted_messages:
+            else:
+                # Always persist the user's message.  The previous guard
+                # ``elif not persisted_messages`` only stored the message
+                # the *first* time — subsequent questions in the same
+                # session were silently dropped (they disappeared on reload).
                 self._store.append_message(session_id, LLMMessage(role="user", content=task_description))
                 persisted_messages = self._store.list_messages(session_id)
 
