@@ -1323,7 +1323,7 @@ class ReActAgent:
             # fallbacks). Runtime owns protocol normalization so persisted
             # assistant/tool pairs always remain provider-valid.
             if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
-                import hashlib as _call_hash
+                import hashlib
                 for _call_index, _tool_call in enumerate(action.tool_calls):
                     if not _tool_call.id:
                         _identity = (
@@ -1331,7 +1331,7 @@ class ReActAgent:
                         ).encode("utf-8")
                         _tool_call.id = (
                             "runtime_call_"
-                            + _call_hash.sha256(_identity).hexdigest()[:24]
+                            + hashlib.sha256(_identity).hexdigest()[:24]
                         )
 
             # ── Control Plane: validate tool calls against registered schemas ──
@@ -1590,11 +1590,11 @@ class ReActAgent:
                 missing_test_target_observation: Observation | None = None
 
                 # ── Batch dedup: skip duplicate (name, params) within same action ──
-                import hashlib as _hlib, json as _json
+                import hashlib, json as _json
                 _batch_seen: set[str] = set()
                 effective_tool_calls: list[ToolCall] = []
                 for tc in action.tool_calls:
-                    _tc_key = f"{tc.name}:{_hlib.sha256(_json.dumps(tc.params or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]}"
+                    _tc_key = f"{tc.name}:{hashlib.sha256(_json.dumps(tc.params or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]}"
                     if _tc_key in _batch_seen:
                         logger.info("Batch dedup: skipping duplicate %s", tc.name)
                         continue
@@ -2566,10 +2566,6 @@ class ReActAgent:
             thought=accumulated_thought,
             message=accumulated_text or "Stream ended.",
         )
-
-    # ------------------------------------------------------------------
-    # 权限模式切换（Plan Mode / Execute Mode）
-    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Compaction（对话压缩）

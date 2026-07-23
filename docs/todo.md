@@ -214,12 +214,12 @@
 
 - [ ] **P2-1** ❌ [agent/core.py:89-90] `_V2_DELEGATION_BLOCK_PREFIX`、`_MAX_STOP_HOOK_RETRIES` 缺少文档
 - [ ] **P2-2** ❌ [agent/core.py:572-665] `_run_body` 内 17 个内联 import
-- [ ] **P2-3** ❌ [agent/core.py:1240] `import hashlib as _call_hash` — 误导性别名
-- [ ] **P2-4** ❌ [agent/core.py:1873] `"(no thought)"` 魔数哨兵字符串
+- [x] **P2-3** ✅ 61ec3ca [agent/core.py:1326,1593] `import hashlib as _call_hash` → `import hashlib`；`_hlib` → `hashlib`
+- [x] **P2-4** ✅ 662451a [agent/constants.py] `"(no thought)"` → `NO_THOUGHT_SENTINEL`（已在 constants.py 中）
 - [ ] **P2-5** ❌ [agent/core.py:2264] `_build_recovery_messages() -> list` — 应为 `list[LLMMessage]`
 - [ ] **P2-6** ❌ [agent/core.py:2382] 注释与代码逻辑矛盾
-- [ ] **P2-7** ❌ [agent/core.py:2557-2562] 空 section header "权限模式切换"
-- [ ] **P2-8** ❌ [agent/core.py:888-890] 冗余 `if decision.strip_tools: pass` — 仅有注释
+- [x] **P2-7** ✅ 61ec3ca [agent/core.py:2570] 空 section header "权限模式切换" 已移除
+- [x] **P2-8** ✅ 662451a [agent/core.py:1146] `decision.strip_tools` 实际被使用（line 1146），不是冗余 pass
 - [ ] **P2-9** ❌ [agent/core.py:586] `_block_tracker` 命名不准确 — 应为 "计数器"
 
 ### core/
@@ -245,14 +245,14 @@
 - [ ] **P2-25** ❌ [chatStore.ts:668-670] WS 消息解析用双 `as unknown as` — 无运行时校验
 - [ ] **P2-26** ❌ [SubagentDetail.tsx, SubagentProgress.tsx, SessionTree.tsx] Inline styles 不一致（部分已在 Batch 3 中清理）
 - [ ] **P2-27** ❌ [ChatView.tsx] Timeline keys 使用数组 index
-- [ ] **P2-28** ❌ [SessionSidebar.tsx] 硬编码用户身份 — 地标（需确认是否已移除）
+- [x] **P2-28** ✅ 已移除 — "Alex Morgan"/"alex@example.com" 地标已删除
 - [x] **P2-29** ✅ ab70813 EventSidebar fetch → api layer with signal（Batch 1）
-- [ ] **P2-30** ❌ [web/src/api/memory.ts:41-68] `buildOverview` 死代码
+- [x] **P2-30** ✅ 已移除 — `buildOverview` 死代码不再存在于 memory.ts
 - [x] **P2-31** ✅ ab70813 HTML 双重转义 → MarkdownRenderer 统一处理（Batch 1）
-- [ ] **P2-32** ❌ [web/src/api/stats.ts:8] `getSessionSteps() -> Promise<any[]>` — 应使用 `StepLog[]`
+- [x] **P2-32** ✅ 已修复 — `getSessionSteps()` 返回 `Promise<StepLog[]>` (line 8)
 - [ ] **P2-33** ❌ [chatStore.ts:618-629] Plan trace 恢复中 `as unknown as` — 不安全
-- [ ] **P2-34** ❌ [App.tsx] "Share" 按钮无 `onClick` — 死 UI
-- [ ] **P2-35** ❌ [ThemeToggle.tsx] 缺少 `aria-label`
+- [x] **P2-34** ✅ 已移除 — "Share" 按钮不再存在于 App.tsx
+- [x] **P2-35** ✅ 已修复 — ThemeToggle 已有 `aria-label="Toggle theme"` (line 24)
 
 ### context/ + hooks/ + llm/
 
@@ -277,7 +277,7 @@
 
 ### app/storage/
 
-- [ ] **P2-20** ❌ [app/storage/sqlite.py:267] `title[:200]` 硬编码截断
+- [x] **P2-20** ✅ 已修复 — `_SESSION_TITLE_MAX_LENGTH` 常量已定义并使用 (line 285)
 
 ### hitl/ — 权限管线防御深度
 
@@ -294,7 +294,7 @@
 - [ ] **P2-52** ❌ [hitl/pipeline.py:311-313] `scoped()` 浅拷贝共享 `_web_confirm_callback`
   | 注释说 "intentionally shared (thread-safe)"；确认 broker 模式隔离充分。
 
-- [ ] **P2-53** ❌ [hitl/pipeline.py:217-231] `_approved_prompts` 列表增长（cap 20 已加 — P1-31）
+- [x] **P2-53** ✅ 662451a [hitl/pipeline.py:234] cap 20 已通过 P1-31 实现
 
 - [ ] **P2-54** ❌ [agent/session/worktree_manager.py:198-201] Worktree `discard()` 非 TOCTOU 安全
 
