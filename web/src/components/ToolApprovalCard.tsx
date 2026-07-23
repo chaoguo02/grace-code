@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ExpandableText } from "./ExpandableText";
+import { formatValue } from "../utils/format";
 
 interface ToolApprovalCardProps {
   requestId: string;
@@ -29,15 +30,6 @@ const TOOL_ICONS: Record<string, string> = {
 
 function toolIcon(name: string): string {
   return TOOL_ICONS[name] || "T";
-}
-
-function formatValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
 }
 
 function summarizeTarget(params: Record<string, unknown>) {

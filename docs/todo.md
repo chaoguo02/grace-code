@@ -212,8 +212,8 @@
 
 ### agent/core.py — 代码卫生
 
-- [ ] **P2-1** ❌ [agent/core.py:89-90] `_V2_DELEGATION_BLOCK_PREFIX`、`_MAX_STOP_HOOK_RETRIES` 缺少文档
-- [ ] **P2-2** ❌ [agent/core.py:572-665] `_run_body` 内 17 个内联 import
+- [x] **P2-1** ✅ 已修复 [agent/core.py:114-120] 两个常量均有文档注释 + P2-1 标记
+- [ ] **P2-2** ❌ [agent/core.py:572-665] `_run_body` 内 23 个内联 import（增长中）
 - [x] **P2-3** ✅ 61ec3ca [agent/core.py:1326,1593] `import hashlib as _call_hash` → `import hashlib`；`_hlib` → `hashlib`
 - [x] **P2-4** ✅ 662451a [agent/constants.py] `"(no thought)"` → `NO_THOUGHT_SENTINEL`（已在 constants.py 中）
 - [ ] **P2-5** ❌ [agent/core.py:2264] `_build_recovery_messages() -> list` — 应为 `list[LLMMessage]`
@@ -226,7 +226,7 @@
 
 - [ ] **P2-10** ❌ [core/base.py:486-504] `ToolRegistry.__init__()` 5 个参数全为 `Any` 类型
 - [ ] **P2-11** ❌ [core/base.py:89-93] `_format_error_for_observation()` 名前缀 `_` 不当
-- [ ] **P2-12** ❌ [core/circuit_breaker.py:70] `CircuitBreaker` 缺少 `frozen=True`
+- [x] **P2-12** ⊘ 误判 [core/circuit_breaker.py:71] 断路器必须有可变状态，`frozen=True` 不可用
 
 ### web/ — 前端（P2 剩余项）
 
@@ -238,10 +238,10 @@
 
 ### web/ — 重复代码与类型安全
 
-- [ ] **P2-21** ❌ `summarizeTarget` 在 WsEventBlock / ToolCallCard / ToolApprovalCard 中重复
-- [ ] **P2-22** ❌ `formatValue` 在 WsEventBlock / ToolApprovalCard 中重复（但 WsEventBlock 现在 import 自 `utils/format` — 实际仅 ToolApprovalCard 独立实现）
+- [ ] **P2-21** ❌ `summarizeTarget` 在 ToolCallCard / ToolApprovalCard 中重复（utils/target.ts 接口签名不同，需设计对齐）
+- [x] **P2-22** ✅ 47ccd4c [ToolApprovalCard.tsx] 本地 `formatValue` → `import { formatValue } from "../utils/format"`
 - [x] **P2-23** ✅ ab70813 `renderMarkdown` 重复 → 统一 `<MarkdownRenderer />`（Batch 1）
-- [ ] **P2-24** ❌ `summarizeStatus` 与 SessionSidebar `statusLabel` 重复
+- [x] **P2-24** ✅ 已修复 [utils/status.ts] `summarizeStatus` 统一导出，SessionSidebar 已导入
 - [ ] **P2-25** ❌ [chatStore.ts:668-670] WS 消息解析用双 `as unknown as` — 无运行时校验
 - [ ] **P2-26** ❌ [SubagentDetail.tsx, SubagentProgress.tsx, SessionTree.tsx] Inline styles 不一致（部分已在 Batch 3 中清理）
 - [ ] **P2-27** ❌ [ChatView.tsx] Timeline keys 使用数组 index
@@ -288,8 +288,7 @@
   | 这是 CC-compatible 的 intentional design（父代 bypass → 子代 bypass）。TODO 建议添加可配置上限（cap 为 `acceptEdits`），但这会破坏 CC 兼容性。
   | **决策**: 维持现状；添加文档说明 blast radius。
 
-- [ ] **P2-51** ❌ [hitl/pipeline.py:713-716, tools/shell_tool.py:26] `_ROOT_REMOVAL_PATTERNS`/`_BLOCKED_PATTERNS` 子串匹配可被绕过
-  | `find / -delete`、`chmod 000 -R /` 等完全绕过拦截。应作为"提示性护栏"而非安全边界宣传。
+- [ ] **P2-51** ⚠️ e039c02 [hitl/pipeline.py:713]+[shell_tool.py:26] P1-32 已同步扩展两项列表 + 添加安全边界文档注释。子串匹配本质不可完全防范——作为 advisory guard 而非 security boundary 宣传。
 
 - [ ] **P2-52** ❌ [hitl/pipeline.py:311-313] `scoped()` 浅拷贝共享 `_web_confirm_callback`
   | 注释说 "intentionally shared (thread-safe)"；确认 broker 模式隔离充分。
