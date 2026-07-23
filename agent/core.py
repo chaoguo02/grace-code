@@ -89,6 +89,9 @@ if TYPE_CHECKING:
     from agent.session.task_state_machine import TaskStateMachine
     from agent.session.run_context import CancellationToken
 
+# P2-2: moved from inline in _run_body — no circular import risk
+from agent.completion_guard import CompletionContext, TaskCompletionGuard
+
 # P2-2 note: agent.session.* imports kept inline in _run_body —
 # moving them to module top causes circular imports (agent.session → agent.core)
 
