@@ -127,7 +127,8 @@ class SqliteStorageBackend(StorageBackend):
                         source TEXT NOT NULL DEFAULT '',
                         source_session_id TEXT NOT NULL DEFAULT '',
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        expires_at TEXT
                     );
 
                     CREATE TABLE IF NOT EXISTS memory_anchors (
@@ -147,6 +148,13 @@ class SqliteStorageBackend(StorageBackend):
                     CREATE INDEX IF NOT EXISTS idx_memory_confidence ON memory_entries(confidence DESC);
                     CREATE INDEX IF NOT EXISTS idx_memory_anchors_name ON memory_anchors(memory_name);
                 """)
+                # Migration: add expires_at column to existing databases
+                try:
+                    conn.execute(
+                        "ALTER TABLE memory_entries ADD COLUMN expires_at TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
         except Exception:
             logger.exception("Failed to create memory tables")
 

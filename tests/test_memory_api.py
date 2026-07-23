@@ -42,7 +42,8 @@ class TestMemoryAPI:
                     status TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'project',
                     confidence REAL NOT NULL DEFAULT 0.7, access_count INTEGER NOT NULL DEFAULT 0,
                     source TEXT NOT NULL DEFAULT '', source_session_id TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    expires_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS memory_anchors (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, memory_name TEXT NOT NULL,
