@@ -97,7 +97,9 @@
 
 ### agent/core.py — 结构与重复
 
-- [ ] **P1-1** ❌ [agent/core.py:519-1989] `_run_body()` 1470 行 — 项目最大单体函数。`_finish_run` 闭包已提取（P1-2 ✅），剩余为 `_run_body` 本身。
+- [ ] **P1-1** ⏸️ 推迟 [agent/core.py:722-1996] `_run_body()` 1275 行单体函数。
+  | **决策**: 架构债，非功能缺陷。需先建立 _run_body 的单元测试基础设施再拆解。P1-2 已完成子部件提取。
+  | **风险**: 在不具备测试安全网的情况下拆分核心执行路径，可能引入死锁/状态漂移/回归漏检。
 
 - [x] **P1-2** ✅ 44fae55 [agent/core.py:344-363, 607-714, 895-907] `_finish_run` 嵌套闭包提取
   | `_FinishRunContext` dataclass (12 fields) + `_build_run_result()` 方法
