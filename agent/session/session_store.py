@@ -379,6 +379,14 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_session(row) for row in rows]
 
+    # ── Context budget: tool output cap ───────────────────────────────────
+    # Full tool output lives in EventLog (for trace display).  Only a
+    # truncated version is stored in session_messages so multi-turn
+    # LLM context injection doesn't accumulate KB-scale Read/Bash/etc.
+    # outputs across turns.  Lines above this limit are dropped from
+    # the stored content, not from the live history inside the run.
+    _MAX_TOOL_OUTPUT_CHARS: int = 2_000
+
     def append_message(self, session_id: str, message: LLMMessage) -> None:
         if self.get_session(session_id) is None:
             raise ValueError(f"Unknown v2 session: {session_id}")
@@ -393,6 +401,13 @@ class SessionStore:
                 ensure_ascii=True,
             )
             tool_name = ",".join(tc.name for tc in message.tool_calls)
+        # ── Truncate tool outputs for context budget ──
+        content = str(message.content)
+        if message.role == "tool" and len(content) > self._MAX_TOOL_OUTPUT_CHARS:
+            content = (
+                content[:self._MAX_TOOL_OUTPUT_CHARS]
+                + f"\n…[truncated — {len(content) - self._MAX_TOOL_OUTPUT_CHARS} more chars in trace log]"
+            )
         with self._connect() as conn:
             conn.execute(
                 """
@@ -405,7 +420,7 @@ class SessionStore:
                 (
                     session_id,
                     message.role,
-                    str(message.content),
+                    content,
                     message.tool_call_id,
                     tool_name,
                     tool_calls_json,
