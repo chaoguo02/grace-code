@@ -1097,6 +1097,17 @@ class SessionRuntime:
                     continue
                 self._store.append_message(session_id, message)
 
+            # Persist the final answer as an explicit assistant message.
+            # The finish action's message (result.summary) is NOT in
+            # history.to_list() — it goes straight to _build_run_result()
+            # and the results table.  Without this the frontend shows
+            # tool outputs but no final answer.
+            if result is not None and result.summary:
+                self._store.append_message(
+                    session_id,
+                    LLMMessage(role="assistant", content=result.summary),
+                )
+
             return result
         except KeyboardInterrupt as exc:
             execution_error = exc
