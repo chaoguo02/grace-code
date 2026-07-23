@@ -150,7 +150,7 @@
 
 - [x] **P1-16** ✅ d841fba [agent/session/session_store.py:44-45] 缺少 WAL 模式 — 已在 P0-1 中修复
 
-- [ ] **P1-17** ❌ [agent/core.py] 文件 2600+ 行 — Clean Code 建议 600 行上限的 4.3 倍。未拆分。
+- [ ] **P1-17** ⏸️ 推迟 — P1-1 衍生物（文件长是因为 `_run_body` 长，根因相同）
 
 ### web/ — 前端可靠性（全部已修复）
 
@@ -204,9 +204,7 @@
 
 ### 🆕 审计遗漏（2026-07-23 核查新增）
 
-- [ ] **P1-34** 🆕 [memory/store.py + sqlite_backend.py] `prune_expired()` 在 startup/shutdown/consolidate hook 中调用
-  | 如果 consolidate hook 因长 LLM 调用而阻塞，shutdown hook 可能延迟。启动时 prune 为同步调用 → 大型记忆库启动慢。
-  | **修复**: 启动 prune 改为后台线程，添加超时保护。
+- [ ] **P1-34** ⚠️ df4d4fc [memory/store.py, server/services/agent_service.py:274] prune 已实现但启动时同步调用 — 大型记忆库启动可能延迟。改为后台线程即可，估时 30 分钟。
 
 ---
 

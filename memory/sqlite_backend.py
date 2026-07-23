@@ -71,7 +71,8 @@ class SqliteMemoryBackend:
                         status TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'project',
                         confidence REAL NOT NULL DEFAULT 0.7, access_count INTEGER NOT NULL DEFAULT 0,
                         source TEXT NOT NULL DEFAULT '', source_session_id TEXT NOT NULL DEFAULT '',
-                        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                        expires_at TEXT
                     );
                     CREATE TABLE IF NOT EXISTS memory_anchors (
                         id INTEGER PRIMARY KEY AUTOINCREMENT, memory_name TEXT NOT NULL,
@@ -80,6 +81,13 @@ class SqliteMemoryBackend:
                     CREATE INDEX IF NOT EXISTS idx_mem_type ON memory_entries(type);
                     CREATE INDEX IF NOT EXISTS idx_mem_scope ON memory_entries(scope);
                 """)
+                # Migration P1-34a: add expires_at to existing databases
+                try:
+                    conn.execute(
+                        "ALTER TABLE memory_entries ADD COLUMN expires_at TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
         except Exception:
             logger.exception("Failed to create memory tables")
 
@@ -276,6 +284,9 @@ class SqliteMemoryBackend:
                 if count:
                     logger.info("TTL-expired %d memories → deprecated", count)
                 return count
+        except sqlite3.OperationalError:
+            logger.debug("prune_expired_ttl skipped — expires_at column not available")
+            return 0
         except Exception:
             logger.exception("Failed to prune expired TTL")
             return 0
