@@ -76,7 +76,7 @@
 - [x] **P0-9** ✅ 59ecec2 [agent/core.py] Guard 异常静默吞没修复
   | `_reflection_guards` 代码段已移除（grep 无匹配）。
 
-- [x] **P0-10** ✅ 37e262c [agent/core.py:344-391, 409-448, completion_guard.py:21-36] `_capture_git_state()` 精确异常捕获修复
+- [x] **P0-10** ✅ dcaeb4b [agent/core.py:344-391, 409-448, completion_guard.py:21-36] `_capture_git_state()` 精确异常捕获修复
   | M1: `_GitState` 新增 `_last_git_error` + `_refresh_error_logged`
   | M2: `except Exception` → `ImportError` / `_git_exc` / `OSError(EACCES,EPERM)→raise`
   | M3: `_refresh_git_state()` `pass` → `is_git_repo=False` + 日志风暴控制（首次WARNING后续DEBUG）
