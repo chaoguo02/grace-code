@@ -912,6 +912,7 @@ class ReActAgent:
         )
 
         # ── Workspace setup: ensure isolated environment before RUNNING ──
+        from core.process import LocalRuntime as _SetupRuntime
         _setup_rt = _SetupRuntime()
         _setup_rt.setup_workspace(task.repo_path)
 
