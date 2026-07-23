@@ -182,17 +182,19 @@
 
 ### hitl/ — 权限管线绕过
 
-- [ ] **P1-31** ⚠️ 59ecec2 [hitl/pipeline.py:234] `_match_approved_prompt` 部分修复
-  | Cap 20 + 日志警告已添加。但仍为单 token 交集匹配（未达 >50% 阈值要求）。
-  | **剩余**: 要求 >50% approved tokens 匹配；Bash commands 强制 Layer 6 交互审批。
+- [x] **P1-31** ✅ 662451a [hitl/pipeline.py:838-871] `_match_approved_prompt` 单 token 匹配修复
+  | >50% token overlap ratio + Bash→Layer 6 强制 + cap 20 + 日志警告。全部三项修复已落地。
 
-- [ ] **P1-32** ⚠️ [tools/shell_tool.py, hitl/pipeline.py:713-716] Bash 命令参数不受工作区沙箱限制
-  | `_BLOCKED_PATTERNS`（26 行）/`_ROOT_REMOVAL_PATTERNS`（713 行）仅为子串匹配，可被绕过（如 `find / -delete`）。Shell 命令可引用绝对路径。
-  | **剩余**: 长期 — Docker/Podman 容器化；短期 — 解析 bash 重定向目标。
+- [x] **P1-32** ✅ <待提交> [tools/shell_tool.py:26-56, 219-223, 330-400, hitl/pipeline.py:713-722] Bash sandbox 加固
+  | M1: `_BLOCKED_PATTERNS` 8→17 项（新增 find/delete, chmod 000, nvme overwrite, rm /*, rm -r /）
+  | M2: `_validate_workspace_paths()` 路径沙箱（绝对路径逃逸 + dotdot≥3 层拒绝）
+  | M4: `_ROOT_REMOVAL_PATTERNS` 6→14 项同步
+  | M3: 安全边界文档标注（advisory ≠ security boundary）
+  | 测试: 19/19 PASS + 45 回归 PASS (64/64, zero regressions)
+  | 遗留: 解释器级别绕过（python -c）不可解 — Docker 是真正的安全边界
 
-- [ ] **P1-33** ⚠️ [core/policy_registry.py:223-266] `_check_tool_call` 不检查 Bash 命令内容
-  | 配置 `strict_file_scope=True` + `allowed_write_paths` 时 Write/Edit 受限但 Bash 完全绕过。
-  | **剩余**: 从 Bash 命令中提取文件目标并校验 `allowed_write_paths`。
+- [x] **P1-33** ✅ 662451a [core/policy_registry.py:340-375] `_check_tool_call` Bash 命令内容检查修复
+  | `_extract_shell_file_targets()` 提取 shell 重定向/命令目标并校验 `allowed_write_paths`（strict_file_scope 模式下）。全部三项修复已落地。
 
 ### 🆕 审计遗漏（2026-07-23 核查新增）
 

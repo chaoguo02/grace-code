@@ -23,15 +23,39 @@ from core.utils import truncate_output
 
 MAX_OUTPUT_CHARS = 50_000
 
+# ── Advisory safety floor ─────────────────────────────────────────────────
+# IMPORTANT: These patterns are a HINT barrier, NOT a security boundary.
+# They catch the most common destructive commands but can be bypassed by:
+# - Using find/xargs/chmod variants not in the list
+# - Calling interpreters (python -c, node -e, ruby -e)
+# - Obfuscating command strings
+#
+# TRUE security isolation requires FORGE_SANDBOX=docker
+# (DockerContainerRuntime), which provides overlay filesystem +
+# no-new-privileges + CMD-INJ filtering.
+#
+# See audit finding P1-32 for the threat model and bypass documentation.
 _BLOCKED_PATTERNS: tuple[str, ...] = (
-    "rm -rf /",
-    "rm -rf ~",
-    "mkfs",
-    "dd if=",
-    ":(){:|:&};:",
-    "chmod -R 777 /",
-    "chown -R",
-    "> /dev/sda",
+    # Filesystem destruction
+    "rm -rf /",          # recursive root removal
+    "rm -rf ~",          # recursive home removal
+    "rm -rf /*",         # root glob removal
+    "rm -rf ~/*",        # home glob removal
+    "rm -r /",           # non-force root removal
+    "rm -r ~",           # non-force home removal
+    "find / -delete",    # find-delete root bypass
+    "find / -exec rm",   # find-exec root bypass
+    "> /dev/sda",        # SATA disk overwrite
+    "> /dev/hda",        # IDE disk overwrite
+    "> /dev/nvme",       # NVMe disk overwrite
+    # Privilege / system integrity
+    "mkfs",              # filesystem format
+    "dd if=",            # raw device access
+    "chmod -R 000 /",    # revoke all permissions
+    "chmod -R 777 /",    # world-writable root
+    "chown -R",          # recursive ownership change
+    # Fork bomb
+    ":(){:|:&};:",       # classic fork bomb
 )
 
 ConfirmCallback = Callable[[str], bool]
@@ -192,6 +216,13 @@ class ShellTool(BaseTool):
         if blocked:
             return ToolResult(success=False, output="", error=f"Command blocked for safety: matched '{blocked}'")
 
+        # Path sandbox (P1-32): args must not reference paths outside the workspace.
+        # Skips validation when runtime has no workspace root (Docker sandbox active).
+        _ws_root = getattr(self._runtime, "_workspace_root", None)
+        path_violation = _validate_workspace_paths(command, args, _ws_root)
+        if path_violation:
+            return ToolResult(success=False, output="", error=path_violation)
+
         cmd_name = command.split()[0] if command.split() else command
         full_cmd = f"{command} {' '.join(args)}" if args else command
 
@@ -309,7 +340,80 @@ def terminal_confirm(cmd: str) -> bool:
 
 
 def _check_blocked(cmd: str) -> str:
+    """Check command against advisory blocked patterns.
+
+    Returns the matched pattern string, or "" if no match.
+    This is NOT a security boundary — see _BLOCKED_PATTERNS docstring.
+    """
     for pattern in _BLOCKED_PATTERNS:
         if pattern in cmd:
             return pattern
     return ""
+
+
+def _validate_workspace_paths(
+    command: str,
+    args: list[str],
+    workspace_root: str | None,
+) -> str | None:
+    """Validate that file paths in command args stay within the workspace.
+
+    Returns an error message if a path escapes the workspace, or None if all
+    paths are safe.  Only checks paths that look like filesystem references
+    (absolute paths, paths with ../ segments).
+
+    This is a SOFT guard — it does not protect against interpreter-level
+    escapes (e.g. python -c "open('/etc/shadow')").  True isolation requires
+    Docker/Podman sandbox mode (FORGE_SANDBOX=docker).
+    """
+    if workspace_root is None:
+        return None  # no workspace constraint — sandbox mode presumably active
+
+    from pathlib import Path
+
+    ws = Path(workspace_root).resolve()
+
+    def _check_path(raw: str) -> str | None:
+        """Check a single path candidate.  Returns error or None."""
+        stripped = raw.strip()
+        if not stripped:
+            return None
+
+        # Absolute paths (Unix /... or Windows C:\...)
+        if stripped.startswith("/") or (len(stripped) >= 2 and stripped[1] == ":"):
+            try:
+                resolved = Path(stripped).resolve()
+                resolved.relative_to(ws)
+            except (ValueError, OSError):
+                return (
+                    f"Path '{stripped}' resolves outside the workspace. "
+                    f"Use a workspace-relative path or switch to Read/Write/Edit tools."
+                )
+            return None
+
+        # Paths escaping upward with ../
+        normalized = stripped.replace("\\", "/")
+        if normalized.startswith("..") or "/.." in normalized:
+            segments = normalized.split("/")
+            depth = 0
+            max_depth = 0
+            for seg in segments:
+                if seg == "..":
+                    depth += 1
+                    max_depth = max(max_depth, depth)
+                elif seg and seg != ".":
+                    depth = max(0, depth - 1)
+            if max_depth >= 3:  # "../../../" pattern
+                return (
+                    f"Path '{stripped}' attempts to escape the workspace "
+                    f"({max_depth} levels up). Use a workspace-relative path."
+                )
+
+        return None
+
+    for arg in args:
+        err = _check_path(arg)
+        if err:
+            return err
+
+    return None

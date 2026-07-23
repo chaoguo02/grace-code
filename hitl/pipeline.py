@@ -711,8 +711,15 @@ class PermissionPipeline:
 
     # CC bypassPermissions: root/home removal still prompts as circuit breaker
     _ROOT_REMOVAL_PATTERNS: tuple[str, ...] = (
+        # Synced with tools/shell_tool._BLOCKED_PATTERNS (P1-32).
+        # Matched commands fall through to Layer 6 interactive approval
+        # even in bypassPermissions mode.
         "rm -rf /", "rm -rf ~", "rm -r /", "rm -r ~",
         "rm -rf /*", "rm -rf ~/*",
+        "find / -delete", "find / -exec rm",
+        "chmod -R 000 /", "chmod -R 777 /",
+        "> /dev/sda", "> /dev/hda", "> /dev/nvme",
+        "mkfs", "dd if=",
     )
 
     def _layer4_permission_mode(self, tool_name, params=None):
