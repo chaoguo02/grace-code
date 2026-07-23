@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from xml.etree import ElementTree as ET
 
 from core.policy import TaskPolicy, build_task_policy
@@ -341,6 +341,29 @@ class _GitState:
     _refresh_error_logged: bool = False
 
 
+@dataclass
+class _FinishRunContext:
+    """Mutable context for the completion-result builder (P1-2).
+
+    Holds all variables previously captured implicitly by the
+    ``_finish_run`` closure inside ``_run_body()``.  Passing them
+    explicitly via this struct makes ``_build_run_result()`` an
+    ordinary method — independently testable.
+    """
+    git_state: _GitState
+    task: Any   # Task
+    completion_ctx: Any  # CompletionContext
+    verification_ok: bool
+    tsm: Any  # TaskStateMachine
+    completion_blocked: int
+    reflection_counts: dict[str, int]
+    get_consecutive_failures: Callable[[], int]
+    log: Any  # EventLog
+    task_obs: Any  # Langfuse observation
+    task_context: Any  # Langfuse context manager
+    task_obs_closed: bool = False
+
+
 def _capture_git_state(repo_path: str) -> _GitState:
     """Capture git baseline before the agent run starts.
 
@@ -581,6 +604,121 @@ class ReActAgent:
         finally:
             self._registry = previous_registry
 
+    def _build_run_result(
+        self,
+        *,
+        status: RunStatus,
+        summary: str,
+        steps_taken: int,
+        total_tokens_used: int,
+        ctx: _FinishRunContext,
+        patch: str | None = None,
+        error: str | None = None,
+        cache_stats: CacheStats | None = None,
+    ) -> RunResult:
+        """Build the final RunResult from the completion context (P1-2).
+
+        Extracted from the ``_finish_run`` closure inside ``_run_body()``.
+        Uses ``ctx`` (a ``_FinishRunContext``) instead of implicitly captured
+        variables, making the method independently testable.
+        """
+        # ── Refresh objective workspace facts for the completion record ──
+        _refresh_git_state(ctx.git_state, ctx.task.repo_path)
+        if ctx.git_state.has_changes:
+            _patch_text = (
+                f"\n{ctx.git_state.current_diff[:DIFF_PREVIEW_MAX_CHARS]}"
+                if ctx.git_state.current_diff else
+                "\nRaw incremental patch is not attributable; the workspace revision changed."
+            )
+            _changed_text = (
+                ", ".join(sorted(ctx.git_state.files_changed)[:10])
+                or "(revision changed; no attributable path list)"
+            )
+            summary = (
+                f"{summary}\n\n"
+                f"--- WORKSPACE DELTA (this run: {len(ctx.git_state.files_changed)} files) ---\n"
+                f"Changed: {_changed_text}\n"
+                f"{_patch_text}"
+            )
+
+        # Verification outcome is orthogonal to lifecycle state.
+        _needs_unverified_tag = ctx.git_state.has_changes or (
+            ctx.completion_ctx.had_any_write and not ctx.git_state.is_git_repo
+        )
+        if status == RunStatus.SUCCESS and _needs_unverified_tag and not ctx.verification_ok:
+            _reason = ctx.tsm.verification_reason
+            if _reason == VerificationReason.NO_TEST_ENVIRONMENT:
+                _tag = "UNVERIFIED — no test environment available"
+            elif _reason == VerificationReason.NO_VERSION_CONTROL:
+                _tag = "UNVERIFIED — project has no Git fact source"
+            elif _reason == VerificationReason.TEST_FAILED:
+                _tag = "UNVERIFIED — tests ran but failed"
+            else:
+                _tag = "UNVERIFIED — test/validation did not run or was unavailable"
+            summary = (
+                f"[{_tag}. "
+                f"Code changes were made but NOT independently verified.]\n\n"
+                f"{summary}"
+            )
+
+        result = RunResult(
+            task_id=ctx.task.task_id,
+            status=status,
+            summary=summary,
+            steps_taken=steps_taken,
+            total_tokens=total_tokens_used,
+            patch=patch,
+            error=error,
+            cache_stats=cache_stats,
+            contract=self._accumulated_plan_contract,
+            termination_reason=ctx.tsm.termination_reason,
+            verification_status=ctx.tsm.verification_status,
+            verification_reason=ctx.tsm.verification_reason,
+            completion_blocked=ctx.completion_blocked,
+        )
+        run_stats = summarize_run(ctx.log)
+        analysis_metadata = build_analysis_run_metadata(
+            run_stats=run_stats,
+            context_stats=getattr(self, "_last_context_stats", None),
+        )
+        ctx.task_obs.update(
+            output=build_run_output(result),
+            metadata=merge_metadata(
+                build_run_metadata(result),
+                {
+                    "reflections": ctx.reflection_counts,
+                    "consecutive_failures": ctx.get_consecutive_failures(),
+                },
+                analysis_metadata,
+            ),
+        )
+        for score in build_run_scores(ctx.task, result, stats=run_stats):
+            ctx.task_obs.score(
+                name=score.name,
+                value=score.value,
+                comment=score.comment,
+                metadata=score.metadata,
+            )
+        append_failure_dataset_item(ctx.task, result, log_path=ctx.log.path, stats=run_stats)
+        if not ctx.task_obs_closed:
+            ctx.task_context.__exit__(None, None, None)
+            ctx.task_obs_closed = True
+        # First-party stats: record session end
+        _sc2 = self._cfg.stats_collector
+        if _sc2 is not None:
+            try:
+                _sc2.record_session_end(
+                    self._cfg.stats_session_id,
+                    agent_name=self._cfg.stats_agent_name,
+                    total_steps=steps_taken,
+                    total_tokens=total_tokens_used,
+                    status=status.value if hasattr(status, 'value') else str(status),
+                    completion_blocked=ctx.completion_blocked,
+                )
+            except Exception:
+                pass
+        return result
+
     def _run_body(self, task: Task, log: EventLog, *, policy: TaskPolicy) -> RunResult:
         """核心循环：所有 return 路径都走这里，由 run() 负责策略包裹和恢复。"""
         self._active_policy = policy
@@ -752,114 +890,20 @@ class ReActAgent:
         _tsm.add_guard(GuardTransition.COMPLETING_TO_COMPLETED, git_diff_guard)
         _tsm.add_guard(GuardTransition.COMPLETING_TO_FAILED, stop_hook_retry_guard)
 
-        def _finish_run(
-            *,
-            status: RunStatus,
-            summary: str,
-            steps_taken: int,
-            total_tokens_used: int,
-            patch: str | None = None,
-            error: str | None = None,
-            cache_stats: CacheStats | None = None,
-        ) -> RunResult:
-            nonlocal task_obs_closed
-
-            # ── Refresh objective workspace facts for the completion record ──
-            _refresh_git_state(_git_state, task.repo_path)
-            if _git_state.has_changes:
-                _patch_text = (
-                    f"\n{_git_state.current_diff[:DIFF_PREVIEW_MAX_CHARS]}"
-                    if _git_state.current_diff else
-                    "\nRaw incremental patch is not attributable; the workspace revision changed."
-                )
-                _changed_text = (
-                    ", ".join(sorted(_git_state.files_changed)[:10])
-                    or "(revision changed; no attributable path list)"
-                )
-                summary = (
-                    f"{summary}\n\n"
-                    f"--- WORKSPACE DELTA (this run: {len(_git_state.files_changed)} files) ---\n"
-                    f"Changed: {_changed_text}\n"
-                    f"{_patch_text}"
-                )
-
-            # Verification outcome is orthogonal to lifecycle state.
-            _needs_unverified_tag = _git_state.has_changes or (
-                completion_ctx.had_any_write and not _git_state.is_git_repo
-            )
-            if status == RunStatus.SUCCESS and _needs_unverified_tag and not _verification_ok:
-                _reason = _tsm.verification_reason
-                if _reason == VerificationReason.NO_TEST_ENVIRONMENT:
-                    _tag = "UNVERIFIED — no test environment available"
-                elif _reason == VerificationReason.NO_VERSION_CONTROL:
-                    _tag = "UNVERIFIED — project has no Git fact source"
-                elif _reason == VerificationReason.TEST_FAILED:
-                    _tag = "UNVERIFIED — tests ran but failed"
-                else:
-                    _tag = "UNVERIFIED — test/validation did not run or was unavailable"
-                summary = (
-                    f"[{_tag}. "
-                    f"Code changes were made but NOT independently verified.]\n\n"
-                    f"{summary}"
-                )
-
-            result = RunResult(
-                task_id=task.task_id,
-                status=status,
-                summary=summary,
-                steps_taken=steps_taken,
-                total_tokens=total_tokens_used,
-                patch=patch,
-                error=error,
-                cache_stats=cache_stats,
-                contract=self._accumulated_plan_contract,
-                termination_reason=_tsm.termination_reason,
-                verification_status=_tsm.verification_status,
-                verification_reason=_tsm.verification_reason,
-                completion_blocked=_completion_blocked,
-            )
-            run_stats = summarize_run(log)
-            analysis_metadata = build_analysis_run_metadata(
-                run_stats=run_stats,
-                context_stats=getattr(self, "_last_context_stats", None),
-            )
-            task_obs.update(
-                output=build_run_output(result),
-                metadata=merge_metadata(
-                    build_run_metadata(result),
-                    {
-                        "reflections": reflection_counts,
-                        "consecutive_failures": _get_consecutive_failures(),
-                    },
-                    analysis_metadata,
-                ),
-            )
-            for score in build_run_scores(task, result, stats=run_stats):
-                task_obs.score(
-                    name=score.name,
-                    value=score.value,
-                    comment=score.comment,
-                    metadata=score.metadata,
-                )
-            append_failure_dataset_item(task, result, log_path=log.path, stats=run_stats)
-            if not task_obs_closed:
-                task_context.__exit__(None, None, None)
-                task_obs_closed = True
-            # First-party stats: record session end
-            _sc2 = self._cfg.stats_collector
-            if _sc2 is not None:
-                try:
-                    _sc2.record_session_end(
-                        self._cfg.stats_session_id,
-                        agent_name=self._cfg.stats_agent_name,
-                        total_steps=steps_taken,
-                        total_tokens=total_tokens_used,
-                        status=status.value if hasattr(status, 'value') else str(status),
-                        completion_blocked=_completion_blocked,
-                    )
-                except Exception:
-                    pass
-            return result
+        # ── Completion result builder: extracted from nested closure (P1-2) ──
+        _finish_ctx = _FinishRunContext(
+            git_state=_git_state,
+            task=task,
+            completion_ctx=completion_ctx,
+            verification_ok=_verification_ok,
+            tsm=_tsm,
+            completion_blocked=_completion_blocked,
+            reflection_counts=reflection_counts,
+            get_consecutive_failures=_get_consecutive_failures,
+            log=log,
+            task_obs=task_obs,
+            task_context=task_context,
+        )
 
         # ── Workspace setup: ensure isolated environment before RUNNING ──
         from core.process import LocalRuntime as _SetupRuntime
@@ -880,7 +924,7 @@ class ReActAgent:
             if _cancellation.is_cancelled:
                 _tsm.cancel(_cancellation.detail)
                 log.log_task_failed(steps=step - 1, reason=_cancellation.detail)
-                return _finish_run(
+                return self._build_run_result(ctx=_finish_ctx, 
                     status=RunStatus.CANCELLED,
                     summary=f"Task cancelled: {_cancellation.detail}",
                     steps_taken=step - 1,
@@ -895,7 +939,7 @@ class ReActAgent:
             # call, before reflection, before any other work.
             if getattr(self, '_circuit_breaker_tripped', False):
                 logger.warning("Circuit breaker tripped — forcing GIVE_UP at step %d", step)
-                return _finish_run(
+                return self._build_run_result(ctx=_finish_ctx, 
                     status=RunStatus.GAVE_UP,
                     summary="Session terminated: permission circuit breaker tripped.",
                     steps_taken=step,
@@ -943,7 +987,7 @@ class ReActAgent:
                 _tsm.fail(decision.terminate_reason, decision.terminate_detail)
                 log.log_task_failed(steps=step, reason=decision.terminate_detail or decision.terminate_reason.value)
                 _term_status = decision.terminate_status or RunStatus.GAVE_UP
-                return _finish_run(
+                return self._build_run_result(ctx=_finish_ctx, 
                     status=_term_status,
                     summary=decision.terminate_summary,
                     steps_taken=step,
@@ -973,7 +1017,7 @@ class ReActAgent:
             if not _guard_result.passed and _guard_result.terminate:
                 _tsm.fail(TerminationReason.GUARD_REJECTED, _guard_result.reason)
                 log.log_task_failed(steps=step, reason=_guard_result.reason)
-                return _finish_run(
+                return self._build_run_result(ctx=_finish_ctx, 
                     status=RunStatus.GAVE_UP,
                     summary=_guard_result.reason,
                     steps_taken=step,
@@ -1178,7 +1222,7 @@ class ReActAgent:
                     logger.error("LLM stream failed at step %d: %s", step, exc)
                     _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
                     log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
-                    return _finish_run(
+                    return self._build_run_result(ctx=_finish_ctx, 
                         status=RunStatus.FAILED,
                         summary=f"LLM stream failed: {exc}",
                         steps_taken=step, total_tokens_used=total_tokens,
@@ -1215,7 +1259,7 @@ class ReActAgent:
                     logger.error("LLM call failed at step %d after retries: %s", step, exc)
                     _tsm.fail(_term_reason, f"LLM error: {exc}")
                     log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
-                    return _finish_run(
+                    return self._build_run_result(ctx=_finish_ctx, 
                         status=RunStatus.FAILED,
                         summary=f"LLM call failed: {exc}",
                         steps_taken=step,
@@ -1406,7 +1450,7 @@ class ReActAgent:
                         logger.warning(reason)
                         log.log_task_failed(steps=step, reason=reason)
                         _tsm.fail(TerminationReason.HOOK_STOPPED, reason)
-                        return _finish_run(
+                        return self._build_run_result(ctx=_finish_ctx, 
                             status=RunStatus.GAVE_UP, summary=reason,
                             steps_taken=step, total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
@@ -1437,7 +1481,7 @@ class ReActAgent:
                         _tsm.transition(TSMState.FAILED, f"abort: {_check_result.blocked_reason}")
                         log.log_task_failed(steps=step, reason=_check_result.blocked_reason)
                         history.add(LLMMessage(role="user", content=_check_result.inject_message))
-                        return _finish_run(
+                        return self._build_run_result(ctx=_finish_ctx, 
                             status=RunStatus.GAVE_UP, summary=_check_result.blocked_reason,
                             steps_taken=step, total_tokens_used=total_tokens,
                         )
@@ -1460,7 +1504,7 @@ class ReActAgent:
                         reason = f"Agent gave up: completion blocked {COMPLETION_BLOCK_THRESHOLD} times for: {guard_result.blocked_reason}"
                         _tsm.fail(TerminationReason.AGENT_GAVE_UP, reason)
                         log.log_task_failed(steps=step, reason=reason)
-                        return _finish_run(
+                        return self._build_run_result(ctx=_finish_ctx, 
                             status=RunStatus.GAVE_UP, summary=reason,
                             steps_taken=step, total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
@@ -1518,7 +1562,7 @@ class ReActAgent:
                 log.log_task_complete(steps=step, summary=summary, contract=self._accumulated_plan_contract, cache_stats=_cache_dict)
                 self._extract_success_memories(task, log, summary)
                 _execution_budget.complete()
-                return _finish_run(
+                return self._build_run_result(ctx=_finish_ctx, 
                     status=RunStatus.SUCCESS,
                     summary=summary,
                     steps_taken=step,
@@ -1531,7 +1575,7 @@ class ReActAgent:
                 reason = action.message or "Agent gave up."
                 _tsm.fail(TerminationReason.AGENT_GAVE_UP, reason)
                 log.log_task_failed(steps=step, reason=reason)
-                return _finish_run(
+                return self._build_run_result(ctx=_finish_ctx, 
                     status=RunStatus.GAVE_UP,
                     summary=reason,
                     steps_taken=step,
@@ -1671,7 +1715,7 @@ class ReActAgent:
                             }
                             logger.warning("Runtime intercepted env blocker: %s", _tool_err.detail)
                             log.log_task_failed(steps=step, reason=_tool_err.detail)
-                            return _finish_run(
+                            return self._build_run_result(ctx=_finish_ctx, 
                                 status=RunStatus.BLOCKED,
                                 summary=_block_msg,
                                 steps_taken=step,
@@ -1763,7 +1807,7 @@ class ReActAgent:
                         logger.info("Stopping immediately after missing pytest target")
                         log.log_task_complete(steps=step, summary=missing_test_target_message)
                         self._extract_success_memories(task, log, missing_test_target_message)
-                        return _finish_run(
+                        return self._build_run_result(ctx=_finish_ctx, 
                             status=RunStatus.SUCCESS,
                             summary=missing_test_target_message,
                             steps_taken=step,
@@ -1806,7 +1850,7 @@ class ReActAgent:
                     )
                     logger.warning(reason)
                     log.log_task_failed(steps=step, reason=reason)
-                    return _finish_run(
+                    return self._build_run_result(ctx=_finish_ctx, 
                         status=RunStatus.GAVE_UP,
                         summary=reason,
                         steps_taken=step,
@@ -1866,7 +1910,7 @@ class ReActAgent:
                         logger.info("Stopping after missing pytest target guardrail")
                         log.log_task_complete(steps=step, summary=missing_test_target_message)
                         self._extract_success_memories(task, log, missing_test_target_message)
-                        return _finish_run(
+                        return self._build_run_result(ctx=_finish_ctx, 
                             status=RunStatus.SUCCESS,
                             summary=missing_test_target_message,
                             steps_taken=step,
@@ -1898,7 +1942,7 @@ class ReActAgent:
                         reason = "Aborting: test failures repeated 3 times without resolution."
                         logger.warning(reason)
                         log.log_task_failed(steps=step, reason=reason)
-                        return _finish_run(
+                        return self._build_run_result(ctx=_finish_ctx, 
                             status=RunStatus.GAVE_UP,
                             summary=reason,
                             steps_taken=step,
@@ -1922,7 +1966,7 @@ class ReActAgent:
                     _tsm.complete(VerificationStatus.NOT_APPLICABLE, detail="LLM returned empty tool_calls — finishing")
                     log.log_task_complete(steps=step, summary=summary)
                     self._extract_success_memories(task, log, summary)
-                    return _finish_run(
+                    return self._build_run_result(ctx=_finish_ctx, 
                         status=RunStatus.SUCCESS,
                         summary=summary,
                         steps_taken=step,
@@ -1943,7 +1987,7 @@ class ReActAgent:
         _tsm.fail(TerminationReason.MAX_STEPS, "max steps exceeded")
         summary = self._extract_summary_from_history(history)
         log.log_task_failed(steps=task.max_steps, reason="max_steps")
-        return _finish_run(
+        return self._build_run_result(ctx=_finish_ctx, 
             status=RunStatus.MAX_STEPS,
             summary=summary,
             steps_taken=task.max_steps,

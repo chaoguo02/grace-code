@@ -97,9 +97,11 @@
 
 ### agent/core.py — 结构与重复
 
-- [ ] **P1-1** ❌ [agent/core.py:519-1989] `_run_body()` 1470 行 — 项目最大单体函数。未拆分。
+- [ ] **P1-1** ❌ [agent/core.py:519-1989] `_run_body()` 1470 行 — 项目最大单体函数。`_finish_run` 闭包已提取（P1-2 ✅），剩余为 `_run_body` 本身。
 
-- [ ] **P1-2** ❌ [agent/core.py:692-799] `_finish_run` 为嵌套 107 行闭包。未提取。
+- [x] **P1-2** ✅ 5ac1a4c~ [agent/core.py:344-363, 607-714, 895-907] `_finish_run` 嵌套闭包提取
+  | `_FinishRunContext` dataclass (12 fields) + `_build_run_result()` 方法
+  | 21 call sites replaced. Tests: 3/3 PASS + 68 regression (71/71)
 
 - [x] **P1-3** ✅ 59ecec2 [agent/core.py:2522] Prompt-too-long 恢复逻辑重复修复
   | `_attempt_reactive_compact()` 已提取为独立方法，streaming + classic 双向调用。
