@@ -185,7 +185,7 @@
 - [x] **P1-31** ✅ 662451a [hitl/pipeline.py:838-871] `_match_approved_prompt` 单 token 匹配修复
   | >50% token overlap ratio + Bash→Layer 6 强制 + cap 20 + 日志警告。全部三项修复已落地。
 
-- [x] **P1-32** ✅ 3614bf9 [tools/shell_tool.py:26-56, 219-223, 330-400, hitl/pipeline.py:713-722] Bash sandbox 加固
+- [x] **P1-32** ✅ e039c02 [tools/shell_tool.py:26-56, 219-223, 330-400, hitl/pipeline.py:713-722] Bash sandbox 加固
   | M1: `_BLOCKED_PATTERNS` 8→17 项（新增 find/delete, chmod 000, nvme overwrite, rm /*, rm -r /）
   | M2: `_validate_workspace_paths()` 路径沙箱（绝对路径逃逸 + dotdot≥3 层拒绝）
   | M4: `_ROOT_REMOVAL_PATTERNS` 6→14 项同步
