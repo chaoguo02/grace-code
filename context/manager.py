@@ -256,6 +256,8 @@ class ContextManager:
         compaction_task_context: str = "",
         tokens_freed: int = 0,
         history_materializer_fn=None,
+        *,
+        step: int = 1,
     ) -> RequestContext:
         """
         组装发给 LLM 的完整 messages。
@@ -323,7 +325,7 @@ class ContextManager:
                         estimate_tokens(str(message.get("content", "")))
                         for message in history_dicts
                     ),
-                    step=1,
+                    step=step,
                     tokens_freed=tokens_freed,
                 ),
                 ContextBudget(

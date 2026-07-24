@@ -1166,6 +1166,17 @@ class SessionRuntime:
                         self._store.set_summary(
                             session_id, result.summary, status=SessionStatus.COMPLETED
                         )
+                        # Persist plan contract into session metadata so
+                        # /timeline plan_state.contract is populated (I5).
+                        _contract = getattr(result, "contract", None)
+                        if isinstance(_contract, dict) and _contract:
+                            try:
+                                self._store.update_metadata(
+                                    session_id,
+                                    {"plan_contract": _contract},
+                                )
+                            except Exception:
+                                pass
                     else:
                         self._store.update_status(
                             session_id,

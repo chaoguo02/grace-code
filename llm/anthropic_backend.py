@@ -156,7 +156,11 @@ def _to_anthropic_messages(messages: list[LLMMessage]) -> list[dict]:
                 }],
             })
         else:
-            result.append({"role": msg.role, "content": msg.content})
+            # If role is "tool" but tool_call_id is None (edge case from
+            # text-mode parsing), wrap it as a user message so the API
+            # accepts it.  Anthropic rejects {"role": "tool", ...}.
+            safe_role = "user" if msg.role == "tool" else msg.role
+            result.append({"role": safe_role, "content": msg.content})
     return result
 
 

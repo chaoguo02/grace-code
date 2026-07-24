@@ -679,6 +679,23 @@ class SessionStore:
             if cursor.rowcount != 1:
                 raise ValueError(f"Unknown session: {session_id}")
 
+    def update_metadata(
+        self, session_id: str, extra: dict[str, Any]
+    ) -> None:
+        """Merge *extra* keys into the session's metadata_json."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_json FROM sessions WHERE id = ?", (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown session: {session_id}")
+            existing = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+            existing.update(extra)
+            conn.execute(
+                "UPDATE sessions SET metadata_json = ? WHERE id = ?",
+                (json.dumps(existing, ensure_ascii=True), session_id),
+            )
+
     def set_agent_result(self, session_id: str, result: AgentRunResult) -> None:
         """Persist the generic typed child result at the session boundary."""
         payload = json.dumps(result.to_dict(), ensure_ascii=True)

@@ -390,7 +390,7 @@ def run_child_agent(
                 # Route child events to PARENT session's WebSocket so the
                 # frontend can render subagent progress in real time.
                 # The event's own session_id is still set for DB trace.
-                _captured_session_id = session_record.parent_id or agent_id
+                _captured_session_id = session_record.parent_id or ""
 
                 def _append_and_emit(event):
                     # Store child session in metadata so frontend can

@@ -603,13 +603,15 @@ def evaluate_observation_batch(
     description_limit: int,
 ) -> ObservationBatchEvaluation:
     """Update the breaker once per batch and classify forced termination."""
-    all_failed = all(
+    # Per-observation failure tracking: any individual tool failure
+    # increments the counter.  Only an all-success batch resets it.
+    any_failed = any(
         not observation.is_success() for observation in observations
     )
-    expected_blocked = all(
-        observation.is_expected_block() for observation in observations
+    any_not_expected = any(
+        not observation.is_expected_block() for observation in observations
     )
-    recorded_error = all_failed and not expected_blocked
+    recorded_error = any_failed and any_not_expected
     if recorded_error:
         record_error()
     else:

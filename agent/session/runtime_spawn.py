@@ -248,7 +248,7 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
         child_result = run_child_agent(
             agent_id=child.id, request=request, source_definition=definition,
             repo_path=repo_path, base_registry=self._base_registry,
-            backend=self.get_backend_for_session(parent_session_id),
+            backend=self.get_backend_for_session(parent.id),
             log_dir=self._log_dir,
             root_agent_config=self._root_agent_config, message_sink=_persist,
             contract=contract, cancellation_token=cancellation_token,

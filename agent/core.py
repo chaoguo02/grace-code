@@ -691,6 +691,11 @@ class ReActAgent:
         Loaded once per run; subsequent calls return the cached text.
         Returns ``""`` if no CLAUDE.md files exist.
         """
+        # Invalidate project instructions cache when repo path changes
+        if getattr(self, "_project_instructions_repo", "") != repo_path:
+            if hasattr(self, "_project_instructions"):
+                del self._project_instructions
+            self._project_instructions_repo = repo_path
         if not hasattr(self, "_project_instructions"):
             from context.claude_md import load
             self._project_instructions = load(repo_path)
@@ -769,6 +774,19 @@ class ReActAgent:
             return self._run_body(task, log, policy=policy)
         finally:
             self._registry = previous_registry
+            # Close the Langfuse observation span on any exit path.
+            # The normal-path close in _build_run_result only fires on
+            # structured completion, not on unhandled exceptions.
+            _task_ctx = getattr(self, "_active_task_context", None)
+            if _task_ctx is not None:
+                try:
+                    _task_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+            self._active_task_context = None
+            # Clear accumulated findings even on exception so stale
+            # findings never leak into a subsequent run() call.
+            self._accumulated_structured_findings.clear()
 
     def _build_run_result(
         self,
@@ -1014,9 +1032,21 @@ class ReActAgent:
                     git_state=_git_state,
                     step=step,
                     total_tokens=total_tokens,
+                    cancellation=_cancellation,
                 )
                 if tool_batch.result is not None:
                     return tool_batch.result
+                # Check cancellation after tool batch — long-running tool
+                # executions may have completed during a cancel request.
+                if _cancellation.is_cancelled:
+                    return self._build_run_result(
+                        ctx=_finish_ctx,
+                        status=RunStatus.CANCELLED,
+                        summary=_cancellation.detail or "Cancelled during execution",
+                        steps_taken=step,
+                        total_tokens_used=total_tokens,
+                        cache_stats=cumulative_cache,
+                    )
                 _test_was_run = (
                     _test_was_run or tool_batch.test_was_run
                 )
@@ -1130,10 +1160,15 @@ class ReActAgent:
         observer = get_observer()
         task_context = observer.start_task(task)
         task_observation = task_context.__enter__()
+        # Store on self so run()'s finally block can close the span
+        # even when _run_body throws an unhandled exception.
+        self._active_task_context = task_context
         log.log_task_start(task)
         logger.info("Agent starting task %s", task.task_id)
 
         history = getattr(self, "_pending_history", None)
+        _had_pending_history = history is not None
+        self._pending_history = None  # Consume once, never reuse across run() calls
         if history is None:
             history = ConversationHistory(
                 max_messages=self._cfg.history_max_messages,
@@ -1148,10 +1183,14 @@ class ReActAgent:
                 ),
             ))
         capabilities = CapabilitySnapshot.probe(task.repo_path)
-        history.add(LLMMessage(
-            role="user",
-            content=capabilities.render_for_agent(),
-        ))
+        # Only inject capabilities when building a fresh history.
+        # If _pending_history was provided (session resume), capabilities
+        # were already injected in the original run.
+        if not _had_pending_history:
+            history.add(LLMMessage(
+                role="user",
+                content=capabilities.render_for_agent(),
+            ))
         logger.info("Capability: %s", capabilities.render_for_agent())
 
         stats_collector = self._cfg.stats_collector
@@ -1464,6 +1503,7 @@ class ReActAgent:
             repo_map,
             consumed_tokens=total_tokens,
             max_context_window=self._backend.max_context_window,
+            step=step,
         )
         provider_request = prepare_provider_request(
             messages=messages,
@@ -1730,11 +1770,17 @@ class ReActAgent:
             self._memory_context.set_active_files(
                 getattr(self, "_accessed_files", None) or set()
             )
-        log.log_action(
-            step=step,
-            action=action,
-            raw_content=getattr(response, "raw_content", ""),
-        )
+        try:
+            log.log_action(
+                step=step,
+                action=action,
+                raw_content=getattr(response, "raw_content", ""),
+            )
+        except Exception as _log_exc:
+            logger.critical("Event log write failed at step %d: %s", step, _log_exc)
+            raise RuntimeError(
+                f"Critical: event log I/O failure at step {step}"
+            ) from _log_exc
         logger.info("Step %d: %r", step, action)
         return _AcceptedActionApplication(
             state,
@@ -2292,6 +2338,7 @@ class ReActAgent:
         git_state: _GitState,
         step: int,
         total_tokens: int,
+        cancellation: Any = None,
     ) -> _ToolBatchApplication:
         """Execute and apply one ordered batch of model tool calls."""
         execution_context = replace(
@@ -2380,6 +2427,24 @@ class ReActAgent:
                     "The task cannot continue until this is resolved. "
                     "Summarize your findings and call finish."
                 )
+                # Log the observation BEFORE returning — event log replay
+                # requires every tool_call to have a paired observation.
+                observation = self._apply_tool_result_analysis(
+                    analysis,
+                    tool_name=tool_call.name,
+                    metadata=metadata,
+                    result=result,
+                    completion_context=completion_context,
+                    execution_budget=execution_budget,
+                    task=task,
+                    git_state=git_state,
+                )
+                observations.append(observation)
+                log.log_observation(
+                    step=step,
+                    observation=observation,
+                    tool_call_id=tool_call.id,
+                )
                 state_machine.fail(
                     TerminationReason.ENVIRONMENT_UNAVAILABLE,
                     block.detail,
@@ -2435,18 +2500,6 @@ class ReActAgent:
                 tool_call_id=tool_call.id,
             )
             if missing_observation is not None:
-                summary = self._format_missing_test_target_summary(
-                    missing_observation,
-                )
-                run_result = self._finish_missing_test_target(
-                    summary=summary,
-                    task=task,
-                    log=log,
-                    finish_context=finish_context,
-                    step=step,
-                    total_tokens=total_tokens,
-                    cache_stats=cache_stats,
-                )
                 return _ToolBatchApplication(
                     tool_calls=tool_calls,
                     observations=tuple(observations),
@@ -2454,7 +2507,6 @@ class ReActAgent:
                     verification_ok=verification_ok,
                     any_test_failed=any_test_failed,
                     missing_test_target_observation=missing_observation,
-                    result=run_result,
                 )
 
         return _ToolBatchApplication(
@@ -2772,6 +2824,8 @@ class ReActAgent:
         repo_map: RepoMap,
         consumed_tokens: int = 0,
         max_context_window: int | None = None,
+        *,
+        step: int = 1,
     ) -> list[LLMMessage]:
         """
         组装发给 LLM 的完整 messages，含 token 裁剪。
@@ -2854,6 +2908,7 @@ class ReActAgent:
             ),
             tokens_freed=getattr(self, "_trim_tokens_freed", 0),
             history_materializer_fn=None,
+            step=step,
         )
 
         self._compact_triggered_this_step = ctx.compact_triggered
@@ -2862,7 +2917,14 @@ class ReActAgent:
         # Post-compaction recovery: re-inject critical context (CC-aligned)
         if ctx.compact_triggered:
             self._persist_compaction_summary(ctx.compaction_summary)
-            ctx.messages = self._inject_recovery_after_compact(ctx.messages)
+            # Do NOT re-inject memory here if it was already injected pre-compaction
+            # by build_request_messages (line 2843).  The `long_term` variable was
+            # passed as long_term_context; if non-empty, it's already in the message
+            # set and reappending it would double-inject.
+            ctx.messages = self._inject_recovery_after_compact(
+                ctx.messages,
+                memory_already_injected=bool(long_term),
+            )
 
         return ctx.messages
 
@@ -2880,9 +2942,9 @@ class ReActAgent:
         _history_dicts = project_view(history.to_dicts(), _collapse_store)
         return ConversationHistory.from_dicts(_history_dicts, max_messages=history.max_messages)
 
-    def _inject_recovery_after_compact(self, messages: list[LLMMessage]) -> list[LLMMessage]:
+    def _inject_recovery_after_compact(self, messages: list[LLMMessage], *, memory_already_injected: bool = False) -> list[LLMMessage]:
         """Append recovery context after a compaction event."""
-        recovery_msgs = self._build_recovery_messages()
+        recovery_msgs = self._build_recovery_messages(memory_already_injected=memory_already_injected)
         findings = getattr(self, "_accumulated_structured_findings", [])
         if findings:
             recovery_msgs.append(LLMMessage(role="user", content=(
@@ -2895,18 +2957,24 @@ class ReActAgent:
             return list(messages) + recovery_msgs
         return messages
 
-    def _build_recovery_messages(self) -> list["LLMMessage"]:
+    def _build_recovery_messages(self, *, memory_already_injected: bool = False) -> list["LLMMessage"]:
         """Post-compaction context re-injection (CC-aligned).
 
         Re-injects: file cache, skill buffer, CLAUDE.md, AND memory section.
+        When memory_already_injected is True, the memory context was already
+        present in the pre-compaction message set and must not be duplicated.
         """
         recovery = _build_compaction_recovery(self._full_registry, self._current_repo_path)
-        msgs = recovery.build_recovery_messages([])
+        raw_msgs = recovery.build_recovery_messages([])
+        msgs = [LLMMessage(role=m.get("role", "user"), content=m.get("content", "")) for m in raw_msgs]
         # M2: re-inject memory section after compaction (CC: auto-memory survives compaction)
-        self._invalidate_ltc()
-        _ltc = self._build_long_term_context()
-        if _ltc:
-            msgs.append(LLMMessage(role="user", content=f"[MEMORY RESTORED]\n{_ltc}"))
+        if not memory_already_injected:
+            self._invalidate_ltc()
+            _ltc = self._build_long_term_context()
+            if _ltc:
+                msgs.append(LLMMessage(role="user", content=f"[MEMORY RESTORED]\n{_ltc}"))
+        # Reset feedback-injected tracking so rules fire again post-compaction
+        self._feedback_injected_files.clear()
         return msgs
 
     def _check_pending_mode_switch(self, registry: Any, history: Any) -> None:
@@ -3188,11 +3256,20 @@ class ReActAgent:
                     message=event.finish_message or accumulated_text,
                 )
 
+        # Stream ended without FINISH (network disruption, backend error, etc.).
+        # If speculative tool execution produced tool calls, return them;
+        # otherwise report the incomplete stream as a structured finish.
         self._stream_usage = None
+        if tool_calls_raw:
+            return Action(
+                action_type=ActionType.TOOL_CALL,
+                thought=accumulated_thought,
+                tool_calls=tool_calls_raw,
+            )
         return Action(
             action_type=ActionType.FINISH,
             thought=accumulated_thought,
-            message=accumulated_text or "Stream ended.",
+            message=accumulated_text or "Stream ended before model produced a result.",
         )
 
     # ------------------------------------------------------------------
@@ -3274,6 +3351,9 @@ class ReActAgent:
             history.replace_messages(
                 history.from_dicts(compacted, history.max_messages),
             )
+            # History was replaced — collapse-store indices are now stale.
+            # Reset to avoid IndexError or context corruption on next projection.
+            self._context_trimming_state.collapse_store = None
             logger.info("Reactive compact succeeded — retrying LLM call")
             return state.with_updates(
                 transition=Transition.reactive_compact(),
