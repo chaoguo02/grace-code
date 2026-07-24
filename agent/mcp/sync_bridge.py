@@ -93,12 +93,22 @@ class SyncMCPToolManager:
         self._thread.start()
         self._bridges: dict[str, MCPToolBridge] = {}
         self._tool_map: dict[str, tuple[str, str]] = {}
+        self._server_tools: dict[str, list[str]] = {}
+        self._failed_servers: dict[str, str] = {}
         self._default_policy = default_policy or ExecutionPolicy()
         self._closed = False
 
     @property
     def bridges(self) -> dict[str, MCPToolBridge]:
         return dict(self._bridges)
+
+    @property
+    def server_tools(self) -> dict[str, list[str]]:
+        return {name: list(tools) for name, tools in self._server_tools.items()}
+
+    @property
+    def failed_servers(self) -> dict[str, str]:
+        return dict(self._failed_servers)
 
     def __enter__(self) -> "SyncMCPToolManager":
         return self
@@ -111,11 +121,13 @@ class SyncMCPToolManager:
         self._ensure_open()
         runtime_tools: list[Any] = []
         for config in server_configs:
+            self._failed_servers.pop(config.name, None)
             bridge = create_mcp_bridge(config)
             try:
                 tools = self._run_coro(bridge.connect())
             except Exception as exc:  # pragma: no cover - exact SDK failures vary
                 logger.warning("Failed to connect MCP server %s: %s", config.name, exc)
+                self._failed_servers[config.name] = str(exc)
                 try:
                     self._run_coro(bridge.close())
                 except Exception:
@@ -123,16 +135,22 @@ class SyncMCPToolManager:
                 continue
 
             self._bridges[config.name] = bridge
+            self._server_tools[config.name] = []
             for tool_info in tools:
                 runtime_tool = mcp_tool_to_runtime_tool(bridge, tool_info)
                 runtime_tools.append(runtime_tool)
                 self._tool_map[runtime_tool.name] = (config.name, tool_info.name)
+                self._server_tools[config.name].append(runtime_tool.name)
             # MCP Resources: also register resource list/read tools
             from agent.mcp.tool_adapter import create_resource_list_tool, create_resource_read_tool
             resource_list_tool = create_resource_list_tool(bridge)
             runtime_tools.append(resource_list_tool)
+            self._tool_map[resource_list_tool.name] = (config.name, resource_list_tool.name)
+            self._server_tools[config.name].append(resource_list_tool.name)
             resource_read_tool = create_resource_read_tool(bridge)
             runtime_tools.append(resource_read_tool)
+            self._tool_map[resource_read_tool.name] = (config.name, resource_read_tool.name)
+            self._server_tools[config.name].append(resource_read_tool.name)
         return runtime_tools
 
     def execute_tool(
@@ -195,17 +213,30 @@ class SyncMCPToolManager:
         except Exception as exc:
             return _error_result(namespaced_name, str(exc))
 
+    def close_server(self, server_name: str) -> None:
+        """Close one connected server and remove its tool registrations."""
+        bridge = self._bridges.pop(server_name, None)
+        if bridge is not None:
+            try:
+                self._run_coro(bridge.close())
+            except Exception:
+                logger.debug("Failed to close MCP server %s", server_name, exc_info=True)
+        for tool_name, (mapped_server, _) in list(self._tool_map.items()):
+            if mapped_server == server_name:
+                del self._tool_map[tool_name]
+        self._server_tools.pop(server_name, None)
+        self._failed_servers.pop(server_name, None)
+
     def close_all(self) -> None:
         """Close all bridges and stop the background event loop."""
         if self._closed:
             return
-        for bridge in list(self._bridges.values()):
-            try:
-                self._run_coro(bridge.close())
-            except Exception:
-                logger.debug("Failed to close MCP bridge", exc_info=True)
+        for server_name in list(self._bridges.keys()):
+            self.close_server(server_name)
         self._bridges.clear()
         self._tool_map.clear()
+        self._server_tools.clear()
+        self._failed_servers.clear()
         self._closed = True
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
@@ -309,10 +340,12 @@ class SyncMCPToolManager:
         stale = [k for k, v in self._tool_map.items() if v[0] == server_name]
         for k in stale:
             del self._tool_map[k]
+        self._server_tools[server_name] = []
         # Register new tools
         for tool_info in tools:
             runtime_tool = mcp_tool_to_runtime_tool(bridge, tool_info)
             self._tool_map[runtime_tool.name] = (server_name, tool_info.name)
+            self._server_tools[server_name].append(runtime_tool.name)
 
 
 def _error_result(tool_name: str, message: str) -> MCPCallResult:

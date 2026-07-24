@@ -176,7 +176,26 @@ def adapt_mcp_tools(tool_infos: list[MCPToolInfo], *, manager: Any, defer: bool 
 
 
 def _sync_execute(tool: Any, arguments: dict[str, Any]) -> Any:
-    result = asyncio.run(tool.call(arguments, ToolUseContext()))
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        result = asyncio.run(tool.call(arguments, ToolUseContext()))
+    else:
+        result_box: dict[str, Any] = {}
+        error_box: dict[str, BaseException] = {}
+
+        def _runner() -> None:
+            try:
+                result_box["result"] = asyncio.run(tool.call(arguments, ToolUseContext()))
+            except BaseException as exc:
+                error_box["error"] = exc
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+        if error_box:
+            raise error_box["error"]
+        result = result_box["result"]
     if result.metadata.get("mcp_error"):
         raise RuntimeError(result.metadata["mcp_error"])
     return result.output
@@ -202,10 +221,14 @@ def create_resource_list_tool(bridge: MCPToolBridge):
 
     return build_tool(
         name=f"mcp__{server_name}__list_resources",
-        description=f"List resources from MCP server '{server_name}'",
+        description_text=f"List resources from MCP server '{server_name}'",
         input_schema={"type": "object", "properties": {}, "required": []},
         call_fn=call_fn,
-        metadata={"mcp_server": server_name, "is_resource": True},
+        mcp_props=MCPToolProps(
+            server_name=server_name,
+            original_tool_name="list_resources",
+            always_load=True,
+        ),
     )
 
 
@@ -229,18 +252,19 @@ def create_resource_read_tool(bridge: MCPToolBridge):
 
     return build_tool(
         name=f"mcp__{server_name}__read_resource",
-        description=f"Read an MCP resource from '{server_name}' by URI",
+        description_text=f"Read an MCP resource from '{server_name}' by URI",
         input_schema={
             "type": "object",
             "properties": {"uri": {"type": "string", "description": "Resource URI to read"}},
             "required": ["uri"],
         },
         call_fn=call_fn,
-        metadata={"mcp_server": server_name, "is_resource": True},
+        mcp_props=MCPToolProps(
+            server_name=server_name,
+            original_tool_name="read_resource",
+            always_load=True,
+        ),
     )
-    if result.metadata.get("mcp_error"):
-        raise RuntimeError(result.metadata["mcp_error"])
-    return result.output
 
 
 def _coerce_execute_result(tool_name: str, result: Any) -> ToolResult[str]:

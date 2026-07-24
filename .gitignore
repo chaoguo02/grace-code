@@ -35,6 +35,7 @@ docs/*.md
 !docs/CORE_ARCHITECTURE_REPORT.md
 !docs/LEGACY_OWNERSHIP.md
 !docs/PHASE10_ROADMAP.md
+!docs/PHASE11_*.md
 !docs/PHASE4_BATCH_*.md
 !docs/PHASE5_BATCH_*.md
 !docs/PHASE5_CLOSURE_REPORT.md

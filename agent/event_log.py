@@ -23,6 +23,12 @@ from pathlib import Path
 from typing import Iterator, Any
 
 from agent.task import Event, EventType, ObservationStatus, Task, Action, Observation, RunResult
+from observability.models import (
+    ReplayContractSnapshot,
+    ReplayRunRecord,
+    ReplayStepRecord,
+    dataclass_to_dict,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +303,34 @@ class EventLog:
                 "steps":  steps,
                 "reason": reason,
             },
+        ))
+
+    # ------------------------------------------------------------------
+    # Replay contract methods
+    # ------------------------------------------------------------------
+
+    def log_replay_step(self, step_record: ReplayStepRecord) -> None:
+        """Emit a single replay step record."""
+        self._append(Event(
+            event_type=EventType.REPLAY_STEP,
+            task_id=self._current_task_id,
+            payload=dataclass_to_dict(step_record),
+        ))
+
+    def log_replay_run(self, run_record: ReplayRunRecord) -> None:
+        """Emit the full replay run record at end of execution."""
+        self._append(Event(
+            event_type=EventType.REPLAY_RUN,
+            task_id=self._current_task_id,
+            payload=dataclass_to_dict(run_record),
+        ))
+
+    def log_replay_snapshot(self, snapshot: ReplayContractSnapshot) -> None:
+        """Emit a complete contract snapshot (version + run)."""
+        self._append(Event(
+            event_type=EventType.REPLAY_RUN,
+            task_id=self._current_task_id,
+            payload=dataclass_to_dict(snapshot),
         ))
 
     # ------------------------------------------------------------------
