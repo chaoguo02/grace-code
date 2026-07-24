@@ -2138,14 +2138,16 @@ class SessionRuntime:
         ``broker.resolve()``.  This is the exact same synchronous-blocking
         pattern as CC's stdin ``control_response``.
         """
-        if session_id not in self._approval_brokers:
-            from server.services.approval_broker import ApprovalBroker
-            self._approval_brokers[session_id] = ApprovalBroker(session_id)
-        return self._approval_brokers[session_id]
+        with self._active_sessions_lock:
+            if session_id not in self._approval_brokers:
+                from server.services.approval_broker import ApprovalBroker
+                self._approval_brokers[session_id] = ApprovalBroker(session_id)
+            return self._approval_brokers[session_id]
 
     def get_approval_broker(self, session_id: str) -> "ApprovalBroker | None":
         """Return the ApprovalBroker for *session_id*, if one exists."""
-        return self._approval_brokers.get(session_id)
+        with self._active_sessions_lock:
+            return self._approval_brokers.get(session_id)
 
     def set_web_confirm_callback(
         self, session_id: str, callback: "WebConfirmCallback",

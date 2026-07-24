@@ -1026,6 +1026,10 @@ class AgentService:
         Returns:
             bool: True if an active cancellation token was found and signalled.
         """
+        # Wake any pending approval first so the agent loop can exit quickly
+        broker = self._runtime.get_approval_broker(session_id)
+        if broker is not None:
+            broker.cancel_pending()
         cancelled = self._runtime.cancel_session(session_id, detail=detail)
         if cancelled and getattr(self, "_event_bus", None) is not None:
             self._event_bus.publish_typed(

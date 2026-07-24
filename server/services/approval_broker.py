@@ -134,6 +134,11 @@ class ApprovalBroker:
         with self._lock:
             self._pending.pop(req_id, None)
 
+        # Check decision first — resolve() may have raced with the timeout
+        # and set the decision after event.wait() returned False.
+        if pending.decision is not None:
+            return pending.decision
+
         if not signaled:
             logger.warning("ApprovalBroker timeout — id=%s tool=%s", req_id, request.tool_name)
             return PromptDecision(
@@ -167,6 +172,26 @@ class ApprovalBroker:
         pending.decision = decision
         pending.event.set()
         return True
+
+    # ── Cancel ────────────────────────────────────────────────────────────
+
+    def cancel_pending(self) -> int:
+        """Cancel ALL pending approvals for this session.
+
+        Called from cancel_session() — wakes any agent thread blocked in
+        wait_for_decision() so cancellation takes effect immediately
+        instead of waiting up to 60s for the timeout.
+        """
+        with self._lock:
+            count = len(self._pending)
+            for pending in list(self._pending.values()):
+                pending.decision = PromptDecision(
+                    action=PromptAction.DENY,
+                    note="Session cancelled",
+                )
+                pending.event.set()
+            self._pending.clear()
+            return count
 
     # ── Introspection ────────────────────────────────────────────────────
 

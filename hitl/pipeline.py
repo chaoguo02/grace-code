@@ -409,6 +409,10 @@ class PermissionPipeline:
         scoped._session_rules = list(self._session_rules)
         scoped._stats = PipelineStats()
         scoped._permission_mode = self._permission_mode
+        # Isolate denial counters so child agents don't trigger
+        # the parent's circuit breaker via shared mutable state.
+        scoped._denial_counters = dict(self._denial_counters)
+        scoped._total_denials = self._total_denials
         # _web_confirm_callback is intentionally shared (thread-safe)
         return scoped
 
@@ -425,6 +429,10 @@ class PermissionPipeline:
         derived._session_rules = list(self._session_rules)
         derived._stats = PipelineStats()
         derived._permission_mode = self._permission_mode
+        # Isolate denial counters so child agents don't trigger
+        # the parent's circuit breaker via shared mutable state.
+        derived._denial_counters = dict(self._denial_counters)
+        derived._total_denials = self._total_denials
         return derived
 
     @property

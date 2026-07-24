@@ -1826,6 +1826,9 @@ class ReActAgent:
                 step,
             )
         summary = action.thought or action.message or "Task complete."
+        from agent.session.task_state_machine import TaskState
+        if state_machine.state is not TaskState.COMPLETING:
+            state_machine.transition(TaskState.COMPLETING, detail or "auto-complete")
         state_machine.complete(
             VerificationStatus.NOT_APPLICABLE,
             detail=detail,
@@ -2974,7 +2977,8 @@ class ReActAgent:
             if _ltc:
                 msgs.append(LLMMessage(role="user", content=f"[MEMORY RESTORED]\n{_ltc}"))
         # Reset feedback-injected tracking so rules fire again post-compaction
-        self._feedback_injected_files.clear()
+        if hasattr(self, "_feedback_injected_files"):
+            self._feedback_injected_files.clear()
         return msgs
 
     def _check_pending_mode_switch(self, registry: Any, history: Any) -> None:
