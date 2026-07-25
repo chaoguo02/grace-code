@@ -72,25 +72,35 @@ function StatusCluster() {
 export default function App() {
   const [activeView, setActiveView] = useState<ViewName>("chat");
   const activeId = useSessionStore((s) => s.activeId);
+  const [leftCollapsed, setLeftCollapsed] = useState(false);
+  const [rightCollapsed, setRightCollapsed] = useState(false);
+
+  const appClass = [
+    activeView === "chat" ? "has-event-sidebar" : "",
+    leftCollapsed ? "left-collapsed" : "",
+    rightCollapsed ? "right-collapsed" : "",
+  ].filter(Boolean).join(" ");
 
   return (
     <div id="app-shell">
-      <div id="app" className={activeView === "chat" ? "has-event-sidebar" : ""}>
-        <div className="left-rail">
-          <ErrorBoundary>
-            <SessionSidebar />
-            <SessionTree />
-          </ErrorBoundary>
+      <div id="app" className={appClass}>
+        <div className={`left-rail${leftCollapsed ? " collapsed" : ""}`}>
+          {leftCollapsed ? (
+            <div className="left-rail-collapsed-strip">
+              <button className="sidebar-expand-btn" type="button" onClick={() => setLeftCollapsed(false)} aria-label="Expand sidebar">›</button>
+            </div>
+          ) : (
+            <ErrorBoundary>
+              <SessionSidebar onToggleCollapse={() => setLeftCollapsed(true)} />
+              <SessionTree />
+            </ErrorBoundary>
+          )}
         </div>
 
         <ErrorBoundary>
           <main className="main main-workbench">
-            <header className="topbar topbar-workbench">
+            <header className="topbar topbar-workbench topbar-compact">
               <div className="topbar-left">
-                <div className="topbar-workbench-copy">
-                  <div className="topbar-kicker">Agent workbench</div>
-                  <div className="topbar-title">Calm, structured, and centered on the current session</div>
-                </div>
                 <div className="view-tabs">
                   {TABS.map((tab) => (
                     <button
@@ -124,7 +134,12 @@ export default function App() {
           </main>
         </ErrorBoundary>
 
-        {activeView === "chat" && <ErrorBoundary><EventSidebar key={activeId ?? "no-session"} /></ErrorBoundary>}
+        {activeView === "chat" && !rightCollapsed && <ErrorBoundary><EventSidebar key={activeId ?? "no-session"} onToggleCollapse={() => setRightCollapsed(!rightCollapsed)} /></ErrorBoundary>}
+        {activeView === "chat" && rightCollapsed && (
+          <div className="right-rail-collapsed">
+            <button className="sidebar-expand-btn" type="button" onClick={() => setRightCollapsed(false)} aria-label="Expand trace">‹</button>
+          </div>
+        )}
       </div>
     </div>
   );

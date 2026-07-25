@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import type { Message, TimelineItem, WsMessage } from "../types";
 import type { WsEnvelope, WsPlanReadyEvent } from "../types/events";
+import type { ContentBlock, ThoughtBlock, ToolUseBlock } from "../types/blocks";
+import { blockId, blockHash } from "../types/blocks";
 import * as api from "../api/sessions";
 import { ApiError } from "../api/client";
 import { connectWebSocket, disconnectWebSocket, scheduleReconnect } from "../hooks/useWebSocket";
@@ -58,6 +60,12 @@ export interface SessionUiState {
   contextTotal: number;
   /** Highest backend trace sequence rendered for this session. */
   lastTraceSeq: number;
+  /** Live streaming blocks — WS deltas mutate this array directly. */
+  streamingBlocks: ContentBlock[];
+  /** DB-loaded blocks per message id. Replaces streaming on loadTimeline. */
+  dbBlocksByMsgId: Record<string, { blocks: ContentBlock[]; role: "user" | "assistant" }>;
+  /** View mode: verbose | normal | summary (CC-aligned). */
+  viewMode: "verbose" | "normal" | "summary";
 }
 
 interface ChatState {
@@ -93,6 +101,7 @@ interface ChatState {
   setDraft: (text: string, sessionId?: string | null) => void;
   setRunning: (sessionId: string | null | undefined, value: boolean) => void;
   setMode: (mode: string, sessionId?: string | null) => void;
+  cycleViewMode: (sessionId?: string | null) => void;
   switchModel: (model: string, provider?: string, sessionId?: string | null) => Promise<void>;
   compactSession: (sessionId?: string | null) => Promise<boolean>;
   setViewingChild: (id: string | null, sessionId?: string | null) => void;
@@ -118,7 +127,151 @@ export function createEmptySessionUiState(): SessionUiState {
     streamingThought: "",
     contextTotal: 200000,  // default for deepseek-v4 / large models
     lastTraceSeq: 0,
+    streamingBlocks: [],
+    dbBlocksByMsgId: {},
+    viewMode: loadViewModePreference(),
   };
+}
+
+/** Load global view mode preference from localStorage. Default: normal. */
+function loadViewModePreference(): "verbose" | "normal" | "summary" {
+  try {
+    const v = localStorage.getItem("grace-view-mode");
+    if (v === "verbose" || v === "summary") return v;
+  } catch { /* localStorage unavailable */ }
+  return "normal";
+}
+
+// ── WS → ContentBlock mapping ──────────────────────────────────────────
+
+/** Map a WS event to a ContentBlock delta for the streaming blocks array. */
+function applyWsToBlocks(
+  blocks: ContentBlock[],
+  ev: WsMessage,
+  messageId: string,
+): void {
+  if (ev.type === "thought_delta") {
+    const last = blocks[blocks.length - 1];
+    if (last?.type === "thought" && last.phase === "streaming") {
+      last.content += ev.text || "";
+    } else {
+      blocks.push({
+        type: "thought",
+        content: ev.text || "",
+        summary: "",
+        phase: "streaming",
+      });
+    }
+    return;
+  }
+
+  if (ev.type === "thought") {
+    // Full thought replaces any streaming thought blocks
+    const last = blocks[blocks.length - 1];
+    if (last?.type === "thought" && last.phase === "streaming") {
+      last.content = ev.content || "";
+      last.phase = "completed";
+      last.summary = summarizeThought(ev.content || "");
+    } else {
+      blocks.push({
+        type: "thought",
+        content: ev.content || "",
+        summary: summarizeThought(ev.content || ""),
+        phase: "completed",
+      });
+    }
+    return;
+  }
+
+  if (ev.type === "tool_call") {
+    blocks.push({
+      type: "tool_use",
+      id: ev.id || blockId(messageId, blocks.length),
+      name: ev.name || "unknown",
+      input: (ev.params || {}) as Record<string, unknown>,
+      status: "running",
+    });
+    return;
+  }
+
+  if (ev.type === "observation") {
+    // Find the matching tool_use block (last running one with matching id)
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i];
+      if (b.type === "tool_use" && b.status === "running") {
+        if (!ev.id || b.id === ev.id || b.name === (ev.tool_name || "")) {
+          b.status = ev.error ? "error" : "success";
+          b.output = ev.output;
+          b.error = ev.error;
+          b.outputSize = (ev.output || "").length;
+          break;
+        }
+      }
+    }
+    return;
+  }
+
+  // Other events (status, subagent, etc.) — not mapped to blocks
+}
+
+/** Extract first sentence as thought summary. Fallback: generic label. */
+function summarizeThought(content: string): string {
+  const first = content.split(/[.。\n]/)[0]?.trim() || "";
+  return first.length > 10 && first.length < 120 ? first : "Thinking…";
+}
+
+/** Extract ContentBlocks from merged timeline items (DB path). */
+function extractBlocksFromTimeline(
+  items: TimelineItem[],
+): Map<string, { blocks: ContentBlock[]; role: "user" | "assistant" }> {
+  const result = new Map<string, { blocks: ContentBlock[]; role: "user" | "assistant" }>();
+  let currentMsgId = "";
+  let currentRole: "user" | "assistant" = "assistant";
+  let blocks: ContentBlock[] = [];
+
+  for (const item of items) {
+    if (item.source === "message") {
+      const role = item.msg.role;
+      // Flush previous message before starting a new one
+      if (currentMsgId && blocks.length > 0) {
+        result.set(currentMsgId, { blocks, role: currentRole });
+      }
+      currentMsgId = item.msg.created_at || `msg_${result.size}`;
+      blocks = [];
+
+      if (role === "user" && item.msg.content) {
+        currentRole = "user";
+        blocks.push({ type: "text", content: item.msg.content });
+      } else if (role === "assistant" && item.msg.content) {
+        currentRole = "assistant";
+        blocks.push({ type: "text", content: item.msg.content });
+      }
+      // tool messages are ignored — their content appears in tool_use blocks
+    } else if (item.source === "ws") {
+      const msgId = currentMsgId || `msg_${result.size}_stream`;
+      applyWsToBlocks(blocks, item.ws, msgId);
+    }
+  }
+  if (currentMsgId && blocks.length > 0) {
+    result.set(currentMsgId, { blocks, role: currentRole });
+  }
+  return result;
+}
+
+/** Integrity check: compare streaming block count + last block hash with DB. */
+function checkBlockIntegrity(
+  streamingBlocks: ContentBlock[],
+  dbBlocksByMsgId: Record<string, { blocks: ContentBlock[]; role: string }>,
+): boolean {
+  if (streamingBlocks.length === 0) return true;
+  const allDbBlocks = Object.values(dbBlocksByMsgId).flatMap((e) => e.blocks);
+  if (allDbBlocks.length === 0) return true;
+
+  if (streamingBlocks.length !== allDbBlocks.length) return false;
+
+  const wsLast = streamingBlocks[streamingBlocks.length - 1];
+  const dbLast = allDbBlocks[allDbBlocks.length - 1];
+  return blockHash(wsLast) === blockHash(dbLast);
 }
 
 const EMPTY_SESSION_UI_STATE = createEmptySessionUiState();
@@ -378,9 +531,28 @@ export const useChatStore = create<ChatState>((set, get) => {
         lastTraceSeq: evSeq > prev.lastTraceSeq ? evSeq : prev.lastTraceSeq,
       }));
 
+      // ── ContentBlock streaming: map WS events to blocks ──
+      // Mutates the streamingBlocks array in place for the current session.
+      if (
+        ev.type === "thought_delta" || ev.type === "thought" ||
+        ev.type === "tool_call" || ev.type === "observation"
+      ) {
+        patchSession(sid, (prev) => {
+          const blocks = [...prev.streamingBlocks];
+          applyWsToBlocks(blocks, ev, `msg_${sid}_stream`);
+          return { ...prev, streamingBlocks: blocks };
+        });
+      }
+
       if (ev.type === "status") {
         if (ev.status === "running") {
-          patchSession(sid, (prev) => ({ ...prev, isRunning: true, error: null }));
+          patchSession(sid, (prev) => ({
+            ...prev, isRunning: true, error: null,
+            // Only clear if truly empty — sendChat may have already
+            // injected the user's prompt.  WS reconnect or replay can
+            // send running again without going through sendChat.
+            streamingBlocks: prev.streamingBlocks.length > 0 ? prev.streamingBlocks : [],
+          }));
         } else if (ev.status === "completed") {
           clearWatchdog();
           patchSession(sid, (prev) => ({
@@ -389,6 +561,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             steps: ev.result?.steps_taken ?? prev.steps,
             tokens: ev.result?.total_tokens ?? prev.tokens,
             streamingThought: "",
+            streamingBlocks: [],  // run complete → clear live blocks
             // Do NOT clear planApproval here — when the plan agent
             // exits via ExitPlanMode, the plan_ready event that
             // follows immediately will overwrite it.  If the plan
@@ -669,6 +842,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         // Only clear planApproval if it was already resolved (not waiting).
         // Preserve it when user is sending feedback while plan is still pending.
         planApproval: prev.planApproval?.isWaiting ? prev.planApproval : null,
+        // Inject the user's prompt as the first streaming block.
+        // This fills the "streaming window gap" before WS events arrive.
+        // loadTimeline replaces this with real DB blocks on completion.
+        streamingBlocks: [{ type: "text", content: prompt }],
       }));
       clearWatchdog();  // clear any stale timer from a previous run
       _watchdogTimer = setTimeout(() => {
@@ -738,6 +915,19 @@ export const useChatStore = create<ChatState>((set, get) => {
       const sid = resolveSessionId(sessionId);
       if (!sid) return;
       patchSession(sid, (prev) => ({ ...prev, currentMode: mode }));
+    },
+
+    cycleViewMode: (sessionId) => {
+      const sid = resolveSessionId(sessionId);
+      if (!sid) return;
+      const next: Record<string, "verbose" | "normal" | "summary"> = {
+        verbose: "normal", normal: "summary", summary: "verbose",
+      };
+      patchSession(sid, (prev) => {
+        const vm = next[prev.viewMode] || "normal";
+        try { localStorage.setItem("grace-view-mode", vm); } catch { /* ok */ }
+        return { ...prev, viewMode: vm };
+      });
     },
 
     switchModel: async (model, provider, sessionId) => {
@@ -830,16 +1020,31 @@ export const useChatStore = create<ChatState>((set, get) => {
           };
         }
 
-        patchSession(sessionId, (prev) => ({
-          ...prev,
-          events: afterSeq > 0
-            ? [...events.slice().reverse(), ...prev.events].slice(0, 100)
-            : events.slice().reverse().slice(0, 100),
-          timeline: mergeTimelineItems(afterSeq > 0 ? prev.timeline : [], timelineItems),
-          // Only clear planApproval on initial load; preserve live WS-set state on reconnect.
-          planApproval: afterSeq > 0 ? prev.planApproval : (planApproval ?? prev.planApproval),
-          lastTraceSeq: Math.max(prev.lastTraceSeq, response.last_seq || 0),
-        }));
+        // ── ContentBlock integrity check ──
+        // Compare streaming blocks with DB blocks. If they match, silently
+        // replace attributes (no remount). If they differ, full remount.
+        const dbBlocks = extractBlocksFromTimeline(timelineItems);
+        const dbBlocksByMsgId: Record<string, { blocks: ContentBlock[]; role: "user" | "assistant" }> = {};
+        for (const [msgId, entry] of dbBlocks) {
+          if (entry.blocks.length > 0) dbBlocksByMsgId[msgId] = entry;
+        }
+
+        patchSession(sessionId, (prev) => {
+          const integrityOk = checkBlockIntegrity(prev.streamingBlocks, dbBlocksByMsgId);
+          return {
+            ...prev,
+            events: afterSeq > 0
+              ? [...events.slice().reverse(), ...prev.events].slice(0, 100)
+              : events.slice().reverse().slice(0, 100),
+            timeline: mergeTimelineItems(afterSeq > 0 ? prev.timeline : [], timelineItems),
+            planApproval: afterSeq > 0 ? prev.planApproval : (planApproval ?? prev.planApproval),
+            lastTraceSeq: Math.max(prev.lastTraceSeq, response.last_seq || 0),
+            dbBlocksByMsgId,
+            // If integrity passes, streamingBlocks survive (no remount for render).
+            // If it fails, clear them so the render layer creates fresh components.
+            streamingBlocks: integrityOk ? prev.streamingBlocks : [],
+          };
+        });
       } catch (e: unknown) {
         if (afterSeq <= 0) {
           await get().loadMessages(sessionId, signal);
@@ -977,6 +1182,12 @@ export const useChatStore = create<ChatState>((set, get) => {
           planApproval: { ...planApproval, isWaiting: false },
         }));
         await api.approveSession(sid, comment);
+        // Explicit mode switch — approve always transitions to build.
+        // Don't rely on the useEffect to catch agent_name change because
+        // if the user temporarily switched to build in-memory before
+        // approving, the backend writing "build" again is a no-op and
+        // refreshActive won't trigger a mode sync.
+        get().setMode("build", sid);
         // Defensive: catch any events the backend emitted during
         // the approve → build transition (P4).
         try { void get().loadTimeline(sid, undefined, 0); } catch { /* best-effort */ }

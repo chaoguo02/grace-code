@@ -39,6 +39,7 @@ class AgentCfg:
     max_steps: int = 40
     budget_tokens: int = 80_000
     log_dir: str = ""
+    default_agent: str = "build"  # "build" | "plan" | "explore"
 
 
 @dataclass

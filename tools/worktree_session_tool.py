@@ -21,6 +21,9 @@ class EnterWorktreeTool(BaseTool):
 
     metadata = ToolMetadata(effects=frozenset({ToolEffect.WRITE_WORKSPACE}))
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
+
     @property
     def name(self) -> str:
         return "EnterWorktree"
@@ -72,6 +75,9 @@ class ExitWorktreeTool(BaseTool):
     """Exit a worktree session and return to the original directory."""
 
     metadata = ToolMetadata(effects=frozenset())
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     @property
     def name(self) -> str:

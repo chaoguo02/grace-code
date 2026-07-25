@@ -258,22 +258,50 @@ def run_child_agent(
 
     # Model override: subagent can use a different model than parent.
     # CC-aligned cost optimization — use cheaper model for exploration.
+    # Priority: 1) tool call model parameter  2) AgentDefinition.model field
     _effective_backend = backend
-    if getattr(request, 'model_name', None):
-        _model_name = request.model_name
+    _model_name = getattr(request, 'model_name', None) or None
+    if not _model_name:
+        _model_name = getattr(definition, 'model', None) or None
+    if _model_name and _model_name not in ("inherit", ""):
         logger.info("Subagent '%s' using model override: %s", agent_id[:8], _model_name)
         try:
             from llm.router import create_backend_from_config
             _cfg_snapshot = getattr(backend, '_config', None)
             if _cfg_snapshot is not None:
-                _effective_backend = create_backend_from_config({
-                    "provider": getattr(_cfg_snapshot, 'provider', ''),
-                    "model": _model_name,
-                    "api_key": getattr(_cfg_snapshot, 'api_key', None),
-                    "base_url": getattr(_cfg_snapshot, 'base_url', None),
-                    "max_tokens": getattr(_cfg_snapshot, 'max_tokens', None),
-                    "timeout_seconds": getattr(_cfg_snapshot, 'timeout_seconds', 60),
-                })
+                _parent_provider = str(getattr(_cfg_snapshot, 'provider', '')).lower()
+                # G2: cross-provider guard — model override only works within
+                # the same provider family. If the requested model doesn't match
+                # the parent provider, fall back to parent model.
+                _model_lower = _model_name.lower()
+                _provider_model_map = {
+                    "anthropic": ["claude-"],
+                    "openai": ["gpt-", "o1-", "o3-"],
+                    "deepseek": ["deepseek-"],
+                    "groq": [],  # Groq serves multiple model families
+                    "ollama": [],  # Ollama uses arbitrary model names
+                }
+                _expected_prefixes = _provider_model_map.get(_parent_provider)
+                _provider_ok = (
+                    _expected_prefixes is None  # unknown provider → allow
+                    or len(_expected_prefixes) == 0  # multi-family → allow
+                    or any(_model_lower.startswith(p) for p in _expected_prefixes)
+                )
+                if not _provider_ok:
+                    logger.warning(
+                        "Model override '%s' doesn't match parent provider '%s' — "
+                        "falling back to parent model",
+                        _model_name, _parent_provider,
+                    )
+                else:
+                    _effective_backend = create_backend_from_config({
+                        "provider": getattr(_cfg_snapshot, 'provider', ''),
+                        "model": _model_name,
+                        "api_key": getattr(_cfg_snapshot, 'api_key', None),
+                        "base_url": getattr(_cfg_snapshot, 'base_url', None),
+                        "max_tokens": getattr(_cfg_snapshot, 'max_tokens', None),
+                        "timeout_seconds": getattr(_cfg_snapshot, 'timeout_seconds', 60),
+                    })
         except Exception:
             logger.debug("Model override failed for %s, using parent model", agent_id[:8], exc_info=True)
 

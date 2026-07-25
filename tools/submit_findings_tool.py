@@ -135,6 +135,9 @@ class SubmitFindingsTool(BaseTool):
 
     metadata = ToolMetadata(effects=frozenset({ToolEffect.PRODUCE_DELIVERABLE}))
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(
         self, *, repo_path: str, accumulator: FindingsAccumulator | None = None,
     ) -> None:

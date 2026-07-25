@@ -185,6 +185,20 @@ class ShellTool(BaseTool):
                 return ToolConcurrency.PARALLEL_SAFE
         return ToolConcurrency.SERIAL
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        cmd = (params or {}).get("command", "").strip()
+        if not cmd:
+            return False
+        first_word = cmd.split()[0] if cmd else ""
+        if first_word in _READ_ONLY_COMMANDS:
+            return True
+        # Check read-only prefixes (git status, git log, etc.)
+        full_cmd_lower = cmd.lower().strip()
+        for prefix in _READ_ONLY_PREFIXES:
+            if full_cmd_lower.startswith(prefix):
+                return True
+        return False
+
     def permission_denial_reason(self, params: dict[str, Any]) -> str | None:
         cmd = self._build_cmd_repr(params)
         if _check_blocked(cmd):

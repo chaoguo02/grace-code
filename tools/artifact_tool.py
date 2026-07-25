@@ -23,6 +23,10 @@ class ArtifactListTool(BaseTool):
         effects=frozenset({ToolEffect.READ_AGENT_STATE}),
         dependency=ToolDependency.ARTIFACT_STORE,
     )
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(self, store_ref: ArtifactStoreRef) -> None:
         self._store_ref = store_ref
 
@@ -56,6 +60,10 @@ class ArtifactReadTool(BaseTool):
         effects=frozenset({ToolEffect.READ_AGENT_STATE}),
         dependency=ToolDependency.ARTIFACT_STORE,
     )
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(self, store_ref: ArtifactStoreRef) -> None:
         self._store_ref = store_ref
 

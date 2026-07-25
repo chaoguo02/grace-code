@@ -127,6 +127,8 @@ class ChatRequest:
     intent: TaskIntent | None = None
     permission_mode: str = "acceptEdits"
     repo_path: str = "."
+    allowed_prompts: tuple[dict[str, str], ...] = ()
+    """CC-aligned: ExitPlanMode pre-approved tool calls for the build session."""
 
 
 @dataclass(frozen=True)
@@ -358,6 +360,7 @@ class ChatPipeline:
             inject_permission_mode=request.permission_mode,
             inject_rules=inject_rules,
             session_context_text=prepared.session_context_text or "",
+            allowed_prompts=list(request.allowed_prompts),
         )
 
         # Accumulate cross-round stats in session metadata
@@ -400,28 +403,34 @@ class ChatPipeline:
                     )
             except Exception:
                 pass
-        # Write plan file to disk (not an event, just storage)
+        # Plan file is written by ExitPlanModeTool during agent execution.
+        # This is a fallback only — catches cases where the agent produced
+        # a contract without calling ExitPlanMode (e.g. max_turns reached).
         if _has_plan and result.summary:
             try:
                 _plan_dir = Path(self._ports.repo_path) / ".grace" / "plans"
                 _plan_dir.mkdir(parents=True, exist_ok=True)
                 _plan_file = _plan_dir / f"{request.session_id}.md"
-                _contract = result.contract
-                _plan_content = result.summary
-                if _contract:
-                    _plan_content = (
-                        f"---\n"
-                        f"goal: {_contract.get('goal', '')}\n"
-                        f"steps:\n"
-                        + "".join(f"  - {s}\n" for s in _contract.get('steps', []))
-                        + f"target_files:\n"
-                        + "".join(f"  - {f}\n" for f in _contract.get('target_files', []))
-                        + f"verification: {_contract.get('verification', '')}\n"
-                        + f"---\n\n"
-                        + result.summary
-                    )
-                _plan_file.write_text(_plan_content, encoding="utf-8")
-                logger.info("Plan file written: %s", _plan_file)
+                # Only write if ExitPlanMode hasn't already written it
+                if not _plan_file.is_file():
+                    _contract = result.contract
+                    _plan_content = result.summary
+                    if _contract:
+                        _plan_content = (
+                            f"---\n"
+                            f"goal: {_contract.get('goal', '')}\n"
+                            f"steps:\n"
+                            + "".join(f"  - {s}\n" for s in _contract.get('steps', []))
+                            + f"target_files:\n"
+                            + "".join(f"  - {f}\n" for f in _contract.get('target_files', []))
+                            + f"verification: {_contract.get('verification', '')}\n"
+                            + f"---\n\n"
+                            + result.summary
+                        )
+                    _plan_file.write_text(_plan_content, encoding="utf-8")
+                    logger.info("Plan file written (fallback): %s", _plan_file)
+                else:
+                    logger.debug("Plan file already exists (ExitPlanMode wrote it): %s", _plan_file)
             except Exception:
                 logger.debug("Plan file write skipped", exc_info=True)
         # Update DB agent_name if LLM produced plan in non-plan session

@@ -86,6 +86,9 @@ class GitStatusTool(BaseTool):
     (see class docstring below)
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(self, runtime: Runtime | None = None) -> None:
         from core.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
@@ -136,6 +139,9 @@ class GitDiffTool(BaseTool):
     """
     (see class docstring below)
     """
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     def __init__(self, runtime: Runtime | None = None) -> None:
         from core.process import LocalRuntime
@@ -216,6 +222,9 @@ class GitAddTool(BaseTool):
     (see class docstring below)
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
+
     def __init__(self, runtime: Runtime | None = None) -> None:
         from core.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
@@ -279,6 +288,9 @@ class GitCommitTool(BaseTool):
     """
     (see class docstring below)
     """
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
 
     def __init__(self, runtime: Runtime | None = None) -> None:
         from core.process import LocalRuntime

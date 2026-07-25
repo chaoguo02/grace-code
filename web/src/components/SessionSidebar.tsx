@@ -2,6 +2,8 @@ import { useEffect, useState, useCallback } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { SessionStatsDrawer } from "./SessionStatsDrawer";
 import { ConfirmModal } from "./ConfirmModal";
+import { getAppDefaults } from "../api/config";
+import { updateSession } from "../api/sessions";
 import type { SessionSummary } from "../types";
 import { summarizeStatus } from "../utils/status";
 
@@ -26,7 +28,7 @@ function statusClass(status: string) {
   return "status-neutral";
 }
 
-export function SessionSidebar() {
+export function SessionSidebar({ onToggleCollapse }: { onToggleCollapse?: () => void }) {
   const {
     sessions,
     activeId,
@@ -37,6 +39,7 @@ export function SessionSidebar() {
     createSession,
     deleteSession,
     deleteSessionsBatch,
+    refreshActive,
   } = useSessionStore();
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -115,17 +118,21 @@ export function SessionSidebar() {
             <span className="brand-mark">GC</span>
             <span className="brand-name">Grace Code</span>
           </div>
-          <button className="sidebar-collapse-btn" type="button" aria-label="Collapse sidebar">
+          <button className="sidebar-collapse-btn" type="button" aria-label="Collapse sidebar" onClick={onToggleCollapse}>
             ‹
           </button>
         </div>
 
         <div className="sidebar-action-row">
-          <button className="btn-primary sidebar-primary" type="button" onClick={() => createSession()}>
-            + Build
-          </button>
-          <button className="btn-secondary sidebar-primary" type="button" onClick={() => createSession("plan")}>
-            + Plan
+          <button className="btn-primary sidebar-primary" type="button" onClick={async () => {
+            try {
+              const defaults = await getAppDefaults();
+              createSession(defaults.default_agent || "build");
+            } catch {
+              createSession();  // fallback to build
+            }
+          }}>
+            + New Session
           </button>
         </div>
 
@@ -161,55 +168,36 @@ export function SessionSidebar() {
               onClick={() => handleOpen(s.id)}
               onKeyDown={(e: React.KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleOpen(s.id); } }}
             >
-              <div className="session-mainline">
-                <input
-                  className="session-checkbox"
-                  type="checkbox"
-                  aria-label={`Select session ${s.title || s.id}`}
-                  checked={selectedIds.has(s.id)}
-                  onChange={() => toggleSelectById(s.id)}
-                  onClick={(e) => e.stopPropagation()}
-                />
-
-                <div className="session-body">
-                  <div className="session-headline">
-                    <span className={`session-status-dot ${statusClass(s.status)}`} />
-                    <span className={`session-status-pill ${statusClass(s.status)}`}>
-                      {summarizeStatus(s.status)}
-                    </span>
-                    <span className="summary-subtle session-age">{formatRelative(s.updated_at)}</span>
-                  </div>
-
-                  <div className="session-preview" title={s.title || s.summary || s.id}>
-                    {s.title || s.summary || s.id}
-                  </div>
-
-                  <div className="session-meta">
-                    <span>{s.agent_name}</span>
-                    {s.total_tokens_estimate != null && <span>{s.total_tokens_estimate.toLocaleString()} tokens</span>}
-                    {s.message_count != null && <span>{s.message_count} steps</span>}
-                  </div>
-                </div>
-
+              <span className={`session-dot ${statusClass(s.status)}`} />
+              <span className="session-title" title={s.title || s.summary || s.id}>
+                {s.title || s.summary || s.id}
+              </span>
+              <span className="session-time">{formatRelative(s.updated_at)}</span>
+              <span className="session-actions">
                 <button
-                  className="session-stats-btn"
-                  onClick={(e) => {
+                  className="session-action-btn"
+                  title="Rename"
+                  aria-label="Rename session"
+                  onClick={async (e) => {
                     e.stopPropagation();
-                    setStatsSession(s);
+                    const name = prompt("Rename session:", s.title || "");
+                    if (name && name.trim() && name.trim() !== s.title) {
+                      try {
+                        await updateSession(s.id, { title: name.trim() });
+                        loadSessions();
+                        if (s.id === activeId) refreshActive();
+                      } catch { /* ignore */ }
+                    }
                   }}
-                  title="Session stats"
-                >
-                  Stats
-                </button>
+                >✎</button>
                 <button
-                  className="session-delete"
-                  onClick={(e) => handleDelete(e, s.id)}
-                  title="Delete session"
+                  className="session-action-btn session-action-delete"
+                  title="Delete"
+                  aria-label="Delete session"
                   disabled={deletingId === s.id}
-                >
-                  {deletingId === s.id ? "…" : "×"}
-                </button>
-              </div>
+                  onClick={(e) => handleDelete(e, s.id)}
+                >{deletingId === s.id ? "…" : "×"}</button>
+              </span>
             </div>
           ))}
         </div>

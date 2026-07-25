@@ -26,7 +26,8 @@ class SubmitAnalysisTool(BaseTool):
     function calls at the JSON Schema level.
     """
 
-    is_read_only = True
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     @property
     def name(self) -> str:

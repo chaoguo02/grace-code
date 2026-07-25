@@ -851,6 +851,7 @@ class SessionRuntime:
         inject_rules: list | None = None,              # Web: permission rules from settings
         inject_permission_mode: str | None = None,     # Web: "acceptEdits" / "default" / etc.
         session_context_text: str = "",                 # Web: session summary for Runtime injection (NOT persisted)
+        allowed_prompts: list[dict[str, str]] | None = None,  # CC: ExitPlanMode pre-approvals
     ) -> RunResult:
         session = self._store.get_session(session_id)
         if session is None:
@@ -949,6 +950,7 @@ class SessionRuntime:
                     requesting_agent=spec.name,
                     session_id=session_id,
                     circuit_breaker=agent_cfg.circuit_breaker,
+                    approved_prompts=tuple(allowed_prompts or ()),
                 ),
             )
 
@@ -958,31 +960,27 @@ class SessionRuntime:
             )
             # CC-aligned plan mode throttling: full injection on turn 1,
             # sparse reminder every 5 turns, full re-injection every 25 turns.
+            # Delegates to PlanModeAttachmentManager for CC-aligned constants.
             _base_msg_source = lambda: (
                 self._claim_completion_messages(session_id)
                 + self._claim_new_messages(session_id)
             )
             if spec.permission_mode == "plan":
+                from agent.plan_attachment_manager import PlanModeAttachmentManager
+                _plan_mgr = PlanModeAttachmentManager()
                 _plan_step = [0]
                 def _plan_throttled_source():
                     _plan_step[0] += 1
-                    _step = _plan_step[0]
+                    _plan_mgr.set_turn(_plan_step[0])
                     _msgs = list(_base_msg_source())
-                    if _step == 1:
-                        return _msgs  # full injection already in build_runtime_messages
-                    if _step % 5 == 0 and _step % 25 != 0:
-                        _msgs.append(LLMMessage(role="user", content=(
-                            "[PLAN MODE] You are still in plan mode. "
-                            "Analysis only — no edits. Produce a structured "
-                            "plan with a JSON contract before finishing."
-                        )))
-                    elif _step % 25 == 0:
-                        from prompts.builder import get_plan_mode_injection
-                        _msgs.append(LLMMessage(
-                            role="user", content=get_plan_mode_injection(),
-                        ))
+                    attachment = _plan_mgr.get_attachment()
+                    if attachment is not None:
+                        from llm.base import LLMMessage
+                        _msgs.append(LLMMessage(role="user", content=attachment))
                     return _msgs
                 agent_cfg.runtime_message_source = _plan_throttled_source
+                # Store ref for compaction-triggered refresh
+                agent_cfg._plan_attachment_manager = _plan_mgr
             else:
                 agent_cfg.runtime_message_source = _base_msg_source
             agent_cfg.stop_hook_event = HookEvent.STOP

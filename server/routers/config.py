@@ -66,34 +66,80 @@ def create_config_router(get_service: Any) -> APIRouter:
             return []
 
     # ── GET /api/config/models ──────────────────────────────────────────────
-    # SSOT: model metadata is defined here, not in the frontend (P2-13/14).
+    # Model catalog built from the active config, not hardcoded.
 
-    _MODEL_CATALOG: list[dict[str, Any]] = [
-        {
-            "key": "deepseek-v4-flash", "family": "Fast",
-            "note": "Quick iteration and lower latency.",
-        },
-        {
-            "key": "deepseek-v4", "family": "Balanced",
-            "note": "General coding and reasoning.",
-        },
-        {
-            "key": "gpt-5-codex", "family": "Strong",
-            "note": "Best for long multi-step tasks.",
-        },
-    ]
+    # Known alternatives per provider — used as suggestions beyond the active model.
+    _PROVIDER_ALTERNATIVES: dict[str, list[dict[str, Any]]] = {
+        "deepseek": [
+            {"key": "deepseek-v4", "family": "Balanced",
+             "note": "General coding and reasoning."},
+        ],
+        "openai": [
+            {"key": "gpt-4o", "family": "Balanced",
+             "note": "General coding and reasoning."},
+            {"key": "gpt-4o-mini", "family": "Fast",
+             "note": "Quick iteration and lower latency."},
+        ],
+        "anthropic": [
+            {"key": "claude-sonnet-5", "family": "Balanced",
+             "note": "General coding and reasoning."},
+            {"key": "claude-haiku-4-5", "family": "Fast",
+             "note": "Quick iteration and lower latency."},
+        ],
+    }
 
     @router.get("/models")
     async def list_models(
         service=Depends(get_service),
         response: Response = None,
     ) -> list[dict[str, Any]]:
-        """Return the available LLM model catalog (SSOT).
+        """Return the LLM model catalog — active model + provider alternatives.
 
         Cache-Control: max-age=300 (5 min).  Frontend falls back to
         a built-in default list when this endpoint is unreachable.
         """
         response.headers["Cache-Control"] = "max-age=300"
-        return _MODEL_CATALOG
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        # 1. Active model from config
+        _llm_cfg = getattr(service, "_config", None)
+        active_model = getattr(_llm_cfg.llm, "model", "") if _llm_cfg else ""
+        active_provider = getattr(_llm_cfg.llm, "provider", "").lower() if _llm_cfg else ""
+        if active_model:
+            result.append({
+                "key": active_model, "family": "Active",
+                "note": "Currently configured model.",
+            })
+            seen.add(active_model)
+
+        # 2. Provider-specific alternatives
+        for alt in _PROVIDER_ALTERNATIVES.get(active_provider, []):
+            if alt["key"] not in seen:
+                result.append(dict(alt))
+                seen.add(alt["key"])
+
+        # 3. Fallback: if nothing was added, return minimal defaults
+        if not result:
+            result = [
+                {"key": "deepseek-v4", "family": "Balanced",
+                 "note": "General coding and reasoning."},
+            ]
+
+        return result
+
+    # ── GET /api/config/defaults ──────────────────────────────────────────
+
+    @router.get("/defaults")
+    async def get_defaults(
+        service=Depends(get_service),
+        response: Response = None,
+    ) -> dict[str, Any]:
+        """Return default config values for new sessions."""
+        response.headers["Cache-Control"] = "max-age=300"
+        _cfg = getattr(service, "_config", None)
+        return {
+            "default_agent": getattr(_cfg.agent, "default_agent", "build") if _cfg else "build",
+        }
 
     return router

@@ -223,6 +223,8 @@ class FileReadTool(BaseTool):
         path (str): 文件路径（相对或绝对）
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     def __init__(
         self,
@@ -371,6 +373,8 @@ class FileViewTool(BaseTool):
         start_line (int): 从第几行开始（1-indexed，默认 1）
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     def __init__(
         self,
@@ -492,6 +496,9 @@ class FileWriteTool(BaseTool):
         path (str):    文件路径
         content (str): 要写入的内容
     """
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
 
     def __init__(self, allowed_paths: list[str | Path] | None = None,
                  read_cache: FileReadCache | None = None,

@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
-import { MessageBubble } from "./MessageBubble";
-import { WsEventBlock } from "./WsEventBlock";
 import { ToolApprovalCard } from "./ToolApprovalCard";
 import { SubagentDetail } from "./SubagentDetail";
 import { SubagentProgress } from "./SubagentProgress";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import { BlocksMessage } from "./BlocksMessage";
+import { ModeTab, getPlaceholder } from "./ModeTab";
 import { apiPost } from "../api/client";
 import { cancelSession, fetchSkills, updateSession } from "../api/sessions";
 import { getModelCatalog } from "../api/config";
@@ -14,7 +14,7 @@ import { formatBytes, formatRuntime, runtimeSeconds } from "../utils/format";
 import { summarizeStatus } from "../utils/status";
 
 type ComposerMenu = "closed" | "actions" | "mode" | "model" | "context" | "settings";
-type ModeKey = "build" | "plan" | "explore";
+export type ModeKey = "build" | "plan" | "explore";
 type EffortKey = "low" | "medium" | "high";
 
 interface ContextChip {
@@ -33,6 +33,7 @@ const MODE_OPTIONS: Array<{ key: ModeKey; title: string; description: string; in
 const MODEL_FALLBACK: Array<{ key: string; family: string; note: string }> = [
   { key: "deepseek-v4-flash", family: "Fast", note: "Quick iteration and lower latency." },
   { key: "deepseek-v4", family: "Balanced", note: "General coding and reasoning." },
+  { key: "gpt-5-codex", family: "Strong", note: "Best for long multi-step tasks." },
 ];
 
 const PROJECT_FILE_SUGGESTIONS = [
@@ -85,13 +86,6 @@ const HERO_CARDS = [
     icon: "▣",
     tone: "knowledge",
   },
-];
-
-const SUGGESTED_PROMPTS = [
-  "Review the system architecture",
-  "Add authentication with OAuth",
-  "Optimize database queries",
-  "Add tests for new features",
 ];
 
 const COMPOSER_QUICK_TOOLS = [
@@ -193,6 +187,9 @@ export function ChatView() {
     backgroundAgents,
     draft: storedDraft,
     streamingThought,
+    streamingBlocks,
+    dbBlocksByMsgId,
+    viewMode,
     events,
   } = useChatStore((s) => selectSessionUi(s, activeId));
   const {
@@ -211,6 +208,7 @@ export function ChatView() {
     compactSession,
     setDraft: setStoredDraft,
     setMode: setSessionMode,
+    cycleViewMode,
     setRunning,
     handleWsEvent,
   } = useChatStore();
@@ -223,6 +221,7 @@ export function ChatView() {
   const [draft, setLocalDraft] = useState(storedDraft);
   const latestDraftRef = useRef(draft);
   latestDraftRef.current = draft;
+  const lastSyncedSessionRef = useRef<string | null>(null);  // one-time mode sync per session load
 
   // Sync local draft changes back to store so they survive tab switches
   const updateDraft = (value: string | ((prev: string) => string)) => {
@@ -302,16 +301,14 @@ export function ChatView() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [timeline, isRunning, error]);
 
-  // Refresh after round completion: DB messages are committed before
-  // the WS completion event.  Reload messages + trace events so the
-  // final assistant answer (from DB, clean markdown) appears in the
-  // timeline alongside the real-time WS trace cards.
+  // Refresh after round completion: reload timeline for clean markdown
+  // answer + refresh active session stats. Session list reload is handled
+  // by SessionSidebar — no need to refetch all sessions here.
   const prevRunning = useRef(isRunning);
   useEffect(() => {
     if (prevRunning.current && !isRunning && activeId) {
       loadTimeline(activeId);
       useSessionStore.getState().refreshActive();
-      useSessionStore.getState().loadSessions();
     }
     prevRunning.current = isRunning;
   }, [isRunning, activeId, loadTimeline]);
@@ -327,17 +324,24 @@ export function ChatView() {
       activeId
     ) {
       useSessionStore.getState().refreshActive();
-      useSessionStore.getState().loadSessions();
     }
   }, [events, activeId]);
 
+  // One-time sync: on first load of a session, set local mode from the
+  // session's persisted agent_name.  After that, temporary in-memory
+  // switches (via slash command or mode menu) are authoritative.
+  const nextMode = activeDetail?.agent_name;
   useEffect(() => {
-    const nextMode = activeDetail?.agent_name;
-    if (nextMode === "plan" || nextMode === "explore" || nextMode === "build") {
-      setMode(nextMode);
-      setSessionMode(nextMode, activeId);
-    }
-  }, [activeDetail?.agent_name, activeId, setSessionMode]);
+    if (!activeId) { lastSyncedSessionRef.current = null; return; }
+    if (nextMode && (nextMode === "plan" || nextMode === "explore" || nextMode === "build")) {
+      // Only sync when the session identity changes (new session or reopen)
+      if (lastSyncedSessionRef.current !== activeId) {
+        lastSyncedSessionRef.current = activeId;
+        setMode(nextMode);
+        setSessionMode(nextMode, activeId);
+      }
+      }
+    }, [activeDetail?.agent_name, activeId]);
 
   useEffect(() => {
     if (currentMode === "plan" || currentMode === "explore" || currentMode === "build") {
@@ -360,6 +364,28 @@ export function ChatView() {
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, []);
 
+  // Global keyboard shortcuts (non-editing state only)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      // Skip when user is typing in an input/textarea/contenteditable
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      const isEditing = tag === "input" || tag === "textarea" ||
+        (e.target as HTMLElement)?.getAttribute("contenteditable") === "true";
+      if (isEditing) return;
+
+      // Ctrl+O = cycle view mode
+      if (e.ctrlKey && e.key === "o") { e.preventDefault(); cycleViewMode(activeId); return; }
+      // Mod+Shift+B/P/E = switch mode
+      if (e.ctrlKey && e.shiftKey) {
+        if (e.key === "b") { e.preventDefault(); setMode("build"); setSessionMode("build", activeId); return; }
+        if (e.key === "p") { e.preventDefault(); setMode("plan"); setSessionMode("plan", activeId); return; }
+        if (e.key === "e") { e.preventDefault(); setMode("explore"); setSessionMode("explore", activeId); return; }
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [activeId, cycleViewMode, setSessionMode]);
+
   useEffect(() => {
     if (!draftRef.current) return;
     draftRef.current.style.height = "0px";
@@ -367,33 +393,9 @@ export function ChatView() {
     draftRef.current.style.height = `${Math.max(nextHeight, 96)}px`;
   }, [draft]);
 
-  const toolResults = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const item of timeline) {
-      if (item.source === "ws" && item.ws.type === "observation" && item.ws.id) {
-        map.set(item.ws.id, item.ws.output || item.ws.error || "");
-      }
-      if (item.source === "message" && item.msg.role === "tool" && item.msg.tool_call_id) {
-        map.set(item.msg.tool_call_id, item.msg.content);
-      }
-    }
-    return map;
-  }, [timeline]);
-
-  const pairedTimeline = useMemo(() => {
-    const liveToolCallIds = new Set<string>();
-    for (const item of timeline) {
-      if (item.source === "ws" && item.ws.type === "tool_call" && item.ws.id) {
-        liveToolCallIds.add(item.ws.id);
-      }
-    }
-    return timeline.map((item) => {
-      if (item.source !== "ws" || item.ws.type !== "observation" || !item.ws.id || !liveToolCallIds.has(item.ws.id)) {
-        return item;
-      }
-      return { source: "ws" as const, ws: { ...item.ws, paired: true } };
-    });
-  }, [timeline]);
+  // Unified blocks for rendering — single data path.
+  // Priority: streaming (live) > dbBlocks (loaded) > empty (no data yet).
+  const hasBlocks = streamingBlocks.length > 0 || Object.keys(dbBlocksByMsgId).length > 0;
 
   const slashMatches = useMemo(() => {
     if (!draft.startsWith("/")) return [];
@@ -831,92 +833,6 @@ export function ChatView() {
   return (
     <>
       <div className="chat-shell">
-        <div className="chat-summary-bar chat-summary-bar-rich">
-          <div className="summary-card summary-card-session">
-            {editingTitle ? (
-              <div className="summary-session-title-row">
-                <input
-                  autoFocus
-                  value={titleDraft}
-                  onChange={(e) => setTitleDraft(e.target.value)}
-                  onKeyDown={async (e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      if (titleDraft.trim() && activeId) {
-                        await updateSession(activeId, { title: titleDraft.trim() });
-                        useSessionStore.getState().refreshActive();
-                        useSessionStore.getState().loadSessions();
-                      }
-                      setEditingTitle(false);
-                    } else if (e.key === "Escape") {
-                      setEditingTitle(false);
-                    }
-                  }}
-                  onBlur={async () => {
-                    if (titleDraft.trim() && activeId && titleDraft.trim() !== activeDetail?.title) {
-                      await updateSession(activeId, { title: titleDraft.trim() });
-                      useSessionStore.getState().refreshActive();
-                      useSessionStore.getState().loadSessions();
-                    }
-                    setEditingTitle(false);
-                  }}
-                  style={{
-                    fontSize: 14, fontWeight: 600, border: "1px solid var(--accent)",
-                    borderRadius: 4, padding: "2px 6px", background: "var(--bg)",
-                    color: "var(--text)", width: "100%",
-                  }}
-                />
-              </div>
-            ) : (
-              <div className="summary-session-title-row">
-                <div className="summary-session-title" title="Click ✎ to rename">
-                  {activeDetail?.title || activeId?.slice(0, 8) || "Session"}
-                </div>
-                {activeId && (
-                  <button
-                    type="button"
-                    className="summary-edit-btn"
-                    aria-label="Edit session title"
-                    onClick={() => { setEditingTitle(true); setTitleDraft(activeDetail?.title || ""); }}
-                  >
-                    ✎
-                  </button>
-                )}
-              </div>
-            )}
-            <div className="summary-subtle">
-              {activeDetail?.created_at
-                ? `${activeDetail.agent_name} · ${new Date(activeDetail.created_at).toLocaleDateString()}`
-                : "Create or open a session to begin"}
-            </div>
-          </div>
-
-          <div className="summary-card">
-            <div className="summary-label">Status</div>
-            <div className="summary-status-line">
-              <span className={`summary-status-dot ${isRunning ? "running" : error ? "failed" : "idle"}`} />
-              <div className="summary-value">{summarizeStatus(activeDetail?.status || (isRunning ? "running" : ""))}</div>
-            </div>
-          </div>
-
-          <div className="summary-card">
-            <div className="summary-label">Steps</div>
-            <div className="summary-value">{steps || activeDetail?.message_count || "—"}</div>
-          </div>
-
-          <div className="summary-card">
-            <div className="summary-label">Tokens</div>
-            <div className="summary-value">{tokens ? tokens.toLocaleString() : activeDetail?.total_tokens_estimate ? activeDetail.total_tokens_estimate.toLocaleString() : "—"}</div>
-          </div>
-
-          <div className="summary-card">
-            <div className="summary-label">Runtime</div>
-            <div className="summary-value">{runtimeLabel}</div>
-          </div>
-
-          <ContextUsageBar />
-        </div>
-
         <section className="chat view active" data-view-name="chat">
           {/* Compact permission bar — only visible when there are pending approvals */}
           {pendingApprovals > 0 && (
@@ -951,17 +867,6 @@ export function ChatView() {
                 ))}
               </div>
 
-              <div className="welcome-suggestions">
-                <div className="summary-label">Suggested Prompts</div>
-                <div className="welcome-chip-row welcome-chip-grid">
-                  {SUGGESTED_PROMPTS.map((prompt) => (
-                    <button key={prompt} className="welcome-chip action-chip prompt-chip" type="button" onClick={() => updateDraft(prompt)}>
-                      <span className="prompt-chip-icon">◌</span>
-                      <span>{prompt}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
             </div>
           )}
 
@@ -992,22 +897,19 @@ export function ChatView() {
           )}
 
           <div id="messages">
-            {pairedTimeline.map((item, i) =>
-              item.source === "message" ? (
-                <MessageBubble
-                  key={`m-${item.msg.tool_call_id || item.msg.created_at || i}`}
-                  message={item.msg}
-                  toolResults={toolResults}
+            {/* Blocks-first unified rendering — single data path */}
+            <div className="blocks-container">
+              {streamingBlocks.length > 0 && (
+                <BlocksMessage
+                  blocks={streamingBlocks}
+                  metadata={{ steps, tokens, durationMs: runtimeSec * 1000, agentName: activeDetail?.agent_name }}
                 />
-              ) : (
-                <WsEventBlock
-                  key={`ws-${item.ws.type || "event"}-${i}`}
-                  event={item.ws}
-                />
-              ),
-            )}
+              )}
+              {Object.entries(dbBlocksByMsgId).map(([msgId, entry]) => (
+                <BlocksMessage key={msgId} blocks={entry.blocks} role={entry.role} />
+              ))}
 
-            {isRunning && (
+            {isRunning && !hasBlocks && (
               <div className="trace-block">
                 <div className="trace-card trace-thought">
                   <div className="trace-header">
@@ -1042,6 +944,7 @@ export function ChatView() {
                 </div>
               </div>
             )}
+            </div>
           </div>
           <div ref={bottomRef} />
         </section>
@@ -1123,6 +1026,7 @@ export function ChatView() {
           </div>
         ) : (
           <div className="composer-shell">
+            <ModeTab mode={mode} onChange={(m) => { setMode(m); setSessionMode(m, activeId); }} disabled={isRunning || !activeId} />
             <div ref={composerRef} className="composer-card composer-card-elevated">
               <input ref={fileInputRef} type="file" hidden multiple onChange={handleFileInput} />
 
@@ -1147,7 +1051,7 @@ export function ChatView() {
                 <textarea
                   ref={draftRef}
                   id="prompt-input"
-                  placeholder="Ask Grace Code to inspect, plan, or change something..."
+                  placeholder={getPlaceholder(mode)}
                   rows={1}
                   autoComplete="off"
                   value={draft}
@@ -1186,14 +1090,6 @@ export function ChatView() {
               </div>
 
               <div className="composer-bottom-row">
-                <div className="composer-bottom-left">
-                  {COMPOSER_QUICK_TOOLS.map((tool) => (
-                    <button key={tool.key} type="button" className="composer-tool-btn" onClick={() => handleQuickTool(tool.key)}>
-                      <span className="composer-tool-icon">{tool.icon}</span>
-                    </button>
-                  ))}
-                </div>
-
                 <div className="composer-bottom-right">
                   <button type="button" className={`composer-chip-btn composer-bottom-pill ${composerMenu === "mode" ? "active" : ""}`} onClick={() => openMenu("mode")}>
                     {modeTitle(mode)}
@@ -1202,22 +1098,8 @@ export function ChatView() {
                   <button type="button" className={`composer-chip-btn composer-bottom-pill ${composerMenu === "model" ? "active" : ""}`} onClick={() => openMenu("model")}>
                     Model: {model}
                   </button>
-                  <button type="button" className={`composer-pill composer-bottom-pill ${thinking ? "on" : ""}`} onClick={() => {
-                    const next = !thinking;
-                    setThinking(next);
-                    updateSettings({ thinking: next });
-                  }}>
-                    Thinking
-                  </button>
-                  <button type="button" className={`composer-pill composer-bottom-pill ${editAutomatically ? "on" : ""}`} onClick={() => {
-                    const next = !editAutomatically;
-                    setEditAutomatically(next);
-                    updateSettings({ permission_mode: next ? "acceptEdits" : "default" });
-                  }}>
-                    Edit automatically
-                  </button>
                   <button type="button" className={`composer-pill composer-bottom-pill ${composerMenu === "settings" ? "active" : ""}`} onClick={() => openMenu("settings")}>
-                    Effort {effort}
+                    ⋯
                   </button>
                 </div>
               </div>
@@ -1239,17 +1121,30 @@ export function ChatView() {
           </div>
         )}
 
-        <div className="composer-meta">
-          <span>{activeDetail ? `${activeDetail.agent_name} · ${activeDetail.execution_placement || activeDetail.status}` : ""}</span>
-          <span className="composer-meta-stack">
-            <span>{activeDetail?.message_count != null ? `${activeDetail.message_count} msgs` : ""}</span>
-            <span>{activeDetail?.total_tokens_estimate != null ? `~${activeDetail.total_tokens_estimate} tok` : ""}</span>
-            <span>{modeTitle(mode)} mode</span>
-            <span>Enter to send</span>
+        {/* Compact inline status — one line */}
+        <div className="composer-status-line">
+          <span className="composer-status-title" title={activeDetail?.title || activeId || ""}>
+            {activeDetail?.title || activeId?.slice(0, 8) || "Session"}
           </span>
-        </div>
-        <div className="composer-runtime-summary">
-          {`${modeTitle(mode)} mode · ${steps || activeDetail?.message_count || 0} steps this session · ~${(tokens || activeDetail?.total_tokens_estimate || 0).toLocaleString()} tok total · ${runtimeSec}s runtime`}
+          <span className={`composer-status-dot ${isRunning ? "busy" : error ? "error" : ""}`} />
+          <span>{isRunning ? "Running" : error ? "Error" : "Idle"}</span>
+          <span className="composer-status-sep">·</span>
+          <span>{steps || activeDetail?.message_count || 0} steps</span>
+          <span className="composer-status-sep">·</span>
+          <span>~{(tokens || activeDetail?.total_tokens_estimate || 0).toLocaleString()} tok</span>
+          <span className="composer-status-sep">·</span>
+          <button
+            type="button"
+            className="composer-status-viewmode"
+            onClick={() => cycleViewMode(activeId)}
+            title={`View: ${viewMode} (Ctrl+O to cycle)`}
+          >
+            {viewMode === "verbose" ? "≡" : viewMode === "summary" ? "···" : "□"}
+          </button>
+          <span className="composer-status-sep">·</span>
+          <span>{runtimeLabel}</span>
+          {runtimeSec > 0 && <span className="composer-status-sep">·</span>}
+          {runtimeSec > 0 && <span>{runtimeSec}s</span>}
         </div>
       </footer>
 

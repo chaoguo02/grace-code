@@ -369,6 +369,28 @@ class BaseTool(ABC):
         """Declare whether this specific call may run beside sibling calls."""
         return ToolConcurrency.SERIAL
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        """Return True when this call has no side effects (CC-aligned).
+
+        Default: ``False`` (fail-closed — assume writes, requires permission).
+        Tools that only read data MUST override this to return ``True``.
+
+        Input-aware tools (e.g. Bash with ``ls`` vs ``rm``) SHOULD inspect
+        *params*.  The permission pipeline calls this during plan mode and
+        dontAsk mode to decide whether the tool can auto-proceed.
+
+        Fallback: ``ToolMetadata.effects`` — if no override and all declared
+        effects fall within ``READ_ONLY_EFFECTS``, the tool is treated as
+        read-only.  This catches tools that forgot to override.
+        """
+        # Check metadata effects as a static fallback
+        effects = self.metadata.effects if self.metadata else frozenset()
+        if effects:
+            from core.policy import READ_ONLY_EFFECTS
+            if effects.issubset(READ_ONLY_EFFECTS):
+                return True
+        return False
+
     @abstractmethod
     def execute(self, params: dict[str, Any]) -> ToolResult:
         """执行工具，返回 ToolResult。不抛异常——所有异常已在内部处理。"""

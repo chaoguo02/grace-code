@@ -222,6 +222,14 @@ class CircuitBreaker:
         self._state = CircuitBreakerState.OPEN
         self._trip_reason = reason
 
+    def is_gate_enabled(self) -> bool:
+        """Check if auto mode gate is still open (circuit not tripped).
+
+        Used during plan mode exit: if the circuit breaker tripped while
+        in plan mode, auto mode should NOT be restored.
+        """
+        return self._state is not CircuitBreakerState.OPEN
+
     # ── Serialization ──
 
     def to_summary(self) -> dict:

@@ -46,6 +46,9 @@ class FileEditTool(BaseTool):
         new_str (str): 替换后的字符串
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
+
     def __init__(self, read_cache: "FileReadCache | None" = None,
                  workspace_root: str | None = None) -> None:
         self._read_cache = read_cache

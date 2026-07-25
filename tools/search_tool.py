@@ -181,6 +181,9 @@ class SearchTextTool(BaseTool):
         type (str):        ripgrep file type filter (e.g. 'py', 'rust')
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
@@ -409,6 +412,9 @@ class FindFilesTool(BaseTool):
         path (str):    root directory to search (default: cwd)
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
@@ -490,6 +496,9 @@ class FindSymbolTool(BaseTool):
         symbol (str): function or class name (partial match supported)
         path (str):   root directory to search (default: cwd)
     """
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())

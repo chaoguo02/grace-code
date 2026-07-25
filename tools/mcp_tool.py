@@ -59,6 +59,14 @@ class McpToolWrapper(BaseTool):
 
     # ── BaseTool interface ────────────────────────────────────────────
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        annotations = self._tool_def.get("annotations", {})
+        if annotations.get("readOnlyHint"):
+            return True
+        if annotations.get("destructiveHint"):
+            return False
+        return False
+
     @property
     def name(self) -> str:
         return self._canonical_name

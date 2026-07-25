@@ -86,7 +86,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     _WINDOW: float = 60.0
     _CHAT_LIMIT: int = 10
-    _GENERAL_LIMIT: int = 60
+    _GENERAL_LIMIT: int = 300  # Web UI makes many read requests on startup
 
     def __init__(self, app):
         super().__init__(app)

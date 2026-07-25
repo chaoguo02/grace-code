@@ -1,6 +1,11 @@
-import { useState } from "react";
-import { ExpandableText } from "./ExpandableText";
-import { formatValue } from "../utils/format";
+/**
+ * Inline HITL approval bar — CC-aligned permission prompt.
+ *
+ * Renders as a compact bar above the composer, not a floating card.
+ * Keyboard: Y=approve, N=deny, Shift+Y=approve+remember.
+ * Focus safety: keys are disabled when user is typing in input/textarea.
+ */
+import { useState, useEffect, useCallback } from "react";
 
 interface ToolApprovalCardProps {
   requestId: string;
@@ -17,173 +22,103 @@ interface ToolApprovalCardProps {
   disabled?: boolean;
 }
 
-const TOOL_ICONS: Record<string, string> = {
-  Read: "R",
-  Write: "W",
-  Edit: "E",
-  Bash: "B",
-  Glob: "G",
-  Grep: "S",
-  Agent: "A",
-  WebFetch: "F",
-};
+type MemoryScope = "once" | "session" | "file_pattern";
 
-function toolIcon(name: string): string {
-  return TOOL_ICONS[name] || "T";
-}
-
-function summarizeTarget(params: Record<string, unknown>) {
+function summarizeTarget(params: Record<string, unknown>): string {
   const priorityKeys = ["file_path", "path", "target_file", "command", "pattern", "url"];
   for (const key of priorityKeys) {
-    const value = params[key];
-    if (value != null) return String(value);
+    const v = params[key];
+    if (v != null) {
+      const s = String(v);
+      return s.length > 100 ? s.slice(0, 97) + "…" : s;
+    }
   }
-  const firstEntry = Object.entries(params)[0];
-  if (!firstEntry) return "No explicit target";
-  return `${firstEntry[0]}: ${formatValue(firstEntry[1])}`;
+  return "";
 }
 
-function inferRisk(toolName: string, params: Record<string, unknown>, riskLevel?: string) {
-  if (riskLevel) return riskLevel;
-  const lowered = `${toolName} ${JSON.stringify(params)}`.toLowerCase();
-  if (toolName === "Write" || toolName === "Edit" || lowered.includes(".git") || lowered.includes("delete")) {
-    return "high";
-  }
-  if (toolName === "Bash") return "medium";
-  return "low";
-}
-
-function riskLabel(risk: string) {
-  if (risk === "high") return "High risk";
-  if (risk === "medium") return "Needs review";
-  return "Low risk";
+function riskColor(riskLevel?: string): string {
+  if (riskLevel === "high") return "var(--error)";
+  if (riskLevel === "medium") return "var(--warning)";
+  return "var(--text-muted)";
 }
 
 export function ToolApprovalCard({
-  requestId,
-  toolName,
-  params,
-  thought,
-  decisionReason,
-  toolUseId,
-  permissionMode,
-  riskLevel,
-  onApprove,
-  onAlwaysAllow,
-  onDeny,
-  disabled,
+  requestId, toolName, params, thought, decisionReason, riskLevel,
+  onApprove, onAlwaysAllow, onDeny, disabled,
 }: ToolApprovalCardProps) {
-  const [note, setNote] = useState("");
-  const risk = inferRisk(toolName, params, riskLevel);
-  const paramEntries = Object.entries(params);
+  const [scope, setScope] = useState<MemoryScope>("once");
   const target = summarizeTarget(params);
+  const risk = riskLevel || "medium";
+
+  const approve = useCallback(() => {
+    if (scope === "session") onAlwaysAllow();
+    else onApprove();
+  }, [scope, onApprove, onAlwaysAllow]);
+
+  const deny = useCallback(() => onDeny(), [onDeny]);
+
+  // Global keyboard shortcuts with focus safety
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      const isEditing = tag === "input" || tag === "textarea" ||
+        (e.target as HTMLElement)?.getAttribute("contenteditable") === "true";
+      if (isEditing) return;
+
+      if (e.key === "y" || e.key === "Y") {
+        e.preventDefault();
+        if (e.shiftKey) { setScope("session"); onAlwaysAllow(); }
+        else onApprove();
+      }
+      if (e.key === "n" || e.key === "N") {
+        e.preventDefault();
+        onDeny();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [onApprove, onAlwaysAllow, onDeny]);
 
   return (
-    <div className="permission-card-wrap">
-      <div className={`permission-card permission-risk-${risk}`}>
-        <div className="permission-card-side" />
-        <div className="permission-card-main">
-          <div className="permission-card-header">
-            <div className="permission-card-header-main">
-              <div className="permission-card-icon">{toolIcon(toolName)}</div>
-              <div>
-                <div className="permission-card-eyebrow">Permission Request</div>
-                <div className="permission-card-title">
-                  Allow <code>{toolName}</code> to run?
-                </div>
-              </div>
-            </div>
-            <div className="permission-card-badges">
-              <span className={`permission-badge risk-${risk}`}>{riskLabel(risk)}</span>
-              <span className="permission-badge subtle">{permissionMode || "default"}</span>
-            </div>
-          </div>
+    <div
+      className="hitl-bar"
+      style={{ borderLeftColor: riskColor(riskLevel) }}
+      role="alert"
+      aria-live="polite"
+    >
+      <div className="hitl-main-row">
+        <span className="hitl-icon" title={riskLevel || "medium"}>
+          {risk === "high" ? "⚠" : "⚡"}
+        </span>
+        <span className="hitl-tool-name">{toolName}</span>
+        {target && <span className="hitl-target">: {target}</span>}
+        {thought && <span className="hitl-thought" title={thought}>{thought.slice(0, 60)}{thought.length > 60 ? "…" : ""}</span>}
 
-          <div className="permission-hero-grid">
-            <div className="permission-hero-panel">
-              <div className="permission-panel-label">Target</div>
-              <div className="permission-hero-value">{target}</div>
-            </div>
-            <div className="permission-hero-panel">
-              <div className="permission-panel-label">Reason</div>
-              <div className="permission-hero-value">
-                {decisionReason || "This tool requires explicit user approval before execution."}
-              </div>
-            </div>
-          </div>
+        <span className="hitl-spacer" />
 
-          {thought ? (
-            <div className="permission-section">
-              <div className="permission-panel-label">Agent rationale</div>
-              <ExpandableText
-                text={thought}
-                maxLength={200}
-                className="permission-rationale"
-                expandLabel="Show full rationale"
-                collapseLabel="Collapse"
-              />
-            </div>
-          ) : null}
+        <span className="hitl-scope-label">Remember:</span>
+        <select
+          className="hitl-scope-select"
+          value={scope}
+          onChange={(e) => setScope(e.target.value as MemoryScope)}
+          disabled={disabled}
+        >
+          <option value="once">Once</option>
+          <option value="session">Session</option>
+          <option value="file_pattern" disabled title="Backend support pending (P2)">File Pattern ⏳</option>
+        </select>
 
-          {paramEntries.length ? (
-            <div className="permission-section">
-              <div className="permission-panel-label">Arguments</div>
-              <div className="permission-args">
-                {paramEntries.slice(0, 6).map(([key, value]) => (
-                  <div key={key} className="permission-arg-row">
-                    <span className="permission-arg-key">{key}</span>
-                    <span className="permission-arg-value">{formatValue(value)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : null}
-
-          <div className="permission-meta-row">
-            <span className="permission-meta-pill">Request ID: {requestId}</span>
-            <span className="permission-meta-pill">Tool Use: {toolUseId || "pending"}</span>
-          </div>
-
-          <div className="permission-note-row">
-            <input
-              type="text"
-              placeholder="Add an optional note for this approval..."
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              disabled={disabled}
-              className="permission-note-input"
-            />
-          </div>
-
-          <div className="permission-actions">
-            <button
-              className="btn-approve permission-primary-action"
-              type="button"
-              disabled={disabled}
-              onClick={() => onApprove(note || undefined)}
-            >
-              Allow once
-            </button>
-            <button
-              className="btn-ghost"
-              type="button"
-              disabled={disabled}
-              onClick={() => onAlwaysAllow(note || undefined)}
-              title="Persist an allow rule for matching future requests"
-            >
-              Always allow
-            </button>
-            <button
-              className="btn-reject"
-              type="button"
-              disabled={disabled}
-              onClick={() => onDeny(note || "Denied by user")}
-            >
-              Deny
-            </button>
-          </div>
-        </div>
+        <button className="hitl-btn hitl-deny" type="button" disabled={disabled} onClick={deny}>
+          <kbd>N</kbd> Deny
+        </button>
+        <button className="hitl-btn hitl-approve" type="button" disabled={disabled} onClick={approve}>
+          <kbd>Y</kbd> Approve
+        </button>
       </div>
+
+      {decisionReason && (
+        <div className="hitl-reason">{decisionReason}</div>
+      )}
     </div>
   );
 }

@@ -711,6 +711,7 @@ class AgentService:
         prompt: str,
         agent_name: str = "build",
         intent: str | None = None,
+        allowed_prompts: list[dict[str, str]] | None = None,
     ) -> None:
         """Execute chat asynchronously in a background thread.
 
@@ -724,6 +725,9 @@ class AgentService:
 
         The caller should ensure the frontend has subscribed to the WS
         before calling this method.
+
+        allowed_prompts: CC-aligned ExitPlanMode pre-approved tool calls
+        that carry over to the build session.
         """
         resolved_intent: TaskIntent | None = None
         if intent is not None:
@@ -787,6 +791,7 @@ class AgentService:
             intent=resolved_intent,
             permission_mode=_effective_perm,
             repo_path=self.repo_path,
+            allowed_prompts=tuple(allowed_prompts or ()),
         )
         pipeline.run_in_background(request)
 

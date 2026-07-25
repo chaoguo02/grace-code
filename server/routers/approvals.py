@@ -65,13 +65,54 @@ def create_approvals_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=400, detail="No plan found in session summary")
 
         comment = body.comment.strip()
-        plan_context = (
-            f"[PLAN CONTEXT] The following implementation plan has been reviewed and approved. "
-            f"Execute it now."
-        )
+
+        # CC-aligned: detect if user edited the plan file before approving
+        plan_was_edited = False
+        try:
+            from pathlib import Path
+            plan_file = Path(service.repo_path) / ".grace" / "plans" / f"{session_id}.md"
+            if plan_file.is_file():
+                # Compare current file hash to stored revision hash
+                import hashlib
+                current_hash = hashlib.sha256(
+                    plan_file.read_text(encoding="utf-8").encode()
+                ).hexdigest()
+                if hasattr(service, '_plan_revisions'):
+                    revs = service._plan_revisions.list_revisions(session_id)
+                    if revs:
+                        stored_hash = getattr(revs[-1], "content_hash", "")
+                        if stored_hash and current_hash != stored_hash:
+                            plan_was_edited = True
+        except Exception:
+            pass
+
+        # CC-aligned: extract allowedPrompts from plan contract for build session
+        plan_contract = rec.metadata.get("plan_contract", {}) if rec.metadata else {}
+        allowed_prompts = list(plan_contract.get("allowed_prompts", []) or [])
+
+        approval_tag = "Approved Plan (edited by user)" if plan_was_edited else "Approved Plan"
+        plan_context = f"[PLAN CONTEXT] {approval_tag}. Execute it now."
         if comment:
             plan_context += f"\n\nApprover note: {comment}"
-        plan_context += f"\n\n{plan_text}"
+
+        # CC-aligned: inject structured contract steps so the build agent
+        # has a concrete task list to work through (not just raw summary).
+        _steps = plan_contract.get("steps", [])
+        _targets = plan_contract.get("target_files", [])
+        _verification = plan_contract.get("verification", "")
+        if _steps or _targets:
+            plan_context += "\n\n## Plan Steps"
+            for i, step in enumerate(_steps, 1):
+                plan_context += f"\n{i}. {step}"
+            if _targets:
+                plan_context += "\n\n## Target Files"
+                for f in _targets:
+                    plan_context += f"\n- {f}"
+            if _verification:
+                plan_context += f"\n\n## Verification\n{_verification}"
+            plan_context += f"\n\n## Full Plan\n{plan_text}"
+        else:
+            plan_context += f"\n\n{plan_text}"
 
         from llm.base import LLMMessage
         service._storage.append_message(session_id, LLMMessage(
@@ -110,6 +151,7 @@ def create_approvals_router(get_service: Any) -> APIRouter:
             prompt=plan_context,
             agent_name="build",
             intent="edit",
+            allowed_prompts=allowed_prompts,
         )
 
         return {"approved": True, "session_id": session_id, "message": "Build started with plan context"}

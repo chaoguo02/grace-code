@@ -772,6 +772,8 @@ def _format_fork_result(
         "  <summary>",
         _xml_escape(str(result.summary or "").strip()),
         "  </summary>",
+        f"  <resume-hint>To continue this agent, use SendMessage(to=\"{result.session_id}\")"
+        " with a follow-up task.</resume-hint>",
         "</task-notification>",
     ])
     return "\n".join(lines)

@@ -310,6 +310,11 @@ def get_plan_mode_injection() -> str:
     return _render_prompt("modes/plan.md")
 
 
+def get_plan_mode_sparse_reminder() -> str:
+    """Return the brief plan mode reminder injected every 5 turns (CC-aligned)."""
+    return _render_prompt("modes/plan-sparse.md")
+
+
 def get_dag_plan_prompt() -> str:
     return _render_prompt("modes/plan-dag.md")
 

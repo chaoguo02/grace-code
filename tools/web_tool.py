@@ -67,6 +67,9 @@ class WebSearchTool(BaseTool):
         count  (int): 返回结果数（默认 5，最大由配置决定）
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(self, max_results: int = DEFAULT_SEARCH_MAX_RESULTS) -> None:
         self._max_results = max_results
 
@@ -215,6 +218,9 @@ class WebFetchTool(BaseTool):
     params:
         url (str): 要抓取的网页 URL
     """
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     def __init__(
         self,

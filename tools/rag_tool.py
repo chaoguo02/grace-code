@@ -26,6 +26,9 @@ class SearchCodeTool(BaseTool):
         top_k (int):         返回数量（默认 5）
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(self, retriever=None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._retriever = retriever

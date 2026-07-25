@@ -151,6 +151,8 @@ class PermissionSessionConfig:
     requesting_agent: str = ""
     session_id: str = ""
     circuit_breaker: Any = None
+    approved_prompts: tuple[dict[str, str], ...] = ()
+    """CC-aligned: prompts approved during plan exit, carried to build session."""
 
 
 @dataclass(frozen=True)
@@ -279,6 +281,9 @@ class PermissionPipeline:
                 self._session_id = config.session_id
             if config.circuit_breaker is not None:
                 self._circuit_breaker = config.circuit_breaker
+            if config.approved_prompts:
+                for item in config.approved_prompts:
+                    self.add_approved_prompts([item])
 
     def attach_hook_dispatcher(self, dispatcher: Any) -> None:
         """Attach the lifecycle dispatcher without exposing mutable fields."""
@@ -580,8 +585,7 @@ class PermissionPipeline:
 
         # Step 4: Permission Mode
         mode_result = self._layer4_permission_mode(
-            tool_name,
-            params,
+            tool, params,
             force_interactive=force_interactive,
         )
         if mode_result is not None:
@@ -745,8 +749,7 @@ class PermissionPipeline:
             )
 
         mode_result = self._layer4_permission_mode(
-            tool.name,
-            params,
+            tool, params,
             force_interactive=force_interactive,
         )
         if (
@@ -865,13 +868,6 @@ class PermissionPipeline:
 
     # --- Layer 4: Permission Mode (CC-aligned Step 4) ---
 
-    # Tools that are read-only and safe to auto-approve in any mode.
-    # CC: "Read-only: No approval required within the working directory."
-    _READONLY_SAFE_TOOLS: frozenset[str] = frozenset({
-        "Read", "Grep", "Glob", "WebSearch", "WebFetch",
-        "Skill", "Task", "SendMessage", "WaitForAgent",
-    })
-
     # CC acceptEdits: "common filesystem commands such as mkdir, touch, mv, cp"
     _FILESYSTEM_SAFE_COMMANDS: frozenset[str] = frozenset({
         "mkdir", "touch", "mv", "cp",
@@ -893,25 +889,24 @@ class PermissionPipeline:
 
     def _layer4_permission_mode(
         self,
-        tool_name,
+        tool,
         params=None,
         *,
         force_interactive: bool = False,
     ):
+        tool_name = getattr(tool, "name", "unknown")
         mode = self._permission_mode
         if not mode or mode in ("default", "manual"):
             return None
 
         if mode == "bypassPermissions":
-            # CC: bypassPermissions skips prompts EXCEPT when _force_interactive
-            # is set (ask rule matched at Layer 3 — bypass-immune).
             if force_interactive:
-                return None  # fall through to Layer 6
+                return None
             if tool_name == "Bash" and params:
                 cmd = str(params.get("command", "")).strip()
                 for pattern in self._ROOT_REMOVAL_PATTERNS:
                     if cmd.startswith(pattern) or pattern in cmd:
-                        return None  # fall through to Layer 6 for approval
+                        return None
             return PermissionResult(
                 decision=PermissionDecision.ALLOW,
                 layer=PermissionLayer.RULE,
@@ -919,17 +914,14 @@ class PermissionPipeline:
             )
 
         if mode == "acceptEdits":
-            # CC: if _force_interactive (ask rule matched), fall through to
-            # Layer 6 — ask rules are bypass-immune even in acceptEdits.
             if force_interactive:
                 return None
             if tool_name in {"Write", "Edit"}:
                 return PermissionResult(
                     decision=PermissionDecision.ALLOW,
                     layer=PermissionLayer.RULE,
-                    reason="acceptEdits: %s auto-approved" % tool_name,
+                    reason=f"acceptEdits: {tool_name} auto-approved",
                 )
-            # CC: also auto-approve common filesystem commands
             if tool_name == "Bash" and params:
                 cmd = str(params.get("command", "")).strip()
                 cmd_base = cmd.split()[0] if cmd else ""
@@ -942,42 +934,37 @@ class PermissionPipeline:
             return None
 
         if mode == "plan":
-            # Plan mode: read-only.  ASK rules are bypass-immune — deny
-            # immediately since plan mode cannot show interactive prompts.
             if force_interactive:
                 return PermissionResult(
                     decision=PermissionDecision.DENY,
                     layer=PermissionLayer.RULE,
                     reason="plan mode: ask rule requires interaction (blocked in plan mode)",
                 )
-            # Plan mode: read-only.  Write/Edit/Bash always denied,
-            # even if an ask rule matched (plan overrides ask).
-            if tool_name in {"Write", "Edit", "Bash"}:
+            # CC-aligned dynamic check: deny any tool that is NOT read-only
+            is_ro = getattr(tool, "isReadOnly", lambda _p: False)(params or {})
+            if not is_ro:
                 return PermissionResult(
                     decision=PermissionDecision.DENY,
                     layer=PermissionLayer.RULE,
-                    reason=f"plan mode: {tool_name} is read-only",
+                    reason=f"plan mode: {tool_name} is not read-only",
                 )
-            # No decision for read-only tools → fall through
             return None
 
         if mode == "dontAsk":
-            # CC: if _force_interactive (ask rule matched), deny immediately —
-            # dontAsk mode never prompts and ask rules require interaction.
             if force_interactive:
                 return PermissionResult(
                     decision=PermissionDecision.DENY,
                     layer=PermissionLayer.RULE,
                     reason="dontAsk mode: ask rule requires interaction (blocked in non-interactive mode)",
                 )
-            # 1. Read-only tools always pass
-            if tool_name in self._READONLY_SAFE_TOOLS:
+            # CC-aligned dynamic check: read-only tools auto-pass
+            is_ro = getattr(tool, "isReadOnly", lambda _p: False)(params or {})
+            if is_ro:
                 return PermissionResult(
                     decision=PermissionDecision.ALLOW,
                     layer=PermissionLayer.RULE,
                     reason="dontAsk: read-only tool auto-approved",
                 )
-            # 2. Check allow rules + session rules
             for rule in self._allow_rules + self._session_rules:
                 if rule.matches(tool_name, params):
                     return PermissionResult(
@@ -985,7 +972,6 @@ class PermissionPipeline:
                         layer=PermissionLayer.RULE,
                         reason=f"dontAsk: allowed by rule '{rule.raw}'",
                     )
-            # 3. Everything else → deny (never reaches Layer 6)
             return PermissionResult(
                 decision=PermissionDecision.DENY,
                 layer=PermissionLayer.RULE,

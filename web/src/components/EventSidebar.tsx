@@ -61,7 +61,7 @@ function countTools(events: WsMessage[]) {
   return counts;
 }
 
-export function EventSidebar() {
+export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => void }) {
   const activeId = useSessionStore((s) => s.activeId);
   const { events, isRunning, steps, tokens } = useChatStore((s) => selectSessionUi(s, activeId));
   const sessionCount = useSessionStore((s) => s.sessions.length);
@@ -70,21 +70,17 @@ export function EventSidebar() {
   const [sessionStats, setSessionStats] = useState<SessionStats | null>(null);
   const [eventFilter, setEventFilter] = useState<string>("all");
 
-  const fetchStats = useCallback((signal?: AbortSignal) => {
-    getStorageStats(signal)
-      .then(setStats)
-      .catch(() => {});
-  }, []);
-
+  // Fetch storage stats once on mount — not per-session.
   useEffect(() => {
     const controller = new AbortController();
-    fetchStats(controller.signal);
+    getStorageStats(controller.signal)
+      .then(setStats)
+      .catch(() => {});
     return () => controller.abort();
-  }, [fetchStats, activeId, sessionCount]);
+  }, []);  // empty deps: fire once, never refire
 
-  // Fetch persisted stats once on mount as a historical baseline.
-  // After that, execution stats follow the real-time WS stream via chatStore
-  // (steps, tokens, events[]) — no polling needed.
+  // Fetch persisted session stats when activeId changes (baseline).
+  // Live execution stats follow the WS stream — no polling.
   useEffect(() => {
     if (!activeId) {
       setSessionStats(null);
@@ -141,8 +137,8 @@ export function EventSidebar() {
       <div className="event-header">
         <div className="event-header-topline">
           <div className="event-title">Live Trace</div>
-          <button className="event-header-action" type="button" aria-label="Collapse live trace">
-            ‹
+          <button className="event-header-action" type="button" aria-label="Collapse live trace" onClick={onToggleCollapse}>
+            ›
           </button>
         </div>
         <div className="event-subtitle">

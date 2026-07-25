@@ -58,6 +58,9 @@ class PytestTool(BaseTool):
         cwd (str):   工作目录（默认当前目录）
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False  # Executes code, which has side effects
+
     def __init__(
         self,
         runtime: Runtime | None = None,

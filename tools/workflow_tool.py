@@ -24,6 +24,9 @@ class WorkflowTool(BaseTool):
 
     metadata = ToolMetadata(effects=frozenset({ToolEffect.DELEGATE_WRITE}))
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
+
     @property
     def name(self) -> str:
         return "Workflow"
@@ -91,6 +94,9 @@ class ToolSearchTool(BaseTool):
     """
 
     metadata = ToolMetadata(effects=frozenset())
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     def __init__(self) -> None:
         super().__init__()
@@ -243,6 +249,9 @@ class WaitForMcpServersTool(BaseTool):
     """
 
     metadata = ToolMetadata(effects=frozenset())
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     def __init__(self) -> None:
         super().__init__()

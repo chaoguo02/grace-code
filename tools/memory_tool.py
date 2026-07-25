@@ -68,6 +68,9 @@ class MemoryReadTool(BaseTool):
     常用于 memory_list 之后读取具体内容。
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(self, store: "MemoryStore") -> None:
         self._store = store
 
@@ -126,6 +129,9 @@ class MemoryWriteTool(BaseTool):
     创建或更新一条记忆。自动更新 MEMORY.md 索引。
     当 agent 发现值得跨会话记住的信息时使用（构建命令、用户偏好、调试技巧等）。
     """
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
 
     def __init__(self, store: "MemoryStore", memory_context: Any = None) -> None:
         self._store = store
@@ -271,6 +277,9 @@ class MemoryListTool(BaseTool):
     agent 在开始任务前应调用此工具检查是否有相关记忆。
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
     def __init__(self, store: "MemoryStore") -> None:
         self._store = store
 
@@ -414,6 +423,9 @@ class MemoryDeleteTool(BaseTool):
     谨慎使用——删除不可恢复。
     """
 
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
+
     def __init__(self, store: "MemoryStore") -> None:
         self._store = store
 
@@ -468,6 +480,9 @@ class MemorySearchTool(BaseTool):
     语义搜索外部记忆。返回按相关性排序的结果。
     和 memory_list（精准列出）互补，适合"记得有但想不起来叫什么"的场景。
     """
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
 
     def __init__(self, external_store: "ExternalMemoryStore | None" = None) -> None:
         self._store = external_store
