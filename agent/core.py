@@ -1233,6 +1233,8 @@ class ReActAgent:
             ),
         )
         execution_budget.start()
+        # Wire budget into the tool execution pipeline for per-tool gating
+        self._full_registry._budget = execution_budget
         cancellation = self._cfg.cancellation_token or CancellationToken()
         delegation_effects = {ToolEffect.PRODUCE_DELIVERABLE}
         for tool_name in self._registry.tool_names:
@@ -2143,6 +2145,7 @@ class ReActAgent:
         )
         if analysis.delegated_tokens > 0:
             execution_budget.consume(analysis.delegated_tokens)
+            execution_budget.record_subagent_tokens(analysis.delegated_tokens)
             logger.debug(
                 "Charged %d subagent tokens to parent budget (total: %d)",
                 analysis.delegated_tokens,

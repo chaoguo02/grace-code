@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { ToolApprovalCard } from "./ToolApprovalCard";
@@ -7,11 +7,13 @@ import { SubagentProgress } from "./SubagentProgress";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { BlocksMessage } from "./BlocksMessage";
 import { ModeTab, getPlaceholder } from "./ModeTab";
+import { KeyboardHelp } from "./KeyboardHelp";
 import { apiPost } from "../api/client";
 import { cancelSession, fetchSkills, updateSession } from "../api/sessions";
 import { getModelCatalog } from "../api/config";
 import { formatBytes, formatRuntime, runtimeSeconds } from "../utils/format";
 import { summarizeStatus } from "../utils/status";
+import { fuzzyFilter } from "../utils/fuzzy";
 
 type ComposerMenu = "closed" | "actions" | "mode" | "model" | "context" | "settings";
 export type ModeKey = "build" | "plan" | "explore";
@@ -187,8 +189,8 @@ export function ChatView() {
     backgroundAgents,
     draft: storedDraft,
     streamingThought,
-    streamingBlocks,
-    dbBlocksByMsgId,
+    activeTurn,
+    completedTurns,
     viewMode,
     events,
   } = useChatStore((s) => selectSessionUi(s, activeId));
@@ -241,6 +243,7 @@ export function ChatView() {
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
   const [modelOptions, setModelOptions] = useState(MODEL_FALLBACK);
   const [planContractExpanded, setPlanContractExpanded] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -373,6 +376,8 @@ export function ChatView() {
         (e.target as HTMLElement)?.getAttribute("contenteditable") === "true";
       if (isEditing) return;
 
+      // ? = keyboard help
+      if (e.key === "?") { e.preventDefault(); setHelpOpen((v) => !v); return; }
       // Ctrl+O = cycle view mode
       if (e.ctrlKey && e.key === "o") { e.preventDefault(); cycleViewMode(activeId); return; }
       // Mod+Shift+B/P/E = switch mode
@@ -393,9 +398,8 @@ export function ChatView() {
     draftRef.current.style.height = `${Math.max(nextHeight, 96)}px`;
   }, [draft]);
 
-  // Unified blocks for rendering — single data path.
-  // Priority: streaming (live) > dbBlocks (loaded) > empty (no data yet).
-  const hasBlocks = streamingBlocks.length > 0 || Object.keys(dbBlocksByMsgId).length > 0;
+  // Unified blocks for rendering — single data path via StreamingTurn.
+  const hasBlocks = activeTurn !== null || completedTurns.length > 0;
 
   const slashMatches = useMemo(() => {
     if (!draft.startsWith("/")) return [];
@@ -409,9 +413,9 @@ export function ChatView() {
   }, [draft]);
 
   const filteredProjectFiles = useMemo(() => {
-    const q = contextQuery.trim().toLowerCase();
-    if (!q) return PROJECT_FILE_SUGGESTIONS;
-    return PROJECT_FILE_SUGGESTIONS.filter((path) => path.toLowerCase().includes(q));
+    const q = contextQuery.trim();
+    if (!q) return PROJECT_FILE_SUGGESTIONS.slice(0, 8);
+    return fuzzyFilter(PROJECT_FILE_SUGGESTIONS, q, (p) => p, 8);
   }, [contextQuery]);
 
   const runtimeLabel = formatRuntime(activeDetail?.created_at, activeDetail?.completed_at);
@@ -722,27 +726,43 @@ export function ChatView() {
     }
 
     if (composerMenu === "model") {
+      const tiers = ["Active", "Fast", "Balanced", "Strong"];
+      const grouped = new Map<string, typeof modelOptions>();
+      for (const opt of modelOptions) {
+        const tier = opt.family || "Other";
+        if (!grouped.has(tier)) grouped.set(tier, []);
+        grouped.get(tier)!.push(opt);
+      }
+      // Ensure tiers in order
+      const orderedTiers = tiers.filter((t) => grouped.has(t)).concat(
+        [...grouped.keys()].filter((k) => !tiers.includes(k))
+      );
       return (
         <div className="composer-panel">
-          <ComposerPanelHeader title="Switch model" detail="UI presets for the current run." onBack={() => setComposerMenu("actions")} />
+          <ComposerPanelHeader title="Switch model" detail="Tiers + full model list." onBack={() => setComposerMenu("actions")} />
           <div className="composer-option-list">
-            {modelOptions.map((option) => (
-              <button
-                key={option.key}
-                type="button"
-                className={`composer-option-card ${model === option.key ? "active" : ""}`}
-                onClick={() => {
-                  setModel(option.key);
-                  switchModel(option.key, undefined, activeId);
-                  setComposerMenu("closed");
-                }}
-              >
-                <div className="composer-option-topline">
-                  <span>{option.key}</span>
+            {orderedTiers.map((tier) => (
+              <div key={tier}>
+                <div className="composer-tier-label">{tier}</div>
+                {(grouped.get(tier) || []).map((option) => (
+                  <button
+                    key={option.key}
+                    type="button"
+                    className={`composer-option-card ${model === option.key ? "active" : ""}`}
+                    onClick={() => {
+                      setModel(option.key);
+                      switchModel(option.key, undefined, activeId);
+                      setComposerMenu("closed");
+                    }}
+                  >
+                    <div className="composer-option-topline">
+                      <span>{option.key}</span>
                   <span className="composer-option-hint">{option.family}</span>
                 </div>
                 <small>{option.note}</small>
               </button>
+                ))}
+              </div>
             ))}
           </div>
         </div>
@@ -897,17 +917,39 @@ export function ChatView() {
           )}
 
           <div id="messages">
-            {/* Blocks-first unified rendering — single data path */}
             <div className="blocks-container">
-              {streamingBlocks.length > 0 && (
-                <BlocksMessage
-                  blocks={streamingBlocks}
-                  metadata={{ steps, tokens, durationMs: runtimeSec * 1000, agentName: activeDetail?.agent_name }}
-                />
-              )}
-              {Object.entries(dbBlocksByMsgId).map(([msgId, entry]) => (
-                <BlocksMessage key={msgId} blocks={entry.blocks} role={entry.role} />
+              {/* Past turns from DB */}
+              {completedTurns.map((turn) => (
+                <React.Fragment key={turn.id}>
+                  <BlocksMessage blocks={turn.userMessage.blocks} role="user" />
+                  <BlocksMessage
+                    blocks={turn.assistantResponse.blocks}
+                    role="assistant"
+                    metadata={turn.meta.steps > 0 ? {
+                      steps: turn.meta.steps,
+                      tokens: turn.meta.tokens,
+                      durationMs: turn.meta.completedAt ? turn.meta.completedAt - turn.meta.startedAt : 0,
+                    } : undefined}
+                  />
+                </React.Fragment>
               ))}
+              {/* Active streaming turn */}
+              {activeTurn && (
+                <React.Fragment>
+                  <BlocksMessage blocks={activeTurn.userMessage.blocks} role="user" />
+                  <BlocksMessage
+                    blocks={activeTurn.assistantResponse.blocks}
+                    role="assistant"
+                    metadata={activeTurn.meta.steps > 0 ? {
+                      steps: activeTurn.meta.steps,
+                      tokens: activeTurn.meta.tokens,
+                      durationMs: activeTurn.meta.startedAt
+                        ? Date.now() - activeTurn.meta.startedAt
+                        : 0,
+                    } : undefined}
+                  />
+                </React.Fragment>
+              )}
 
             {isRunning && !hasBlocks && (
               <div className="trace-block">
@@ -1051,11 +1093,11 @@ export function ChatView() {
                 <textarea
                   ref={draftRef}
                   id="prompt-input"
-                  placeholder={getPlaceholder(mode)}
+                  placeholder={activeDetail?.status === "running" ? "Agent is working… (spectator mode)" : getPlaceholder(mode)}
                   rows={1}
                   autoComplete="off"
                   value={draft}
-                  disabled={isRunning || !activeId}
+                  disabled={isRunning || !activeId || activeDetail?.status === "running"}
                   onChange={(e) => {
                     updateDraft(e.target.value);
                     if (e.target.value.startsWith("/")) setComposerMenu("closed");
@@ -1078,11 +1120,11 @@ export function ChatView() {
                     </button>
                   ) : null}
                   <div className="send-cluster">
-                    <button className="btn-send composer-send-btn" type="button" disabled={isRunning || !activeId || !draft.trim()} onClick={handleSend}>
+                    <button className="btn-send composer-send-btn" type="button" disabled={isRunning || !activeId || !draft.trim() || activeDetail?.status === "running"} onClick={handleSend}>
                       <span className="send-btn-icon">➤</span>
                       <span>Send</span>
                     </button>
-                    <button className="composer-send-caret" type="button" disabled={isRunning || !activeId} aria-label="More send actions">
+                    <button className="composer-send-caret" type="button" disabled={isRunning || !activeId || activeDetail?.status === "running"} aria-label="More send actions">
                       ▾
                     </button>
                   </div>
@@ -1161,6 +1203,9 @@ export function ChatView() {
         agents={Object.values(backgroundAgents)}
         onViewChild={(childId) => setViewingChild(childId, activeId)}
       />
+
+      {/* Keyboard shortcut help */}
+      {helpOpen && <KeyboardHelp onClose={() => setHelpOpen(false)} />}
     </>
   );
 }

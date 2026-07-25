@@ -1,8 +1,8 @@
 import { create } from "zustand";
 import type { Message, TimelineItem, WsMessage } from "../types";
 import type { WsEnvelope, WsPlanReadyEvent } from "../types/events";
-import type { ContentBlock, ThoughtBlock, ToolUseBlock } from "../types/blocks";
-import { blockId, blockHash } from "../types/blocks";
+import type { ContentBlock, ThoughtBlock, ToolUseBlock, StreamingTurn } from "../types/blocks";
+import { blockId, blockHash, createStreamingTurn } from "../types/blocks";
 import * as api from "../api/sessions";
 import { ApiError } from "../api/client";
 import { connectWebSocket, disconnectWebSocket, scheduleReconnect } from "../hooks/useWebSocket";
@@ -60,10 +60,10 @@ export interface SessionUiState {
   contextTotal: number;
   /** Highest backend trace sequence rendered for this session. */
   lastTraceSeq: number;
-  /** Live streaming blocks — WS deltas mutate this array directly. */
-  streamingBlocks: ContentBlock[];
-  /** DB-loaded blocks per message id. Replaces streaming on loadTimeline. */
-  dbBlocksByMsgId: Record<string, { blocks: ContentBlock[]; role: "user" | "assistant" }>;
+  /** Current streaming turn — created by sendChat, finalized by loadTimeline. */
+  activeTurn: StreamingTurn | null;
+  /** Past turns loaded from DB. */
+  completedTurns: StreamingTurn[];
   /** View mode: verbose | normal | summary (CC-aligned). */
   viewMode: "verbose" | "normal" | "summary";
 }
@@ -127,8 +127,8 @@ export function createEmptySessionUiState(): SessionUiState {
     streamingThought: "",
     contextTotal: 200000,  // default for deepseek-v4 / large models
     lastTraceSeq: 0,
-    streamingBlocks: [],
-    dbBlocksByMsgId: {},
+    activeTurn: null,
+    completedTurns: [],
     viewMode: loadViewModePreference(),
   };
 }
@@ -258,19 +258,27 @@ function extractBlocksFromTimeline(
   return result;
 }
 
-/** Integrity check: compare streaming block count + last block hash with DB. */
-function checkBlockIntegrity(
-  streamingBlocks: ContentBlock[],
+/** Integrity check: compare activeTurn's streaming blocks against DB. */
+function checkTurnIntegrity(
+  turn: StreamingTurn,
   dbBlocksByMsgId: Record<string, { blocks: ContentBlock[]; role: string }>,
 ): boolean {
-  if (streamingBlocks.length === 0) return true;
-  const allDbBlocks = Object.values(dbBlocksByMsgId).flatMap((e) => e.blocks);
-  if (allDbBlocks.length === 0) return true;
+  if (turn.meta.hasGap) return false;  // known packet loss → force remount
+  if (Object.keys(dbBlocksByMsgId).length === 0) return true;  // no DB data
 
-  if (streamingBlocks.length !== allDbBlocks.length) return false;
+  const streamBlocks = turn.assistantResponse.blocks;
+  if (streamBlocks.length === 0) return true;  // no streaming data yet
 
-  const wsLast = streamingBlocks[streamingBlocks.length - 1];
-  const dbLast = allDbBlocks[allDbBlocks.length - 1];
+  // Only compare assistant blocks — user messages are separate.
+  const dbAsstBlocks = Object.values(dbBlocksByMsgId)
+    .filter((e) => e.role === "assistant")
+    .flatMap((e) => e.blocks);
+
+  if (dbAsstBlocks.length === 0) return true;
+  if (streamBlocks.length !== dbAsstBlocks.length) return false;
+
+  const wsLast = streamBlocks[streamBlocks.length - 1];
+  const dbLast = dbAsstBlocks[dbAsstBlocks.length - 1];
   return blockHash(wsLast) === blockHash(dbLast);
 }
 
@@ -531,16 +539,25 @@ export const useChatStore = create<ChatState>((set, get) => {
         lastTraceSeq: evSeq > prev.lastTraceSeq ? evSeq : prev.lastTraceSeq,
       }));
 
-      // ── ContentBlock streaming: map WS events to blocks ──
-      // Mutates the streamingBlocks array in place for the current session.
+      // ── ContentBlock streaming: mutate activeTurn.assistantResponse ──
       if (
         ev.type === "thought_delta" || ev.type === "thought" ||
         ev.type === "tool_call" || ev.type === "observation"
       ) {
         patchSession(sid, (prev) => {
-          const blocks = [...prev.streamingBlocks];
-          applyWsToBlocks(blocks, ev, `msg_${sid}_stream`);
-          return { ...prev, streamingBlocks: blocks };
+          if (!prev.activeTurn) return prev;
+          const turn = { ...prev.activeTurn };
+          const blocks = [...turn.assistantResponse.blocks];
+          applyWsToBlocks(blocks, ev, turn.assistantResponse.id);
+          turn.assistantResponse = { ...turn.assistantResponse, blocks };
+          // eventSeq: detect gaps in WS event stream
+          const wsSeq = ev.seq || 0;
+          turn.meta = {
+            ...turn.meta,
+            eventSeq: wsSeq > 0 ? wsSeq : turn.meta.eventSeq,
+            hasGap: turn.meta.hasGap || (wsSeq > 0 && wsSeq !== turn.meta.eventSeq + 1 && turn.meta.eventSeq > 0),
+          };
+          return { ...prev, activeTurn: turn };
         });
       }
 
@@ -548,10 +565,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (ev.status === "running") {
           patchSession(sid, (prev) => ({
             ...prev, isRunning: true, error: null,
-            // Only clear if truly empty — sendChat may have already
-            // injected the user's prompt.  WS reconnect or replay can
-            // send running again without going through sendChat.
-            streamingBlocks: prev.streamingBlocks.length > 0 ? prev.streamingBlocks : [],
+            // activeTurn is owned by sendChat — never clear on running.
+            // WS reconnect/replay can send running again without going
+            // through sendChat; the activeTurn survives.
           }));
         } else if (ev.status === "completed") {
           clearWatchdog();
@@ -561,43 +577,34 @@ export const useChatStore = create<ChatState>((set, get) => {
             steps: ev.result?.steps_taken ?? prev.steps,
             tokens: ev.result?.total_tokens ?? prev.tokens,
             streamingThought: "",
-            streamingBlocks: [],  // run complete → clear live blocks
+            // Mark activeTurn as completed but keep it alive.
+            // loadTimeline will run integrity_check against it and
+            // handle the final transition to completedTurns.
+            activeTurn: prev.activeTurn ? {
+              ...prev.activeTurn,
+              assistantResponse: { ...prev.activeTurn.assistantResponse, status: "completed" as const },
+              meta: { ...prev.activeTurn.meta, completedAt: Date.now() },
+            } : null,
             // Do NOT clear planApproval here — when the plan agent
             // exits via ExitPlanMode, the plan_ready event that
-            // follows immediately will overwrite it.  If the plan
-            // agent exited WITHOUT a contract (error / step budget
-            // / model gave up), the planApproval stays visible and
-            // the next loadTimeline will restore it from plan_state.
+            // follows immediately will overwrite it.
           }));
           return;
-        } else if (ev.status === "failed") {
+        } else if (ev.status === "failed" || ev.status === "cancelled" || ev.status === "finish" || ev.status === "gave_up") {
           clearWatchdog();
           patchSession(sid, (prev) => ({
             ...prev,
             isRunning: false,
-            error: ev.error || "Execution failed",
-            planApproval: null,  // a failed run invalidates any pending plan
+            error: ev.status === "failed" ? (ev.error || "Execution failed") :
+                   ev.status === "cancelled" ? (ev.error || ev.message || "Execution cancelled") : null,
+            planApproval: null,
             streamingThought: "",
-          }));
-          return;
-        } else if (ev.status === "cancelled") {
-          clearWatchdog();
-          patchSession(sid, (prev) => ({
-            ...prev,
-            isRunning: false,
-            error: ev.error || ev.message || "Execution cancelled",
-            planApproval: null,  // explicit cancellation invalidates the plan
-            streamingThought: "",
-          }));
-          return;
-        } else if (ev.status === "finish" || ev.status === "gave_up") {
-          clearWatchdog();
-          patchSession(sid, (prev) => ({
-            ...prev,
-            isRunning: false,
-            streamingThought: "",
-            planApproval: null,  // agent gave a final response, not a plan
-            timeline: ev.message ? [...prev.timeline, { source: "ws" as const, ws: ev }] : prev.timeline,
+            // Terminal without success — move turn to completedTurns as-is.
+            // loadTimeline will replace with canonical DB data shortly.
+            completedTurns: prev.activeTurn
+              ? [...prev.completedTurns, { ...prev.activeTurn, assistantResponse: { ...prev.activeTurn.assistantResponse, status: "error" as const } }]
+              : prev.completedTurns,
+            activeTurn: null,
           }));
           return;
         }
@@ -839,13 +846,15 @@ export const useChatStore = create<ChatState>((set, get) => {
         ...prev,
         isRunning: true,
         error: null,
-        // Only clear planApproval if it was already resolved (not waiting).
-        // Preserve it when user is sending feedback while plan is still pending.
         planApproval: prev.planApproval?.isWaiting ? prev.planApproval : null,
-        // Inject the user's prompt as the first streaming block.
-        // This fills the "streaming window gap" before WS events arrive.
-        // loadTimeline replaces this with real DB blocks on completion.
-        streamingBlocks: [{ type: "text", content: prompt }],
+        // Create a new StreamingTurn — the single owner of this round's data.
+        // Use Date.now() as unique suffix so turn ID is always distinct
+        // even if completedTurns hasn't been loaded from DB yet.
+        activeTurn: createStreamingTurn(
+          sessionId,
+          Math.floor(Date.now() / 1000),  // unique per-send suffix
+          prompt,
+        ),
       }));
       clearWatchdog();  // clear any stale timer from a previous run
       _watchdogTimer = setTimeout(() => {
@@ -1021,8 +1030,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
 
         // ── ContentBlock integrity check ──
-        // Compare streaming blocks with DB blocks. If they match, silently
-        // replace attributes (no remount). If they differ, full remount.
+        // Extract blocks from DB timeline. If integrity passes against
+        // activeTurn, silently replace tempIds with realIds (no remount).
+        // If it fails, move activeTurn → completedTurns and rebuild.
         const dbBlocks = extractBlocksFromTimeline(timelineItems);
         const dbBlocksByMsgId: Record<string, { blocks: ContentBlock[]; role: "user" | "assistant" }> = {};
         for (const [msgId, entry] of dbBlocks) {
@@ -1030,7 +1040,36 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
 
         patchSession(sessionId, (prev) => {
-          const integrityOk = checkBlockIntegrity(prev.streamingBlocks, dbBlocksByMsgId);
+          const activeTurn = prev.activeTurn;
+          const integrityOk = activeTurn
+            ? checkTurnIntegrity(activeTurn, dbBlocksByMsgId)
+            : true;
+
+          // Build completedTurns from DB — any turn we have DB data for
+          // that isn't the active turn (or active failed integrity).
+          const newCompleted: StreamingTurn[] = [];
+          for (const [msgId, entry] of Object.entries(dbBlocksByMsgId)) {
+            const isActiveUser = activeTurn && integrityOk && activeTurn.userMessage.id === msgId;
+            const isActiveAsst = activeTurn && integrityOk && activeTurn.assistantResponse.id === msgId;
+            if (isActiveUser || isActiveAsst) {
+              continue;  // activeTurn still alive, skip DB version
+            }
+            // Carry over metadata from activeTurn if integrity failed and
+            // this is the corresponding DB entry for the failed turn.
+            const inheritMeta = activeTurn && !integrityOk
+              ? activeTurn.meta : { steps: 0, tokens: 0, startedAt: 0, eventSeq: 0, hasGap: false };
+            newCompleted.push({
+              id: `turn_${sessionId}_db_${msgId}`,
+              userMessage: entry.role === "user"
+                ? { id: msgId, blocks: entry.blocks }
+                : { id: msgId, blocks: [{ type: "text" as const, content: "" }] },
+              assistantResponse: entry.role === "assistant"
+                ? { id: msgId, blocks: entry.blocks, status: "completed" as const }
+                : { id: msgId, blocks: [], status: "completed" as const },
+              meta: { ...inheritMeta },
+            });
+          }
+
           return {
             ...prev,
             events: afterSeq > 0
@@ -1039,10 +1078,11 @@ export const useChatStore = create<ChatState>((set, get) => {
             timeline: mergeTimelineItems(afterSeq > 0 ? prev.timeline : [], timelineItems),
             planApproval: afterSeq > 0 ? prev.planApproval : (planApproval ?? prev.planApproval),
             lastTraceSeq: Math.max(prev.lastTraceSeq, response.last_seq || 0),
-            dbBlocksByMsgId,
-            // If integrity passes, streamingBlocks survive (no remount for render).
-            // If it fails, clear them so the render layer creates fresh components.
-            streamingBlocks: integrityOk ? prev.streamingBlocks : [],
+            // If integrity passes, activeTurn survives with its tempIds
+            // (rendered identically to DB). If it fails, clear it so
+            // completedTurns takes over with canonical DB data.
+            activeTurn: integrityOk ? activeTurn : null,
+            completedTurns: newCompleted,
           };
         });
       } catch (e: unknown) {

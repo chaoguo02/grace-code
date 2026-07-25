@@ -130,3 +130,72 @@ export function toolUseSummary(block: ToolUseBlock): string {
   const max = 60;
   return str.length > max ? str.slice(0, max) + "…" : str;
 }
+
+// ── StreamingTurn — lifecycle-managed streaming context ──────────────────
+
+/**
+ * A single conversation turn: one user message + its assistant response.
+ *
+ * Created by sendChat, mutated by WS events, finalized by loadTimeline.
+ * This replaces the three-array patchwork (streamingBlocks + dbBlocksByMsgId
+ * + timeline) with a single lifecycle-managed domain object.
+ */
+export interface StreamingTurn {
+  /** Stable turn ID: turn_{sessionId}_{generation}. Survives streaming→DB. */
+  id: string;
+
+  userMessage: {
+    /** tempId before DB load, real message ID after */
+    id: string;
+    blocks: ContentBlock[];
+  };
+
+  assistantResponse: {
+    /** tempId before DB load, real message ID after */
+    id: string;
+    blocks: ContentBlock[];
+    status: "streaming" | "completed" | "error";
+  };
+
+  meta: {
+    steps: number;
+    tokens: number;
+    startedAt: number;
+    completedAt?: number;
+    /** Monotonic WS event counter, starts at 1. */
+    eventSeq: number;
+    /** True when seq discontinuity detected — forces remount on DB load. */
+    hasGap: boolean;
+  };
+}
+
+/** Create a fresh StreamingTurn for a new chat request. */
+export function createStreamingTurn(
+  sessionId: string,
+  generation: number,
+  prompt: string,
+): StreamingTurn {
+  const now = Date.now();
+  const tempUserId = `temp_u_${now}`;
+  const tempAsstId = `temp_a_${now}`;
+  return {
+    id: `turn_${sessionId}_${generation}`,
+    userMessage: {
+      id: tempUserId,
+      blocks: [{ type: "text", content: prompt }],
+    },
+    assistantResponse: {
+      id: tempAsstId,
+      blocks: [],
+      status: "streaming",
+    },
+    meta: {
+      steps: 0,
+      tokens: 0,
+      startedAt: now,
+      eventSeq: 0,
+      hasGap: false,
+    },
+  };
+}
+

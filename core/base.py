@@ -662,6 +662,7 @@ class ToolRegistry:
             hook_dispatcher=self._hook_dispatcher,
             capability_registry=self._capability_registry,
             session_id=getattr(self, "_session_id", ""),
+            budget=getattr(self, "_budget", None),
         )
         result = pipeline.execute(tool, params, thought=thought)
 

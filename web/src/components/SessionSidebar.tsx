@@ -47,6 +47,7 @@ export function SessionSidebar({ onToggleCollapse }: { onToggleCollapse?: () => 
   const [statsSession, setStatsSession] = useState<SessionSummary | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [confirmBatchDelete, setConfirmBatchDelete] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; sessionId: string; title: string } | null>(null);
 
   useEffect(() => {
     loadSessions();
@@ -55,6 +56,13 @@ export function SessionSidebar({ onToggleCollapse }: { onToggleCollapse?: () => 
   useEffect(() => {
     setSelectedIds(new Set());
   }, [sessions.length]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [contextMenu]);
 
   const handleOpen = async (id: string) => {
     await openSession(id);
@@ -166,6 +174,7 @@ export function SessionSidebar({ onToggleCollapse }: { onToggleCollapse?: () => 
               aria-current={s.id === activeId ? "true" : undefined}
               className={`session-item ${s.id === activeId ? "active" : ""}`}
               onClick={() => handleOpen(s.id)}
+              onContextMenu={(e) => { e.preventDefault(); setContextMenu({ x: e.clientX, y: e.clientY, sessionId: s.id, title: s.title || s.id }); }}
               onKeyDown={(e: React.KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleOpen(s.id); } }}
             >
               <span className={`session-dot ${statusClass(s.status)}`} />
@@ -248,6 +257,18 @@ export function SessionSidebar({ onToggleCollapse }: { onToggleCollapse?: () => 
         onConfirm={executeBatchDelete}
         onCancel={() => setConfirmBatchDelete(false)}
       />
+
+      {contextMenu && (
+        <div className="ctx-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
+          <button className="ctx-menu-item" onClick={async () => {
+            const name = prompt("Rename:", contextMenu.title);
+            if (name?.trim()) { try { await updateSession(contextMenu.sessionId, { title: name.trim() }); loadSessions(); if (contextMenu.sessionId === activeId) refreshActive(); } catch { /* ok */ } }
+            setContextMenu(null);
+          }}>✎ Rename</button>
+          <button className="ctx-menu-item" onClick={() => { navigator.clipboard.writeText(contextMenu.sessionId).catch(() => {}); setContextMenu(null); }}>📋 Copy ID</button>
+          <button className="ctx-menu-item ctx-menu-danger" onClick={() => { setConfirmDeleteId(contextMenu.sessionId); setContextMenu(null); }}>× Delete</button>
+        </div>
+      )}
     </aside>
   );
 }

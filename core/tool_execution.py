@@ -37,12 +37,14 @@ class ToolExecutionPipeline:
         hook_dispatcher: Any = None,
         capability_registry: Any = None,
         session_id: str = "",
+        budget: Any = None,  # ExecutionBudget — only EXHAUSTED gates tool calls
     ) -> None:
         self._permission_pipeline = permission_pipeline
         self._hitl_manager = hitl_manager
         self._hook_dispatcher = hook_dispatcher
         self._capability_registry = capability_registry
         self._session_id = session_id
+        self._budget = budget
 
     def execute(
         self,
@@ -61,6 +63,16 @@ class ToolExecutionPipeline:
         capability_error = self._check_capability(tool)
         if capability_error is not None:
             return capability_error
+
+        # ── Per-tool budget gate (EXHAUSTED only — WARNING/CRITICAL
+        #     are handled per-step to avoid double-penalty message injection) ──
+        if self._budget is not None:
+            budget_status = self._budget.check()
+            if getattr(budget_status, "is_exhausted", False):
+                return ToolResult.from_error(
+                    error_type=ToolErrorType.UNAVAILABLE,
+                    detail=getattr(budget_status, "inject_message", "") or "Budget exhausted",
+                )
 
         permission_result = None
         if self._permission_pipeline is not None:

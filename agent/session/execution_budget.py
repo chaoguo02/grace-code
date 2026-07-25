@@ -104,20 +104,46 @@ class BudgetStatus:
 class ExecutionBudgetConfig:
     """Configuration for the unified execution budget."""
 
-    token_limit: int = 80_000
+    token_limit: int = 200_000
     """Maximum billable tokens for the entire run (including subagents)."""
 
-    step_limit: int = 40
+    step_limit: int = 100
     """Maximum main-loop steps."""
 
-    time_limit_seconds: float = 600.0
-    """Wall-clock time limit in seconds. 0 = disabled. Default 10 min for build agent."""
+    time_limit_seconds: float = 1800.0
+    """Wall-clock time limit in seconds. 0 = disabled. Default 30 min for build agent."""
 
     warning_threshold: float = 0.80
     """Fraction of limit at which WARNING level triggers."""
 
     critical_threshold: float = 0.95
     """Fraction of limit at which CRITICAL level triggers."""
+
+# ---------------------------------------------------------------------------
+# BudgetUsage — consumption attribution (P2)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BudgetUsage:
+    """Track where budget is spent: productive work vs retries vs overhead."""
+    productive_steps: int = 0
+    retry_steps: int = 0         # safety checks (Read-before-Edit etc) triggering rework
+    overhead_tokens: int = 0     # system/error messages consuming budget
+    subagent_tokens: int = 0     # tokens consumed by delegated subagents
+
+    @property
+    def total_steps(self) -> int:
+        return self.productive_steps + self.retry_steps
+
+    def to_dict(self) -> dict:
+        return {
+            "productive_steps": self.productive_steps,
+            "retry_steps": self.retry_steps,
+            "overhead_tokens": self.overhead_tokens,
+            "subagent_tokens": self.subagent_tokens,
+            "total_steps": self.total_steps,
+        }
+
 
 # ---------------------------------------------------------------------------
 # ExecutionBudget
@@ -167,6 +193,31 @@ class ExecutionBudget:
     _warning_injected: bool = False
     _critical_injected: bool = False
     _force_finish_injected: bool = False
+    usage: BudgetUsage = field(default_factory=BudgetUsage)
+
+    def record_retry_step(self) -> None:
+        """Mark a step as triggered by safety check (Read-before-Edit etc)."""
+        self.usage.retry_steps += 1
+
+    def record_overhead_tokens(self, tokens: int) -> None:
+        """Track tokens spent on system/error messages."""
+        self.usage.overhead_tokens += tokens
+
+    def record_subagent_tokens(self, tokens: int) -> None:
+        """Track tokens consumed by delegated subagents."""
+        self.usage.subagent_tokens += tokens
+
+    def get_usage_report(self) -> dict:
+        """Return budget consumption attribution for diagnostics."""
+        return {
+            **self.usage.to_dict(),
+            "token_used": self._token_used,
+            "token_limit": self.config.token_limit,
+            "steps_taken": self._steps_taken,
+            "step_limit": self.config.step_limit,
+            "elapsed_s": round(self.elapsed_seconds, 1),
+            "time_limit_s": self.config.time_limit_seconds,
+        }
 
     # ── Properties ──
 
@@ -231,9 +282,13 @@ class ExecutionBudget:
         """Consume tokens from the budget. Charges subagent usage here."""
         self._token_used += max(0, tokens)
 
-    def record_step(self) -> int:
+    def record_step(self, *, retry: bool = False) -> int:
         """Record a main-loop iteration. Returns the new step count."""
         self._steps_taken += 1
+        if retry:
+            self.usage.retry_steps += 1
+        else:
+            self.usage.productive_steps += 1
         return self._steps_taken
 
     # ── Check ──

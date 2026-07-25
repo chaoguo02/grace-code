@@ -45,6 +45,22 @@ function statusColor(status: string): string {
   return "var(--text-muted)";
 }
 
+/** MIME-aware output rendering (P2). */
+function renderOutput(output: string, toolName: string) {
+  // JSON → collapsible tree
+  if (toolName === "WebFetch" || (output.trim().startsWith("{") && output.trim().endsWith("}"))) {
+    try {
+      const obj = JSON.parse(output);
+      return <pre className="output-json">{JSON.stringify(obj, null, 2)}</pre>;
+    } catch { /* fall through */ }
+  }
+  // Large text → Markdown with collapse
+  if (output.length > 1000) {
+    return <MarkdownRenderer content={output.slice(0, 2000)} />;
+  }
+  return <MarkdownRenderer content={output} />;
+}
+
 // ── InlineToolBlock ────────────────────────────────────────────────────────
 
 function InlineToolBlock({ block }: { block: ToolUseBlock }) {
@@ -70,7 +86,9 @@ function InlineToolBlock({ block }: { block: ToolUseBlock }) {
         <span className="inline-tool-icon">{toolIcon(block.name)}</span>
         <span className="inline-tool-name">{block.name}</span>
         {isMerged && (
-          <span className="inline-tool-group-count">({block.groupedWith!.length + 1})</span>
+          <span className="inline-tool-group-count" title={`${block.groupLabel || block.name + " group"}\n${block.groupedWith!.length + 1} files merged`}>
+            ({block.groupedWith!.length + 1})
+          </span>
         )}
         {summary && <span className="inline-tool-summary">{summary}</span>}
         {isRetry && (
@@ -88,7 +106,7 @@ function InlineToolBlock({ block }: { block: ToolUseBlock }) {
           )}
           {block.output && (
             <div className="inline-tool-output">
-              <MarkdownRenderer content={block.output.slice(0, 2000)} />
+              {renderOutput(block.output, block.name)}
               {block.output.length > 2000 && (
                 <div className="inline-tool-truncated">
                   … output truncated ({block.output.length.toLocaleString()} chars total)
@@ -98,6 +116,14 @@ function InlineToolBlock({ block }: { block: ToolUseBlock }) {
           )}
           {!block.output && !block.error && block.status === "running" && (
             <div className="inline-tool-running">Waiting for result…</div>
+          )}
+          {/* Anchor targets for reference backlinks (P2) */}
+          {block.anchorTargets && block.anchorTargets.length > 0 && (
+            <div className="inline-tool-anchors">
+              {block.anchorTargets.map((f) => (
+                <span key={f} className="anchor-chip" title={`Referenced: ${f}`}>📎 {f}</span>
+              ))}
+            </div>
           )}
         </div>
       )}
@@ -139,12 +165,50 @@ function InlineThoughtBlock({ block }: { block: ThoughtBlock }) {
 
 // ── BlocksMessage (main) ───────────────────────────────────────────────────
 
+/** Merge consecutive same-name tool_use blocks into groups. */
+function groupBlocks(blocks: ContentBlock[]): ContentBlock[] {
+  const result: ContentBlock[] = [];
+  let pending: ToolUseBlock[] = [];
+
+  const flush = () => {
+    if (pending.length === 0) return;
+    if (pending.length >= 3) {
+      // Merge: keep first, set groupLabel + groupedWith
+      const first = { ...pending[0] };
+      first.groupedWith = pending.slice(1).map((b) => b.id);
+      first.groupLabel = `${first.name} ${pending.length} files`;
+      result.push(first);
+    } else {
+      result.push(...pending);
+    }
+    pending = [];
+  };
+
+  for (const block of blocks) {
+    if (block.type === "tool_use" && block.status === "success" && !block.retryOf) {
+      const last = pending[pending.length - 1];
+      if (last && last.name === block.name && last.status === "success") {
+        pending.push(block);
+      } else {
+        flush();
+        pending.push(block);
+      }
+    } else {
+      flush();
+      result.push(block);
+    }
+  }
+  flush();
+  return result;
+}
+
 export function BlocksMessage({ blocks, role, metadata }: BlocksMessageProps) {
   const isUser = role === "user";
+  const grouped = isUser ? blocks : groupBlocks(blocks);
 
   return (
     <div className={`blocks-message${isUser ? " blocks-user" : ""}`}>
-      {blocks.map((block, i) => {
+      {grouped.map((block, i) => {
         if (block.type === "text") {
           return (
             <div key={i} className="blocks-text">

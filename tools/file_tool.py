@@ -80,6 +80,9 @@ class FileReadCache:
 
     entries: dict[str, list[_CacheEntry]] = field(default_factory=dict)
     _hit_count: int = 0   # diagnostics: total cache hits this session
+    MAX_ENTRIES: int = 200
+    MAX_TOTAL_BYTES: int = 50 * 1024 * 1024  # 50 MB
+    _total_bytes: int = 0
 
     # ── Public API ──
 
@@ -193,11 +196,27 @@ class FileReadCache:
             content=content,
             mtime_ns=mtime_ns,
         )
+
+        # ── Eviction: enforce size limits (FIFO) ──
+        entry_bytes = len(content.encode("utf-8"))
+        while self.entries and (
+            len(self.entries) >= self.MAX_ENTRIES
+            or self._total_bytes + entry_bytes > self.MAX_TOTAL_BYTES
+        ):
+            oldest_key = next(iter(self.entries))
+            oldest_entries = self.entries[oldest_key]
+            for e in oldest_entries:
+                self._total_bytes -= len(e.content.encode("utf-8"))
+            del self.entries[oldest_key]
+
         self.entries.setdefault(normalized_path, []).append(entry)
+        self._total_bytes += entry_bytes
 
     def invalidate(self, normalized_path: str) -> None:
         """Remove all cached entries for a path. Called after file writes."""
         if normalized_path in self.entries:
+            for e in self.entries[normalized_path]:
+                self._total_bytes -= len(e.content.encode("utf-8"))
             del self.entries[normalized_path]
             logger.debug("FileReadCache invalidated (write): %s", normalized_path)
 
@@ -560,6 +579,25 @@ class FileWriteTool(BaseTool):
             except ValueError as e:
                 return ToolResult(success=False, output="", error=str(e))
             path = Path(clean)
+
+        # ── Read-before-Write (CC-aligned safety gate) ──
+        # For existing files: must have read the file this session.
+        # New files (path doesn't exist yet) and symlinks to deleted
+        # targets are exempt — the check only applies when overwriting
+        # content the agent hasn't inspected.
+        _rbw_exempt = False
+        try:
+            _rbw_exempt = not path.exists() and not path.is_symlink()
+        except OSError:
+            _rbw_exempt = True  # can't stat → assume new file, allow
+        if not _rbw_exempt and self._read_cache is not None:
+            cache_info = self._read_cache.get(str(path.resolve()))
+            if cache_info is None:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"Read-before-Write: '{path}' has not been read in this session. "
+                          "Read the file first, then write to it.",
+                )
 
         # ── Layers 2+3: resolve parent + O_NOFOLLOW (TOCTOU protection) ──
         if ws is not None:

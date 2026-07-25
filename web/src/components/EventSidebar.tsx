@@ -68,7 +68,6 @@ export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => vo
   const activeDetail = useSessionStore((s) => s.activeDetail);
   const [stats, setStats] = useState<StorageStats | null>(null);
   const [sessionStats, setSessionStats] = useState<SessionStats | null>(null);
-  const [eventFilter, setEventFilter] = useState<string>("all");
 
   // Fetch storage stats once on mount — not per-session.
   useEffect(() => {
@@ -98,28 +97,6 @@ export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => vo
       cancelled = true;
     };
   }, [activeId]);
-
-  const renderTitle = (ev: (typeof events)[number]) => {
-    if (ev.type === "thought") return "Planning";
-    if (ev.type === "tool_call") return ev.name || "Tool Call";
-    if (ev.type === "observation") return ev.tool_name || "Observation";
-    if (ev.type === "reflection") return "Reflection";
-    if (ev.type === "subagent_start") return "Subagent Started";
-    if (ev.type === "subagent_stop") return "Subagent Finished";
-    if (ev.type === "memory_recall") return "Memory Recall";
-    if (ev.type === "memory_written") return "Memory Saved";
-    return ev.type || "Event";
-  };
-
-  const renderPreview = (ev: (typeof events)[number]) =>
-    (ev as { content?: string }).content ||
-    (ev as { name?: string }).name ||
-    (ev as { output?: string }).output ||
-    (ev as { error?: string }).error ||
-    (ev as { message?: string }).message ||
-    (ev.type === "memory_recall" ? `${ev.injected_count} injected from ${ev.candidate_count} candidates` : "") ||
-    (ev.type === "memory_written" ? ev.description : "") ||
-    "Waiting for details";
 
   const toolCounts = sessionStats?.tools && Object.keys(sessionStats.tools).length
     ? sessionStats.tools
@@ -158,13 +135,10 @@ export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => vo
         </div>
       </div>
 
-      <div className="event-filter-row">
-        {(["all", "steps", "logs", "files"] as const).map((f) => (
-          <button key={f} className={`event-filter ${eventFilter === f ? "active" : ""}`}
-            type="button" onClick={() => setEventFilter(f)}>
-            {f === "all" ? "All" : f === "steps" ? "Steps" : f === "logs" ? "Logs" : "Files"}
-          </button>
-        ))}
+      <div className="event-filter-row" style={{ justifyContent: "flex-end" }}>
+        <a href="#" onClick={(e) => { e.preventDefault(); /* TODO: switch to Trace tab */ }} style={{ fontSize: 10, color: "var(--text-muted)" }}>
+          Open Full Trace →
+        </a>
       </div>
 
       <div className="execution-stats-card">
@@ -216,29 +190,17 @@ export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => vo
           <div className="empty-state">Waiting for execution...</div>
         )}
 
-        {events
-          .filter((ev) => {
-            if (eventFilter === "all") return true;
-            if (eventFilter === "steps") return ev.type === "tool_call" || ev.type === "observation";
-            if (eventFilter === "logs") return ev.type === "thought" || ev.type === "reflection" || ev.type === "status";
-            if (eventFilter === "files") return ev.type === "observation" && !!ev.diff;
-            return true;
-          })
-          .map((ev, i) => {
+        {events.slice(0, 5).map((ev, i) => {
+          const icon = ev.type === "tool_call" ? "⚙" :
+                       ev.type === "thought" ? "▸" :
+                       ev.type === "observation" ? "○" : "•";
+          const label = ev.type === "tool_call" ? (ev.name || "Tool") :
+                        ev.type === "thought" ? "Thought" :
+                        ev.type === "observation" ? (ev.tool_name || "Result") : (ev.type || "Event");
           return (
-            <div key={i} className="timeline-row">
-              <div className="timeline-time">{formatTimeLabel(ev, i)}</div>
-              <div className="timeline-node" />
-              <div className="timeline-card">
-                <div className="timeline-card-head">
-                  <div className="timeline-card-icon">
-                    {ev.type === "thought" ? "T" : ev.type === "tool_call" ? "A" : ev.type === "memory_recall" ? "M" : ev.type === "memory_written" ? "N" : "O"}
-                  </div>
-                  <div className="timeline-card-title">{renderTitle(ev)}</div>
-                  <div className="timeline-card-status">•</div>
-                </div>
-                <div className="timeline-card-body">{renderPreview(ev)}</div>
-              </div>
+            <div key={i} className="timeline-row-compact">
+              <span className="timeline-compact-icon">{icon}</span>
+              <span className="timeline-compact-label">{label}</span>
             </div>
           );
         })}

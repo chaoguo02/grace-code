@@ -5692,6 +5692,29 @@ footer.composer { margin-top: 0; padding-top: 0; }
 }
 .composer-bottom-right { gap: 4px; }
 
+/* ── Context menu ── */
+
+.ctx-menu {
+  position: fixed; z-index: 999;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+  padding: 4px;
+  min-width: 140px;
+}
+.ctx-menu-item {
+  display: block; width: 100%;
+  text-align: left;
+  border: none; background: none;
+  padding: 6px 12px; font-size: 12px;
+  border-radius: 4px; cursor: pointer;
+  color: var(--text);
+}
+.ctx-menu-item:hover { background: var(--bg); }
+.ctx-menu-danger { color: var(--error); }
+.ctx-menu-danger:hover { background: var(--error-soft); }
+
 /* ── Session sidebar: single-line items ── */
 
 .session-item {
@@ -5763,6 +5786,52 @@ footer.composer { margin-top: 0; padding-top: 0; }
 }
 .session-action-btn:hover { background: var(--bg); color: var(--text); }
 .session-action-delete:hover { color: var(--error); }
+
+/* ── Compact event timeline (EventSidebar) ── */
+
+.timeline-row-compact {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 8px; font-size: 11px;
+}
+.timeline-compact-icon { width: 14px; text-align: center; flex-shrink: 0; color: var(--text-muted); }
+.timeline-compact-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+
+/* ── Keyboard help overlay ── */
+
+.help-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.4);
+  display: flex; align-items: center; justify-content: center;
+}
+.help-panel {
+  background: var(--bg-elev);
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 520px; width: 90vw;
+  max-height: 80vh; overflow-y: auto;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+}
+.help-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.help-header h2 { font-size: 16px; margin: 0; }
+.help-close { border: none; background: none; font-size: 20px; cursor: pointer; color: var(--text-muted); }
+.help-table { display: flex; flex-direction: column; gap: 2px; }
+.help-row { display: flex; align-items: center; gap: 12px; padding: 6px 8px; border-radius: 4px; }
+.help-row:hover { background: var(--bg); }
+.help-keys {
+  font-family: inherit; font-size: 11px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 8px;
+  min-width: 100px; text-align: center;
+  white-space: nowrap;
+}
+.help-action { flex: 1; font-size: 13px; }
+.help-scope { font-size: 10px; color: var(--text-muted); }
+
+.composer-tier-label {
+  font-size: 10px; font-weight: 600; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.5px;
+  padding: 8px 0 4px;
+}
 
 /* ── HITL inline approval bar ── */
 
@@ -5857,6 +5926,24 @@ footer.composer { margin-top: 0; padding-top: 0; }
   font-weight: 600;
 }
 .mode-tab:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.output-json {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  background: var(--bg);
+  padding: 8px;
+  border-radius: 4px;
+  overflow-x: auto;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.anchor-chip {
+  display: inline-flex; align-items: center; gap: 2px;
+  font-size: 10px; color: var(--accent);
+  background: var(--accent-soft);
+  padding: 1px 6px; border-radius: 10px;
+  margin: 2px;
+}
 
 /* ── Inline blocks (ContentBlock rendering) ── */
 
