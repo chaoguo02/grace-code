@@ -866,7 +866,7 @@ export function ChatView() {
             </div>
           )}
 
-          {timeline.length === 0 && (
+          {timeline.length === 0 && !hasBlocks && (
             <div className="welcome welcome-hero">
               <div className="welcome-hero-badge">✦</div>
               <h1>Welcome to Grace Code</h1>
