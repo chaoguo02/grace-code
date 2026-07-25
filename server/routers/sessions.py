@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -443,46 +444,33 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         limit: int = 200,
         service=Depends(get_service),
     ) -> dict[str, Any]:
-        """Return a backend-composed session timeline for frontend rendering."""
+        """Return a backend-composed session timeline for frontend rendering.
+
+        Returns turn-grouped ``turns`` (primary path — each turn has
+        user_message + assistant_message + trace_events + meta) alongside
+        the legacy ``items`` (flat message+event list) for backward compat.
+        """
         _assert_valid_session_id(session_id)
         rec = service.session_service.get_session(session_id)
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
         try:
-            messages = service.session_service.get_messages(session_id) if after_seq <= 0 else []
-            events = _load_typed_trace_events(
-                service, session_id, after_seq=after_seq, limit=limit,
+            result = service.session_service.build_turn_timeline(
+                session_id, after_seq=after_seq, limit=limit,
             )
         except ValueError:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
-        items: list[dict[str, Any]] = []
-        if after_seq <= 0:
-            for msg in messages:
-                items.append({
-                    "source": "message",
-                    "timestamp": msg.get("created_at", ""),
-                    "message": msg,
-                })
-        for ev in events:
-            items.append({
-                "source": "ws",
-                "timestamp": ev.get("timestamp", ""),
-                "event": ev,
-                "seq": ev.get("seq", 0),
-            })
-
-        items.sort(key=lambda item: item.get("timestamp") or "")
-        max_seq = max((int(item.get("seq") or 0) for item in items), default=after_seq)
-
-        # Build explicit plan_state so the frontend doesn't infer it from events.
         plan_state = _build_plan_state(rec)
 
         return {
             "session_id": session_id,
-            "items": items,
-            "last_seq": max_seq,
-            "has_more": len(events) >= limit,
+            "turns": result["turns"],
+            "items": result["items"],          # legacy compat
+            "last_seq": result["last_seq"],
+            "has_more": result["has_more"],
+            "active_run": result["active_run"],
             "plan_state": plan_state,
         }
 
@@ -566,6 +554,84 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         if rec.status == SessionStatus.RUNNING:
             raise HTTPException(status_code=409, detail="Session is already running")
 
+        # ── Idempotency + concurrency + Run/Turn creation ──
+        import uuid as _uuid_mod
+        _idem_key = (body.idempotency_key or "").strip()
+        _run_id: str | None = None
+        _turn_id: str | None = None
+        _turn_index: int = 0
+
+        if hasattr(service, "_storage") and service._storage is not None:
+            _storage = service._storage
+
+            # 1. Idempotency check
+            if _idem_key:
+                existing = _storage.check_idempotent_run(session_id, _idem_key)
+                if existing is not None:
+                    if existing.get("prompt", "") != body.prompt:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="idempotency key reused with different prompt",
+                        )
+                    return {
+                        "accepted": True,
+                        "run_id": existing["id"],
+                        "turn_id": existing["turn_id"],
+                        "turn_index": existing["turn_index"],
+                    }
+
+            # 2. Concurrency check — no parallel runs
+            active_run = _storage.get_active_run(session_id)
+            if active_run is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="RUN_ALREADY_ACTIVE",
+                )
+
+            # 3. Create Run + Turn in a single transaction
+            _run_id = str(_uuid_mod.uuid4())
+            _turn_id = str(_uuid_mod.uuid4())
+            try:
+                from datetime import datetime, timezone as _tz
+                _now = datetime.now(_tz.utc).isoformat()
+                with _storage._store._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    # Atomic turn_index increment
+                    conn.execute(
+                        "UPDATE sessions SET run_generation = run_generation + 1 WHERE id = ?",
+                        (session_id,),
+                    )
+                    row = conn.execute(
+                        "SELECT run_generation FROM sessions WHERE id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    _turn_index = int(row["run_generation"]) if row else 1
+
+                    # Create run record
+                    conn.execute(
+                        """INSERT INTO runs
+                           (id, session_id, turn_id, turn_index, idempotency_key, prompt,
+                            status, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                        (_run_id, session_id, _turn_id, _turn_index, _idem_key,
+                         body.prompt, _now, _now),
+                    )
+
+                    # Persist user message with turn_id
+                    conn.execute(
+                        """INSERT INTO session_messages
+                           (session_id, role, content, turn_id, created_at)
+                           VALUES (?, 'user', ?, ?, ?)""",
+                        (session_id, body.prompt, _turn_id, _now),
+                    )
+                    conn.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                logger.warning("Run conflict for session %s — concurrent request", session_id)
+                raise HTTPException(status_code=409, detail="RUN_ALREADY_ACTIVE")
+            except Exception:
+                logger.exception("Failed to create Run for session %s", session_id)
+                raise HTTPException(status_code=500, detail="Failed to create run")
+
         # Ensure event bus subscriber exists
         if hasattr(service, "_event_bus") and service._event_bus is not None:
             await service._event_bus.create_session(session_id)
@@ -581,16 +647,30 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         # Start async execution in background thread
         try:
+            from agent.session.models import RunContext
+            _ctx = RunContext(
+                session_id=session_id,
+                run_id=_run_id,
+                turn_id=_turn_id,
+                turn_index=_turn_index,
+                idempotency_key=_idem_key,
+            ) if _run_id else None
             service.run_chat_async(
                 session_id=session_id,
                 prompt=body.prompt,
                 agent_name=effective_agent,
                 intent=body.intent,
+                run_context=_ctx,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 
-        return {"accepted": True}
+        return {
+            "accepted": True,
+            "run_id": _run_id,
+            "turn_id": _turn_id,
+            "turn_index": _turn_index,
+        }
 
     # ── POST /api/sessions/{session_id}/cancel ───────────────────────────
 

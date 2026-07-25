@@ -53,6 +53,7 @@ export interface Message {
   tool_calls?: ToolCall[];
   tool_call_id?: string | null;
   created_at?: string;
+  turn_id?: string;
 }
 
 export interface ChatResponse {
@@ -109,10 +110,36 @@ export interface PlanState {
   contract?: Record<string, unknown> | null;
 }
 
+export interface TurnTimeline {
+  turn_id: string;
+  run_id: string;
+  turn_index: number;
+  user_message: Message | null;
+  assistant_message: Message | null;
+  trace_events: WsMessage[];
+  meta: {
+    steps: number;
+    tokens: number;
+    status: string;
+    started_at: string;
+    completed_at: string;
+  };
+}
+
 export interface TimelineResponse {
   session_id: string;
+  /** Primary: turn-grouped data for direct StreamingTurn construction. */
+  turns: TurnTimeline[];
+  /** Legacy: flat message+event list (backward compat). */
   items: BackendTimelineItem[];
   last_seq: number;
   has_more: boolean;
   plan_state?: PlanState;
+  active_run?: {
+    run_id: string;
+    turn_id: string;
+    turn_index: number;
+    prompt: string;
+    status: string;
+  } | null;
 }

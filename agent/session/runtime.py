@@ -59,6 +59,25 @@ logger = logging.getLogger(__name__)
 class ExplicitDelegationError(ValueError):
     """An explicit child request cannot be honored by the parent contract."""
 
+
+def _inject_shared_read_cache(
+    registry: ToolRegistry,
+    read_cache: object,
+) -> tuple[str, ...]:
+    """Bind every cache-aware file tool to the Runtime-owned cache.
+
+    Registry aliases are not keys in ``_tools``.  Iterating the registered
+    instances avoids silently missing canonical tools such as ``Edit`` whose
+    backward-compatible alias is ``file_edit``.
+    """
+    injected: list[str] = []
+    for tool_name, tool in getattr(registry, "_tools", {}).items():
+        if hasattr(tool, "_read_cache"):
+            tool._read_cache = read_cache
+            injected.append(tool_name)
+    return tuple(injected)
+
+
 if TYPE_CHECKING:
     from agent.completion_guard import CompletionCheckResult
     from core.policy import PhasePolicy
@@ -99,6 +118,11 @@ class SessionRuntime:
         self._hook_dispatcher = hook_dispatcher
         self._mcp_integration = mcp_integration
         self._event_callback = event_callback
+        # Callback for publishing run_terminal / run_started WS events.
+        # Set by AgentService.  Signature: (session_id, event_dict) -> None.
+        # Unlike _event_callback which receives agent.task.Event objects,
+        # this receives pre-formatted WS message dicts ready for broadcast.
+        self._publish_run_terminal: Callable[[str, dict], None] | None = None
         # Per-session ApprovalBroker instances for headless Web mode.
         # CC-aligned: each session has its own blocking approval queue,
         # equivalent to CC's per-session stdin control_request channel.
@@ -107,6 +131,8 @@ class SessionRuntime:
         # before run_session().  keyed by session_id.
         self._web_confirm_callbacks: dict[str, "WebConfirmCallback"] = {}
         self._stream_callbacks: dict[str, "StreamCallback"] = {}
+        self._text_lifecycle_callbacks: dict[str, object] = {}
+        self._text_delta_callbacks: dict[str, object] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
         self._backend_store: dict[str, "LLMBackend"] = {}
         # Shared read cache — survives tool registry rebuilds across turns.
@@ -155,6 +181,8 @@ class SessionRuntime:
         self._approval_brokers.clear()
         self._web_confirm_callbacks.clear()
         self._stream_callbacks.clear()
+        self._text_lifecycle_callbacks.clear()
+        self._text_delta_callbacks.clear()
         self._cancellation_tokens.clear()
 
     # ── P1-10 thin adapter methods (used by ChatPipeline) ────────────────
@@ -852,6 +880,7 @@ class SessionRuntime:
         inject_permission_mode: str | None = None,     # Web: "acceptEdits" / "default" / etc.
         session_context_text: str = "",                 # Web: session summary for Runtime injection (NOT persisted)
         allowed_prompts: list[dict[str, str]] | None = None,  # CC: ExitPlanMode pre-approvals
+        run_context: Any = None,  # RunContext from POST /chat transaction
     ) -> RunResult:
         session = self._store.get_session(session_id)
         if session is None:
@@ -871,6 +900,40 @@ class SessionRuntime:
         self._cancellation_tokens[session_key] = cancellation_token
         execution_error: BaseException | None = None
 
+        # ── Run lifecycle: QUEUED → RUNNING ──
+        _run_ctx = run_context
+        _run_transitioned = False
+        if _run_ctx is not None:
+            try:
+                _run_id = getattr(_run_ctx, "run_id", None)
+                if _run_id:
+                    _updated = self._store.update_run(
+                        _run_id,
+                        status="running",
+                        expect_status="queued",
+                    )
+                    if _updated:
+                        _run_transitioned = True
+                        # Emit run_started WS event (synthetic)
+                        if self._publish_run_terminal is not None:
+                            import uuid as _uuid_mod
+                            from datetime import datetime as _dt, timezone as _tz
+                            self._publish_run_terminal(
+                                getattr(_run_ctx, "session_id", session_id),
+                                {
+                                    "type": "run_started",
+                                    "run_id": _run_id,
+                                    "turn_id": getattr(_run_ctx, "turn_id", ""),
+                                    "turn_index": getattr(_run_ctx, "turn_index", 0),
+                                    "timestamp": _dt.now(_tz.utc).isoformat(),
+                                    "event_id": str(_uuid_mod.uuid4()),
+                                },
+                            )
+                    else:
+                        logger.warning("Run %s CAS transition queued→running failed", _run_id)
+            except Exception:
+                logger.debug("Run lifecycle transition skipped", exc_info=True)
+
         try:
             # ── Session memory tracker ──
             session_memory_tracker = None
@@ -888,10 +951,7 @@ class SessionRuntime:
             # Inject shared read cache into base registry tools before each run.
             # The PolicyAwareToolRegistry shares tool instances from the base,
             # so all Read/Edit/Write/View tools in the run get the same cache.
-            for _tool_name in ("Read", "file_view", "Write", "file_edit"):
-                _t = getattr(self._base_registry._tools, "get", lambda _: None)(_tool_name)
-                if _t is not None and hasattr(_t, "_read_cache"):
-                    _t._read_cache = self._read_cache
+            _inject_shared_read_cache(self._base_registry, self._read_cache)
 
             from agent.session.agent_factory import AgentFactory
             _effective_backend = self.get_backend_for_session(session_id)
@@ -932,6 +992,13 @@ class SessionRuntime:
             _stream_cb = self._stream_callbacks.pop(session_id, None)
             if _stream_cb is not None:
                 agent_cfg.stream_callback = _stream_cb
+            # ── Inject text stream callbacks for assistant_text_start/delta/end ──
+            _text_lifecycle_cb = self._text_lifecycle_callbacks.pop(session_id, None)
+            _text_delta_cb = self._text_delta_callbacks.pop(session_id, None)
+            if _text_lifecycle_cb is not None:
+                agent_cfg.text_stream_lifecycle_callback = _text_lifecycle_cb
+            if _text_delta_cb is not None:
+                agent_cfg.text_stream_delta_callback = _text_delta_cb
 
             # ── Inject web_confirm_callback into the PermissionPipeline ──
             # CC-aligned: in headless Web mode, the pipeline's Layer 6
@@ -1100,12 +1167,13 @@ class SessionRuntime:
                 if self._event_callback is not None:
                     original_append = log._append
                     _captured_session_id = session_id
+                    _captured_run_ctx = _run_ctx  # capture for turn_id injection
 
                     def _append_and_emit(event):
                         event.session_id = _captured_session_id
                         original_append(event)
                         try:
-                            self._event_callback(event)
+                            self._event_callback(event, run_context=_captured_run_ctx)
                         except Exception:
                             logger.debug("Event callback failed", exc_info=True)
 
@@ -1116,19 +1184,22 @@ class SessionRuntime:
             # Wrap in try/except — the session may have been deleted by a
             # concurrent DELETE handler while the agent was running.
             try:
+                _tid = getattr(_run_ctx, "turn_id", "") if _run_ctx else ""
                 for message in history.to_list():
                     if _msg_fingerprint(message) in _pre_run_fingerprints:
                         continue
                     content = str(message.content or "")
                     if any(content.startswith(p) for p in _RUNTIME_PREFIXES):
                         continue
+                    if _tid:
+                        message.turn_id = _tid
                     self._store.append_message(session_id, message)
 
                 if result is not None and result.summary:
-                    self._store.append_message(
-                        session_id,
-                        LLMMessage(role="assistant", content=result.summary),
-                    )
+                    _amsg = LLMMessage(role="assistant", content=result.summary)
+                    if _tid:
+                        _amsg.turn_id = _tid
+                    self._store.append_message(session_id, _amsg)
             except ValueError as store_error:
                 logger.warning(
                     "Session %s was deleted before messages could be persisted — "
@@ -1160,12 +1231,19 @@ class SessionRuntime:
                         self._store.set_summary(
                             session_id, result.summary, status=SessionStatus.CANCELLED,
                         )
+                        # ── Run lifecycle: CANCELLED ──
+                        self._finalize_run(_run_ctx, result, "cancelled",
+                                          error=result.error or result.summary)
                     elif result.is_success():
+                        # ── Transition session from RUNNING back to a stable state ──
+                        # The frontend ChatView syncs isRunning from session.status;
+                        # if we leave it as RUNNING, refreshActive() will re-set
+                        # isRunning=true forever.  COMPLETED is the backward-compat
+                        # value — future work can introduce SessionStatus.ACTIVE.
                         self._store.set_summary(
-                            session_id, result.summary, status=SessionStatus.COMPLETED
+                            session_id, result.summary, status=SessionStatus.COMPLETED,
                         )
-                        # Persist plan contract into session metadata so
-                        # /timeline plan_state.contract is populated (I5).
+                        # Persist plan contract into session metadata
                         _contract = getattr(result, "contract", None)
                         if isinstance(_contract, dict) and _contract:
                             try:
@@ -1175,6 +1253,8 @@ class SessionRuntime:
                                 )
                             except Exception:
                                 pass
+                        # ── Run lifecycle: COMPLETED (transaction: messages + run + run_terminal) ──
+                        self._finalize_run(_run_ctx, result, "completed")
                     else:
                         self._store.update_status(
                             session_id,
@@ -1184,6 +1264,9 @@ class SessionRuntime:
                         self._store.set_summary(
                             session_id, result.summary, status=SessionStatus.FAILED
                         )
+                        # ── Run lifecycle: FAILED ──
+                        self._finalize_run(_run_ctx, result, "failed",
+                                          error=result.error or result.summary)
                 elif cancellation_token.is_cancelled:
                     detail = cancellation_token.detail
                     self._store.update_status(
@@ -1193,6 +1276,7 @@ class SessionRuntime:
                         session_id, f"Task cancelled: {detail}",
                         status=SessionStatus.CANCELLED,
                     )
+                    self._finalize_run(_run_ctx, None, "cancelled", error=detail)
                 elif execution_error is not None:
                     detail = str(execution_error) or type(execution_error).__name__
                     self._store.update_status(
@@ -1202,6 +1286,7 @@ class SessionRuntime:
                         session_id, "Session execution failed before producing a result",
                         status=SessionStatus.FAILED,
                     )
+                    self._finalize_run(_run_ctx, None, "failed", error=detail)
             except ValueError:
                 logger.warning(
                     "Session %s was deleted before state could be persisted — "
@@ -1209,6 +1294,93 @@ class SessionRuntime:
                     session_id[:8],
                 )
             self._cancellation_tokens.pop(session_key, None)
+
+    # ── Run lifecycle helper ───────────────────────────────────────────────
+
+    def _finalize_run(
+        self,
+        run_ctx: Any,
+        result: RunResult | None,
+        status: str,
+        *,
+        error: str = "",
+    ) -> None:
+        """Transition run to terminal state and broadcast run_terminal.
+
+        1. CAS-update the Run record (single transaction)
+        2. Broadcast run_terminal via _publish_run_terminal.
+           The callback sends through EventBus.publish_raw() which
+           persists to trace_events AND broadcasts to WS in one code path
+           — same as all other events. No skip_persist bypass.
+        """
+        if run_ctx is None:
+            return
+        _run_id = getattr(run_ctx, "run_id", None)
+        if not _run_id:
+            return
+
+        try:
+            _summary = result.summary if result is not None else ""
+            _steps = result.steps_taken if result is not None else 0
+            _tokens = result.total_tokens if result is not None else 0
+            _session_id = getattr(run_ctx, "session_id", "")
+            import uuid as _uuid_mod
+            from datetime import datetime as _dt, timezone as _tz
+
+            # 1. CAS update — only transitions from 'running'
+            _updated = self._store.update_run(
+                _run_id,
+                status=status,
+                summary=_summary,
+                steps_taken=_steps,
+                total_tokens=_tokens,
+                error=error,
+                expect_status="running",
+            )
+            if not _updated:
+                logger.warning("Run %s CAS running→%s failed (already terminal)",
+                              _run_id[:8], status)
+                return
+
+            # 2. Broadcast through normal EventBus channel
+            if self._publish_run_terminal is not None:
+                _terminal_evt = {
+                    "type": "run_terminal",
+                    "run_id": _run_id,
+                    "turn_id": getattr(run_ctx, "turn_id", ""),
+                    "turn_index": getattr(run_ctx, "turn_index", 0),
+                    "status": status,
+                    "summary": _summary,
+                    "steps_taken": _steps,
+                    "total_tokens": _tokens,
+                    "error": error,
+                    "termination_reason": (
+                        result.termination_reason.value
+                        if result is not None
+                        and hasattr(result.termination_reason, "value")
+                        else str(getattr(result, "termination_reason", "") or "")
+                    ),
+                    "verification_status": (
+                        result.verification_status.value
+                        if result is not None
+                        and hasattr(result.verification_status, "value")
+                        else str(getattr(result, "verification_status", "") or "")
+                    ),
+                    "verification_reason": (
+                        result.verification_reason.value
+                        if result is not None
+                        and hasattr(result.verification_reason, "value")
+                        else str(getattr(result, "verification_reason", "") or "")
+                    ),
+                    "timestamp": _dt.now(_tz.utc).isoformat(),
+                    "event_id": str(_uuid_mod.uuid4()),
+                }
+                try:
+                    self._publish_run_terminal(_session_id, _terminal_evt)
+                except Exception:
+                    logger.debug("publish_run_terminal failed", exc_info=True)
+        except Exception:
+            logger.exception("Failed to finalize run %s", _run_id)
 
     # ── Child subagent ──
     # ⚠️ WARNING: The spawn_agent and _execute_child_session methods below
@@ -2167,6 +2339,21 @@ class SessionRuntime:
         render thoughts as they arrive instead of waiting for completion.
         """
         self._stream_callbacks[session_id] = callback
+
+    def set_text_stream_callbacks(
+        self,
+        session_id: str,
+        lifecycle_callback: object,
+        delta_callback: object,
+    ) -> None:
+        """Register assistant text streaming callbacks.
+
+        Called by ChatPipeline before run_session().  During LLM generation:
+          - lifecycle_callback("start"|"end"|"aborted", block_id, reason)
+          - delta_callback(block_id, text)
+        """
+        self._text_lifecycle_callbacks[session_id] = lifecycle_callback
+        self._text_delta_callbacks[session_id] = delta_callback
 
     # ── Model switching (mid-session) ────────────────────────────────────
 

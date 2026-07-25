@@ -129,6 +129,8 @@ class ChatRequest:
     repo_path: str = "."
     allowed_prompts: tuple[dict[str, str], ...] = ()
     """CC-aligned: ExitPlanMode pre-approved tool calls for the build session."""
+    run_context: Any = None
+    """RunContext from POST /chat transaction — carries run_id/turn_id/turn_index."""
 
 
 @dataclass(frozen=True)
@@ -310,16 +312,46 @@ class ChatPipeline:
         if self._event_bus is not None:
             eb = self._event_bus
             sid = request.session_id
+            run_ctx = request.run_context  # captured in closures, never stored on EventBus
+
+            from server.events import (
+                WsThoughtDelta,
+                WsAssistantTextStart, WsAssistantTextDelta,
+                WsAssistantTextEnd, WsAssistantTextAborted,
+            )
 
             def _stream_cb(text: str) -> None:
                 try:
-                    from server.events import WsThoughtDelta
-                    eb.publish_typed(sid, WsThoughtDelta(text=text))
+                    eb.publish_typed(sid, WsThoughtDelta(text=text), run_context=run_ctx)
                 except Exception:
                     pass
 
             stream_callback = _stream_cb
             self._runtime.set_stream_callback(request.session_id, _stream_cb)
+
+            # ── Text stream lifecycle callback → assistant_text_start/end/aborted ──
+            def _text_lifecycle_cb(evt_type: str, block_id: str, reason: str = "") -> None:
+                try:
+                    if evt_type == "start":
+                        eb.publish_typed(sid, WsAssistantTextStart(block_id=block_id), run_context=run_ctx)
+                    elif evt_type == "end":
+                        eb.publish_typed(sid, WsAssistantTextEnd(block_id=block_id), run_context=run_ctx)
+                    elif evt_type == "aborted":
+                        eb.publish_typed(sid, WsAssistantTextAborted(block_id=block_id, reason=reason), run_context=run_ctx)
+                except Exception:
+                    pass
+
+            def _text_delta_cb(block_id: str, text: str) -> None:
+                try:
+                    eb.publish_typed(sid, WsAssistantTextDelta(block_id=block_id, text=text), run_context=run_ctx)
+                except Exception:
+                    pass
+
+            self._runtime.set_text_stream_callbacks(
+                request.session_id,
+                _text_lifecycle_cb,
+                _text_delta_cb,
+            )
         return confirm_callback, stream_callback
 
     # ── Stage 5: execute ─────────────────────────────────────────────────
@@ -361,6 +393,7 @@ class ChatPipeline:
             inject_rules=inject_rules,
             session_context_text=prepared.session_context_text or "",
             allowed_prompts=list(request.allowed_prompts),
+            run_context=request.run_context,
         )
 
         # Accumulate cross-round stats in session metadata
@@ -469,11 +502,34 @@ class ChatPipeline:
             except Exception as exc:
                 logger.exception("ChatPipeline failed for session %s", request.session_id)
                 if self._event_bus is not None:
-                    self._event_bus.publish_raw(request.session_id, {
-                        "type": "status",
+                    # Send run_terminal (not status:failed) — consistent with _finalize_run.
+                    # If run_context is available, use its run_id/turn_id so the frontend
+                    # can deduplicate by run_id and properly archive the optimistic turn.
+                    _rc = request.run_context
+                    _terminal = {
+                        "type": "run_terminal",
+                        "run_id": getattr(_rc, "run_id", "") if _rc else "",
+                        "turn_id": getattr(_rc, "turn_id", "") if _rc else "",
+                        "turn_index": getattr(_rc, "turn_index", 0) if _rc else 0,
                         "status": "failed",
+                        "summary": "",
+                        "steps_taken": 0,
+                        "total_tokens": 0,
                         "error": str(exc),
-                    })
+                    }
+                    self._event_bus.publish_raw(request.session_id, _terminal)
+                    # Also CAS-update the Run record so DB reflects the failure
+                    _run_id = getattr(_rc, "run_id", "") if _rc else ""
+                    if _run_id:
+                        try:
+                            self._runtime._store.update_run(
+                                _run_id,
+                                status="failed",
+                                error=str(exc),
+                                expect_status="running",
+                            )
+                        except Exception:
+                            pass
             finally:
                 self._runtime.release_session(request.session_id)
                 self._runtime.release_backend_for_session(request.session_id)

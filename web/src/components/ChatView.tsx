@@ -304,14 +304,17 @@ export function ChatView() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [timeline, isRunning, error]);
 
-  // Refresh after round completion: reload timeline for clean markdown
-  // answer + refresh active session stats. Session list reload is handled
-  // by SessionSidebar — no need to refetch all sessions here.
+  // After round completion: run_terminal has archived activeTurn → completedTurns.
+  // Do an incremental DB sync (afterSeq > 0 → merge, not replace) to verify
+  // consistency between live streaming blocks and persisted DB data.
   const prevRunning = useRef(isRunning);
   useEffect(() => {
     if (prevRunning.current && !isRunning && activeId) {
-      loadTimeline(activeId);
       useSessionStore.getState().refreshActive();
+      const lastSeq = useChatStore.getState().sessionStateById[activeId]?.lastTraceSeq ?? 0;
+      if (lastSeq > 0) {
+        void loadTimeline(activeId, undefined, lastSeq);
+      }
     }
     prevRunning.current = isRunning;
   }, [isRunning, activeId, loadTimeline]);
@@ -398,8 +401,10 @@ export function ChatView() {
     draftRef.current.style.height = `${Math.max(nextHeight, 96)}px`;
   }, [draft]);
 
-  // Unified blocks for rendering — single data path via StreamingTurn.
-  const hasBlocks = activeTurn !== null || completedTurns.length > 0;
+  // Single data source for welcome/messages toggle.
+  // Both read from the same blocks state — no more timeline/welcome mismatch.
+  const hasContent = activeTurn !== null || completedTurns.length > 0;
+  const isLoadingSession = !!activeId && !activeDetail;
 
   const slashMatches = useMemo(() => {
     if (!draft.startsWith("/")) return [];
@@ -866,7 +871,8 @@ export function ChatView() {
             </div>
           )}
 
-          {timeline.length === 0 && !hasBlocks && (
+          {/* Welcome: only when no messages and session is loaded */}
+          {!hasContent && !isLoadingSession && (
             <div className="welcome welcome-hero">
               <div className="welcome-hero-badge">✦</div>
               <h1>Welcome to Grace Code</h1>
@@ -874,7 +880,6 @@ export function ChatView() {
                 Your AI software engineer that plans, builds, and ships with clarity.
                 Describe what you want to build or explore.
               </p>
-
               <div className="welcome-grid welcome-grid-four">
                 {HERO_CARDS.map((card) => (
                   <div key={card.title} className={`welcome-card welcome-feature-card tone-${card.tone}`}>
@@ -886,7 +891,14 @@ export function ChatView() {
                   </div>
                 ))}
               </div>
+            </div>
+          )}
 
+          {/* Loading: session selected but detail not yet loaded */}
+          {!hasContent && isLoadingSession && (
+            <div className="welcome welcome-hero">
+              <div className="welcome-hero-badge">◌</div>
+              <h1>Loading session…</h1>
             </div>
           )}
 
@@ -951,7 +963,7 @@ export function ChatView() {
                 </React.Fragment>
               )}
 
-            {isRunning && !hasBlocks && (
+            {isRunning && !hasContent && (
               <div className="trace-block">
                 <div className="trace-card trace-thought">
                   <div className="trace-header">

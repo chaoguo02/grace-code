@@ -1,8 +1,20 @@
 import { create } from "zustand";
 import type { Message, TimelineItem, WsMessage } from "../types";
-import type { WsEnvelope, WsPlanReadyEvent } from "../types/events";
-import type { ContentBlock, ThoughtBlock, ToolUseBlock, StreamingTurn } from "../types/blocks";
-import { blockId, blockHash, createStreamingTurn } from "../types/blocks";
+import type {
+  WsEnvelope, WsPlanReadyEvent,
+  WsObservationEvent,
+  WsRunTerminalEvent,
+  WsAssistantTextStartEvent, WsAssistantTextDeltaEvent, WsAssistantTextEndEvent,
+  WsAssistantTextAbortedEvent,
+} from "../types/events";
+import type { ContentBlock, StreamingTurn } from "../types/blocks";
+import {
+  blockId,
+  createStreamingTurn,
+  upsertByTurnId,
+  mergeTurnsByTurnId,
+  reconcileFinalTextBlock,
+} from "../types/blocks";
 import * as api from "../api/sessions";
 import { ApiError } from "../api/client";
 import { connectWebSocket, disconnectWebSocket, scheduleReconnect } from "../hooks/useWebSocket";
@@ -60,8 +72,16 @@ export interface SessionUiState {
   contextTotal: number;
   /** Highest backend trace sequence rendered for this session. */
   lastTraceSeq: number;
+  /** Highest applied sequence — only events ≤ this have been rendered. */
+  lastAppliedSequence: number;
+  /** Events received out-of-order, keyed by sequence. */
+  pendingEvents: [number, WsMessage][];
+  /** Observations buffered before their tool_call arrives, keyed by tool_call_id. */
+  pendingObservations: Record<string, WsObservationEvent>;
   /** Current streaming turn — created by sendChat, finalized by loadTimeline. */
   activeTurn: StreamingTurn | null;
+  /** Active run_id for the current turn. */
+  activeRunId: string;
   /** Past turns loaded from DB. */
   completedTurns: StreamingTurn[];
   /** View mode: verbose | normal | summary (CC-aligned). */
@@ -84,7 +104,7 @@ interface ChatState {
   pruneSessions: (validSessionIds: string[]) => void;
   sendChat: (sessionId: string, prompt: string, intent?: string) => Promise<void>;
   loadMessages: (sessionId: string, signal?: AbortSignal) => Promise<void>;
-  loadTimeline: (sessionId: string, signal?: AbortSignal, afterSeq?: number) => Promise<void>;
+  loadTimeline: (sessionId: string, signal?: AbortSignal, afterSeq?: number, reconcileTurnId?: string) => Promise<void>;
   loadTraceEvents: (sessionId: string, signal?: AbortSignal, afterSeq?: number) => Promise<void>;
   connectWs: (sessionId: string) => void;
   disconnectWs: () => void;
@@ -127,7 +147,11 @@ export function createEmptySessionUiState(): SessionUiState {
     streamingThought: "",
     contextTotal: 200000,  // default for deepseek-v4 / large models
     lastTraceSeq: 0,
+    lastAppliedSequence: 0,
+    pendingEvents: [],
+    pendingObservations: {},
     activeTurn: null,
+    activeRunId: "",
     completedTurns: [],
     viewMode: loadViewModePreference(),
   };
@@ -144,12 +168,21 @@ function loadViewModePreference(): "verbose" | "normal" | "summary" {
 
 // ── WS → ContentBlock mapping ──────────────────────────────────────────
 
-/** Map a WS event to a ContentBlock delta for the streaming blocks array. */
+/**
+ * Single entry point for mapping ANY WS event → ContentBlock mutations.
+ *
+ * This is the ONLY function that mutates a ContentBlock[] array.  All three
+ * consumption paths (live WS, timeline replay, DB rebuild) go through here.
+ *
+ * Events that do NOT produce blocks (run_started, status, subagent_*, etc.)
+ * are no-ops — they're handled by downstream UI state updates in handleWsEvent.
+ */
 function applyWsToBlocks(
   blocks: ContentBlock[],
   ev: WsMessage,
   messageId: string,
 ): void {
+  // ── Thought streaming (delta) ──
   if (ev.type === "thought_delta") {
     const last = blocks[blocks.length - 1];
     if (last?.type === "thought" && last.phase === "streaming") {
@@ -165,8 +198,8 @@ function applyWsToBlocks(
     return;
   }
 
+  // ── Thought completed ──
   if (ev.type === "thought") {
-    // Full thought replaces any streaming thought blocks
     const last = blocks[blocks.length - 1];
     if (last?.type === "thought" && last.phase === "streaming") {
       last.content = ev.content || "";
@@ -183,6 +216,7 @@ function applyWsToBlocks(
     return;
   }
 
+  // ── Tool call ──
   if (ev.type === "tool_call") {
     blocks.push({
       type: "tool_use",
@@ -194,8 +228,8 @@ function applyWsToBlocks(
     return;
   }
 
+  // ── Observation (tool result) ──
   if (ev.type === "observation") {
-    // Find the matching tool_use block (last running one with matching id)
     for (let i = blocks.length - 1; i >= 0; i--) {
       const b = blocks[i];
       if (b.type === "tool_use" && b.status === "running") {
@@ -211,75 +245,76 @@ function applyWsToBlocks(
     return;
   }
 
-  // Other events (status, subagent, etc.) — not mapped to blocks
+  // ── Assistant text streaming (was a separate branch in handleWsEvent) ──
+  if (ev.type === "assistant_text_start") {
+    const se = ev as WsAssistantTextStartEvent;
+    blocks.push({ type: "text", content: "", blockId: se.block_id, phase: "streaming" });
+    return;
+  }
+
+  if (ev.type === "assistant_text_delta") {
+    const de = ev as WsAssistantTextDeltaEvent;
+    const bid = de.block_id || "";
+    const last = blocks[blocks.length - 1];
+    if (last?.type === "text" && last.phase === "streaming" && last.blockId === bid) {
+      last.content += de.text || "";
+    } else if (last?.type === "text" && last.phase === "streaming") {
+      // Fallback: append regardless of blockId (survives missing text_start)
+      last.content += de.text || "";
+    } else {
+      blocks.push({ type: "text", content: de.text || "", blockId: bid, phase: "streaming" });
+    }
+    return;
+  }
+
+  if (ev.type === "assistant_text_end") {
+    const ee = ev as WsAssistantTextEndEvent;
+    const bid = ee.block_id || "";
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i];
+      if (b.type === "text" && b.phase === "streaming" && b.blockId === bid) {
+        b.phase = "completed";
+        break;
+      }
+    }
+    return;
+  }
+
+  if (ev.type === "assistant_text_aborted") {
+    const ae = ev as WsAssistantTextAbortedEvent;
+    const bid = ae.block_id || "";
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i];
+      if (b.type === "text" && b.phase === "streaming" && b.blockId === bid) {
+        b.phase = "completed";
+        b.content += `\n\n[Aborted: ${ae.reason || "stream error"}]`;
+        break;
+      }
+    }
+    return;
+  }
+
+  // ── run_terminal summary → text fallback ──
+  // If no text block was streamed via assistant_text_delta, append the
+  // final summary from run_terminal as a text block.
+  if (ev.type === "run_terminal") {
+    const re = ev as WsRunTerminalEvent;
+    if (re.status === "completed") {
+      reconcileFinalTextBlock(blocks, re.summary || "");
+    }
+    return;
+  }
+
+  // All other events (run_started, status, subagent_start/stop, approval,
+  // plan_ready, memory_*, etc.) are NOT mapped to ContentBlocks.
+  // They drive UI state changes (isRunning, toolApprovals, planApproval)
+  // via their dedicated handleWsEvent branches — not through blocks.
 }
 
 /** Extract first sentence as thought summary. Fallback: generic label. */
 function summarizeThought(content: string): string {
   const first = content.split(/[.。\n]/)[0]?.trim() || "";
   return first.length > 10 && first.length < 120 ? first : "Thinking…";
-}
-
-/** Extract ContentBlocks from merged timeline items (DB path). */
-function extractBlocksFromTimeline(
-  items: TimelineItem[],
-): Map<string, { blocks: ContentBlock[]; role: "user" | "assistant" }> {
-  const result = new Map<string, { blocks: ContentBlock[]; role: "user" | "assistant" }>();
-  let currentMsgId = "";
-  let currentRole: "user" | "assistant" = "assistant";
-  let blocks: ContentBlock[] = [];
-
-  for (const item of items) {
-    if (item.source === "message") {
-      const role = item.msg.role;
-      // Flush previous message before starting a new one
-      if (currentMsgId && blocks.length > 0) {
-        result.set(currentMsgId, { blocks, role: currentRole });
-      }
-      currentMsgId = item.msg.created_at || `msg_${result.size}`;
-      blocks = [];
-
-      if (role === "user" && item.msg.content) {
-        currentRole = "user";
-        blocks.push({ type: "text", content: item.msg.content });
-      } else if (role === "assistant" && item.msg.content) {
-        currentRole = "assistant";
-        blocks.push({ type: "text", content: item.msg.content });
-      }
-      // tool messages are ignored — their content appears in tool_use blocks
-    } else if (item.source === "ws") {
-      const msgId = currentMsgId || `msg_${result.size}_stream`;
-      applyWsToBlocks(blocks, item.ws, msgId);
-    }
-  }
-  if (currentMsgId && blocks.length > 0) {
-    result.set(currentMsgId, { blocks, role: currentRole });
-  }
-  return result;
-}
-
-/** Integrity check: compare activeTurn's streaming blocks against DB. */
-function checkTurnIntegrity(
-  turn: StreamingTurn,
-  dbBlocksByMsgId: Record<string, { blocks: ContentBlock[]; role: string }>,
-): boolean {
-  if (turn.meta.hasGap) return false;  // known packet loss → force remount
-  if (Object.keys(dbBlocksByMsgId).length === 0) return true;  // no DB data
-
-  const streamBlocks = turn.assistantResponse.blocks;
-  if (streamBlocks.length === 0) return true;  // no streaming data yet
-
-  // Only compare assistant blocks — user messages are separate.
-  const dbAsstBlocks = Object.values(dbBlocksByMsgId)
-    .filter((e) => e.role === "assistant")
-    .flatMap((e) => e.blocks);
-
-  if (dbAsstBlocks.length === 0) return true;
-  if (streamBlocks.length !== dbAsstBlocks.length) return false;
-
-  const wsLast = streamBlocks[streamBlocks.length - 1];
-  const dbLast = dbAsstBlocks[dbAsstBlocks.length - 1];
-  return blockHash(wsLast) === blockHash(dbLast);
 }
 
 const EMPTY_SESSION_UI_STATE = createEmptySessionUiState();
@@ -315,6 +350,28 @@ let _watchdogTimer: ReturnType<typeof setTimeout> | null = null;
 // Lightweight event dedup: tracks fingerprints of recently seen timeline events.
 // Capped at 200 entries per session to bound memory.
 const _seenFingerprintsBySession = new Map<string, Set<string>>();
+
+// Terminal event idempotency: ensures each run_id is only processed once.
+// Prevents duplicate archiving when both status:"completed" and run_terminal
+// arrive for the same run (legacy + new signal paths).
+const _seenTerminalRunsBySession = new Map<string, Set<string>>();
+
+function _isDuplicateTerminal(sessionId: string, runId: string): boolean {
+  if (!runId) return false;
+  let seen = _seenTerminalRunsBySession.get(sessionId);
+  if (!seen) {
+    seen = new Set<string>();
+    _seenTerminalRunsBySession.set(sessionId, seen);
+  }
+  if (seen.has(runId)) return true;
+  seen.add(runId);
+  // Cap at 50 entries per session
+  if (seen.size > 50) {
+    const iter = seen.values();
+    for (let i = 0; i < 10; i++) { const v = iter.next().value; if (v) seen.delete(v); }
+  }
+  return false;
+}
 
 function _eventFingerprint(ev: WsMessage): string | null {
   // Only fingerprint events that go into the timeline.
@@ -488,6 +545,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       ws.close();
     }
     _seenFingerprintsBySession.delete(sessionId);
+    _seenTerminalRunsBySession.delete(sessionId);
     set((state) => {
       const next = { ...state.sessionStateById };
       delete next[sessionId];
@@ -540,9 +598,13 @@ export const useChatStore = create<ChatState>((set, get) => {
       }));
 
       // ── ContentBlock streaming: mutate activeTurn.assistantResponse ──
+      // ALL event types that produce ContentBlocks go through this single branch.
+      // applyWsToBlocks() is the ONLY function that mutates blocks.
       if (
         ev.type === "thought_delta" || ev.type === "thought" ||
-        ev.type === "tool_call" || ev.type === "observation"
+        ev.type === "tool_call" || ev.type === "observation" ||
+        ev.type === "assistant_text_start" || ev.type === "assistant_text_delta" ||
+        ev.type === "assistant_text_end" || ev.type === "assistant_text_aborted"
       ) {
         patchSession(sid, (prev) => {
           if (!prev.activeTurn) return prev;
@@ -559,38 +621,136 @@ export const useChatStore = create<ChatState>((set, get) => {
           };
           return { ...prev, activeTurn: turn };
         });
+        // text_delta is too noisy for timeline — let text_start/end fall through
+        if (ev.type === "assistant_text_delta") return;
       }
 
+      // ── New run lifecycle events (P0) ──
+      if (ev.type === "run_started") {
+                patchSession(sid, (prev) => ({ ...prev, isRunning: true, error: null }));
+        return;
+      }
+
+      if (ev.type === "run_terminal") {
+        clearWatchdog();
+        const re = ev as WsRunTerminalEvent;
+        // Idempotency: skip duplicate terminal events for the same run
+        if (_isDuplicateTerminal(sid, re.run_id || "")) return;
+        if (re.status === "completed") {
+          patchSession(sid, (prev) => {
+            if (!prev.activeTurn) {
+              // A refresh/reconnect can clear the optimistic activeTurn while
+              // the backend run continues.  Update an already reconstructed
+              // turn when possible; the full reconciliation below supplies
+              // messages and trace blocks if it is not in memory yet.
+              const matchingIndex = prev.completedTurns.findIndex(
+                (turn) =>
+                  (re.turn_id && turn.turnId === re.turn_id) ||
+                  (re.run_id && turn.runId === re.run_id),
+              );
+              if (matchingIndex < 0) {
+                return { ...prev, isRunning: false, streamingThought: "" };
+              }
+              const completedTurns = [...prev.completedTurns];
+              const matching = completedTurns[matchingIndex];
+              const blocks = [...matching.assistantResponse.blocks];
+              applyWsToBlocks(blocks, ev, matching.assistantResponse.id);
+              completedTurns[matchingIndex] = {
+                ...matching,
+                turnId: re.turn_id || matching.turnId,
+                runId: re.run_id || matching.runId,
+                assistantResponse: {
+                  ...matching.assistantResponse,
+                  blocks,
+                  status: "completed" as const,
+                },
+                meta: { ...matching.meta, completedAt: Date.now() },
+              };
+              return {
+                ...prev,
+                isRunning: false,
+                streamingThought: "",
+                completedTurns,
+              };
+            }
+            // Delegate block mutations (incl. summary→text fallback) to unified builder
+            const blocks = [...prev.activeTurn.assistantResponse.blocks];
+            applyWsToBlocks(blocks, ev, prev.activeTurn.assistantResponse.id);
+
+            // Archive completed turn — move from activeTurn to completedTurns.
+            // The turn is now immutable; further DB sync via loadTimeline will
+            // merge by turn_id without creating duplicates.
+            const completedTurn: StreamingTurn = {
+              ...prev.activeTurn,
+              turnId: re.turn_id || prev.activeTurn.turnId,
+              runId: re.run_id || prev.activeTurn.runId,
+              assistantResponse: { ...prev.activeTurn.assistantResponse, blocks, status: "completed" as const },
+              meta: { ...prev.activeTurn.meta, completedAt: Date.now() },
+            };
+
+            return {
+              ...prev,
+              isRunning: false,
+              steps: re.steps_taken ?? prev.steps,
+              tokens: re.total_tokens ?? prev.tokens,
+              streamingThought: "",
+              activeTurn: null,
+              completedTurns: upsertByTurnId(prev.completedTurns, completedTurn),
+            };
+          });
+          // Reconcile from the durable source after terminal persistence.
+          // A full load is intentional: incremental loading after the
+          // terminal sequence cannot rebuild events from earlier in the turn.
+          void get().loadTimeline(sid, undefined, 0);
+        } else {
+          patchSession(sid, (prev) => {
+            const turn = prev.activeTurn;
+            return {
+              ...prev,
+              isRunning: false,
+              error: re.error || (re.status === "cancelled" ? "Run cancelled" : "Run failed"),
+              planApproval: null,
+              streamingThought: "",
+              completedTurns: turn
+                ? [...prev.completedTurns, { ...turn, assistantResponse: { ...turn.assistantResponse, status: "error" as const }, meta: { ...turn.meta, completedAt: Date.now() } }]
+                : prev.completedTurns,
+              activeTurn: null,
+            };
+          });
+        }
+        return;
+      }
       if (ev.type === "status") {
         if (ev.status === "running") {
-          patchSession(sid, (prev) => ({
+                    patchSession(sid, (prev) => ({
             ...prev, isRunning: true, error: null,
-            // activeTurn is owned by sendChat — never clear on running.
-            // WS reconnect/replay can send running again without going
-            // through sendChat; the activeTurn survives.
           }));
         } else if (ev.status === "completed") {
+          // Legacy path — run_terminal is the canonical completion signal.
+          // Only set isRunning=false.  If activeTurn still lingers (abnormal),
+          // defensively archive it.
           clearWatchdog();
-          patchSession(sid, (prev) => ({
-            ...prev,
-            isRunning: false,
-            steps: ev.result?.steps_taken ?? prev.steps,
-            tokens: ev.result?.total_tokens ?? prev.tokens,
-            streamingThought: "",
-            // Mark activeTurn as completed but keep it alive.
-            // loadTimeline will run integrity_check against it and
-            // handle the final transition to completedTurns.
-            activeTurn: prev.activeTurn ? {
-              ...prev.activeTurn,
-              assistantResponse: { ...prev.activeTurn.assistantResponse, status: "completed" as const },
-              meta: { ...prev.activeTurn.meta, completedAt: Date.now() },
-            } : null,
-            // Do NOT clear planApproval here — when the plan agent
-            // exits via ExitPlanMode, the plan_ready event that
-            // follows immediately will overwrite it.
-          }));
+          patchSession(sid, (prev) => {
+            const turn = prev.activeTurn;
+            return {
+              ...prev,
+              isRunning: false,
+              steps: ev.result?.steps_taken ?? prev.steps,
+              tokens: ev.result?.total_tokens ?? prev.tokens,
+              streamingThought: "",
+              activeTurn: null,
+              completedTurns: turn
+                ? upsertByTurnId(prev.completedTurns, {
+                    ...turn,
+                    assistantResponse: { ...turn.assistantResponse, status: "completed" as const },
+                    meta: { ...turn.meta, completedAt: Date.now() },
+                  })
+                : prev.completedTurns,
+            };
+          });
           return;
         } else if (ev.status === "failed" || ev.status === "cancelled" || ev.status === "finish" || ev.status === "gave_up") {
+          if (_isDuplicateTerminal(sid, (ev as { run_id?: string }).run_id || "")) return;
           clearWatchdog();
           patchSession(sid, (prev) => ({
             ...prev,
@@ -804,6 +964,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       const sid = resolveSessionId(sessionId);
       if (!sid) return;
       _seenFingerprintsBySession.delete(sid);
+      _seenTerminalRunsBySession.delete(sid);
       patchSession(sid, (prev) => ({
         ...createEmptySessionUiState(),
         currentMode: prev.currentMode,
@@ -818,6 +979,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       const validIds = new Set(validSessionIds);
       for (const sessionId of _seenFingerprintsBySession.keys()) {
         if (!validIds.has(sessionId)) _seenFingerprintsBySession.delete(sessionId);
+    _seenTerminalRunsBySession.delete(sessionId);
       }
       const { ws, _wsSessionId } = get();
       const activeRemoved = _wsSessionId && !validIds.has(_wsSessionId);
@@ -842,25 +1004,38 @@ export const useChatStore = create<ChatState>((set, get) => {
     sendChat: async (sessionId, prompt, intent) => {
       if (get()._wsSessionId !== sessionId) return;
       ensureSession(sessionId);
+
+      // Generate clientRequestId — same value used as POST idempotency_key.
+      // This binds the optimistic turn to the server-created run/turn via the HTTP response.
+      const clientRequestId = crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
       patchSession(sessionId, (prev) => ({
         ...prev,
         isRunning: true,
         error: null,
         planApproval: prev.planApproval?.isWaiting ? prev.planApproval : null,
-        // Create a new StreamingTurn — the single owner of this round's data.
-        // Use Date.now() as unique suffix so turn ID is always distinct
-        // even if completedTurns hasn't been loaded from DB yet.
+        // Defensive: normally run_terminal has already archived activeTurn.
+        // If it's still here (agent crashed before emitting run_terminal), archive as error.
+        completedTurns: prev.activeTurn
+          ? upsertByTurnId(prev.completedTurns, {
+              ...prev.activeTurn,
+              assistantResponse: { ...prev.activeTurn.assistantResponse, status: "error" as const },
+              meta: { ...prev.activeTurn.meta, completedAt: Date.now() },
+            })
+          : prev.completedTurns,
         activeTurn: createStreamingTurn(
           sessionId,
-          Math.floor(Date.now() / 1000),  // unique per-send suffix
+          Math.floor(Date.now() / 1000),
           prompt,
+          clientRequestId,
         ),
       }));
-      clearWatchdog();  // clear any stale timer from a previous run
+      clearWatchdog();
       _watchdogTimer = setTimeout(() => {
         const current = selectSessionUi(get(), sessionId);
         if (current.isRunning) {
-          // Try to cancel the backend run so resources aren't wasted (I3).
           try { void api.cancelSession(sessionId, "Timed out from web frontend"); } catch { /* best-effort */ }
           patchSession(sessionId, (prev) => ({
             ...prev,
@@ -877,27 +1052,30 @@ export const useChatStore = create<ChatState>((set, get) => {
           timeline: mergeTimelineItems(prev.timeline, [{ source: "message" as const, msg: userMsg }]),
         }));
         if (get()._wsSessionId !== sessionId) return;
-        // Wait for WS connection before triggering the backend (I1).
-        // If the WS isn't ready yet, events emitted by the agent will be
-        // persisted to SQLite but never delivered live — resulting in a
-        // spinner with no visible progress.
         if (!get().wsConnected) {
           const deadline = Date.now() + 3000;
           while (!get().wsConnected && Date.now() < deadline) {
             await new Promise((r) => setTimeout(r, 50));
           }
-          if (!get().wsConnected) {
-            // WS still not connected — events will be missed.
-            // loadTimeline will recover them, but set a flag so the UI
-            // knows to refresh when the WS finally opens.
-            // WS still not connected after wait — events delivered
-            // during this gap will be recovered by loadTimeline on
-            // the next user action or page refresh.
-          }
         }
         const { currentMode } = selectSessionUi(get(), sessionId);
-        await api.chat(sessionId, prompt, intent, currentMode);
-        // api.chat() returned OK — keep watchdog alive; WS events will clear it on completion
+        const result = await api.chat(sessionId, prompt, intent, currentMode, clientRequestId);
+
+        // ── Bind server turn_id / run_id to the optimistic activeTurn ──
+        if (get()._wsSessionId === sessionId && result) {
+          const turnId = (result as Record<string, unknown>).turn_id as string | undefined;
+          const runId = (result as Record<string, unknown>).run_id as string | undefined;
+          if (turnId) {
+            patchSession(sessionId, (prev) => {
+              if (!prev.activeTurn || prev.activeTurn.clientRequestId !== clientRequestId) return prev;
+              return {
+                ...prev,
+                activeRunId: runId || "",
+                activeTurn: { ...prev.activeTurn, turnId, runId: runId || "" },
+              };
+            });
+          }
+        }
       } catch (e: unknown) {
         clearWatchdog();  // network error — no WS events will follow
         if (e instanceof ApiError && e.status === 404) {
@@ -998,26 +1176,19 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
-    loadTimeline: async (sessionId, signal, afterSeq = 0) => {
+    loadTimeline: async (sessionId, signal, afterSeq = 0, reconcileTurnId = "") => {
       try {
         ensureSession(sessionId);
         const response = await api.getTimeline(sessionId, signal, afterSeq);
-        const timelineItems = response.items.map((item) => (
-          item.source === "message"
-            ? { source: "message" as const, msg: item.message }
-            : { source: "ws" as const, ws: { ...item.event, seq: item.seq } }
-        ));
-        const events = response.items
-          .filter((item) => item.source === "ws")
-          .map((item) => item.source === "ws" ? item.event : null)
-          .filter((item): item is WsMessage => !!item);
 
-        // Read plan approval from backend-owned plan_state (primary path).
-        // Falls back to event scanning only when plan_state is absent (legacy).
+        // ── Legacy events for timeline/plan_state compat ──
+        const events = (response.items || [])
+          .filter((item) => item.source === "ws")
+          .map((item) => (item as { source: "ws"; event: WsMessage }).event);
+
+        // Plan approval from backend-owned plan_state
         const planState = response.plan_state;
         let planApproval: PlanApproval | null = null;
-        // "waiting" = fresh plan, "saved" = deferred after explicit Save — both
-        // should present the approval UI after refresh (I6).
         if (planState && (planState.lifecycle === "waiting" || planState.lifecycle === "saved") && planState.plan_text) {
           planApproval = {
             planText: planState.plan_text,
@@ -1029,46 +1200,93 @@ export const useChatStore = create<ChatState>((set, get) => {
           };
         }
 
-        // ── ContentBlock integrity check ──
-        // Extract blocks from DB timeline. If integrity passes against
-        // activeTurn, silently replace tempIds with realIds (no remount).
-        // If it fails, move activeTurn → completedTurns and rebuild.
-        const dbBlocks = extractBlocksFromTimeline(timelineItems);
-        const dbBlocksByMsgId: Record<string, { blocks: ContentBlock[]; role: "user" | "assistant" }> = {};
-        for (const [msgId, entry] of dbBlocks) {
-          if (entry.blocks.length > 0) dbBlocksByMsgId[msgId] = entry;
-        }
+        // ── Build completedTurns directly from backend turn-grouped data ──
+        // No more extractBlocksFromTimeline — the backend owns turn grouping.
+        const dbTurns: StreamingTurn[] = (response.turns || []).map((turn) => {
+          // Build assistant blocks from trace events via the unified builder
+          const asstBlocks: ContentBlock[] = [];
+          const asstId = `${turn.turn_id}_asst`;
+          for (const ev of turn.trace_events) {
+            applyWsToBlocks(asstBlocks, ev, asstId);
+          }
+          // The durable final assistant message is canonical.  Reconcile it
+          // even when streaming left an empty block or a pre-tool preamble.
+          reconcileFinalTextBlock(
+            asstBlocks,
+            turn.assistant_message?.content || "",
+          );
+
+          const localId = `turn_${sessionId}_db_${turn.turn_id.slice(0, 8)}`;
+          return {
+            localId,
+            turnId: turn.turn_id,
+            runId: turn.run_id || "",
+            clientRequestId: "",
+            id: localId,
+            userMessage: {
+              id: `${turn.turn_id}_user`,
+              blocks: turn.user_message?.content
+                ? [{ type: "text" as const, content: turn.user_message.content }]
+                : [{ type: "text" as const, content: "" }],
+            },
+            assistantResponse: {
+              id: asstId,
+              blocks: asstBlocks,
+              status: "completed" as const,
+            },
+            meta: {
+              steps: turn.meta.steps || 0,
+              tokens: turn.meta.tokens || 0,
+              startedAt: turn.meta.started_at ? new Date(turn.meta.started_at).getTime() : 0,
+              completedAt: turn.meta.completed_at ? new Date(turn.meta.completed_at).getTime() : undefined,
+              eventSeq: 0,
+              hasGap: false,
+            },
+          };
+        });
+
+        // Legacy timeline items (for backward compat)
+        const timelineItems = response.items.map((item) => (
+          item.source === "message"
+            ? { source: "message" as const, msg: (item as { source: "message"; message: Message }).message }
+            : { source: "ws" as const, ws: { ...(item as { source: "ws"; event: WsMessage; seq?: number }).event, seq: item.seq } }
+        ));
 
         patchSession(sessionId, (prev) => {
-          const activeTurn = prev.activeTurn;
-          const integrityOk = activeTurn
-            ? checkTurnIntegrity(activeTurn, dbBlocksByMsgId)
-            : true;
-
-          // Build completedTurns from DB — any turn we have DB data for
-          // that isn't the active turn (or active failed integrity).
-          const newCompleted: StreamingTurn[] = [];
-          for (const [msgId, entry] of Object.entries(dbBlocksByMsgId)) {
-            const isActiveUser = activeTurn && integrityOk && activeTurn.userMessage.id === msgId;
-            const isActiveAsst = activeTurn && integrityOk && activeTurn.assistantResponse.id === msgId;
-            if (isActiveUser || isActiveAsst) {
-              continue;  // activeTurn still alive, skip DB version
+            let activeTurn = prev.activeTurn;
+            const activeRun = response.active_run;
+            if (activeRun) {
+              const restored = dbTurns.find(
+                (turn) =>
+                  turn.runId === activeRun.run_id ||
+                  turn.turnId === activeRun.turn_id,
+              );
+              if (restored) {
+                activeTurn = {
+                  ...restored,
+                  assistantResponse: {
+                    ...restored.assistantResponse,
+                    status: "streaming" as const,
+                  },
+                };
+              } else if (!activeTurn) {
+                activeTurn = createStreamingTurn(
+                  sessionId,
+                  activeRun.turn_index || Math.floor(Date.now() / 1000),
+                  activeRun.prompt || "",
+                  "",
+                );
+                activeTurn = {
+                  ...activeTurn,
+                  turnId: activeRun.turn_id || "",
+                  runId: activeRun.run_id,
+                };
+              }
             }
-            // Carry over metadata from activeTurn if integrity failed and
-            // this is the corresponding DB entry for the failed turn.
-            const inheritMeta = activeTurn && !integrityOk
-              ? activeTurn.meta : { steps: 0, tokens: 0, startedAt: 0, eventSeq: 0, hasGap: false };
-            newCompleted.push({
-              id: `turn_${sessionId}_db_${msgId}`,
-              userMessage: entry.role === "user"
-                ? { id: msgId, blocks: entry.blocks }
-                : { id: msgId, blocks: [{ type: "text" as const, content: "" }] },
-              assistantResponse: entry.role === "assistant"
-                ? { id: msgId, blocks: entry.blocks, status: "completed" as const }
-                : { id: msgId, blocks: [], status: "completed" as const },
-              meta: { ...inheritMeta },
-            });
-          }
+            const activeTurnId = activeTurn?.turnId || "";
+
+          // Filter out the turn matching live activeTurn
+          const newCompleted = dbTurns.filter((t) => t.turnId !== activeTurnId);
 
           return {
             ...prev,
@@ -1078,11 +1296,15 @@ export const useChatStore = create<ChatState>((set, get) => {
             timeline: mergeTimelineItems(afterSeq > 0 ? prev.timeline : [], timelineItems),
             planApproval: afterSeq > 0 ? prev.planApproval : (planApproval ?? prev.planApproval),
             lastTraceSeq: Math.max(prev.lastTraceSeq, response.last_seq || 0),
-            // If integrity passes, activeTurn survives with its tempIds
-            // (rendered identically to DB). If it fails, clear it so
-            // completedTurns takes over with canonical DB data.
-            activeTurn: integrityOk ? activeTurn : null,
-            completedTurns: newCompleted,
+            lastAppliedSequence: afterSeq > 0
+              ? prev.lastAppliedSequence
+              : Math.max(prev.lastAppliedSequence, response.last_seq || 0),
+            isRunning: activeRun ? true : prev.isRunning,
+            activeRunId: activeRun?.run_id || "",
+            activeTurn,
+            completedTurns: afterSeq > 0
+              ? mergeTurnsByTurnId(prev.completedTurns, newCompleted)
+              : newCompleted,
           };
         });
       } catch (e: unknown) {

@@ -14,6 +14,8 @@
 export interface TextBlock {
   type: "text";
   content: string; // Markdown
+  blockId?: string; // server-assigned block_id (from assistant_text_start)
+  phase?: "streaming" | "completed"; // streaming lifecycle
 }
 
 export interface ThoughtBlock {
@@ -21,14 +23,16 @@ export interface ThoughtBlock {
   content: string; // raw thought text
   summary: string; // smart summary (not "Thinking..."), populated on completion
   phase: "streaming" | "completed";
+  blockId?: string; // server-assigned block_id
 }
 
 export interface ToolUseBlock {
   type: "tool_use";
-  id: string; // stable ID: b_{messageId}_{index}
+  id: string; // stable ID: tool_call_id (model-assigned)
   name: string; // tool name (Read, Write, Bash, ...)
   input: Record<string, unknown>; // tool call params
   status: "running" | "success" | "error";
+  blockId?: string; // = tool_call_id
 
   output?: string; // observation output (success)
   error?: string; // observation error (failure)
@@ -48,6 +52,47 @@ export interface ToolUseBlock {
 
 export type ContentBlock = TextBlock | ThoughtBlock | ToolUseBlock;
 
+const LEGACY_UNVERIFIED_PREFIX =
+  /^\[UNVERIFIED — [^\]]*Code changes were made but NOT independently verified\.\]\s*/;
+
+/**
+ * Reconcile the durable final assistant message into an ordered block list.
+ *
+ * Streaming may leave an empty text_start block, or may emit a short preamble
+ * before the final tool call without producing a later text block.  In both
+ * cases merely checking for the existence of any text block hides the final
+ * answer.  A text block after the final non-text block is the final-answer
+ * slot; otherwise append a new one.
+ */
+export function reconcileFinalTextBlock(
+  blocks: ContentBlock[],
+  finalContent: string,
+): void {
+  const cleanFinalContent = finalContent.replace(LEGACY_UNVERIFIED_PREFIX, "");
+  if (!cleanFinalContent.trim()) return;
+
+  let lastTextIndex = -1;
+  let lastNonTextIndex = -1;
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].type === "text") {
+      lastTextIndex = i;
+    } else {
+      lastNonTextIndex = i;
+    }
+  }
+
+  if (lastTextIndex >= 0 && lastTextIndex > lastNonTextIndex) {
+    const current = blocks[lastTextIndex];
+    if (current.type === "text") {
+      current.content = cleanFinalContent;
+      current.phase = "completed";
+    }
+    return;
+  }
+
+  blocks.push({ type: "text", content: cleanFinalContent, phase: "completed" });
+}
+
 // ── Message with blocks ──────────────────────────────────────────────────
 
 export interface BlocksMessage {
@@ -65,43 +110,13 @@ export interface BlocksMessageMeta {
   mode?: string;
 }
 
-// ── Integrity check ──────────────────────────────────────────────────────
-
-export interface IntegrityCheck {
-  wsBlockCount: number;
-  dbBlockCount: number;
-  wsLastBlockHash: string; // SHA-256 first 8 hex chars of last block JSON
-  dbLastBlockHash: string;
-}
-
-/**
- * Returns true when WS and DB data agree — safe for silent attribute replacement.
- * Returns false when structural mismatch detected — full message remount needed.
- */
-export function integrityPasses(check: IntegrityCheck): boolean {
-  return (
-    check.wsBlockCount === check.dbBlockCount &&
-    check.wsLastBlockHash === check.dbLastBlockHash
-  );
-}
-
 // ── Block helpers ────────────────────────────────────────────────────────
 
 let _blockSeq = 0;
 
-/** Generate a stable block ID. */
+/** Generate a stable block ID (fallback when server doesn't provide one). */
 export function blockId(messageId: string, index: number): string {
   return `b_${messageId}_${index}`;
-}
-
-/** Lightweight hash of a block's JSON representation (first 8 hex chars). */
-export function blockHash(block: ContentBlock): string {
-  const json = JSON.stringify(block);
-  let hash = 0;
-  for (let i = 0; i < json.length; i++) {
-    hash = ((hash << 5) - hash + json.charCodeAt(i)) | 0;
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0").slice(0, 8);
 }
 
 /** Check if a block can be merged with its predecessor (smart grouping). */
@@ -141,17 +156,28 @@ export function toolUseSummary(block: ToolUseBlock): string {
  * + timeline) with a single lifecycle-managed domain object.
  */
 export interface StreamingTurn {
-  /** Stable turn ID: turn_{sessionId}_{generation}. Survives streaming→DB. */
+  /** Frontend-local ID — stable React key, never used for merge/dedup. */
+  localId: string;
+
+  /** Server-assigned UUID — the authoritative identity across live + DB paths.
+   *  Bound from POST /messages 202 response.  Empty until HTTP response arrives. */
+  turnId: string;
+
+  /** Server-assigned run UUID — bound from POST response. */
+  runId: string;
+
+  /** Client-generated — matches POST idempotency_key, used to bind HTTP response. */
+  clientRequestId: string;
+
+  /** Legacy: included for backward compat with code that reads .id. */
   id: string;
 
   userMessage: {
-    /** tempId before DB load, real message ID after */
     id: string;
     blocks: ContentBlock[];
   };
 
   assistantResponse: {
-    /** tempId before DB load, real message ID after */
     id: string;
     blocks: ContentBlock[];
     status: "streaming" | "completed" | "error";
@@ -162,9 +188,7 @@ export interface StreamingTurn {
     tokens: number;
     startedAt: number;
     completedAt?: number;
-    /** Monotonic WS event counter, starts at 1. */
     eventSeq: number;
-    /** True when seq discontinuity detected — forces remount on DB load. */
     hasGap: boolean;
   };
 }
@@ -174,12 +198,18 @@ export function createStreamingTurn(
   sessionId: string,
   generation: number,
   prompt: string,
+  clientRequestId: string,
 ): StreamingTurn {
   const now = Date.now();
+  const localId = `turn_${sessionId}_${generation}`;
   const tempUserId = `temp_u_${now}`;
   const tempAsstId = `temp_a_${now}`;
   return {
-    id: `turn_${sessionId}_${generation}`,
+    localId,
+    turnId: "",
+    runId: "",
+    clientRequestId,
+    id: localId,
     userMessage: {
       id: tempUserId,
       blocks: [{ type: "text", content: prompt }],
@@ -199,3 +229,73 @@ export function createStreamingTurn(
   };
 }
 
+// ── Turn merge helpers ──────────────────────────────────────────────────
+
+/** Upsert a turn into an array, keyed by turnId. */
+export function upsertByTurnId(
+  turns: StreamingTurn[],
+  turn: StreamingTurn,
+): StreamingTurn[] {
+  if (!turn.turnId) return [...turns, turn];
+  const idx = turns.findIndex((t) => t.turnId === turn.turnId);
+  if (idx >= 0) {
+    const next = [...turns];
+    next[idx] = turn;
+    return next;
+  }
+  return [...turns, turn];
+}
+
+/** Merge DB turns into existing turns by turnId.
+ *  DB text blocks are canonical (from persisted assistant_message).
+ *  Live non-text blocks (tool calls, thoughts) are preserved when DB
+ *  has fewer blocks — this handles post-completion sync where DB
+ *  trace_events may be empty (afterSeq > 0 returns no new events). */
+export function mergeTurnsByTurnId(
+  current: StreamingTurn[],
+  incoming: StreamingTurn[],
+): StreamingTurn[] {
+  const map = new Map(current.filter((t) => t.turnId).map((t) => [t.turnId, t]));
+
+  for (const dbTurn of incoming) {
+    if (!dbTurn.turnId) continue;
+    const live = map.get(dbTurn.turnId);
+    if (live) {
+      const dbBlocks = dbTurn.assistantResponse.blocks;
+      const liveBlocks = live.assistantResponse.blocks;
+
+      // If DB has fewer blocks, it's a post-completion sync — supplement,
+      // don't replace.  Only add DB text blocks missing from live.
+      if (dbBlocks.length < liveBlocks.length) {
+        const dbTexts = dbBlocks.filter((b) => b.type === "text");
+        const hasLiveText = liveBlocks.some((b) => b.type === "text");
+        map.set(dbTurn.turnId, {
+          ...live,
+          assistantResponse: {
+            ...live.assistantResponse,
+            blocks: hasLiveText
+              ? liveBlocks
+              : [...liveBlocks, ...dbTexts],
+          },
+        });
+      } else {
+        // DB has full data (afterSeq=0 reload) — DB is canonical
+        const dbBlockIds = new Set(dbBlocks.map((b) => b.blockId).filter(Boolean));
+        const liveOnlyBlocks = liveBlocks.filter(
+          (b) => b.blockId && !dbBlockIds.has(b.blockId),
+        );
+        map.set(dbTurn.turnId, {
+          ...dbTurn,
+          assistantResponse: {
+            ...dbTurn.assistantResponse,
+            blocks: [...dbBlocks, ...liveOnlyBlocks],
+          },
+        });
+      }
+    } else {
+      map.set(dbTurn.turnId, dbTurn);
+    }
+  }
+
+  return [...map.values()];
+}

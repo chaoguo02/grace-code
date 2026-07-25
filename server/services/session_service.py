@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,11 @@ from llm.base import LLMMessage
 from app.storage.protocol import StorageBackend
 
 logger = logging.getLogger(__name__)
+
+_LEGACY_UNVERIFIED_PREFIX = re.compile(
+    r"^\[UNVERIFIED — [^\]]*"
+    r"Code changes were made but NOT independently verified\.\]\s*",
+)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -56,12 +62,18 @@ def _serialize_message(msg: LLMMessage) -> dict[str, Any]:
             }
             for tc in msg.tool_calls
         ]
+    content = msg.content
+    if msg.role == "assistant" and isinstance(content, str):
+        # Compatibility for answers persisted before verification metadata
+        # was separated from assistant prose.
+        content = _LEGACY_UNVERIFIED_PREFIX.sub("", content, count=1)
     return {
         "role": msg.role,
-        "content": msg.content,
+        "content": content,
         "tool_calls": tool_calls,
         "tool_call_id": msg.tool_call_id,
         "created_at": getattr(msg, "created_at", ""),
+        "turn_id": getattr(msg, "turn_id", ""),
     }
 
 
@@ -323,6 +335,230 @@ class SessionService:
         return [_serialize_message(m) for m in msgs]
 
     # ── Events ────────────────────────────────────────────────────────────
+
+    def build_turn_timeline(
+        self, session_id: str, *, after_seq: int = 0, limit: int = 200,
+    ) -> dict[str, Any]:
+        """Build a turn-grouped timeline for frontend consumption.
+
+        Returns a dict with ``turns`` (primary, turn-grouped) and ``items``
+        (legacy, flat message+event list).  The frontend uses ``turns`` for
+        direct StreamingTurn construction — no more flat-list reconstruction.
+
+        Each turn contains:
+        - turn_id, run_id, turn_index
+        - user_message (from session_messages)
+        - assistant_message (from session_messages)
+        - trace_events (WS-format events, sorted by seq)
+        - meta (steps, tokens, status from runs table)
+        """
+        if self._storage.get_session(session_id) is None:
+            raise ValueError(f"Unknown session: {session_id}")
+
+        import json as _json
+
+        # ── 1. Query messages (always — they're static after persist) ──
+        raw_messages: list[dict[str, Any]] = self.get_messages(session_id)
+
+        # ── 2. Query trace events (already parsed from event_json) ──
+        raw_events = self.list_trace_events(
+            session_id, after_seq=after_seq, limit=limit,
+        )
+
+        # ── 3. Query runs for turn metadata ──
+        runs_by_turn: dict[str, dict[str, Any]] = {}
+        try:
+            store = getattr(self._storage, "store", None)
+            if store is not None:
+                with store._connect() as conn:
+                    rows = conn.execute(
+                        """SELECT turn_id, id AS run_id, turn_index, status,
+                                  steps_taken, total_tokens, started_at, completed_at
+                           FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY turn_id ORDER BY created_at DESC) AS rn
+                                 FROM runs WHERE session_id = ?)
+                           WHERE rn = 1""",
+                        (session_id,),
+                    ).fetchall()
+                    for row in rows:
+                        runs_by_turn[row["turn_id"]] = {
+                            "run_id": row["run_id"] or "",
+                            "turn_index": row["turn_index"] or 0,
+                            "status": row["status"] or "",
+                            "steps_taken": row["steps_taken"] or 0,
+                            "total_tokens": row["total_tokens"] or 0,
+                            "started_at": row["started_at"] or "",
+                            "completed_at": row["completed_at"] or "",
+                        }
+        except Exception:
+            logger.debug("Failed to query runs for turn timeline", exc_info=True)
+
+        # ── 4. Group messages by turn_id ──
+        user_msgs_by_turn: dict[str, dict[str, Any]] = {}
+        asst_msgs_by_turn: dict[str, dict[str, Any]] = {}
+        _turn_order: list[str] = []
+
+        for msg in raw_messages:
+            tid = (msg.get("turn_id") or "").strip()
+            role = (msg.get("role") or "").strip()
+            if not tid:
+                continue
+            if tid not in _turn_order:
+                _turn_order.append(tid)
+            if role == "user":
+                if tid not in user_msgs_by_turn:
+                    user_msgs_by_turn[tid] = msg
+            elif role == "assistant":
+                # Runtime can persist intermediate assistant/tool-call history
+                # before appending the canonical RunResult summary.  The final
+                # assistant message in a turn is therefore authoritative.
+                asst_msgs_by_turn[tid] = msg
+
+        # ── 5. Build run_id → turn_id reverse mapping ──
+        # Events are injected with turn_id (Batch 5 fix) but legacy events
+        # may only have run_id.  Resolve via the runs table.
+        turn_id_by_run: dict[str, str] = {}
+        for tid, meta in runs_by_turn.items():
+            _rid = meta.get("run_id", "")
+            if _rid:
+                turn_id_by_run[_rid] = tid
+
+        # ── 6. Group trace events by turn_id ──
+        events_by_turn: dict[str, list[dict[str, Any]]] = {}
+        # Older persisted typed events can have blank run_id/turn_id because
+        # their dataclass supplied empty envelope fields which EventBus did
+        # not overwrite.  run_started/run_terminal still carry the real
+        # identifiers, so use the ordered lifecycle span to recover those
+        # otherwise orphaned events on replay.
+        active_event_turn_id = ""
+        for ev in raw_events:
+            tid = (ev.get("turn_id") or "").strip()
+            if not tid:
+                # Legacy: events only have run_id — resolve via runs table
+                _rid = (ev.get("run_id") or "").strip()
+                if _rid and _rid in turn_id_by_run:
+                    tid = turn_id_by_run[_rid]
+                else:
+                    tid = _rid
+            if not tid:
+                tid = active_event_turn_id
+            if not tid:
+                continue
+            if ev.get("type") == "run_started":
+                active_event_turn_id = tid
+            if tid not in events_by_turn:
+                events_by_turn[tid] = []
+            events_by_turn[tid].append(ev)
+            if ev.get("type") == "run_terminal" and tid == active_event_turn_id:
+                active_event_turn_id = ""
+
+        # ── 6. Build turn list ──
+        turns: list[dict[str, Any]] = []
+        seen_tids: set[str] = set()
+
+        for tid in _turn_order:
+            if tid in seen_tids:
+                continue
+            seen_tids.add(tid)
+
+            run_meta = runs_by_turn.get(tid, {})
+            turn_events = sorted(
+                events_by_turn.pop(tid, []),
+                key=lambda e: e.get("seq", 0),
+            )
+
+            turns.append({
+                "turn_id": tid,
+                "run_id": run_meta.get("run_id", ""),
+                "turn_index": run_meta.get("turn_index", 0),
+                "user_message": user_msgs_by_turn.get(tid),
+                "assistant_message": asst_msgs_by_turn.get(tid),
+                "trace_events": turn_events,
+                "meta": {
+                    "steps": run_meta.get("steps_taken", 0),
+                    "tokens": run_meta.get("total_tokens", 0),
+                    "status": run_meta.get("status", ""),
+                    "started_at": run_meta.get("started_at", ""),
+                    "completed_at": run_meta.get("completed_at", ""),
+                },
+            })
+
+        # Remaining events (turn_id not in messages, e.g. plan_mode runs)
+        for tid, evs in events_by_turn.items():
+            if tid in seen_tids:
+                continue
+            seen_tids.add(tid)
+            run_meta = runs_by_turn.get(tid, {})
+            turn_events = sorted(evs, key=lambda e: e.get("seq", 0))
+            turns.append({
+                "turn_id": tid,
+                "run_id": run_meta.get("run_id", ""),
+                "turn_index": run_meta.get("turn_index", 0),
+                "user_message": None,
+                "assistant_message": None,
+                "trace_events": turn_events,
+                "meta": {
+                    "steps": run_meta.get("steps_taken", 0),
+                    "tokens": run_meta.get("total_tokens", 0),
+                    "status": run_meta.get("status", ""),
+                    "started_at": run_meta.get("started_at", ""),
+                    "completed_at": run_meta.get("completed_at", ""),
+                },
+            })
+
+        # ── 7. Active run ──
+        active_run: dict[str, Any] | None = None
+        try:
+            store_ref = getattr(self._storage, "store", None)
+            if store_ref is not None:
+                with store_ref._connect() as conn:
+                    row = conn.execute(
+                        """SELECT id, turn_id, turn_index, prompt, status
+                           FROM runs
+                           WHERE session_id=? AND status IN ('queued','running')
+                           LIMIT 1""",
+                        (session_id,),
+                    ).fetchone()
+                    if row:
+                        active_run = {
+                            "run_id": row["id"],
+                            "turn_id": row["turn_id"],
+                            "turn_index": row["turn_index"],
+                            "prompt": row["prompt"],
+                            "status": row["status"],
+                        }
+        except Exception:
+            pass
+
+        max_seq = max(
+            (int(e.get("seq") or 0) for e in raw_events),
+            default=after_seq,
+        )
+
+        # ── 8. Build legacy items (for backward compat) ──
+        items: list[dict[str, Any]] = []
+        if after_seq <= 0:
+            for msg in raw_messages:
+                items.append({
+                    "source": "message",
+                    "timestamp": msg.get("created_at", ""),
+                    "message": msg,
+                })
+        for ev in raw_events:
+            items.append({
+                "source": "ws",
+                "timestamp": ev.get("timestamp", ""),
+                "event": ev,
+                "seq": ev.get("seq", 0),
+            })
+        items.sort(key=lambda item: item.get("timestamp") or "")
+
+        return {
+            "turns": turns,
+            "items": items,
+            "last_seq": max_seq,
+            "has_more": len(raw_events) >= limit,
+            "active_run": active_run,
+        }
 
     def list_trace_events(
         self, session_id: str, *, after_seq: int = 0, limit: int = 200,
