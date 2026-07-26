@@ -17,6 +17,7 @@ function iconFor(event: WsMessage): string {
       return "R";
     case "approval_required":
     case "approval_timeout":
+    case "approval_resolved":
       return "!";
     case "subagent_start":
       return "S";
@@ -49,6 +50,7 @@ function labelFor(event: WsMessage): string {
       return "Reflection";
     case "approval_required":
     case "approval_timeout":
+    case "approval_resolved":
       return "Approval";
     case "subagent_start":
     case "subagent_stop":
@@ -81,6 +83,8 @@ function titleFor(event: WsMessage): string {
       return `Approval required for ${event.tool_name || "tool"}`;
     case "approval_timeout":
       return "Approval request timed out";
+    case "approval_resolved":
+      return `Approval ${event.decision.replace(/_/g, " ")}`;
     case "subagent_start":
       return `Spawned ${event.agent_name || "subagent"}`.trim();
     case "subagent_stop":
@@ -137,6 +141,8 @@ function summaryFor(event: WsMessage): string {
       return (event.decision_reason || event.thought || "This action needs review before execution.").slice(0, 300);
     case "approval_timeout":
       return `Request ${event.request_id?.slice(0, 8) || "???"} was not resolved in time.`;
+    case "approval_resolved":
+      return `${event.tool_name} was ${event.decision.replace(/_/g, " ")} after ${Math.round(event.wait_ms || 0)} ms.`;
     case "subagent_start":
       return `Child session ${event.child_session_id?.slice(0, 8) || "???"} is now running.`;
     case "subagent_stop":
@@ -162,6 +168,7 @@ function detailFor(event: WsMessage): string {
   if (event.type === "observation") return event.output || event.error || "";
   if (event.type === "approval_required") return formatValue(event.params || {});
   if (event.type === "approval_timeout") return `Timed out request: ${event.request_id}`;
+  if (event.type === "approval_resolved") return event.note || `Decision: ${event.decision}`;
   if (event.type === "subagent_start") return `Child session ${event.child_session_id || ""}`.trim();
   if (event.type === "subagent_stop") return `${event.child_session_id} · ${event.status || ""}`.trim();
   if (event.type === "plan_ready") return event.plan_text || event.result?.summary || "";
@@ -201,6 +208,10 @@ function cardClass(event: WsMessage): string {
       return "trace-card trace-card-approval";
     case "approval_timeout":
       return "trace-card trace-card-observation-error";
+    case "approval_resolved":
+      return event.decision === "deny"
+        ? "trace-card trace-card-observation-error"
+        : "trace-card trace-card-approval";
     case "subagent_start":
       return "trace-card trace-card-subagent";
     case "subagent_stop":
@@ -230,6 +241,7 @@ function supportsExpansion(event: WsMessage): boolean {
     "observation",
     "reflection",
     "approval_required",
+    "approval_resolved",
     "plan_ready",
     "status",
     "worktree_resolved",
@@ -324,6 +336,7 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
               || event.type === "memory_written"
               || event.type === "subagent_start"
               || event.type === "subagent_stop"
+              || event.type === "approval_resolved"
               || event.type === "approval_timeout") && <MarkdownRenderer className="trace-body-copy" content={detail} />}
 
             {event.type === "observation" && !ev.diff && <MarkdownRenderer content={detail} />}

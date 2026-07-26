@@ -1,5 +1,10 @@
 import { apiGet } from "./client";
-import type { SessionStats, DailyRollup, StepLog } from "../types/stats";
+import type {
+  DailyRollup,
+  SessionContextInspection,
+  SessionStats,
+  StepLog,
+} from "../types/stats";
 
 export function getSessionStats(id: string, signal?: AbortSignal): Promise<SessionStats> {
   return apiGet(`/api/sessions/${encodeURIComponent(id)}/stats`, signal);
@@ -7,6 +12,13 @@ export function getSessionStats(id: string, signal?: AbortSignal): Promise<Sessi
 
 export function getSessionSteps(id: string, signal?: AbortSignal): Promise<StepLog[]> {
   return apiGet(`/api/sessions/${encodeURIComponent(id)}/steps`, signal);
+}
+
+export function getSessionContext(
+  id: string,
+  signal?: AbortSignal,
+): Promise<SessionContextInspection> {
+  return apiGet(`/api/sessions/${encodeURIComponent(id)}/context`, signal);
 }
 
 export function getDailyRollups(days = 30, signal?: AbortSignal): Promise<DailyRollup[]> {

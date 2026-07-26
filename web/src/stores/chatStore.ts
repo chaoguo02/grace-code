@@ -18,6 +18,7 @@ import {
 import * as api from "../api/sessions";
 import { ApiError } from "../api/client";
 import { connectWebSocket, disconnectWebSocket, scheduleReconnect } from "../hooks/useWebSocket";
+import { agentNameForUiMode } from "../modes";
 
 let sessionMissingHandler: ((sessionId: string) => void) | null = null;
 
@@ -414,6 +415,7 @@ function _eventFingerprint(ev: WsMessage): string | null {
     case "subagent_stop":  return `ss:${step}:${ev.child_session_id || ""}`;
     case "plan_ready":   return `pr:${step}`;
     case "approval_required": return `ar:${ev.request_id || ""}`;
+    case "approval_resolved": return `ad:${ev.request_id || ""}`;
     default:             return `${ev.type}:${step}`;
   }
 }
@@ -880,6 +882,20 @@ export const useChatStore = create<ChatState>((set, get) => {
         return;
       }
 
+      if (ev.type === "approval_resolved") {
+        const rid = ev.request_id || "";
+        patchSession(sid, (prev) => {
+          const nextApprovals = { ...prev.toolApprovals };
+          delete nextApprovals[rid];
+          return {
+            ...prev,
+            toolApprovals: nextApprovals,
+            timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
+          };
+        });
+        return;
+      }
+
       if (ev.type === "plan_ready") {
         patchSession(sid, (prev) => ({
           ...prev,
@@ -1118,7 +1134,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           sessionId,
           prompt,
           intent,
-          currentMode,
+          agentNameForUiMode(currentMode),
           clientRequestId,
           skill,
         );

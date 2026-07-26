@@ -178,6 +178,8 @@ class AgentService:
 
         self._stats_service = StatsService(self._storage)
         self._stats_recorder = StatsRecorder(self._stats_service)
+        from server.services.evaluation_service import EvaluationService
+        self._evaluation_service = EvaluationService(self.repo_path)
         if self._event_bus is not None:
             from server.services.trace_cache import InMemoryTraceCache
             self._trace_cache = InMemoryTraceCache()
@@ -424,6 +426,20 @@ class AgentService:
             ),
         )
 
+        # Read-only live registry and per-session architecture projection.
+        from server.services.architecture_service import ArchitectureService
+        self._architecture_service = ArchitectureService(self)
+        from server.services.replay_service import ReplayService
+        self._replay_service = ReplayService(self)
+        from server.services.safety_service import SafetyService
+        self._safety_service = SafetyService(self)
+        from server.services.multi_agent_service import MultiAgentService
+        self._multi_agent_service = MultiAgentService(self)
+        from server.services.reliability_service import ReliabilityService
+        self._reliability_service = ReliabilityService(self)
+        from server.services.project_overview_service import ProjectOverviewService
+        self._project_overview_service = ProjectOverviewService(self)
+
         logger.info(
             "AgentService initialized — repo=%s, model=%s",
             self.repo_path, self._config.llm.model,
@@ -568,6 +584,7 @@ class AgentService:
 
         def _confirm(request) -> "PromptDecision":
             from hitl.pipeline import PromptDecision, PromptAction
+            decision_started = time.monotonic()
             ar = ApprovalRequest(
                 tool_name=request.tool_name,
                 params=dict(request.params),
@@ -597,6 +614,18 @@ class AgentService:
 
             # Block until decision or timeout
             decision = broker.wait_for_decision(ar, on_pending=push_event)
+            wait_ms = (time.monotonic() - decision_started) * 1000
+
+            if event_bus is not None:
+                from server.events import WsApprovalResolved
+                event_bus.publish_typed(session_id, WsApprovalResolved(
+                    request_id=ar.request_id or "",
+                    tool_name=_req_info["tool_name"],
+                    decision=decision.action.value,
+                    note=decision.note or "",
+                    updated_input=decision.updated_params is not None,
+                    wait_ms=wait_ms,
+                ))
 
             # If timed out, push a cleanup event so the frontend removes the card
             if decision.action is PromptAction.DENY and "timed out" in (decision.note or ""):

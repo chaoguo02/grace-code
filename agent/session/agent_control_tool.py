@@ -80,7 +80,7 @@ class _BaseAgentControlTool(BaseTool):
 
 
 class SendMessageTool(_BaseAgentControlTool):
-    """Resume a terminal direct child in the background with a new message."""
+    """Steer a live direct child or resume a terminal child."""
 
     @property
     def name(self) -> str:
@@ -90,10 +90,10 @@ class SendMessageTool(_BaseAgentControlTool):
     def description(self) -> str:
         return (
             "Send a follow-up message to an existing direct child session. "
-            "This resumes a stopped child in the background with its persisted "
-            "transcript. Running children cannot receive live follow-up "
-            "messages; use WaitForAgent or CancelAgent until the child "
-            "reaches a terminal state."
+            "For a running child, the message is queued and becomes visible at "
+            "its next safe model turn; it does not interrupt an active tool. "
+            "For a stopped child, this starts a new background generation with "
+            "the persisted transcript."
         )
 
     @property
@@ -326,8 +326,8 @@ class AgentControlTool(_BaseAgentControlTool):
     def description(self) -> str:
         return (
             "Compatibility wrapper for child control. Prefer SendMessage, "
-            "WaitForAgent, and CancelAgent when available. Message resumes "
-            "terminal children only; it does not live-steer a running child."
+            "WaitForAgent, and CancelAgent when available. Live messages are "
+            "queued for the child's next safe model turn."
         )
 
     @property

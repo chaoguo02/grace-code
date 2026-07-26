@@ -14,6 +14,7 @@ by path safety checks inside file tools.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -33,9 +34,19 @@ def attach_delegation_tools(
     circuit_breaker=None,
 ) -> "ToolRegistry":
     """Attach session-bound delegation controls when declared and in depth."""
+    try:
+        configured_depth = int(
+            os.environ.get("GRACE_MAX_SUBAGENT_SPAWN_DEPTH", "1")
+        )
+    except ValueError:
+        configured_depth = 1
+    configured_depth = max(
+        1,
+        min(configured_depth, session.agent_depth.MAX_SUBAGENT_DEPTH),
+    )
     delegatable_children = (
         agent_registry.delegatable_by(spec)
-        if session.agent_depth.can_spawn
+        if session.agent_depth.value < configured_depth
         else []
     )
     if not delegatable_children:
@@ -68,6 +79,25 @@ def attach_delegation_tools(
             caller_agent_name=spec.name,
             circuit_breaker=circuit_breaker,
         ))
+    from agent.session.agent_batch_tool import AgentBatchTool
+    if "AgentBatch" not in registry:
+        registry.register(AgentBatchTool(
+            runtime,
+            session.id,
+            caller_agent_name=spec.name,
+        ))
+    if session.parent_id is None:
+        from agent.team.feature_flags import TeamFeatureConfig
+        if (
+            TeamFeatureConfig.from_environment().enabled
+            and "ProposeAgentTeam" not in registry
+        ):
+            from agent.session.agent_team_tool import ProposeAgentTeamTool
+            registry.register(ProposeAgentTeamTool(
+                runtime,
+                session.id,
+                caller_agent_name=spec.name,
+            ))
     from agent.session.agent_control_tool import (
         AgentControlTool,
         CancelAgentTool,
@@ -166,6 +196,14 @@ def build_registry_for_session(
         runtime=runtime,
         circuit_breaker=circuit_breaker,
     )
+    if (
+        runtime is not None
+        and session.metadata.get("team_id")
+        and session.metadata.get("team_member_id")
+        and "TeamCoordinate" not in registry
+    ):
+        from agent.session.team_coordination_tool import TeamCoordinateTool
+        registry.register(TeamCoordinateTool(runtime, session.id))
 
     # Tag registry with session_id for per-session intercept dedup
     registry = registry.with_session_id(session.id)

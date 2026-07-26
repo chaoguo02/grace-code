@@ -105,6 +105,12 @@ def _parse_definition(path: Path) -> AgentDefinition:
 
     tools_raw = frontmatter.get("tools", "")
     disallowed_raw = frontmatter.get("disallowedTools", frontmatter.get("disallowed_tools", ""))
+    required_tools_raw = frontmatter.get(
+        "requiredTools", frontmatter.get("required_tools", "")
+    )
+    completion_requires_raw = frontmatter.get(
+        "completionRequires", frontmatter.get("completion_requires", {})
+    )
     allowed_subagents_raw = frontmatter.get(
         "allowedSubagents", frontmatter.get("allowed_subagents")
     )
@@ -229,6 +235,10 @@ def _parse_definition(path: Path) -> AgentDefinition:
     elif isinstance(hooks_raw, list):
         hooks = tuple(h for h in hooks_raw if isinstance(h, dict))
 
+    required_tools = _parse_required_tools(path, required_tools_raw)
+    completion_requires = _parse_completion_requires(
+        path, completion_requires_raw
+    )
     tool_delegation_policy = DelegationPolicy.from_tools(_parse_tool_list(tools_raw))
     delegation_policy = (
         _parse_delegation_policy(path, allowed_subagents_raw)
@@ -251,6 +261,8 @@ def _parse_definition(path: Path) -> AgentDefinition:
         max_turns=max_turns,
         max_tokens=max_tokens,
         system_prompt=body or str(frontmatter.get("instructions", "")),
+        required_tools=required_tools,
+        completion_requires=completion_requires,
         permission_mode=permission_mode,
         mcp_servers=mcp_servers,
         skills=skills,
@@ -273,6 +285,43 @@ def _parse_tool_list(value: Any) -> frozenset[str]:
     if isinstance(value, list):
         return frozenset(str(item).strip() for item in value if str(item).strip())
     return frozenset()
+
+
+def _parse_required_tools(path: Path, value: Any) -> frozenset[str]:
+    if value in (None, ""):
+        return frozenset()
+    if not isinstance(value, (str, list)):
+        raise _invalid(
+            path, "field 'requiredTools' must be a string or list of tool names"
+        )
+    if isinstance(value, list) and not all(isinstance(item, str) for item in value):
+        raise _invalid(path, "field 'requiredTools' list items must be strings")
+    tools = _parse_tool_list(value)
+    if not tools:
+        raise _invalid(path, "field 'requiredTools' must not be empty when provided")
+    return tools
+
+
+def _parse_completion_requires(path: Path, value: Any) -> dict[str, int]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise _invalid(
+            path, "field 'completionRequires' must be a mapping of tool names to counts"
+        )
+    requirements: dict[str, int] = {}
+    for tool_name, count in value.items():
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise _invalid(
+                path, "field 'completionRequires' keys must be non-empty strings"
+            )
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise _invalid(
+                path,
+                "field 'completionRequires' counts must be positive integers",
+            )
+        requirements[tool_name.strip()] = count
+    return requirements
 
 
 def _parse_delegation_policy(path: Path, value: Any) -> DelegationPolicy:

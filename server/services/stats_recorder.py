@@ -9,6 +9,7 @@ data (tool names, success/failure, duration) and session metadata
 
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 import logging
 import time
 from typing import Any
@@ -62,6 +63,35 @@ class StatsRecorder:
             duration_ms=int(duration_ms),
             tokens=0,
             timestamp="",
+        )
+
+    def record_context_snapshot(
+        self,
+        session_id: str,
+        *,
+        run_id: str = "",
+        turn_id: str = "",
+        step: int,
+        request_kind: str,
+        context_stats: Any,
+        capabilities: dict[str, Any] | None = None,
+    ) -> int:
+        """Record context facts after request assembly and before provider I/O."""
+        if context_stats is None:
+            return 0
+        stats = (
+            asdict(context_stats)
+            if is_dataclass(context_stats)
+            else dict(context_stats)
+        )
+        return self._stats.record_context_snapshot(
+            session_id,
+            run_id=run_id,
+            turn_id=turn_id,
+            step_number=step,
+            request_kind=request_kind,
+            stats=stats,
+            capabilities=dict(capabilities or {}),
         )
 
     def record_session_end(

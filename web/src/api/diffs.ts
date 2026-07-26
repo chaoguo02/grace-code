@@ -4,9 +4,10 @@ import type { SessionDiff } from "../types/stats";
 export function getSessionDiffs(
   sessionId: string,
   status?: string,
+  signal?: AbortSignal,
 ): Promise<SessionDiff[]> {
   const query = status ? `?status=${encodeURIComponent(status)}` : "";
-  return apiGet(`/api/sessions/${encodeURIComponent(sessionId)}/diffs${query}`);
+  return apiGet(`/api/sessions/${encodeURIComponent(sessionId)}/diffs${query}`, signal);
 }
 
 export function getPendingDiffs(): Promise<SessionDiff[]> {

@@ -180,7 +180,7 @@ def build_replay_run_record(
     permission_snapshot: dict[str, Any] | None = None,
     runtime_snapshot: dict[str, Any] | None = None,
     visible_tools: list[Any] | None = None,
-    steps: list[ReplayStepRecord] | None = None,
+    steps: list[ReplayStepRecord | dict[str, Any]] | None = None,
     termination_reason: TerminationReason | str = TerminationReason.NONE,
     termination_status: str = "",
     summary: str = "",

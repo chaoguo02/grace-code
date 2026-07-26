@@ -7,6 +7,7 @@ SessionRuntime 的子代理生成逻辑。
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from agent.session.models import (
@@ -16,6 +17,7 @@ from agent.session.models import (
     DelegationOrigin,
     ExecutionPlacement,
     ForkStatus,
+    AgentRunStatus,
     
     SessionMode,
     SessionStatus,
@@ -29,6 +31,31 @@ if TYPE_CHECKING:
     from agent.session.runtime import SessionRuntime
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_env(name: str, default: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, min(value, maximum))
+
+
+def _descendants(store, root_id: str):
+    root = store.get_session(root_id)
+    if root is None:
+        return []
+    records = []
+    pending = [root]
+    seen = set()
+    while pending:
+        record = pending.pop()
+        if record.id in seen:
+            continue
+        seen.add(record.id)
+        records.append(record)
+        pending.extend(store.list_child_sessions(record.id))
+    return records
 
 
 def spawn_agent(
@@ -57,8 +84,14 @@ def spawn_agent(
     parent = self._store.get_session(parent_session_id)
     if parent is None:
         raise ValueError(f"Unknown session: {parent_session_id}")
-    if not parent.agent_depth.can_spawn:
-        raise ValueError("Maximum subagent depth reached")
+    max_depth = _positive_env(
+        "GRACE_MAX_SUBAGENT_SPAWN_DEPTH", 1,
+        parent.agent_depth.MAX_SUBAGENT_DEPTH,
+    )
+    if parent.agent_depth.value >= max_depth:
+        raise ValueError(
+            f"Maximum configured subagent depth reached ({max_depth})"
+        )
     parent_definition = self._agent_registry.get(parent.agent_name)
     if request.agent_kind is AgentKind.NAMED_SUBAGENT:
         definition = request.definition
@@ -103,14 +136,47 @@ def spawn_agent(
             and spawn_context.model_name != self._backend.model_name
         ):
             raise ValueError("Fork model must match the parent model")
-    child = self._store.create_session(
-        agent_name=definition.name, mode=SessionMode.SUBAGENT,
-        agent_kind=request.agent_kind, context_origin=request.context_origin,
-        execution_placement=request.execution_placement,
-        workspace_mode=request.workspace_mode, repo_path=_repo,
-        title=request.description[:80] or definition.name,
-        parent_id=parent.id, root_id=parent.root_id,
-        metadata={
+    # Reserve capacity only after all request validation succeeds.  Keeping the
+    # reservation adjacent to durable session creation prevents failed input
+    # validation from leaking a slot while still closing concurrent spawn races.
+    with self._spawn_lock:
+        records = _descendants(self._store, parent.root_id or parent.id)
+        max_spawn = _positive_env(
+            "GRACE_MAX_SUBAGENTS_PER_SESSION", 64, 10_000,
+        )
+        spawned = sum(record.parent_id is not None for record in records)
+        if spawned + self._spawn_reservations >= max_spawn:
+            raise ValueError(
+                f"Subagent spawn limit reached ({max_spawn}); complete directly"
+            )
+        max_concurrent = _positive_env(
+            "GRACE_MAX_CONCURRENT_SUBAGENTS", 4, 64,
+        )
+        terminal = {
+            SessionStatus.COMPLETED,
+            SessionStatus.PARTIAL,
+            SessionStatus.FAILED,
+            SessionStatus.CANCELLED,
+        }
+        active = sum(
+            record.parent_id is not None and record.status not in terminal
+            for record in records
+        )
+        if active + self._spawn_reservations >= max_concurrent:
+            raise ValueError(
+                f"Concurrent subagent limit reached ({max_concurrent}); do not "
+                "retry until a running child completes"
+            )
+        self._spawn_reservations += 1
+    try:
+        child = self._store.create_session(
+            agent_name=definition.name, mode=SessionMode.SUBAGENT,
+            agent_kind=request.agent_kind, context_origin=request.context_origin,
+            execution_placement=request.execution_placement,
+            workspace_mode=request.workspace_mode, repo_path=_repo,
+            title=request.description[:80] or definition.name,
+            parent_id=parent.id, root_id=parent.root_id,
+            metadata={
             **(child_metadata or {}),
             "entrypoint": origin.value,
             "agent_kind": request.agent_kind.value,
@@ -147,8 +213,11 @@ def spawn_agent(
                 else []
             ),
             "source_repo_path": parent_repo,
-        },
-    )
+            },
+        )
+    finally:
+        with self._spawn_lock:
+            self._spawn_reservations = max(0, self._spawn_reservations - 1)
     if child_created_callback is not None:
         try:
             child_created_callback(child)
@@ -326,6 +395,126 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                 agent_name=child_agent_type, status=completed.status,
                 fork_result=child_result,
             )
+            delegation_task_id = str(
+                (completed.metadata or {}).get("delegation_task_id", "")
+            )
+            delegation_run_id = str(
+                (completed.metadata or {}).get("delegation_run_id", "")
+            )
+            if delegation_task_id and delegation_run_id:
+                try:
+                    from agent.session.result_contract import (
+                        ChangedFile,
+                        WorkerReport,
+                        WorkerReportStatus,
+                    )
+
+                    status_map = {
+                        AgentRunStatus.COMPLETED: WorkerReportStatus.COMPLETED,
+                        AgentRunStatus.PARTIAL: WorkerReportStatus.PARTIAL,
+                        AgentRunStatus.FAILED: WorkerReportStatus.FAILED,
+                        AgentRunStatus.CANCELLED: WorkerReportStatus.CANCELLED,
+                    }
+                    effective_status = (
+                        child_result.status
+                        if child_result is not None
+                        else AgentRunStatus.FAILED
+                    )
+                    evidence = (
+                        child_result.worktree
+                        if child_result is not None else None
+                    )
+                    report = WorkerReport(
+                        task_id=delegation_task_id.rsplit(":", 1)[-1],
+                        session_id=completed.id,
+                        generation=int(completed.generation),
+                        agent_type=child_agent_type,
+                        status=status_map[effective_status],
+                        summary=(
+                            child_result.summary
+                            if child_result is not None else child_error
+                        ),
+                        findings=(
+                            child_result.structured_findings
+                            if child_result is not None else ()
+                        ),
+                        changed_files=tuple(
+                            ChangedFile(path=path)
+                            for path in (
+                                evidence.changed_files
+                                if evidence is not None else ()
+                            )
+                        ),
+                        unresolved=(
+                            (child_error,)
+                            if child_result is None and child_error else ()
+                        ),
+                        warnings=tuple(
+                            item
+                            for item in (
+                                (
+                                    child_result.warning
+                                    if child_result is not None else ""
+                                ),
+                                (
+                                    child_result.failure_diagnosis
+                                    if child_result is not None else ""
+                                ),
+                            )
+                            if item
+                        ),
+                        tokens_used=(
+                            child_result.tokens_used
+                            if child_result is not None else 0
+                        ),
+                        worktree=(
+                            evidence.to_dict()
+                            if evidence is not None else None
+                        ),
+                    )
+                    self._store.update_delegation_task(
+                        delegation_task_id,
+                        status=report.status.value,
+                        child_session_id=completed.id,
+                        generation=int(completed.generation),
+                        report=report.to_dict(),
+                        error=(
+                            child_result.error
+                            if child_result is not None else child_error
+                        ),
+                    )
+                    tasks = self._store.list_delegation_tasks(
+                        delegation_run_id
+                    )
+                    terminal_states = {
+                        "completed", "partial", "failed", "cancelled",
+                        "no_findings",
+                    }
+                    if tasks and all(
+                        str(item["status"]) in terminal_states
+                        for item in tasks
+                    ):
+                        required_failed = any(
+                            bool(item["required"])
+                            and str(item["status"]) in {"failed", "cancelled"}
+                            for item in tasks
+                        )
+                        any_partial = any(
+                            str(item["status"]) == "partial" for item in tasks
+                        )
+                        self._store.complete_delegation_run(
+                            delegation_run_id,
+                            status=(
+                                "partial"
+                                if required_failed or any_partial
+                                else "completed"
+                            ),
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist delegation result for child %s",
+                        completed.id,
+                    )
         self._cancellation_tokens.pop(
             (child.id, child.generation), None,
         )

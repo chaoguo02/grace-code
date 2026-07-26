@@ -235,6 +235,29 @@ class StorageBackend(Protocol):
         """Get per-step logs for one session."""
         ...
 
+    def insert_context_snapshot(
+        self,
+        session_id: str,
+        *,
+        run_id: str = "",
+        turn_id: str = "",
+        step_number: int,
+        request_kind: str,
+        stats_json: str,
+        capabilities_json: str,
+    ) -> int:
+        """Persist one actually assembled provider-request context."""
+        ...
+
+    def get_context_snapshots(
+        self,
+        session_id: str,
+        *,
+        limit: int = 200,
+    ) -> list[dict]:
+        """List provider-request context snapshots for a session."""
+        ...
+
     # ── Typed trace events ────────────────────────────────────────────────
 
     def insert_trace_event(

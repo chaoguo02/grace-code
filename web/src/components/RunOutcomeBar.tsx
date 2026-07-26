@@ -5,6 +5,7 @@ interface RunOutcomeBarProps {
   outcome?: RunOutcome;
   steps?: number;
   tokens?: number;
+  onInspect?: () => void;
 }
 
 const STATUS_LABELS: Record<RunOutcome["status"], string> = {
@@ -28,6 +29,7 @@ export function RunOutcomeBar({
   outcome,
   steps = 0,
   tokens = 0,
+  onInspect,
 }: RunOutcomeBarProps) {
   const [expanded, setExpanded] = useState(false);
   if (!outcome) return null;
@@ -68,6 +70,15 @@ export function RunOutcomeBar({
         {tokens > 0 && <span className="run-outcome-metric">{(tokens / 1000).toFixed(1)}K tokens</span>}
         {hasDetails && <span className="run-outcome-chevron" aria-hidden="true">{expanded ? "⌃" : "⌄"}</span>}
       </button>
+      {onInspect && (
+        <button
+          type="button"
+          className="run-outcome-inspect"
+          onClick={onInspect}
+        >
+          Inspect run
+        </button>
+      )}
 
       {expanded && (
         <div className="run-outcome-details">

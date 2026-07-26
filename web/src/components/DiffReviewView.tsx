@@ -11,10 +11,11 @@ import {
   startMultiAgentReview,
 } from "../api/reviews";
 import { DiffBlock } from "./DiffBlock";
+import { ReviewOrchestrationPanel } from "./ReviewOrchestrationPanel";
 import { useSessionStore } from "../stores/sessionStore";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import type { SessionDiff, SessionStats, StepLog } from "../types/stats";
-import type { ReviewJob, ReviewTaskAttempt } from "../api/reviews";
+import type { ReviewJob } from "../api/reviews";
 
 function EmptyState({ title, body }: { title: string; body: string }) {
   return (
@@ -49,26 +50,6 @@ function statusTone(status?: string | null) {
   if (status === "failed" || status === "gave_up") return "bad";
   if (status === "running") return "busy";
   return "neutral";
-}
-
-function attemptMetrics(attempt: ReviewTaskAttempt) {
-  const metrics: string[] = [];
-  const startedAt = Date.parse(attempt.started_at);
-  const completedAt = attempt.completed_at
-    ? Date.parse(attempt.completed_at)
-    : Number.NaN;
-  if (
-    Number.isFinite(startedAt)
-    && Number.isFinite(completedAt)
-    && completedAt >= startedAt
-  ) {
-    metrics.push(`${Math.max(1, Math.round((completedAt - startedAt) / 1000))}s`);
-  }
-  const tokens = attempt.result.tokens_used;
-  if (typeof tokens === "number" && Number.isFinite(tokens)) {
-    metrics.push(`${tokens.toLocaleString()} tokens`);
-  }
-  return metrics.join(" · ");
 }
 
 function collectVerificationSignals(steps: StepLog[]) {
@@ -394,70 +375,15 @@ export function DiffReviewView() {
                 <span>{reviewJob.result.total_tokens?.toLocaleString() || 0} tokens</span>
               </div>
 
-              <div className="multi-review-tasks">
-                {reviewJob.tasks.map((task) => (
-                  <div key={task.id} className="multi-review-task">
-                    <span className={`summary-status-dot ${statusTone(task.status)}`} />
-                    <div>
-                      <strong>{task.title}</strong>
-                      <span>{task.status}</span>
-                      {task.error && <small>{task.error}</small>}
-                      {task.attempts.length > 0 && (
-                        <details className="review-attempts">
-                          <summary>
-                            {task.attempts.length} attempt
-                            {task.attempts.length === 1 ? "" : "s"}
-                          </summary>
-                          <ol>
-                            {[...task.attempts].reverse().map((attempt) => (
-                              <li key={attempt.id}>
-                                <span>
-                                  #{attempt.attempt_number} · {attempt.status}
-                                </span>
-                                {attemptMetrics(attempt) && (
-                                  <small>{attemptMetrics(attempt)}</small>
-                                )}
-                                {attempt.error && <small>{attempt.error}</small>}
-                                {attempt.child_session_id && (
-                                  <button
-                                    type="button"
-                                    onClick={() => useSessionStore.getState().openSession(
-                                      attempt.child_session_id,
-                                    )}
-                                  >
-                                    View run
-                                  </button>
-                                )}
-                              </li>
-                            ))}
-                          </ol>
-                        </details>
-                      )}
-                    </div>
-                    {task.child_session_id && (
-                      <button
-                        type="button"
-                        className="review-session-link"
-                        onClick={() => useSessionStore.getState().openSession(task.child_session_id)}
-                      >
-                        View agent
-                      </button>
-                    )}
-                    {["completed", "partial", "stale", "failed", "cancelled"].includes(reviewJob.status)
-                      && ["partial", "failed", "cancelled"].includes(task.status)
-                      && reviewJob.snapshot_available && (
-                        <button
-                          type="button"
-                          className="review-task-retry"
-                          disabled={Boolean(reviewTaskRetrying) || reviewStarting}
-                          onClick={() => handleTaskRetry(task.id)}
-                        >
-                          {reviewTaskRetrying === task.id ? "Retrying..." : "Retry reviewer"}
-                        </button>
-                      )}
-                  </div>
-                ))}
-              </div>
+              <ReviewOrchestrationPanel
+                job={reviewJob}
+                retryingTaskId={reviewTaskRetrying}
+                lifecycleBusy={reviewStarting}
+                onOpenSession={(sessionId) => (
+                  useSessionStore.getState().openSession(sessionId)
+                )}
+                onRetryTask={handleTaskRetry}
+              />
 
               {reviewJob.status === "stale" && (
                 <div className="multi-review-stale">

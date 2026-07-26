@@ -45,7 +45,17 @@ function deriveDurationSeconds(createdAt?: string | null, completedAt?: string |
   return Math.max(0, Math.floor((end - start) / 1000));
 }
 
-export function TraceView() {
+interface TraceViewProps {
+  requestedRunId?: string;
+  requestedSequence?: number;
+  onShowSession?: () => void;
+}
+
+export function TraceView({
+  requestedRunId,
+  requestedSequence,
+  onShowSession,
+}: TraceViewProps = {}) {
   const activeId = useSessionStore((s) => s.activeId);
   const activeDetail = useSessionStore((s) => s.activeDetail);
   const { events, isRunning, steps, tokens, timeline } = useChatStore((s) =>
@@ -64,10 +74,13 @@ export function TraceView() {
 
   // Filter events
   const filtered = useMemo(() => {
-    if (filter === "all") return events;
-    if (filter === "subagent") return events.filter((e) => e.type === "subagent_start" || e.type === "subagent_stop");
-    return events.filter((e) => e.type === filter);
-  }, [events, filter]);
+    const runEvents = requestedRunId
+      ? events.filter((event) => event.run_id === requestedRunId)
+      : events;
+    if (filter === "all") return runEvents;
+    if (filter === "subagent") return runEvents.filter((e) => e.type === "subagent_start" || e.type === "subagent_stop");
+    return runEvents.filter((e) => e.type === filter);
+  }, [events, filter, requestedRunId]);
 
   // Reverse for chronological display (oldest first for timeline)
   const chronological = useMemo(() => [...filtered].reverse(), [filtered]);
@@ -100,6 +113,12 @@ export function TraceView() {
       el?.scrollIntoView({ behavior: "smooth" });
     }
   }, [events.length, isRunning, autoScroll]);
+
+  useEffect(() => {
+    if (!requestedSequence) return;
+    document.getElementById(`trace-event-${requestedSequence}`)
+      ?.scrollIntoView({ block: "center" });
+  }, [requestedSequence, chronological.length]);
 
   return (
     <section className="view active" data-view-name="events">
@@ -145,6 +164,14 @@ export function TraceView() {
         </div>
 
         {/* Filter bar */}
+        {requestedRunId && (
+          <div className="evidence-target-banner">
+            <span>Filtered to run <code>{requestedRunId}</code></span>
+            {onShowSession && (
+              <button type="button" onClick={onShowSession}>Show full session</button>
+            )}
+          </div>
+        )}
         <div style={{
           padding: "8px 20px",
           borderBottom: "1px solid var(--border)",
@@ -220,7 +247,13 @@ export function TraceView() {
                 </div>
               )}
               {group.events.map((ev, i) => (
-                <WsEventBlock key={`${group.step}-${i}`} event={ev} />
+                <div
+                  id={ev.sequence ? `trace-event-${ev.sequence}` : undefined}
+                  className={ev.sequence === requestedSequence ? "trace-event-target" : ""}
+                  key={`${group.step}-${i}`}
+                >
+                  <WsEventBlock event={ev} />
+                </div>
               ))}
             </div>
           ))}

@@ -137,6 +137,17 @@ export interface WsApprovalTimeoutEvent extends EventEnvelope {
   timestamp?: string;
 }
 
+export interface WsApprovalResolvedEvent extends EventEnvelope {
+  type: "approval_resolved";
+  request_id: string;
+  tool_name: string;
+  decision: "allow_once" | "always_allow" | "deny" | string;
+  note?: string;
+  updated_input?: boolean;
+  wait_ms?: number;
+  timestamp?: string;
+}
+
 // ── Plan ────────────────────────────────────────────────────────────────
 
 export interface WsPlanReadyEvent extends EventEnvelope {
@@ -283,6 +294,7 @@ export type WsMessage =
   | WsSubagentStopEvent
   | WsApprovalRequiredEvent
   | WsApprovalTimeoutEvent
+  | WsApprovalResolvedEvent
   | WsPlanReadyEvent
   | WsWorktreeResolvedEvent
   | WsReviewUpdatedEvent

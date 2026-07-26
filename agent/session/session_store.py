@@ -99,6 +99,43 @@ class SessionStore:
                     UNIQUE(child_session_id, generation)
                 );
 
+                CREATE TABLE IF NOT EXISTS delegation_runs (
+                    id TEXT PRIMARY KEY,
+                    parent_session_id TEXT NOT NULL,
+                    parent_run_id TEXT NOT NULL DEFAULT '',
+                    topology TEXT NOT NULL,
+                    reason_code TEXT NOT NULL DEFAULT '',
+                    explanation TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    budget_json TEXT NOT NULL DEFAULT '{}',
+                    downgraded_from TEXT NULL,
+                    is_team INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS delegation_tasks (
+                    id TEXT PRIMARY KEY,
+                    delegation_run_id TEXT NOT NULL,
+                    child_session_id TEXT NULL,
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    agent_type TEXT NOT NULL,
+                    purpose TEXT NOT NULL DEFAULT 'analysis',
+                    goal TEXT NOT NULL,
+                    prompt TEXT NOT NULL DEFAULT '',
+                    scope_json TEXT NOT NULL DEFAULT '[]',
+                    dependencies_json TEXT NOT NULL DEFAULT '[]',
+                    expected_files_json TEXT NOT NULL DEFAULT '[]',
+                    write_files_json TEXT NOT NULL DEFAULT '[]',
+                    required INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL,
+                    report_json TEXT NULL,
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    started_at TEXT NULL,
+                    completed_at TEXT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_sessions_parent_id
                     ON sessions(parent_id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_root_id
@@ -107,6 +144,10 @@ class SessionStore:
                     ON session_messages(session_id, id);
                 CREATE INDEX IF NOT EXISTS idx_agent_notifications_parent_state_id
                     ON agent_notifications(parent_session_id, delivery_state, id);
+                CREATE INDEX IF NOT EXISTS idx_delegation_runs_parent
+                    ON delegation_runs(parent_session_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_delegation_tasks_run
+                    ON delegation_tasks(delegation_run_id, created_at);
                 """
             )
             columns = {
@@ -236,6 +277,15 @@ class SessionStore:
                             parent_session_id, delivery_state, id
                         );
                     """
+                )
+            delegation_task_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(delegation_tasks)")
+            }
+            if "prompt" not in delegation_task_columns:
+                conn.execute(
+                    "ALTER TABLE delegation_tasks "
+                    "ADD COLUMN prompt TEXT NOT NULL DEFAULT ''"
                 )
 
     def create_session(
@@ -571,6 +621,278 @@ class SessionStore:
                     _utc_now(),
                 ),
             )
+
+    def create_delegation_run(
+        self,
+        *,
+        run_id: str,
+        parent_session_id: str,
+        topology: str,
+        reason_code: str = "",
+        explanation: str = "",
+        parent_run_id: str = "",
+        budget: dict[str, object] | None = None,
+        downgraded_from: str | None = None,
+        is_team: bool = False,
+    ) -> dict[str, object]:
+        if self.get_session(parent_session_id) is None:
+            raise ValueError(f"Unknown parent session: {parent_session_id}")
+        now = _utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO delegation_runs (
+                    id, parent_session_id, parent_run_id, topology,
+                    reason_code, explanation, status, budget_json,
+                    downgraded_from, is_team, created_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, NULL)
+                """,
+                (
+                    run_id,
+                    parent_session_id,
+                    parent_run_id,
+                    topology,
+                    reason_code,
+                    explanation,
+                    json.dumps(budget or {}, ensure_ascii=True),
+                    downgraded_from,
+                    int(is_team),
+                    now,
+                ),
+            )
+        return self.get_delegation_run(run_id) or {}
+
+    def create_delegation_task(
+        self,
+        *,
+        task_id: str,
+        delegation_run_id: str,
+        agent_type: str,
+        goal: str,
+        prompt: str = "",
+        purpose: str = "analysis",
+        scope: tuple[str, ...] = (),
+        dependencies: tuple[str, ...] = (),
+        expected_files: tuple[str, ...] = (),
+        write_files: tuple[str, ...] = (),
+        required: bool = True,
+    ) -> dict[str, object]:
+        now = _utc_now()
+        with self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM delegation_runs WHERE id = ?",
+                (delegation_run_id,),
+            ).fetchone()
+            if exists is None:
+                raise ValueError(f"Unknown delegation run: {delegation_run_id}")
+            conn.execute(
+                """
+                INSERT INTO delegation_tasks (
+                    id, delegation_run_id, child_session_id, generation,
+                    agent_type, purpose, goal, prompt, scope_json,
+                    dependencies_json, expected_files_json, write_files_json,
+                    required, status,
+                    report_json, error, created_at, started_at, completed_at
+                ) VALUES (?, ?, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued',
+                          NULL, '', ?, NULL, NULL)
+                """,
+                (
+                    task_id,
+                    delegation_run_id,
+                    agent_type,
+                    purpose,
+                    goal,
+                    prompt,
+                    json.dumps(list(scope), ensure_ascii=True),
+                    json.dumps(list(dependencies), ensure_ascii=True),
+                    json.dumps(list(expected_files), ensure_ascii=True),
+                    json.dumps(list(write_files), ensure_ascii=True),
+                    int(required),
+                    now,
+                ),
+            )
+        return self.get_delegation_task(task_id) or {}
+
+    def update_delegation_task(
+        self,
+        task_id: str,
+        *,
+        status: str,
+        child_session_id: str | None = None,
+        generation: int | None = None,
+        report: dict[str, object] | None = None,
+        error: str = "",
+    ) -> None:
+        now = _utc_now()
+        terminal = status in {
+            "completed", "partial", "failed", "cancelled", "no_findings",
+            "budget_exhausted", "rejected", "superseded",
+        }
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE delegation_tasks
+                SET status = ?,
+                    child_session_id = COALESCE(?, child_session_id),
+                    generation = COALESCE(?, generation),
+                    report_json = COALESCE(?, report_json),
+                    error = ?,
+                    started_at = CASE
+                        WHEN ? = 'running' THEN COALESCE(started_at, ?)
+                        ELSE started_at
+                    END,
+                    completed_at = CASE WHEN ? THEN ? ELSE completed_at END
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    child_session_id,
+                    generation,
+                    (
+                        json.dumps(report, ensure_ascii=True)
+                        if report is not None else None
+                    ),
+                    error,
+                    status,
+                    now,
+                    int(terminal),
+                    now,
+                    task_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown delegation task: {task_id}")
+
+    def complete_delegation_run(self, run_id: str, *, status: str) -> None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE delegation_runs
+                SET status = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (status, _utc_now(), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown delegation run: {run_id}")
+
+    def get_delegation_run(self, run_id: str) -> dict[str, object] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM delegation_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+        return self._delegation_run_row(row) if row is not None else None
+
+    def get_delegation_task(self, task_id: str) -> dict[str, object] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM delegation_tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+        return self._delegation_task_row(row) if row is not None else None
+
+    def list_delegation_runs(
+        self, parent_session_id: str,
+    ) -> list[dict[str, object]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM delegation_runs
+                WHERE parent_session_id = ?
+                ORDER BY created_at, id
+                """,
+                (parent_session_id,),
+            ).fetchall()
+        return [self._delegation_run_row(row) for row in rows]
+
+    def list_delegation_tasks(
+        self, delegation_run_id: str,
+    ) -> list[dict[str, object]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM delegation_tasks
+                WHERE delegation_run_id = ?
+                ORDER BY created_at, id
+                """,
+                (delegation_run_id,),
+            ).fetchall()
+        return [self._delegation_task_row(row) for row in rows]
+
+    @staticmethod
+    def _delegation_run_row(row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "id": str(row["id"]),
+            "parent_session_id": str(row["parent_session_id"]),
+            "parent_run_id": str(row["parent_run_id"]),
+            "topology": str(row["topology"]),
+            "reason_code": str(row["reason_code"]),
+            "explanation": str(row["explanation"]),
+            "status": str(row["status"]),
+            "budget": json.loads(row["budget_json"] or "{}"),
+            "downgraded_from": row["downgraded_from"],
+            "is_team": bool(row["is_team"]),
+            "created_at": str(row["created_at"]),
+            "completed_at": row["completed_at"],
+        }
+
+    @staticmethod
+    def _delegation_task_row(row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "id": str(row["id"]),
+            "delegation_run_id": str(row["delegation_run_id"]),
+            "child_session_id": row["child_session_id"],
+            "generation": int(row["generation"]),
+            "agent_type": str(row["agent_type"]),
+            "purpose": str(row["purpose"]),
+            "goal": str(row["goal"]),
+            "prompt": str(row["prompt"]),
+            "scope": json.loads(row["scope_json"] or "[]"),
+            "dependencies": json.loads(row["dependencies_json"] or "[]"),
+            "expected_files": json.loads(row["expected_files_json"] or "[]"),
+            "write_files": json.loads(row["write_files_json"] or "[]"),
+            "required": bool(row["required"]),
+            "status": str(row["status"]),
+            "report": (
+                json.loads(row["report_json"])
+                if row["report_json"] is not None else None
+            ),
+            "error": str(row["error"]),
+            "created_at": str(row["created_at"]),
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+        }
+
+    def list_agent_notifications(
+        self, parent_session_id: str,
+    ) -> list[dict[str, object]]:
+        """Read durable child-completion delivery facts without claiming them."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, parent_session_id, child_session_id, generation,
+                       payload_json, delivery_state, created_at, delivered_at
+                FROM agent_notifications
+                WHERE parent_session_id = ?
+                ORDER BY id
+                """,
+                (parent_session_id,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "parent_session_id": str(row["parent_session_id"]),
+                "child_session_id": str(row["child_session_id"]),
+                "generation": int(row["generation"]),
+                "payload": json.loads(row["payload_json"]),
+                "delivery_state": str(row["delivery_state"]),
+                "created_at": str(row["created_at"]),
+                "delivered_at": (
+                    str(row["delivered_at"])
+                    if row["delivered_at"] is not None else None
+                ),
+            }
+            for row in rows
+        ]
 
     def prepare_session_resume(
         self, session_id: str, message: LLMMessage,

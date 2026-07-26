@@ -140,6 +140,148 @@ class SubagentReport:
         return tuple(f for f in self.findings if f.severity is FindingSeverity.HIGH)
 
 
+class WorkerReportStatus(str, Enum):
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    NO_FINDINGS = "no_findings"
+
+
+class VerificationStatus(str, Enum):
+    PASSED = "passed"
+    PRODUCT_FAILURE = "product_failure"
+    ENVIRONMENT_FAILURE = "environment_failure"
+    TIMEOUT = "timeout"
+    NOT_RUN = "not_run"
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    command: str
+    status: VerificationStatus
+    summary: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", VerificationStatus(self.status))
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "command": self.command,
+            "status": self.status.value,
+            "summary": self.summary,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VerificationResult":
+        return cls(
+            command=str(data.get("command", "")),
+            status=VerificationStatus(data.get("status", "not_run")),
+            summary=str(data.get("summary", "")),
+        )
+
+
+@dataclass(frozen=True)
+class ChangedFile:
+    path: str
+    change: str = "modified"
+
+    def to_dict(self) -> dict[str, str]:
+        return {"path": self.path, "change": self.change}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ChangedFile":
+        return cls(
+            path=str(data.get("path", "")),
+            change=str(data.get("change", "modified")),
+        )
+
+
+@dataclass(frozen=True)
+class WorkerReport:
+    """Uniform result envelope for analysis, edit, and verification workers."""
+
+    task_id: str
+    session_id: str
+    generation: int
+    agent_type: str
+    status: WorkerReportStatus
+    summary: str = ""
+    findings: tuple[Finding, ...] = ()
+    changed_files: tuple[ChangedFile, ...] = ()
+    verification: tuple[VerificationResult, ...] = ()
+    unresolved: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    tokens_used: int = 0
+    duration_ms: int = 0
+    worktree: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", WorkerReportStatus(self.status))
+        if not self.task_id:
+            raise ValueError("WorkerReport.task_id must be non-empty")
+        if not self.session_id:
+            raise ValueError("WorkerReport.session_id must be non-empty")
+        if self.generation < 0:
+            raise ValueError("WorkerReport.generation cannot be negative")
+        if self.tokens_used < 0 or self.duration_ms < 0:
+            raise ValueError("WorkerReport usage values cannot be negative")
+        if self.status is WorkerReportStatus.NO_FINDINGS and self.findings:
+            raise ValueError("A no_findings WorkerReport cannot contain findings")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "session_id": self.session_id,
+            "generation": self.generation,
+            "agent_type": self.agent_type,
+            "status": self.status.value,
+            "summary": self.summary,
+            "findings": [item.to_dict() for item in self.findings],
+            "changed_files": [item.to_dict() for item in self.changed_files],
+            "verification": [item.to_dict() for item in self.verification],
+            "unresolved": list(self.unresolved),
+            "warnings": list(self.warnings),
+            "tokens_used": self.tokens_used,
+            "duration_ms": self.duration_ms,
+            "worktree": self.worktree,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WorkerReport":
+        return cls(
+            task_id=str(data.get("task_id", "")),
+            session_id=str(data.get("session_id", "")),
+            generation=int(data.get("generation", 0)),
+            agent_type=str(data.get("agent_type", "")),
+            status=WorkerReportStatus(data.get("status", "failed")),
+            summary=str(data.get("summary", "")),
+            findings=tuple(
+                Finding.from_dict(item)
+                for item in data.get("findings", [])
+                if isinstance(item, dict)
+            ),
+            changed_files=tuple(
+                ChangedFile.from_dict(item)
+                for item in data.get("changed_files", [])
+                if isinstance(item, dict)
+            ),
+            verification=tuple(
+                VerificationResult.from_dict(item)
+                for item in data.get("verification", [])
+                if isinstance(item, dict)
+            ),
+            unresolved=tuple(str(item) for item in data.get("unresolved", [])),
+            warnings=tuple(str(item) for item in data.get("warnings", [])),
+            tokens_used=int(data.get("tokens_used", 0)),
+            duration_ms=int(data.get("duration_ms", 0)),
+            worktree=(
+                dict(data["worktree"])
+                if isinstance(data.get("worktree"), dict) else None
+            ),
+        )
+
+
 def _normalize_project_path(raw_path: object, repo_path: str | None) -> str:
     value = str(raw_path or "").strip()
     if not value:

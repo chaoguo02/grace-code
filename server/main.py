@@ -184,6 +184,13 @@ def create_app(service: AgentService) -> FastAPI:
     from server.routers.memory import create_memory_router
     from server.routers.plans import create_plans_router
     from server.routers.reviews import create_reviews_router
+    from server.routers.evaluations import create_evaluations_router
+    from server.routers.architecture import create_architecture_router
+    from server.routers.replay import create_replay_router
+    from server.routers.safety import create_safety_router
+    from server.routers.multi_agent import create_multi_agent_router
+    from server.routers.reliability import create_reliability_router
+    from server.routers.overview import create_overview_router
 
     app.include_router(create_sessions_router(get_service))
     app.include_router(create_approvals_router(get_service))
@@ -195,6 +202,13 @@ def create_app(service: AgentService) -> FastAPI:
     app.include_router(create_memory_router(get_service))
     app.include_router(create_plans_router(get_service))
     app.include_router(create_reviews_router(get_service))
+    app.include_router(create_evaluations_router(get_service))
+    app.include_router(create_architecture_router(get_service))
+    app.include_router(create_replay_router(get_service))
+    app.include_router(create_safety_router(get_service))
+    app.include_router(create_multi_agent_router(get_service))
+    app.include_router(create_reliability_router(get_service))
+    app.include_router(create_overview_router(get_service))
 
     # ── GET /api/skills ──────────────────────────────────────────────────
 

@@ -75,6 +75,7 @@ class AgentMessageOutcome(str, Enum):
     """Objective result of sending a message to an existing child."""
 
     RUNNING_UNAVAILABLE = "running_unavailable"
+    LIVE_MESSAGE_QUEUED = "live_message_queued"
     RESUMED_IN_BACKGROUND = "resumed_in_background"
 
 
@@ -311,6 +312,17 @@ class AgentRunStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
 
+    @classmethod
+    def from_run_status(cls, status: RunStatus) -> "AgentRunStatus":
+        typed = RunStatus(status)
+        if typed is RunStatus.SUCCESS:
+            return cls.COMPLETED
+        if typed is RunStatus.MAX_STEPS:
+            return cls.PARTIAL
+        if typed is RunStatus.CANCELLED:
+            return cls.CANCELLED
+        return cls.FAILED
+
 
 # ── Run lifecycle ─────────────────────────────────────────────────────────
 
@@ -505,6 +517,21 @@ class AgentDefinition:
             raise ValueError("max_turns must be positive")
         if self.max_tokens is not None and self.max_tokens < 1:
             raise ValueError("max_tokens must be positive when provided")
+        if not isinstance(self.required_tools, frozenset):
+            object.__setattr__(self, "required_tools", frozenset(self.required_tools))
+        if any(not isinstance(name, str) or not name.strip() for name in self.required_tools):
+            raise ValueError("required_tools must contain non-empty tool names")
+        if not isinstance(self.completion_requires, dict):
+            raise TypeError("completion_requires must be a mapping")
+        for tool_name, count in self.completion_requires.items():
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise ValueError(
+                    "completion_requires keys must be non-empty tool names"
+                )
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValueError(
+                    "completion_requires counts must be positive integers"
+                )
         if self.permission_mode and self.permission_mode not in {
             "default", "acceptEdits", "auto", "dontAsk",
             "bypassPermissions", "plan", "manual",
@@ -982,7 +1009,14 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         intent=TaskIntent.EDIT,
         tools=_DEFAULT_GENERAL_TOOLS,
         delegation_policy=DelegationPolicy.allowlist(
-            frozenset({"explore", "general", "code-reviewer"})
+            frozenset({
+                "explore",
+                "general",
+                "code-reviewer",
+                "debugger",
+                "test-runner",
+                "security-reviewer",
+            })
         ),
         agent_kind=AgentKind.PRIMARY,
         visibility=AgentVisibility.PUBLIC,
@@ -1019,7 +1053,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         intent=TaskIntent.ANALYSIS,
         tools=_DEFAULT_READONLY_TOOLS,
         delegation_policy=DelegationPolicy.allowlist(
-            frozenset({"explore", "code-reviewer"})
+            frozenset({"explore", "plan-researcher", "code-reviewer"})
         ),
         agent_kind=AgentKind.PRIMARY,
         visibility=AgentVisibility.PUBLIC,
@@ -1028,6 +1062,33 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
 Delegate exploration to subagents via the Agent tool. Use 'explore' for code search,
 'code-reviewer' for quality analysis. Spawn multiple agents in one turn for parallel
 investigation, wait for all results, then synthesize into a structured ExitPlanMode contract.""",
+        permission_mode="plan",
+    ),
+    "research": AgentDefinition(
+        name="research",
+        description=(
+            "Primary read-only research agent for broad, decomposable codebase "
+            "questions. It may delegate independent investigation or review work, "
+            "then validates and synthesizes the evidence into one answer."
+        ),
+        intent=TaskIntent.ANALYSIS,
+        tools=(_DEFAULT_READONLY_TOOLS - frozenset({"Bash"}))
+        | frozenset({"Agent"}),
+        disallowed_tools=frozenset({"Write", "Edit", "Bash"}),
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({"explore", "code-reviewer", "security-reviewer"})
+        ),
+        delegation_scope=DelegationScope.READ_ONLY,
+        agent_kind=AgentKind.PRIMARY,
+        visibility=AgentVisibility.PUBLIC,
+        max_turns=70,
+        system_prompt="""You are the primary read-only research agent.
+Answer narrow questions directly. For broad questions with two or more independent
+investigation areas, delegate bounded tasks to the most suitable read-only workers,
+wait for their results, validate cited evidence, remove duplication, and synthesize
+one cohesive answer. Use explore for code discovery, code-reviewer for correctness
+analysis, and security-reviewer only for security-sensitive scope. Never edit files,
+run mutating commands, or expose raw coordination chatter as the final answer.""",
         permission_mode="plan",
     ),
     "explore": AgentDefinition(
@@ -1057,7 +1118,7 @@ investigation, wait for all results, then synthesize into a structured ExitPlanM
         "including shell. Use ONLY when Write, Edit, or Bash is required. "
         "For read-only analysis, code search, or bug-finding, use 'explore' instead.",
         intent=TaskIntent.EDIT,
-        workspace_mode=WorkspaceMode.CURRENT,
+        workspace_mode=WorkspaceMode.WORKTREE,
         visibility=AgentVisibility.PUBLIC,
         tools=_DEFAULT_GENERAL_TOOLS,
         disallowed_tools=frozenset({"Agent"}),
@@ -1071,6 +1132,109 @@ investigation, wait for all results, then synthesize into a structured ExitPlanM
 - If blocked: explain precisely what's missing.
 - Your final message IS your return value.""",
         permission_mode="default",
+    ),
+    "plan-researcher": AgentDefinition(
+        name="plan-researcher",
+        description=(
+            "Investigates current behavior, constraints, impact surface, and "
+            "verification paths for a planning task. Read-only: returns evidence "
+            "to the plan primary and never saves, approves, rejects, or exits a plan."
+        ),
+        intent=TaskIntent.ANALYSIS,
+        workspace_mode=WorkspaceMode.CURRENT,
+        visibility=AgentVisibility.PUBLIC,
+        tools=_DEFAULT_READONLY_TOOLS - frozenset({"Bash"}),
+        disallowed_tools=frozenset({"Write", "Edit", "Bash", "Agent"}),
+        max_turns=45,
+        max_tokens=30_000,
+        system_prompt="""You are a read-only plan research worker.
+Investigate only the assigned planning area. Establish current behavior, constraints,
+affected files and interfaces, dependencies, risks, and a concrete verification path.
+Cite file paths and line-level evidence. Do not edit code and do not save, approve,
+reject, enter, or exit plan mode. Your final message is a standalone report for the
+planning primary.""",
+        permission_mode="plan",
+    ),
+    "debugger": AgentDefinition(
+        name="debugger",
+        description=(
+            "Diagnoses test failures and runtime errors by inspecting code, logs, "
+            "and narrowly scoped verification commands. Use when root cause is "
+            "uncertain. Read-only: reports hypotheses, evidence, and root cause."
+        ),
+        intent=TaskIntent.ANALYSIS,
+        workspace_mode=WorkspaceMode.CURRENT,
+        visibility=AgentVisibility.PUBLIC,
+        tools=frozenset({
+            "Read", "Glob", "Grep", "file_view", "Bash", "pytest",
+            "git_status", "git_diff", "ReportFindings",
+        }),
+        disallowed_tools=frozenset({"Write", "Edit", "Agent"}),
+        max_turns=40,
+        max_tokens=24_000,
+        required_tools=frozenset({"ReportFindings"}),
+        completion_requires={"ReportFindings": 1},
+        system_prompt="""You are a read-only debugging worker.
+State competing hypotheses before testing them. Read relevant code and logs, run only
+narrow verification commands, and distinguish product defects from environment,
+dependency, timeout, and flaky-test failures. Never modify files or use shell commands
+as a substitute for Read or Grep. Submit one structured findings report with the most
+likely root cause, supporting evidence, rejected hypotheses, and remaining uncertainty.""",
+        permission_mode="dontAsk",
+    ),
+    "test-runner": AgentDefinition(
+        name="test-runner",
+        description=(
+            "Runs a parent-specified test command or bounded test scope and returns "
+            "verification evidence. Read-only: classifies failures without editing "
+            "code, snapshots, or expectations."
+        ),
+        intent=TaskIntent.ANALYSIS,
+        workspace_mode=WorkspaceMode.CURRENT,
+        visibility=AgentVisibility.PUBLIC,
+        tools=frozenset({
+            "Read", "Glob", "Grep", "file_view", "Bash", "pytest",
+            "git_status", "git_diff",
+        }),
+        disallowed_tools=frozenset({"Write", "Edit", "Agent"}),
+        max_turns=30,
+        max_tokens=18_000,
+        system_prompt="""You are a read-only verification worker.
+Run exactly the test command or bounded test scope assigned by the parent. Do not
+expand to an expensive full-repository suite unless explicitly requested. Report the
+command, exit status, passed/failed/skipped counts, decisive output, duration when
+available, and classify failures as product, environment, dependency, timeout, or
+unknown. Never update snapshots, tests, or product code to force a pass.""",
+        permission_mode="dontAsk",
+    ),
+    "security-reviewer": AgentDefinition(
+        name="security-reviewer",
+        description=(
+            "Reviews authentication, authorization, paths, command execution, MCP, "
+            "secrets, and input validation. Read-only: reports evidenced vulnerabilities "
+            "and clearly labels unverified risk hypotheses."
+        ),
+        intent=TaskIntent.ANALYSIS,
+        workspace_mode=WorkspaceMode.CURRENT,
+        visibility=AgentVisibility.HIDDEN,
+        tools=frozenset({
+            "Read", "Glob", "Grep", "file_view", "git_status", "git_diff",
+            "ReportFindings",
+        }),
+        disallowed_tools=frozenset({
+            "Write", "Edit", "Bash", "Agent", "WebFetch", "WebSearch",
+        }),
+        max_turns=45,
+        max_tokens=30_000,
+        required_tools=frozenset({"ReportFindings"}),
+        completion_requires={"ReportFindings": 1},
+        system_prompt="""You are a read-only security review worker.
+Inspect only the assigned security-sensitive surface. Trace trust boundaries and
+enforcement points for authentication, authorization, path handling, commands, MCP,
+secrets, and untrusted input. Confirmed vulnerabilities require direct code evidence
+and a realistic abuse path; otherwise classify the item as a hypothesis. Do not edit
+code or drift into ordinary style review. Submit one structured findings report.""",
+        permission_mode="plan",
     ),
     "code-reviewer": AgentDefinition(
         name="code-reviewer",

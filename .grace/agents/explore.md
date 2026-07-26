@@ -3,7 +3,7 @@ name: explore
 description: "Fast read-only agent for code exploration, search, and analysis. Use for: finding files, searching code, analyzing code for bugs, answering questions about the codebase. Uses file_read/search_text — NO shell."
 intent: analysis
 tools: Glob, Grep, Read, file_view, WebFetch, WebSearch
-disallowedTools: Write, Edit, Bash
+disallowedTools: Write, Edit, Bash, Agent
 model: inherit
 maxTurns: 50
 ---

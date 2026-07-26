@@ -58,6 +58,7 @@ from observability.models import (
     build_generation_output,
     build_replay_action_snapshot,
     build_replay_runtime_decision,
+    build_replay_run_record,
     build_replay_step_record,
     build_replay_tool_execution,
     build_run_metadata,
@@ -879,6 +880,70 @@ class ReActAgent:
             workspace_delta=_workspace_delta,
             completion_blocked=completion_blocked,
         )
+        # Emit the versioned run-level replay contract after all step records
+        # are durable, but before the event log is summarized and closed.
+        try:
+            prompt_config = getattr(self._cfg, "prompt_config", None)
+            ctx.log.log_replay_run(build_replay_run_record(
+                run_id=(
+                    str(getattr(self._cfg, "stats_run_id", "") or "")
+                    or ctx.task.task_id
+                ),
+                task=ctx.task,
+                session_id=str(
+                    getattr(self._cfg, "stats_session_id", "") or ""
+                ),
+                provenance={
+                    "provider": type(self._backend).__name__,
+                    "model": str(
+                        getattr(self._backend, "model_name", "") or ""
+                    ),
+                    "prompt_source": str(
+                        getattr(prompt_config, "source", "") or ""
+                    ),
+                    "prompt_label": str(
+                        getattr(prompt_config, "label", "") or ""
+                    ),
+                    "prompt_version": getattr(
+                        prompt_config,
+                        "version",
+                        None,
+                    ),
+                },
+                permission_snapshot={
+                    "agent_name": str(
+                        getattr(self._cfg, "stats_agent_name", "") or ""
+                    ),
+                    "confirm_dangerous": bool(
+                        getattr(self._cfg, "confirm_dangerous", False)
+                    ),
+                    "is_subagent": bool(
+                        getattr(self._cfg, "is_subagent", False)
+                    ),
+                },
+                runtime_snapshot={
+                    "max_steps": ctx.task.max_steps,
+                    "execution_token_budget": ctx.task.budget_tokens,
+                    "request_context_budget": self._cfg.request_budget_tokens,
+                    "streaming_tool_execution": bool(
+                        getattr(
+                            self._cfg,
+                            "streaming_tool_execution",
+                            False,
+                        )
+                    ),
+                },
+                visible_tools=list(self._registry.get_schemas()),
+                steps=ctx.log.replay_step_payloads(),
+                termination_reason=result.termination_reason,
+                termination_status=result.status.value,
+                summary=result.summary,
+            ))
+        except Exception:
+            logger.exception(
+                "Failed to emit replay run contract for task %s",
+                ctx.task.task_id,
+            )
         run_stats = summarize_run(ctx.log)
         analysis_metadata = build_analysis_run_metadata(
             run_stats=run_stats,
@@ -1552,6 +1617,19 @@ class ReActAgent:
         )
         state = provider_request.state
         prepared_turn = provider_request.turn
+        request_kind = (
+            "inherited"
+            if self._inherited_context is not None
+            else "subagent"
+            if self._cfg.is_subagent
+            else "primary"
+        )
+        self._record_context_snapshot(
+            step=step,
+            request_kind=request_kind,
+            context_stats=getattr(self, "_last_context_stats", None),
+            schemas=list(prepared_turn.tools),
+        )
         try:
             provider_turn = invoke_provider_turn(
                 prepared_turn,
@@ -2167,7 +2245,11 @@ class ReActAgent:
         )
         if analysis.delegated_tokens > 0:
             execution_budget.consume(analysis.delegated_tokens)
-            execution_budget.record_subagent_tokens(analysis.delegated_tokens)
+            record_subagent_tokens = getattr(
+                execution_budget, "record_subagent_tokens", None,
+            )
+            if callable(record_subagent_tokens):
+                record_subagent_tokens(analysis.delegated_tokens)
             logger.debug(
                 "Charged %d subagent tokens to parent budget (total: %d)",
                 analysis.delegated_tokens,
@@ -2845,6 +2927,73 @@ class ReActAgent:
 
         return f"Reached max_steps limit ({len(history)}+ messages in history)"
 
+    def _record_context_snapshot(
+        self,
+        *,
+        step: int,
+        request_kind: str,
+        context_stats: Any,
+        schemas: list[Any],
+    ) -> None:
+        """Persist non-content context facts for the Web inspector."""
+        recorder = self._cfg.stats_collector
+        record = getattr(recorder, "record_context_snapshot", None)
+        session_id = str(getattr(self._cfg, "stats_session_id", "") or "")
+        if not callable(record) or not session_id:
+            return
+
+        tool_names: list[str] = []
+        for schema in schemas:
+            if isinstance(schema, dict):
+                name = str(schema.get("name", "") or "")
+            else:
+                name = str(getattr(schema, "name", "") or "")
+            if name and name not in tool_names:
+                tool_names.append(name)
+
+        active_skills: list[str] = []
+        registry = self._registry
+        while hasattr(registry, "_base"):
+            skill_buffer = getattr(registry, "_skill_buffer", None)
+            if skill_buffer is not None:
+                active = getattr(skill_buffer, "active_skills", None)
+                if callable(active):
+                    active_skills = list(active())
+                    break
+            registry = registry._base
+        if not active_skills:
+            skill_tool = getattr(registry, "_tools", {}).get("Skill")
+            skill_buffer = getattr(skill_tool, "_buffer", None)
+            active = getattr(skill_buffer, "active_skills", None)
+            if callable(active):
+                active_skills = list(active())
+
+        mcp_tools = [name for name in tool_names if name.startswith("mcp__")]
+        mcp_servers = sorted({
+            parts[1]
+            for name in mcp_tools
+            if len(parts := name.split("__", 2)) == 3
+        })
+        capabilities = {
+            "tool_names": tool_names,
+            "tool_count": len(tool_names),
+            "mcp_tools": mcp_tools,
+            "mcp_servers": mcp_servers,
+            "active_skills": active_skills,
+        }
+        try:
+            record(
+                session_id,
+                run_id=str(getattr(self._cfg, "stats_run_id", "") or ""),
+                turn_id=str(getattr(self._cfg, "stats_turn_id", "") or ""),
+                step=step,
+                request_kind=request_kind,
+                context_stats=context_stats,
+                capabilities=capabilities,
+            )
+        except Exception:
+            logger.debug("Context snapshot recording failed", exc_info=True)
+
     def _build_messages(
         self,
         history: ConversationHistory,
@@ -2861,11 +3010,16 @@ class ReActAgent:
         委托 ContextManager 执行实际组装。保留此方法签名以兼容现有调用。
         """
         schemas = self._registry.get_schemas()
+        effective_request_budget = token_budget.compute_plan(
+            consumed_tokens=consumed_tokens,
+            max_context_window=max_context_window,
+        ).total
 
         if self._inherited_context is not None:
             ctx = self._context_manager.build_inherited_messages(
                 self._inherited_context, history,
             )
+            ctx.stats.request_budget_tokens = effective_request_budget
             self._last_context_stats = ctx.stats
             return ctx.messages
 
@@ -2875,6 +3029,7 @@ class ReActAgent:
                 schemas,
             )
             ctx = self._context_manager.build_sub_agent_messages(history, system_content)
+            ctx.stats.request_budget_tokens = effective_request_budget
             self._last_context_stats = ctx.stats
             return ctx.messages
 

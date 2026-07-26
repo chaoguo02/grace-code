@@ -333,6 +333,14 @@ class EventLog:
             payload=dataclass_to_dict(snapshot),
         ))
 
+    def replay_step_payloads(self) -> list[dict[str, Any]]:
+        """Return the immutable step payloads already appended for this run."""
+        return [
+            dict(event.payload)
+            for event in self.iter_events()
+            if event.event_type is EventType.REPLAY_STEP
+        ]
+
     # ------------------------------------------------------------------
     # 读取方法
     # ------------------------------------------------------------------

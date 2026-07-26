@@ -1030,6 +1030,59 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
         return service._stats_service.get_session_steps(session_id)
 
+    @router.get("/{session_id}/context")
+    async def get_session_context_inspector(
+        session_id: str,
+        limit: int = 200,
+        service=Depends(get_service),
+    ) -> dict:
+        """Return persisted context assembly facts without prompt contents."""
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {session_id}",
+            )
+
+        snapshots = service._stats_service.get_context_snapshots(
+            session_id,
+            limit=max(1, min(limit, 1000)),
+        )
+        steps = service._stats_service.get_session_steps(session_id)
+        used_tools = sorted({
+            str(step.get("tool_name") or "")
+            for step in steps
+            if step.get("tool_name")
+        })
+        used_mcp_tools = [
+            name for name in used_tools if name.startswith("mcp__")
+        ]
+        used_skills = [
+            name for name in used_tools if name.lower() == "skill"
+        ]
+
+        recall_service = getattr(service, "_memory_recall_service", None)
+        recalls = (
+            recall_service.list_recalls(session_id, limit=100)
+            if recall_service is not None
+            else []
+        )
+        return {
+            "session_id": session_id,
+            "snapshots": snapshots,
+            "memory_recalls": recalls,
+            "actual_usage": {
+                "tool_names": used_tools,
+                "mcp_tools": used_mcp_tools,
+                "skill_tool_used": bool(used_skills),
+            },
+            "disclosure": {
+                "prompt_content_included": False,
+                "token_counts_are_estimates": True,
+                "snapshot_source": "provider_request_assembly",
+            },
+        }
+
     # ── GET /api/sessions/{session_id}/diffs ──────────────────────────
 
     @router.get("/{session_id}/diffs")

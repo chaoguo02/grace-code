@@ -86,6 +86,21 @@ class SqliteStorageBackend(StorageBackend):
                     CREATE INDEX IF NOT EXISTS idx_step_log_session
                         ON step_log(session_id, step_number);
 
+                    CREATE TABLE IF NOT EXISTS context_snapshot (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL DEFAULT '',
+                        turn_id TEXT NOT NULL DEFAULT '',
+                        step_number INTEGER NOT NULL,
+                        request_kind TEXT NOT NULL DEFAULT 'primary',
+                        stats_json TEXT NOT NULL DEFAULT '{}',
+                        capabilities_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_context_snapshot_session
+                        ON context_snapshot(session_id, id);
+
                     CREATE TABLE IF NOT EXISTS session_diffs (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         session_id TEXT NOT NULL,
@@ -188,6 +203,20 @@ class SqliteStorageBackend(StorageBackend):
                         )
         except Exception:
             logger.exception("Failed to migrate structured run outcome columns")
+        try:
+            with self._store._connect() as conn:
+                context_columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(context_snapshot)")
+                }
+                for name in ("run_id", "turn_id"):
+                    if name not in context_columns:
+                        conn.execute(
+                            f"ALTER TABLE context_snapshot "
+                            f"ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                        )
+        except Exception:
+            logger.exception("Failed to migrate context snapshot identity columns")
 
     def _init_memory_tables(self) -> None:
         """Create memory store tables if they don't exist."""
@@ -561,8 +590,21 @@ class SqliteStorageBackend(StorageBackend):
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
                 conn.execute("DELETE FROM session_trace_events WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM context_snapshot WHERE session_id = ?", (session_id,))
                 conn.execute("DELETE FROM agent_notifications WHERE parent_session_id = ?", (session_id,))
                 conn.execute("DELETE FROM agent_notifications WHERE child_session_id = ?", (session_id,))
+                conn.execute(
+                    """DELETE FROM delegation_tasks
+                       WHERE delegation_run_id IN (
+                           SELECT id FROM delegation_runs
+                           WHERE parent_session_id = ?
+                       )""",
+                    (session_id,),
+                )
+                conn.execute(
+                    "DELETE FROM delegation_runs WHERE parent_session_id = ?",
+                    (session_id,),
+                )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
                 conn.execute("COMMIT")
             return True
@@ -583,8 +625,21 @@ class SqliteStorageBackend(StorageBackend):
                 for sid in session_ids:
                     conn.execute("DELETE FROM session_messages WHERE session_id = ?", (sid,))
                     conn.execute("DELETE FROM session_trace_events WHERE session_id = ?", (sid,))
+                    conn.execute("DELETE FROM context_snapshot WHERE session_id = ?", (sid,))
                     conn.execute("DELETE FROM agent_notifications WHERE parent_session_id = ?", (sid,))
                     conn.execute("DELETE FROM agent_notifications WHERE child_session_id = ?", (sid,))
+                    conn.execute(
+                        """DELETE FROM delegation_tasks
+                           WHERE delegation_run_id IN (
+                               SELECT id FROM delegation_runs
+                               WHERE parent_session_id = ?
+                           )""",
+                        (sid,),
+                    )
+                    conn.execute(
+                        "DELETE FROM delegation_runs WHERE parent_session_id = ?",
+                        (sid,),
+                    )
                     c = conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                     if c.rowcount > 0:
                         deleted += 1
@@ -840,6 +895,75 @@ class SqliteStorageBackend(StorageBackend):
                 ).fetchall()
                 return [dict(r) for r in rows]
         except Exception:
+            return []
+
+    def insert_context_snapshot(
+        self,
+        session_id: str,
+        *,
+        run_id: str = "",
+        turn_id: str = "",
+        step_number: int,
+        request_kind: str,
+        stats_json: str,
+        capabilities_json: str,
+    ) -> int:
+        """Persist one actually assembled provider-request context."""
+        try:
+            with self._store._connect() as conn:
+                cur = conn.execute(
+                    """INSERT INTO context_snapshot
+                       (session_id, run_id, turn_id, step_number, request_kind,
+                        stats_json, capabilities_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id,
+                        run_id,
+                        turn_id,
+                        step_number,
+                        request_kind,
+                        stats_json,
+                        capabilities_json,
+                    ),
+                )
+                conn.execute(
+                    """DELETE FROM context_snapshot
+                       WHERE session_id=? AND id NOT IN (
+                           SELECT id FROM context_snapshot
+                           WHERE session_id=?
+                           ORDER BY id DESC
+                           LIMIT 500
+                       )""",
+                    (session_id, session_id),
+                )
+                return cur.lastrowid or 0
+        except Exception:
+            logger.exception(
+                "Failed to insert context snapshot %s step=%d",
+                session_id,
+                step_number,
+            )
+            return 0
+
+    def get_context_snapshots(
+        self,
+        session_id: str,
+        *,
+        limit: int = 200,
+    ) -> list[dict]:
+        """Return context snapshots in provider-request order."""
+        try:
+            with self._store._connect() as conn:
+                rows = conn.execute(
+                    """SELECT * FROM context_snapshot
+                       WHERE session_id=?
+                       ORDER BY id DESC
+                       LIMIT ?""",
+                    (session_id, max(1, min(limit, 1000))),
+                ).fetchall()
+                return [dict(row) for row in reversed(rows)]
+        except Exception:
+            logger.exception("Failed to get context snapshots %s", session_id)
             return []
 
     # ── Typed trace events ────────────────────────────────────────────────

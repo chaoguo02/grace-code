@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 import threading
+import uuid
 from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -147,6 +148,8 @@ class SessionRuntime:
         is used as a fallback for backward compatibility."""
         self._background_runs: dict[tuple[str, int], threading.Thread] = {}
         self._background_runs_lock = threading.Lock()
+        self._spawn_lock = threading.Lock()
+        self._spawn_reservations = 0
         # Prevent concurrent execution on the same session (TOCTOU guard).
         self._active_sessions: set[str] = set()
         self._active_sessions_lock = threading.Lock()
@@ -155,6 +158,8 @@ class SessionRuntime:
         self._is_web_mode: bool = False
         self._session_permission_modes: dict[str, str] = {}
         self._session_injected_rules: dict[str, list] = {}
+        self._teams: dict[str, object] = {}
+        self._team_proposals: dict[str, dict[str, object]] = {}
 
         # ── Circuit Breaker (code-level, not prompt-based) ──
         from core.circuit_breaker import CircuitBreaker
@@ -236,6 +241,549 @@ class SessionRuntime:
     @property
     def capability_registry(self):
         return self._capability_registry
+
+    def propose_agent_team(
+        self,
+        *,
+        session_id: str,
+        members: list[dict[str, str]],
+        tasks: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Create an approval-gated team proposal without starting teammates."""
+        from agent.team import TeamFeatureConfig, TeamRuntime
+
+        session = self._store.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        root_id = session.root_id or session.id
+        if session.id != root_id:
+            raise ValueError("Agent teams must be proposed from the root session")
+        existing_team = self._teams.get(root_id)
+        if (
+            existing_team is not None
+            and not existing_team.state.terminal
+        ):
+            raise RuntimeError(
+                "This session already has a pending or active Agent Team"
+            )
+        config = TeamFeatureConfig.from_environment()
+        if not config.enabled:
+            raise RuntimeError(
+                "Agent teams are disabled; set GRACE_AGENT_TEAMS_ENABLED=1"
+            )
+        if not members or len(members) + 1 > config.max_members:
+            raise ValueError(
+                f"Team requires 1-{config.max_members - 1} teammates"
+            )
+        member_ids = [str(item.get("id", "")).strip() for item in members]
+        if (
+            any(not value for value in member_ids)
+            or len(set(member_ids)) != len(member_ids)
+            or root_id in member_ids
+        ):
+            raise ValueError("Team member ids must be non-empty and unique")
+        parent_definition = self._agent_registry.get(session.agent_name)
+        allowed_roles = {
+            definition.name
+            for definition in self._agent_registry.delegatable_by(
+                parent_definition
+            )
+        }
+        member_roles = [
+            str(item.get("role", "")).strip() for item in members
+        ]
+        invalid_roles = sorted({
+            role for role in member_roles if role not in allowed_roles
+        })
+        if invalid_roles:
+            raise ValueError(
+                "Team member roles must be delegatable agent definitions; "
+                f"invalid={invalid_roles}, available={sorted(allowed_roles)}"
+            )
+        if not tasks or len(tasks) > config.max_tasks:
+            raise ValueError(
+                f"Team requires 1-{config.max_tasks} tasks"
+            )
+        task_ids = [str(item.get("id", "")).strip() for item in tasks]
+        if any(not value for value in task_ids) or len(set(task_ids)) != len(task_ids):
+            raise ValueError("Team task ids must be non-empty and unique")
+        task_id_set = set(task_ids)
+        normalized_tasks: list[dict[str, object]] = []
+        dependencies_by_id: dict[str, tuple[str, ...]] = {}
+        for item, task_id in zip(tasks, task_ids):
+            goal = str(item.get("goal", "")).strip()
+            if not goal:
+                raise ValueError(f"Team task {task_id!r} requires a goal")
+            dependencies = tuple(
+                str(value).strip()
+                for value in item.get("dependencies", [])
+            )
+            unknown = set(dependencies) - task_id_set
+            if unknown:
+                raise ValueError(
+                    f"Team task {task_id!r} has unknown dependencies: "
+                    f"{sorted(unknown)}"
+                )
+            if task_id in dependencies:
+                raise ValueError(
+                    f"Team task {task_id!r} cannot depend on itself"
+                )
+            dependencies_by_id[task_id] = dependencies
+            normalized_tasks.append({
+                **dict(item),
+                "id": task_id,
+                "goal": goal,
+                "dependencies": list(dependencies),
+            })
+        # Stable topological sort catches cycles before any live team state is
+        # created and also permits callers to submit tasks in arbitrary order.
+        ordered_tasks: list[dict[str, object]] = []
+        remaining = {
+            str(item["id"]): item for item in normalized_tasks
+        }
+        completed_ids: set[str] = set()
+        while remaining:
+            ready = [
+                task_id
+                for task_id in task_ids
+                if task_id in remaining
+                and set(dependencies_by_id[task_id]) <= completed_ids
+            ]
+            if not ready:
+                raise ValueError("Team task graph contains a dependency cycle")
+            for task_id in ready:
+                ordered_tasks.append(remaining.pop(task_id))
+                completed_ids.add(task_id)
+        team = TeamRuntime(
+            team_id=f"team-{root_id}",
+            lead_id=root_id,
+            config=config,
+            user_approved=False,
+        )
+        self._teams[root_id] = team
+        self._team_proposals[root_id] = {
+            "members": [dict(item) for item in members],
+            "tasks": ordered_tasks,
+        }
+        return {
+            "team_id": team.team_id,
+            "state": team.state.value,
+            "approval_required": True,
+            "member_count": len(members) + 1,
+            "task_count": len(tasks),
+        }
+
+    def approve_agent_team(self, *, session_id: str) -> dict[str, object]:
+        """Approve, populate, and activate a previously proposed team."""
+        from agent.team import BoardTask, TeamState
+
+        session = self._store.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        root_id = session.root_id or session.id
+        team = self._teams.get(root_id)
+        proposal = self._team_proposals.get(root_id)
+        if team is None or proposal is None:
+            raise ValueError("No pending team proposal for this session")
+        if team.state is TeamState.AWAITING_APPROVAL:
+            team.approve()
+        for item in proposal["members"]:
+            team.add_member(str(item["id"]), str(item.get("role", "teammate")))
+        for item in proposal["tasks"]:
+            team.task_board.add(BoardTask(
+                id=str(item["id"]),
+                goal=str(item.get("goal", "")).strip(),
+                dependencies=tuple(
+                    str(value) for value in item.get("dependencies", [])
+                ),
+            ))
+        team.activate()
+        run_id = f"team-run-{uuid.uuid4().hex}"
+        self._store.create_delegation_run(
+            run_id=run_id,
+            parent_session_id=root_id,
+            topology="team",
+            reason_code="user_approved_peer_coordination",
+            explanation="User approved a shared task board and direct mailbox",
+            is_team=True,
+            budget={"max_members": team.config.max_members},
+        )
+        for item in proposal["tasks"]:
+            self._store.create_delegation_task(
+                task_id=f"{run_id}:{item['id']}",
+                delegation_run_id=run_id,
+                agent_type=str(item.get("agent", "teammate")),
+                purpose=str(item.get("purpose", "general")),
+                goal=str(item.get("goal", "")),
+                dependencies=tuple(
+                    f"{run_id}:{value}"
+                    for value in item.get("dependencies", [])
+                ),
+                required=bool(item.get("required", True)),
+            )
+        self._team_proposals.pop(root_id, None)
+        return {
+            "team_id": team.team_id,
+            "delegation_run_id": run_id,
+            "state": team.state.value,
+            "members": [member.id for member in team.members],
+        }
+
+    def reject_agent_team(self, *, session_id: str) -> dict[str, object]:
+        """Reject a pending proposal without starting or persisting workers."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        root_id = session.root_id or session.id
+        team = self._teams.get(root_id)
+        if team is None:
+            raise ValueError("No pending team proposal for this session")
+        team.reject()
+        self._team_proposals.pop(root_id, None)
+        return {"team_id": team.team_id, "state": team.state.value}
+
+    def send_team_message(
+        self,
+        *,
+        session_id: str,
+        sender_id: str,
+        recipient_id: str,
+        body: str,
+    ) -> dict[str, object]:
+        session = self._store.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        team = self._teams.get(session.root_id or session.id)
+        if team is None or team.state.value != "active":
+            raise ValueError("No active team for this session")
+        message = team.mailbox.send(sender_id, recipient_id, body)
+        return {
+            "id": message.id,
+            "sender_id": message.sender_id,
+            "recipient_id": message.recipient_id,
+            "body": message.body,
+            "created_at": message.created_at,
+        }
+
+    def coordinate_agent_team(
+        self,
+        *,
+        session_id: str,
+        action: str,
+        recipient_id: str = "",
+        message: str = "",
+    ) -> dict[str, object]:
+        """Authorize mailbox and board access from a real teammate session."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        metadata = session.metadata or {}
+        member_id = str(metadata.get("team_member_id", ""))
+        team_id = str(metadata.get("team_id", ""))
+        if not member_id or not team_id:
+            raise PermissionError(
+                "Team coordination is available only to approved teammates"
+            )
+        root_id = session.root_id or session.id
+        team = self._teams.get(root_id)
+        if (
+            team is None
+            or team.team_id != team_id
+            or team.state.value != "active"
+        ):
+            raise ValueError("The teammate's Agent Team is not active")
+        if member_id not in {member.id for member in team.members}:
+            raise PermissionError("The caller is not a registered teammate")
+        if action == "send":
+            sent = team.mailbox.send(member_id, recipient_id, message)
+            return {
+                "action": "sent",
+                "message_id": sent.id,
+                "sender_id": sent.sender_id,
+                "recipient_id": sent.recipient_id,
+            }
+        if action == "inbox":
+            received = team.mailbox.receive(member_id)
+            return {
+                "action": "inbox",
+                "messages": [
+                    {
+                        "id": item.id,
+                        "sender_id": item.sender_id,
+                        "body": item.body,
+                        "created_at": item.created_at,
+                    }
+                    for item in received
+                ],
+            }
+        if action == "board":
+            return {
+                "action": "board",
+                "tasks": [
+                    {
+                        "id": task.id,
+                        "goal": task.goal,
+                        "dependencies": list(task.dependencies),
+                        "status": task.state.value,
+                        "assignee_id": task.assignee_id,
+                        "result_summary": task.result_summary,
+                    }
+                    for task in team.task_board.list()
+                ],
+            }
+        raise ValueError("Team coordination action must be send, inbox, or board")
+
+    def claim_team_task(
+        self, *, session_id: str, task_id: str, member_id: str,
+    ) -> dict[str, object]:
+        session = self._store.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        team = self._teams.get(session.root_id or session.id)
+        if team is None or team.state.value != "active":
+            raise ValueError("No active team for this session")
+        if member_id not in {member.id for member in team.members}:
+            raise PermissionError("Team task claims require a registered member")
+        claimed = team.task_board.claim(task_id, member_id)
+        if claimed is None:
+            raise ValueError("Team task is not claimable")
+        task, lease = claimed
+        return {
+            "task_id": task.id,
+            "member_id": member_id,
+            "lease_token": lease.token,
+            "expires_at": lease.expires_at,
+        }
+
+    def complete_team_task(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        member_id: str,
+        lease_token: str,
+        summary: str,
+        failed: bool = False,
+    ) -> dict[str, object]:
+        session = self._store.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        team = self._teams.get(session.root_id or session.id)
+        if team is None or team.state.value != "active":
+            raise ValueError("No active team for this session")
+        if member_id not in {member.id for member in team.members}:
+            raise PermissionError("Team task completion requires a registered member")
+        method = team.task_board.fail if failed else team.task_board.complete
+        task = method(task_id, member_id, lease_token, summary)
+        return {
+            "task_id": task.id,
+            "status": task.state.value,
+            "summary": task.result_summary,
+        }
+
+    def execute_team_task(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        member_id: str,
+        lease_token: str,
+    ) -> AgentRunResult:
+        """Execute one claimed board task as a real named child session."""
+        from agent.session.task_contract import TaskContract
+        from agent.team import BoardTaskState
+
+        parent = self._store.get_session(session_id)
+        if parent is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        root_id = parent.root_id or parent.id
+        if parent.id != root_id:
+            raise ValueError("Team tasks execute under the root lead session")
+        team = self._teams.get(root_id)
+        if team is None or team.state.value != "active":
+            raise ValueError("No active team for this session")
+        members = {member.id: member for member in team.members}
+        member = members.get(member_id)
+        if member is None or member_id == team.lead_id:
+            raise PermissionError("A registered teammate must execute this task")
+        board_task = team.task_board.get(task_id)
+        lease = team.leases.get(task_id)
+        if (
+            board_task.state is not BoardTaskState.CLAIMED
+            or board_task.assignee_id != member_id
+            or lease is None
+            or lease.token != lease_token
+        ):
+            raise PermissionError("A valid claimed task lease is required")
+        definition = self._agent_registry.get(member.role)
+        parent_definition = self._agent_registry.get(parent.agent_name)
+        allowed = {
+            child.name
+            for child in self._agent_registry.delegatable_by(parent_definition)
+        }
+        if definition.name not in allowed:
+            raise PermissionError(
+                f"Teammate role {definition.name!r} is not delegatable by "
+                f"{parent.agent_name!r}"
+            )
+        messages = team.mailbox.receive(member_id)
+        peer_context = "\n".join(
+            f"- from {message.sender_id}: {message.body}"
+            for message in messages
+        )
+        prompt = (
+            f"TEAM TASK\n{board_task.goal}\n\n"
+            f"PEER MESSAGES\n{peer_context or 'None'}\n\n"
+            "Work only on this claimed task. Return a standalone result to the "
+            "team lead; do not expand scope."
+        )
+        team_runs = [
+            run for run in self._store.list_delegation_runs(root_id)
+            if bool(run.get("is_team"))
+        ]
+        if not team_runs:
+            raise ValueError("Active team has no durable delegation run")
+        run_id = str(team_runs[-1]["id"])
+        durable_task_id = f"{run_id}:{task_id}"
+
+        def created(child) -> None:
+            self._store.update_delegation_task(
+                durable_task_id,
+                status="running",
+                child_session_id=child.id,
+                generation=int(child.generation),
+            )
+
+        contract = TaskContract.for_subagent(
+            definition,
+            self._root_agent_config,
+            parent_budget_tokens=min(
+                self._root_agent_config.budget_tokens,
+                definition.max_tokens or self._root_agent_config.budget_tokens,
+            ),
+            parent_max_steps=self._root_agent_config.max_steps,
+        )
+        try:
+            result = self.run_explicit_delegation(
+                root_id,
+                request=ExplicitDelegationRequest(
+                    agent_name=definition.name,
+                    description=board_task.goal[:80],
+                    prompt=prompt,
+                ),
+                parent_intent=parent_definition.intent,
+                contract=contract,
+                child_metadata={
+                    "team_id": team.team_id,
+                    "team_member_id": member_id,
+                    "team_task_id": task_id,
+                    "delegation_run_id": run_id,
+                    "delegation_task_id": durable_task_id,
+                },
+                child_created_callback=created,
+            )
+            if result.worktree_disposition is WorktreeDisposition.PRESERVED:
+                team.task_board.await_review(
+                    task_id,
+                    member_id,
+                    lease_token,
+                    result.summary or "Worktree changes require lead review",
+                )
+            elif result.status in {
+                AgentRunStatus.COMPLETED,
+                AgentRunStatus.PARTIAL,
+            }:
+                team.task_board.complete(
+                    task_id, member_id, lease_token, result.summary,
+                )
+            else:
+                team.task_board.fail(
+                    task_id,
+                    member_id,
+                    lease_token,
+                    result.error or result.summary,
+                )
+            return result
+        except Exception as exc:
+            try:
+                team.task_board.fail(
+                    task_id, member_id, lease_token, str(exc),
+                )
+            except Exception:
+                logger.debug("Could not mark failed team task", exc_info=True)
+            raise
+
+    def resolve_team_task_review(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        accepted: bool,
+        summary: str = "",
+    ) -> dict[str, object]:
+        """Converge a team board item only after its worktree was resolved."""
+        parent = self._store.get_session(session_id)
+        if parent is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        root_id = parent.root_id or parent.id
+        team = self._teams.get(root_id)
+        if team is None or team.state.value != "active":
+            raise ValueError("No active team for this session")
+        team_runs = [
+            run for run in self._store.list_delegation_runs(root_id)
+            if bool(run.get("is_team"))
+        ]
+        if not team_runs:
+            raise ValueError("Active team has no durable delegation run")
+        durable = self._store.get_delegation_task(
+            f"{team_runs[-1]['id']}:{task_id}"
+        )
+        if durable is None or not durable.get("child_session_id"):
+            raise ValueError("Team task has no child worktree result")
+        child = self._store.get_session(str(durable["child_session_id"]))
+        if child is None or child.agent_result is None:
+            raise ValueError("Team task child result is unavailable")
+        expected = (
+            WorktreeDisposition.APPLIED
+            if accepted else WorktreeDisposition.DISCARDED
+        )
+        if child.agent_result.worktree_disposition is not expected:
+            raise ValueError(
+                f"Resolve the child worktree as {expected.value!r} before "
+                "converging the team task"
+            )
+        task = team.task_board.resolve_review(
+            task_id,
+            accepted=accepted,
+            summary=summary or child.agent_result.summary,
+        )
+        return {
+            "task_id": task.id,
+            "status": task.state.value,
+            "summary": task.result_summary,
+        }
+
+    def shutdown_agent_team(
+        self, *, session_id: str, cancel: bool = False,
+    ) -> dict[str, object]:
+        session = self._store.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        root_id = session.root_id or session.id
+        team = self._teams.get(root_id)
+        if team is None:
+            raise ValueError("No team for this session")
+        team.shutdown(cancel=cancel)
+        team_runs = [
+            run for run in self._store.list_delegation_runs(root_id)
+            if bool(run.get("is_team"))
+        ]
+        if team_runs:
+            self._store.complete_delegation_run(
+                str(team_runs[-1]["id"]),
+                status="cancelled" if cancel else "completed",
+            )
+        return {"team_id": team.team_id, "state": team.state.value}
 
     def cancel_session(self, session_id: str, detail: str = "") -> bool:
         """Cancel one active session; hierarchical tokens propagate to descendants."""
@@ -1118,6 +1666,12 @@ class SessionRuntime:
                 else self._hook_dispatcher
             )
             agent_cfg.stats_session_id = session_id
+            agent_cfg.stats_run_id = str(
+                getattr(_run_ctx, "run_id", "") or session_id
+            )
+            agent_cfg.stats_turn_id = str(
+                getattr(_run_ctx, "turn_id", "") or ""
+            )
             agent_cfg.stats_agent_name = _effective_agent
             agent_cfg.stats_collector = getattr(self, '_stats_recorder', None)
             _memory_event_callback = getattr(self, '_memory_event_callback', None)
@@ -1402,7 +1956,7 @@ class SessionRuntime:
             import uuid as _uuid_mod
             from datetime import datetime as _dt, timezone as _tz
 
-            # 1. CAS update — only transitions from 'running'
+            # 1. CAS update — best-effort transition from 'running'
             _updated = self._store.update_run(
                 _run_id,
                 status=status,
@@ -1418,11 +1972,12 @@ class SessionRuntime:
                 expect_status="running",
             )
             if not _updated:
-                logger.warning("Run %s CAS running→%s failed (already terminal)",
+                logger.warning("Run %s CAS running→%s failed (already terminal) — "
+                              "run_terminal will still be emitted",
                               _run_id[:8], status)
-                return
 
-            # 2. Broadcast through normal EventBus channel
+            # 2. Broadcast run_terminal — ALWAYS, even if CAS failed.
+            #    If we don't emit this, the frontend stays in "Running" forever.
             if self._publish_run_terminal is not None:
                 _terminal_evt = {
                     "type": "run_terminal",
@@ -1905,7 +2460,7 @@ class SessionRuntime:
         cancellation_token: CancellationToken,
         parent_policy: "PhasePolicy",
     ) -> AgentMessageReceipt:
-        """Resume a terminal direct child with its complete persisted transcript."""
+        """Queue bounded steering for a live child or resume a terminal child."""
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
         if budget_tokens <= 0 or parent_max_steps <= 0:
@@ -1937,7 +2492,7 @@ class SessionRuntime:
             return AgentMessageReceipt(
                 child_session_id=child.id,
                 generation=child.generation,
-                outcome=AgentMessageOutcome.RESUMED_IN_BACKGROUND,
+                outcome=AgentMessageOutcome.LIVE_MESSAGE_QUEUED,
             )
         if child.workspace_mode is not WorkspaceMode.CURRENT:
             raise ValueError(

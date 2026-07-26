@@ -89,7 +89,7 @@ export type { WsMessage, WsMessageOfType } from "./events";
 export type {
   WsStatusEvent, WsThoughtEvent, WsToolCallEvent, WsObservationEvent,
   WsSubagentStartEvent, WsSubagentStopEvent,
-  WsApprovalRequiredEvent, WsApprovalTimeoutEvent,
+  WsApprovalRequiredEvent, WsApprovalTimeoutEvent, WsApprovalResolvedEvent,
   WsPlanReadyEvent, WsWorktreeResolvedEvent, WsMemoryRecallEvent, WsMemoryWrittenEvent,
 } from "./events";
 

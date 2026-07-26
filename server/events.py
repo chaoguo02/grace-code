@@ -243,6 +243,23 @@ class WsApprovalTimeout:
         return _to_dict(self)
 
 
+@dataclass
+class WsApprovalResolved:
+    """Persisted response paired with one approval_required event."""
+
+    type: Literal["approval_resolved"] = "approval_resolved"
+    request_id: str = ""
+    tool_name: str = ""
+    decision: str = ""
+    note: str = ""
+    updated_input: bool = False
+    wait_ms: float = 0.0
+    timestamp: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
 # ── Assistant text streaming ───────────────────────────────────────────
 
 
@@ -453,7 +470,7 @@ class WsMemoryWritten:
 WsEvent = (
     WsStatus | WsThought | WsThoughtDelta | WsToolCall | WsObservation | WsReflection
     | WsSubagentStart | WsSubagentStop
-    | WsApprovalRequired | WsApprovalTimeout | WsPlanReady
+    | WsApprovalRequired | WsApprovalTimeout | WsApprovalResolved | WsPlanReady
     | WsWorktreeResolved | WsMemoryRecall | WsMemoryWritten
     | WsAssistantTextStart | WsAssistantTextDelta | WsAssistantTextEnd | WsAssistantTextAborted
     | WsRunStarted | WsRunTerminal

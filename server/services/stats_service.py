@@ -107,6 +107,58 @@ class StatsService:
         """Get per-step log for one session."""
         return self._storage.get_session_steps(session_id)
 
+    def record_context_snapshot(
+        self,
+        session_id: str,
+        *,
+        run_id: str = "",
+        turn_id: str = "",
+        step_number: int,
+        request_kind: str,
+        stats: dict[str, Any],
+        capabilities: dict[str, Any],
+    ) -> int:
+        """Persist the measured context of one provider request."""
+        writer = getattr(self._storage, "insert_context_snapshot", None)
+        if not callable(writer):
+            return 0
+        return writer(
+            session_id,
+            run_id=run_id,
+            turn_id=turn_id,
+            step_number=step_number,
+            request_kind=request_kind,
+            stats_json=json.dumps(stats, ensure_ascii=False),
+            capabilities_json=json.dumps(capabilities, ensure_ascii=False),
+        )
+
+    def get_context_snapshots(
+        self,
+        session_id: str,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return parsed, ordered context snapshots for the inspector."""
+        reader = getattr(self._storage, "get_context_snapshots", None)
+        if not callable(reader):
+            return []
+        snapshots: list[dict[str, Any]] = []
+        for raw in reader(session_id, limit=limit):
+            item = dict(raw)
+            for source, target in (
+                ("stats_json", "stats"),
+                ("capabilities_json", "capabilities"),
+            ):
+                value = item.pop(source, "{}")
+                try:
+                    item[target] = (
+                        json.loads(value) if isinstance(value, str) else value
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    item[target] = {}
+            snapshots.append(item)
+        return snapshots
+
     # ── Diffs ────────────────────────────────────────────────────────────
 
     def get_session_diffs(

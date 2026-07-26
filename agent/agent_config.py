@@ -56,6 +56,8 @@ class AgentConfig:
     hook_agent_id: str = ""
     hook_agent_type: str = ""
     stats_session_id: str = ""
+    stats_run_id: str = ""
+    stats_turn_id: str = ""
     stats_agent_name: str = ""
     hook_dispatcher: object = None
     confirm_dangerous: bool = False

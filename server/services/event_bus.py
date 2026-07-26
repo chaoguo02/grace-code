@@ -132,22 +132,31 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
     child_id = getattr(event, "child_session_id", "")
 
     if ev_type == "task_start":
-        # run_started is now emitted by run_session() after CAS QUEUED→RUNNING.
-        # Suppress to avoid duplicate start events.
-        return []
+        return [WsStatus(status="running", timestamp=ts).to_dict()]
 
     if ev_type == "task_complete":
-        # task_complete is internal-only — the agent loop has finished but
-        # messages and Run status are not yet committed to DB.  The real
-        # run_terminal event is emitted by run_session()'s finally block
-        # AFTER the transaction commits.
-        return []
+        _result: dict = {
+            "summary": payload.get("summary", ""),
+            "steps_taken": payload.get("steps", 0),
+        }
+        _cache = payload.get("cache")
+        if _cache:
+            _result["cache"] = _cache
+        msgs: list[dict] = [WsStatus(status="completed", result=_result, timestamp=ts).to_dict()]
+        _contract = payload.get("contract")
+        if _contract:
+            msgs.append(WsPlanReady(
+                plan_text=payload.get("summary", ""),
+                contract=_contract,
+                result={"summary": payload.get("summary", ""), "steps_taken": payload.get("steps", 0)},
+                timestamp=ts,
+            ).to_dict())
+        return msgs
 
     if ev_type == "task_failed":
-        # Suppressed — the finally block in run_session() handles all
-        # terminal states via _finalize_run() which emits run_terminal
-        # AFTER the DB transaction commits.
-        return []
+        return [WsStatus(status="failed",
+            error=payload.get("error", str(payload.get("reason", "unknown"))),
+            timestamp=ts).to_dict()]
 
     if ev_type == "action":
         action = payload.get("action", {}) or {}

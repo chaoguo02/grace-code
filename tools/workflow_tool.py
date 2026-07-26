@@ -67,10 +67,14 @@ class WorkflowTool(BaseTool):
         steps = params.get("steps", [])
         if not steps:
             return ToolResult(success=False, output="", error="At least one step is required")
-        names = [s.get("agent", "?") for s in steps]
         return ToolResult(
-            success=True,
-            output=f"Workflow dispatched: {len(steps)} steps [{', '.join(names)}]",
+            success=False,
+            output="",
+            error=(
+                "Workflow requires a SessionRuntime-bound AgentBatch tool. "
+                "This unbound compatibility tool never reports fake dispatch "
+                "success."
+            ),
         )
 
 

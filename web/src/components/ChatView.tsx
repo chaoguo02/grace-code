@@ -16,9 +16,10 @@ import { getModelCatalog } from "../api/config";
 import { formatBytes, formatRuntime, runtimeSeconds } from "../utils/format";
 import { summarizeStatus } from "../utils/status";
 import { fuzzyFilter } from "../utils/fuzzy";
+import { uiModeForAgentName, type UiMode } from "../modes";
 
 type ComposerMenu = "closed" | "actions" | "mode" | "model" | "context" | "settings";
-export type ModeKey = "build" | "plan" | "explore";
+export type ModeKey = UiMode;
 type EffortKey = "low" | "medium" | "high";
 
 interface ContextChip {
@@ -175,7 +176,11 @@ function ComposerPanelHeader({
   );
 }
 
-export function ChatView() {
+interface ChatViewProps {
+  onInspectRun?: (runId: string, turnId: string) => void;
+}
+
+export function ChatView({ onInspectRun }: ChatViewProps = {}) {
   const { activeId, activeDetail, createSession } = useSessionStore();
   const {
     timeline,
@@ -340,20 +345,20 @@ export function ChatView() {
   const nextMode = activeDetail?.agent_name;
   useEffect(() => {
     if (!activeId) { lastSyncedSessionRef.current = null; return; }
-    if (nextMode && (nextMode === "plan" || nextMode === "explore" || nextMode === "build")) {
+    const persistedMode = uiModeForAgentName(nextMode);
+    if (persistedMode) {
       // Only sync when the session identity changes (new session or reopen)
       if (lastSyncedSessionRef.current !== activeId) {
         lastSyncedSessionRef.current = activeId;
-        setMode(nextMode);
-        setSessionMode(nextMode, activeId);
+        setMode(persistedMode);
+        setSessionMode(persistedMode, activeId);
       }
-      }
-    }, [activeDetail?.agent_name, activeId]);
+    }
+  }, [nextMode, activeId, setSessionMode]);
 
   useEffect(() => {
-    if (currentMode === "plan" || currentMode === "explore" || currentMode === "build") {
-      setMode(currentMode);
-    }
+    const uiMode = uiModeForAgentName(currentMode);
+    if (uiMode) setMode(uiMode);
   }, [currentMode]);
 
   useEffect(() => {
@@ -963,6 +968,9 @@ export function ChatView() {
                     outcome={turn.meta.outcome}
                     steps={turn.meta.steps}
                     tokens={turn.meta.tokens}
+                    onInspect={turn.runId && onInspectRun
+                      ? () => onInspectRun(turn.runId, turn.turnId)
+                      : undefined}
                   />
                 </React.Fragment>
               ))}
@@ -985,6 +993,9 @@ export function ChatView() {
                     outcome={activeTurn.meta.outcome}
                     steps={activeTurn.meta.steps}
                     tokens={activeTurn.meta.tokens}
+                    onInspect={activeTurn.runId && onInspectRun
+                      ? () => onInspectRun(activeTurn.runId, activeTurn.turnId)
+                      : undefined}
                   />
                 </React.Fragment>
               )}

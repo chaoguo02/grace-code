@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import copy
+import uuid
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
@@ -558,6 +559,36 @@ class AgentTool(BaseTool):
                         "parallel edits that must not touch the parent checkout."
                     ),
                 },
+                "task_id": {
+                    "type": "string",
+                    "description": "Stable id for this bounded delegated task.",
+                },
+                "scope": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Repository-relative paths or modules in scope.",
+                },
+                "constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "deliverable": {
+                    "type": "string",
+                    "description": "Exact result the parent expects.",
+                },
+                "expected_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "write_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "required": {"type": "boolean"},
+                "delegation_reason": {
+                    "type": "string",
+                    "description": "Why a separate specialist context is valuable.",
+                },
             },
             "required": ["subagent_type", "description", "prompt"],
         }
@@ -610,6 +641,49 @@ class AgentTool(BaseTool):
             _model_name = None
 
         try:
+            delegation_run_id = f"delegation-{uuid.uuid4().hex}"
+            task_key = str(params.get("task_id") or "worker").strip() or "worker"
+            persisted_task_id = f"{delegation_run_id}:{task_key}"
+            self._runtime._store.create_delegation_run(
+                run_id=delegation_run_id,
+                parent_session_id=self._parent_session_id,
+                parent_run_id=str(getattr(run_context, "run_id", "") or ""),
+                topology="one_to_one",
+                reason_code="specialist_context",
+                explanation=str(
+                    params.get("delegation_reason")
+                    or "One bounded task benefits from a specialist context"
+                ),
+                budget={
+                    "worker_tokens": run_context.delegation_token_limit,
+                    "parent_reserved": True,
+                },
+            )
+            self._runtime._store.create_delegation_task(
+                task_id=persisted_task_id,
+                delegation_run_id=delegation_run_id,
+                agent_type=plan.facts.subagent_type,
+                purpose=str(params.get("purpose", "general")),
+                goal=plan.description,
+                prompt=plan.user_prompt,
+                scope=tuple(str(item) for item in params.get("scope", [])),
+                expected_files=tuple(
+                    str(item) for item in params.get("expected_files", [])
+                ),
+                write_files=tuple(
+                    str(item) for item in params.get("write_files", [])
+                ),
+                required=bool(params.get("required", True)),
+            )
+
+            def _child_created(child):
+                self._runtime._store.update_delegation_task(
+                    persisted_task_id,
+                    status="running",
+                    child_session_id=child.id,
+                    generation=int(child.generation),
+                )
+
             request = self._build_spawn_request(
                 plan=plan,
                 prompt=prompt,
@@ -630,6 +704,17 @@ class AgentTool(BaseTool):
                     )
                 ),
                 spawn_context=run_context.spawn_context,
+                child_metadata={
+                    "delegation_run_id": delegation_run_id,
+                    "delegation_task_id": persisted_task_id,
+                    "purpose": str(params.get("purpose", "general")),
+                    "scope": list(params.get("scope", [])),
+                    "constraints": list(params.get("constraints", [])),
+                    "deliverable": str(params.get("deliverable", "")),
+                    "expected_files": list(params.get("expected_files", [])),
+                    "write_files": list(params.get("write_files", [])),
+                },
+                child_created_callback=_child_created,
             )
             if isinstance(dispatch_result, BackgroundAgentHandle):
                 return ToolResult(
@@ -638,6 +723,10 @@ class AgentTool(BaseTool):
                         plan.facts.subagent_type, dispatch_result,
                     ),
                     subagent_tokens_used=0,
+                    metadata={
+                        "delegation_run_id": delegation_run_id,
+                        "delegation_task_id": persisted_task_id,
+                    },
                 )
             fork_result = dispatch_result
             output = _format_fork_result(plan.facts.subagent_type, fork_result)
@@ -651,6 +740,20 @@ class AgentTool(BaseTool):
             logger.exception("Subagent '%s' crashed", plan.facts.subagent_type)
             if self._circuit_breaker is not None:
                 self._circuit_breaker.record_subagent_failure()
+            if "persisted_task_id" in locals():
+                try:
+                    self._runtime._store.update_delegation_task(
+                        persisted_task_id,
+                        status="failed",
+                        error=str(exc),
+                    )
+                    self._runtime._store.complete_delegation_run(
+                        delegation_run_id, status="failed",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to persist delegation failure", exc_info=True,
+                    )
             return ToolResult(
                 success=False, output="",
                 error=f"Subagent '{plan.facts.subagent_type}' failed: {exc}",
@@ -678,6 +781,8 @@ class AgentTool(BaseTool):
             metadata={
                 "fork_result": fork_result.to_dict(),
                 "subagent_type": plan.facts.subagent_type,
+                "delegation_run_id": delegation_run_id,
+                "delegation_task_id": persisted_task_id,
             },
         )
 

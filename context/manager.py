@@ -384,6 +384,7 @@ class ContextManager:
             messages=messages,
             system_content=system_content,
             long_term=long_term_context,
+            original_history_dicts=history_dicts,
             trimmed_history_dicts=trimmed_history_dicts,
             anchor=task_anchor,
             budget_total=plan.total,
@@ -435,8 +436,12 @@ class ContextManager:
                 tool_calls=tool_calls,
             ))
 
+        system_tokens = estimate_tokens(system_content)
+        total_tokens = sum(estimate_tokens(m.content or "") for m in messages)
         stats = ContextStats(
-            estimated_total_tokens=sum(estimate_tokens(m.content or "") for m in messages),
+            estimated_total_tokens=total_tokens,
+            system_tokens=system_tokens,
+            task_tokens=max(0, total_tokens - system_tokens),
         )
         return RequestContext(messages=messages, stats=stats)
 
@@ -447,10 +452,18 @@ class ContextManager:
     ) -> RequestContext:
         """Append fork-local history to an immutable parent request prefix."""
         messages = snapshot.materialize() + history.to_list()
+        total_tokens = sum(
+            estimate_tokens(message.content or "") for message in messages
+        )
+        system_tokens = (
+            estimate_tokens(messages[0].content or "")
+            if messages and messages[0].role == "system"
+            else 0
+        )
         stats = ContextStats(
-            estimated_total_tokens=sum(
-                estimate_tokens(message.content or "") for message in messages
-            ),
+            estimated_total_tokens=total_tokens,
+            system_tokens=system_tokens,
+            task_tokens=max(0, total_tokens - system_tokens),
         )
         return RequestContext(messages=messages, stats=stats)
 
@@ -472,6 +485,7 @@ class ContextManager:
         messages: list["LLMMessage"],
         system_content,
         long_term: str | None,
+        original_history_dicts: list[dict],
         trimmed_history_dicts: list[dict],
         anchor: str | None,
         budget_total: int,
@@ -490,6 +504,9 @@ class ContextManager:
             )
 
         memory_tokens = estimate_tokens(long_term) if long_term else 0
+        original_history_tokens = sum(
+            _estimate_msg_tokens(d) for d in original_history_dicts
+        )
         task_tokens = sum(_estimate_msg_tokens(d) for d in trimmed_history_dicts)
         anchor_tokens = estimate_tokens(anchor) if anchor else 0
         repo_map_tokens = estimate_tokens(repo_map_text) if repo_map_text else 0
@@ -510,6 +527,6 @@ class ContextManager:
             task_tokens=task_tokens + anchor_tokens,
             repo_map_tokens=repo_map_tokens,
             artifact_summary_tokens=artifact_summary_tokens,
-            omitted_tokens=0,
+            omitted_tokens=max(0, original_history_tokens - task_tokens),
             compact_triggered=compact_triggered,
         )
