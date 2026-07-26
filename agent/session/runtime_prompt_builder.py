@@ -39,7 +39,11 @@ def build_runtime_messages(
 
     # ── Skills preloading (CC-aligned: full SKILL.md content injected) ──
     if spec.skills:
-        skill_contents = _load_skills(spec.skills, project_dir)
+        skill_contents = _load_skills(
+            spec.skills,
+            project_dir,
+            skill_registry=skill_registry,
+        )
         if skill_contents:
             messages.append(LLMMessage(
                 role="user",
@@ -56,6 +60,13 @@ def build_runtime_messages(
                         "Review your memory above for patterns and decisions "
                         "from previous sessions. Update it after completing work."
             ))
+
+    if skill_registry is not None and "Skill" in spec.tools:
+        skill_listing = skill_registry.format_for_prompt(
+            llm_invocable_only=True,
+        )
+        if skill_listing:
+            messages.append(LLMMessage(role="user", content=skill_listing))
 
     if spec.mode != SessionMode.PRIMARY:
         return messages
@@ -154,19 +165,34 @@ def build_runtime_messages(
     )
     messages.append(LLMMessage(role="user", content=content))
 
-    # CC-aligned: inject Available Skills listing (Phase 1)
-    if skill_registry is not None:
-        skill_listing = skill_registry.format_for_prompt(llm_invocable_only=True)
-        if skill_listing:
-            messages.append(LLMMessage(role="user", content=skill_listing))
-
     return messages
 
 
-def _load_skills(skill_names: tuple[str, ...], project_dir: str | None) -> list[str]:
+def _load_skills(
+    skill_names: tuple[str, ...],
+    project_dir: str | None,
+    *,
+    skill_registry=None,
+) -> list[str]:
     """Load SKILL.md content for preloading into agent context."""
     from pathlib import Path
     contents: list[str] = []
+    if skill_registry is not None:
+        for skill_name in skill_names:
+            rendered = skill_registry.load_and_render(
+                skill_name,
+                project_dir=project_dir or "",
+            )
+            if rendered:
+                contents.append(f"=== {skill_name} ===\n{rendered}")
+            else:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Skill %r not found or empty",
+                    skill_name,
+                )
+        return contents
+
     search_dirs: list[Path] = []
     if project_dir:
         search_dirs.append(Path(project_dir) / ".grace" / "skills")

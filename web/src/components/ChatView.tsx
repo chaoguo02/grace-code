@@ -2,10 +2,12 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { ToolApprovalCard } from "./ToolApprovalCard";
+import { PlanApprovalBar } from "./PlanApprovalBar";
 import { SubagentDetail } from "./SubagentDetail";
 import { SubagentProgress } from "./SubagentProgress";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { BlocksMessage } from "./BlocksMessage";
+import { RunOutcomeBar } from "./RunOutcomeBar";
 import { ModeTab, getPlaceholder } from "./ModeTab";
 import { KeyboardHelp } from "./KeyboardHelp";
 import { apiPost } from "../api/client";
@@ -242,7 +244,6 @@ export function ChatView() {
   const [contextChips, setContextChips] = useState<ContextChip[]>([]);
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
   const [modelOptions, setModelOptions] = useState(MODEL_FALLBACK);
-  const [planContractExpanded, setPlanContractExpanded] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
 
   useEffect(() => {
@@ -409,7 +410,7 @@ export function ChatView() {
   const slashMatches = useMemo(() => {
     if (!draft.startsWith("/")) return [];
     const allCommands = [...BUILTIN_SLASH_COMMANDS, ...dynamicSkills];
-    const lower = draft.toLowerCase();
+    const lower = draft.trimStart().split(/\s+/, 1)[0].toLowerCase();
     return allCommands.filter((command) => command.key.startsWith(lower));
   }, [draft, dynamicSkills]);
 
@@ -538,6 +539,26 @@ export function ChatView() {
   };
 
   const executeSlash = async (command: string) => {
+    const dynamicSkill = dynamicSkills.find((skill) => skill.key === command);
+    if (dynamicSkill) {
+      if (!activeId || isRunning) return;
+      const argumentsText = draft.slice(command.length).trim();
+      const visiblePrompt = argumentsText
+        ? `${command} ${argumentsText}`
+        : command;
+      updateDraft("");
+      setComposerMenu("closed");
+      await sendChat(
+        activeId,
+        visiblePrompt,
+        intentForMode(mode),
+        {
+          name: command.slice(1),
+          arguments: argumentsText,
+        },
+      );
+      return;
+    }
     if (command === "/clear") {
       handleClearConversation();
       return;
@@ -937,11 +958,11 @@ export function ChatView() {
                   <BlocksMessage
                     blocks={turn.assistantResponse.blocks}
                     role="assistant"
-                    metadata={turn.meta.steps > 0 ? {
-                      steps: turn.meta.steps,
-                      tokens: turn.meta.tokens,
-                      durationMs: turn.meta.completedAt ? turn.meta.completedAt - turn.meta.startedAt : 0,
-                    } : undefined}
+                  />
+                  <RunOutcomeBar
+                    outcome={turn.meta.outcome}
+                    steps={turn.meta.steps}
+                    tokens={turn.meta.tokens}
                   />
                 </React.Fragment>
               ))}
@@ -959,6 +980,11 @@ export function ChatView() {
                         ? Date.now() - activeTurn.meta.startedAt
                         : 0,
                     } : undefined}
+                  />
+                  <RunOutcomeBar
+                    outcome={activeTurn.meta.outcome}
+                    steps={activeTurn.meta.steps}
+                    tokens={activeTurn.meta.tokens}
                   />
                 </React.Fragment>
               )}
@@ -1027,57 +1053,22 @@ export function ChatView() {
 
       <footer className="composer">
         {planApproval?.isWaiting ? (
-          <div className="plan-actions">
-            {planApproval.revision != null && planApproval.revision > 0 && (
-              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
-                Revision {planApproval.revision}/{planApproval.maxRevisions ?? 5}
-                {planApproval.revision >= (planApproval.maxRevisions ?? 5) && " (final)"}
-              </div>
-            )}
-            {planApproval.contract && (
-              <div style={{ fontSize: 11, marginBottom: 8 }}>
-                <div style={planContractExpanded ? undefined : { maxHeight: 120, overflow: "hidden" }}>
-                  <MarkdownRenderer content={`**Goal:** ${String(planApproval.contract.goal || "")}`} />
-                </div>
-                <button
-                  type="button"
-                  className="expandable-text-toggle"
-                  onClick={() => setPlanContractExpanded((v) => !v)}
-                  aria-expanded={planContractExpanded}
-                >
-                  {planContractExpanded ? "Collapse" : "Show full contract"}
-                </button>
-              </div>
-            )}
-            <textarea
-              ref={draftRef}
-              value={draft}
-              placeholder="Optional feedback before approving"
-              rows={1}
-              autoComplete="off"
-              disabled={isRunning}
-              onChange={(e) => updateDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && e.shiftKey) {
-                  e.preventDefault();
-                  rejectPlan(activeId, draft || "Request revision");
-                  updateDraft("");
-                }
-              }}
-            />
-            <button className="btn-approve" type="button" disabled={isRunning} onClick={() => { approvePlan(activeId, draft.trim()); updateDraft(""); }}>
-              Approve &amp; Build
-            </button>
-            <button className="btn-reject" type="button" disabled={isRunning} onClick={() => { rejectPlan(activeId, draft.trim() || "Please revise the plan"); updateDraft(""); }}>
-              Reject
-            </button>
-            <button className="btn-secondary" type="button" disabled={isRunning} onClick={() => { savePlan(activeId); }}>
-              Save
-            </button>
-            <button className="btn-ghost" type="button" disabled={isRunning} onClick={() => { abortPlan(activeId); }}>
-              Discard
-            </button>
-          </div>
+          <PlanApprovalBar
+            approval={planApproval}
+            feedback={draft}
+            disabled={isRunning}
+            onFeedbackChange={updateDraft}
+            onApprove={(feedback) => {
+              approvePlan(activeId, feedback);
+              updateDraft("");
+            }}
+            onReject={(feedback) => {
+              rejectPlan(activeId, feedback);
+              updateDraft("");
+            }}
+            onSave={() => savePlan(activeId)}
+            onDiscard={() => abortPlan(activeId)}
+          />
         ) : (
           <div className="composer-shell">
             <ModeTab mode={mode} onChange={(m) => { setMode(m); setSessionMode(m, activeId); }} disabled={isRunning || !activeId} />

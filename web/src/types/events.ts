@@ -8,14 +8,29 @@
  * Source: https://github.com/CorvidLabs/corvid-agent/issues/957
  */
 
+// ── EventEnvelope base ────────────────────────────────────────────────────
+
+/** Fields injected by the backend on every WS event. All optional for backward compat. */
+export interface EventEnvelope {
+  session_id?: string;
+  run_id?: string;
+  turn_id?: string;
+  event_id?: string;
+  sequence?: number;
+  block_id?: string;
+  tool_call_id?: string;
+  turn_index?: number;
+}
+
 // ── Status ──────────────────────────────────────────────────────────────
 
-export interface WsStatusEvent {
+export interface WsStatusEvent extends EventEnvelope {
   type: "status";
   status: "running" | "completed" | "failed" | "finish" | "gave_up" | "cancelled" | "compacted";
   message?: string;
   error?: string;
   result?: { summary?: string; steps_taken?: number; total_tokens?: number };
+  content?: string;
   timestamp?: string;
   step?: number;
   duration_ms?: number;
@@ -25,7 +40,7 @@ export interface WsStatusEvent {
 
 // ── Thought / Reflection ────────────────────────────────────────────────
 
-export interface WsThoughtEvent {
+export interface WsThoughtEvent extends EventEnvelope {
   type: "thought";
   content: string;
   timestamp?: string;
@@ -35,7 +50,7 @@ export interface WsThoughtEvent {
   child_session_id?: string;
 }
 
-export interface WsThoughtDeltaEvent {
+export interface WsThoughtDeltaEvent extends EventEnvelope {
   type: "thought_delta";
   text: string;
   timestamp?: string;
@@ -43,7 +58,7 @@ export interface WsThoughtDeltaEvent {
   child_session_id?: string;
 }
 
-export interface WsReflectionEvent {
+export interface WsReflectionEvent extends EventEnvelope {
   type: "reflection";
   content: string;
   timestamp?: string;
@@ -54,7 +69,7 @@ export interface WsReflectionEvent {
 
 // ── Tool call / Observation ─────────────────────────────────────────────
 
-export interface WsToolCallEvent {
+export interface WsToolCallEvent extends EventEnvelope {
   type: "tool_call";
   name: string;
   params?: Record<string, unknown>;
@@ -66,7 +81,7 @@ export interface WsToolCallEvent {
   child_session_id?: string;
 }
 
-export interface WsObservationEvent {
+export interface WsObservationEvent extends EventEnvelope {
   type: "observation";
   tool_name?: string;
   output?: string;
@@ -84,7 +99,7 @@ export interface WsObservationEvent {
 
 // ── Subagent ────────────────────────────────────────────────────────────
 
-export interface WsSubagentStartEvent {
+export interface WsSubagentStartEvent extends EventEnvelope {
   type: "subagent_start";
   child_session_id: string;
   agent_name?: string;
@@ -92,7 +107,7 @@ export interface WsSubagentStartEvent {
   step?: number;
 }
 
-export interface WsSubagentStopEvent {
+export interface WsSubagentStopEvent extends EventEnvelope {
   type: "subagent_stop";
   child_session_id: string;
   status?: string;
@@ -102,7 +117,7 @@ export interface WsSubagentStopEvent {
 
 // ── Approval ────────────────────────────────────────────────────────────
 
-export interface WsApprovalRequiredEvent {
+export interface WsApprovalRequiredEvent extends EventEnvelope {
   type: "approval_required";
   request_id: string;
   tool_name: string;
@@ -116,7 +131,7 @@ export interface WsApprovalRequiredEvent {
   step?: number;
 }
 
-export interface WsApprovalTimeoutEvent {
+export interface WsApprovalTimeoutEvent extends EventEnvelope {
   type: "approval_timeout";
   request_id: string;
   timestamp?: string;
@@ -124,7 +139,7 @@ export interface WsApprovalTimeoutEvent {
 
 // ── Plan ────────────────────────────────────────────────────────────────
 
-export interface WsPlanReadyEvent {
+export interface WsPlanReadyEvent extends EventEnvelope {
   type: "plan_ready";
   plan_text?: string;
   contract?: Record<string, unknown> | null;
@@ -137,7 +152,7 @@ export interface WsPlanReadyEvent {
 
 // ── Worktree ────────────────────────────────────────────────────────────
 
-export interface WsWorktreeResolvedEvent {
+export interface WsWorktreeResolvedEvent extends EventEnvelope {
   type: "worktree_resolved";
   child_session_id: string;
   action: string;
@@ -147,9 +162,19 @@ export interface WsWorktreeResolvedEvent {
   step?: number;
 }
 
+export interface WsReviewUpdatedEvent extends EventEnvelope {
+  type: "review_updated";
+  job_id: string;
+  status: string;
+  task_states: Record<string, string>;
+  finding_count: number;
+  workspace_revision: string;
+  timestamp?: string;
+}
+
 // ── Memory activity ─────────────────────────────────────────────────────
 
-export interface WsMemoryRecallEvent {
+export interface WsMemoryRecallEvent extends EventEnvelope {
   type: "memory_recall";
   injected_count: number;
   candidate_count: number;
@@ -158,12 +183,90 @@ export interface WsMemoryRecallEvent {
   timestamp?: string;
 }
 
-export interface WsMemoryWrittenEvent {
+export interface WsMemoryWrittenEvent extends EventEnvelope {
   type: "memory_written";
   name: string;
   description: string;
   source: string;
   confidence: number;
+  timestamp?: string;
+}
+
+// ── Assistant text streaming ─────────────────────────────────────────────
+
+export interface WsAssistantTextStartEvent extends EventEnvelope {
+  type: "assistant_text_start";
+  block_id: string;
+  timestamp?: string;
+}
+
+export interface WsAssistantTextDeltaEvent extends EventEnvelope {
+  type: "assistant_text_delta";
+  text: string;
+  block_id: string;
+  timestamp?: string;
+}
+
+export interface WsAssistantTextEndEvent extends EventEnvelope {
+  type: "assistant_text_end";
+  block_id: string;
+  timestamp?: string;
+}
+
+export interface WsAssistantTextAbortedEvent extends EventEnvelope {
+  type: "assistant_text_aborted";
+  block_id: string;
+  reason: string;
+  timestamp?: string;
+}
+
+// ── Run lifecycle ────────────────────────────────────────────────────────
+
+export interface WsRunStartedEvent extends EventEnvelope {
+  type: "run_started";
+  run_id: string;
+  turn_id: string;
+  turn_index: number;
+  timestamp?: string;
+}
+
+export interface RunVerificationCheck {
+  name: string;
+  status: "passed" | "failed" | "skipped" | "unavailable" | string;
+  command?: string;
+  detail?: string;
+  duration_ms?: number;
+}
+
+export interface RunVerification {
+  status: "not_applicable" | "verified" | "unverified" | "unavailable" | "failed" | string;
+  reason: string;
+  checks?: RunVerificationCheck[];
+}
+
+export interface RunWorkspaceDelta {
+  has_changes?: boolean;
+  changed_files?: string[];
+  patch_available?: boolean;
+  source?: "git" | "tool_journal" | string;
+  is_run_scoped?: boolean;
+}
+
+export interface WsRunTerminalEvent extends EventEnvelope {
+  type: "run_terminal";
+  run_id: string;
+  turn_id: string;
+  turn_index: number;
+  status: "completed" | "failed" | "cancelled";
+  summary: string;
+  steps_taken: number;
+  total_tokens: number;
+  error?: string;
+  termination_reason?: string;
+  verification_status?: string;
+  verification_reason?: string;
+  verification?: RunVerification;
+  workspace_delta?: RunWorkspaceDelta;
   timestamp?: string;
 }
 
@@ -182,8 +285,15 @@ export type WsMessage =
   | WsApprovalTimeoutEvent
   | WsPlanReadyEvent
   | WsWorktreeResolvedEvent
+  | WsReviewUpdatedEvent
   | WsMemoryRecallEvent
-  | WsMemoryWrittenEvent;
+  | WsMemoryWrittenEvent
+  | WsAssistantTextStartEvent
+  | WsAssistantTextDeltaEvent
+  | WsAssistantTextEndEvent
+  | WsAssistantTextAbortedEvent
+  | WsRunStartedEvent
+  | WsRunTerminalEvent;
 
 // ── Typed handler utility ───────────────────────────────────────────────
 

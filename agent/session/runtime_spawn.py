@@ -37,6 +37,9 @@ def spawn_agent(
     cancellation_token: CancellationToken, parent_policy: "PhasePolicy",
     origin: DelegationOrigin = DelegationOrigin.TOOL,
     spawn_context: AgentSpawnContext | None = None,
+    execution_repo_path: str | None = None,
+    child_metadata: dict[str, object] | None = None,
+    child_created_callback=None,
 ):
     from core.policy import PhasePolicy
     if budget_tokens <= 0:
@@ -80,7 +83,12 @@ def spawn_agent(
         definition, self._root_agent_config,
         parent_budget_tokens=budget_tokens, parent_max_steps=parent_max_steps,
     )
-    _repo = self._require_project_scope(parent.repo_path)
+    parent_repo = self._require_project_scope(parent.repo_path)
+    _repo = (
+        self._require_review_snapshot_scope(parent_repo, execution_repo_path)
+        if execution_repo_path is not None
+        else parent_repo
+    )
     if spawn_context is not None:
         if not isinstance(spawn_context, AgentSpawnContext):
             raise TypeError("spawn_context must be an AgentSpawnContext")
@@ -103,6 +111,7 @@ def spawn_agent(
         title=request.description[:80] or definition.name,
         parent_id=parent.id, root_id=parent.root_id,
         metadata={
+            **(child_metadata or {}),
             "entrypoint": origin.value,
             "agent_kind": request.agent_kind.value,
             "context_origin": request.context_origin.value,
@@ -137,8 +146,17 @@ def spawn_agent(
                 if is_fork and spawn_context is not None
                 else []
             ),
+            "source_repo_path": parent_repo,
         },
     )
+    if child_created_callback is not None:
+        try:
+            child_created_callback(child)
+        except Exception:
+            logger.exception(
+                "Child creation callback failed for session %s",
+                child.id,
+            )
     child_cancellation = cancellation_token.child()
     self._cancellation_tokens[(child.id, child.generation)] = child_cancellation
     if request.agent_kind is AgentKind.FORK:
@@ -262,13 +280,14 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
             parent_pipeline_state=_inherited_state,
         )
         self._store.set_agent_result(child.id, child_result)
-        self._store.append_message(child.id, LLMMessage(role="assistant", content=child_result.summary))
+        if child_result.summary:
+            self._store.append_message(
+                child.id,
+                LLMMessage(role="assistant", content=child_result.summary),
+            )
         return child_result
     except Exception as exc:
         child_error = str(exc) or type(exc).__name__
-        self._store.append_message(
-            child.id, LLMMessage(role="assistant", content=f"Subagent failed: {exc}"),
-        )
         raise
     finally:
         if child_result is not None and child_result.status is ForkStatus.CANCELLED:
@@ -276,12 +295,24 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                 child.id, SessionStatus.CANCELLED,
                 error=child_result.error or child_result.summary,
             )
-            self._store.set_summary(child.id, child_result.summary, status=SessionStatus.CANCELLED)
+            if child_result.summary:
+                self._store.set_summary(
+                    child.id,
+                    child_result.summary,
+                    status=SessionStatus.CANCELLED,
+                )
         elif child_result is None or child_result.status is ForkStatus.FAILED:
-            summary = child_result.summary if child_result is not None else "Subagent execution failed"
-            err = (child_result.error or summary) if child_result is not None else (child_error or summary)
+            summary = child_result.summary if child_result is not None else ""
+            err = (
+                (child_result.error or summary)
+                if child_result is not None
+                else (child_error or "Subagent execution failed")
+            )
             self._store.update_status(child.id, SessionStatus.FAILED, error=err)
-            self._store.set_summary(child.id, summary, status=SessionStatus.FAILED)
+            if summary:
+                self._store.set_summary(
+                    child.id, summary, status=SessionStatus.FAILED,
+                )
         elif child_result.status is ForkStatus.PARTIAL:
             self._store.set_summary(child.id, child_result.summary, status=SessionStatus.PARTIAL)
         else:

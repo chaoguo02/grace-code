@@ -279,7 +279,13 @@ class SessionStatus(str, Enum):
 
     @classmethod
     def from_run_status(cls, status: RunStatus) -> "SessionStatus":
-        """Converge a primary run into its durable session lifecycle."""
+        """Converge a primary run into its durable session lifecycle.
+
+        .. deprecated::
+            Use ``RunState`` for per-run lifecycle.  SessionStatus now only
+            reflects session-level state (ACTIVE / ARCHIVED / DELETED).
+            This method is kept for backward compatibility only.
+        """
         typed = RunStatus(status)
         if typed is RunStatus.SUCCESS:
             return cls.COMPLETED
@@ -305,47 +311,41 @@ class AgentRunStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
 
-    @classmethod
-    def from_run_status(cls, status: RunStatus) -> "AgentRunStatus":
-        return {
-            RunStatus.SUCCESS: cls.COMPLETED,
-            RunStatus.MAX_STEPS: cls.PARTIAL,
-            RunStatus.CANCELLED: cls.CANCELLED,
-        }.get(RunStatus(status), cls.FAILED)
 
-    @classmethod
-    def from_session_status(cls, status: SessionStatus) -> "AgentRunStatus":
-        typed = SessionStatus(status)
-        if typed in {SessionStatus.QUEUED, SessionStatus.RUNNING}:
-            raise ValueError("A running session has no terminal agent result")
-        return {
-            SessionStatus.COMPLETED: cls.COMPLETED,
-            SessionStatus.PARTIAL: cls.PARTIAL,
-            SessionStatus.FAILED: cls.FAILED,
-            SessionStatus.CANCELLED: cls.CANCELLED,
-        }[typed]
+# ── Run lifecycle ─────────────────────────────────────────────────────────
 
-    @property
-    def session_status(self) -> SessionStatus:
-        return SessionStatus.from_agent_run_status(self)
 
-    @property
-    def run_status(self) -> RunStatus:
-        return {
-            AgentRunStatus.COMPLETED: RunStatus.SUCCESS,
-            AgentRunStatus.PARTIAL: RunStatus.MAX_STEPS,
-            AgentRunStatus.FAILED: RunStatus.FAILED,
-            AgentRunStatus.CANCELLED: RunStatus.CANCELLED,
-        }[self]
+class RunState(str, Enum):
+    """Per-run lifecycle status — persisted in the ``runs`` table.
 
-    @property
-    def termination_reason(self) -> TerminationReason:
-        return {
-            AgentRunStatus.COMPLETED: TerminationReason.NONE,
-            AgentRunStatus.PARTIAL: TerminationReason.MAX_STEPS,
-            AgentRunStatus.FAILED: TerminationReason.INTERNAL_ERROR,
-            AgentRunStatus.CANCELLED: TerminationReason.USER_CANCELLED,
-        }[self]
+    Session-level state is tracked separately via ``SessionStatus``.
+    A completed / cancelled / failed run does NOT change the session
+    status — the session stays ACTIVE and can accept new messages.
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+# ── RunContext — immutable context passed through the pipeline ────────────
+
+
+@dataclass(frozen=True)
+class RunContext:
+    """Immutable run identity passed from POST handler → Pipeline → Runtime.
+
+    Created once in the POST /chat transaction and carried through the
+    entire execution.  Never written to mutable session metadata.
+    """
+
+    session_id: str
+    run_id: str
+    turn_id: str
+    turn_index: int
+    idempotency_key: str = ""
 
 
 # Compatibility alias while execution APIs are migrated in Batch 3.

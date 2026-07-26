@@ -11,6 +11,7 @@ with feedback).  Revision count is tracked in session metadata (capped at 5).
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -34,7 +35,10 @@ def create_approvals_router(get_service: Any) -> APIRouter:
 
     # ── POST /api/sessions/{session_id}/approve ──────────────────────────
 
-    @router.post("/api/sessions/{session_id}/approve")
+    @router.post(
+        "/api/sessions/{session_id}/approve",
+        response_model=ApprovalResponse,
+    )
     async def approve(
         session_id: str,
         body: ApproveRequest = ApproveRequest(),
@@ -114,20 +118,32 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         else:
             plan_context += f"\n\n{plan_text}"
 
-        from llm.base import LLMMessage
-        service._storage.append_message(session_id, LLMMessage(
-            role="user", content=plan_context,
-        ))
+        submitted = _submit_plan_run(
+            service,
+            session_id=session_id,
+            prompt=plan_context,
+            action="approve",
+            discriminator=f"{plan_text}\n{comment}",
+        )
+        if not submitted.created:
+            return ApprovalResponse(
+                approved=True,
+                session_id=session_id,
+                status="running",
+                message="Build already submitted",
+                run_id=submitted.run_id,
+                turn_id=submitted.turn_id,
+                turn_index=submitted.turn_index,
+            )
 
-        # Update metadata to clear plan state
-        _clear_plan_metadata(service, session_id)
+        current_revision = _current_plan_revision(service, rec)
 
         # Mark plan revision as approved
         if hasattr(service, '_plan_revisions'):
             try:
                 service._plan_revisions.mark_status(
                     session_id,
-                    rec.metadata.get("plan_revision", 0) + 1,
+                    current_revision,
                     "approved",
                 )
             except Exception:
@@ -138,15 +154,19 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         # Plan file is KEPT on disk so PlanView can reference it after approval.
         try:
             service.session_service.update_agent_name(session_id, "build")
-            _update_plan_metadata(service, session_id, "plan_approved_at",
-                                  datetime.now(timezone.utc).isoformat())
+            _transition_plan_metadata(
+                service,
+                session_id,
+                marker="plan_approved_at",
+                revision=current_revision,
+                clear_contract=False,
+            )
         except Exception:
             pass
 
-        # Ensure EventBus subscriber exists so build events reach the frontend
-        if hasattr(service, "_event_bus") and service._event_bus is not None:
-            await service._event_bus.create_session(session_id)
-        service.run_chat_async(
+        await _start_submitted_plan_run(
+            service,
+            submitted=submitted,
             session_id=session_id,
             prompt=plan_context,
             agent_name="build",
@@ -154,7 +174,15 @@ def create_approvals_router(get_service: Any) -> APIRouter:
             allowed_prompts=allowed_prompts,
         )
 
-        return {"approved": True, "session_id": session_id, "message": "Build started with plan context"}
+        return ApprovalResponse(
+            approved=True,
+            session_id=session_id,
+            status="running",
+            message="Build started with plan context",
+            run_id=submitted.run_id,
+            turn_id=submitted.turn_id,
+            turn_index=submitted.turn_index,
+        )
 
     # ── POST /api/sessions/{session_id}/reject ───────────────────────────
 
@@ -184,8 +212,8 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
-        rev_count = rec.metadata.get("plan_revision", 0)
-        if rev_count >= _MAX_PLAN_REVISIONS:
+        current_revision = _current_plan_revision(service, rec)
+        if current_revision >= _MAX_PLAN_REVISIONS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Maximum plan revisions ({_MAX_PLAN_REVISIONS}) reached. Please approve or start a new plan.",
@@ -193,57 +221,75 @@ def create_approvals_router(get_service: Any) -> APIRouter:
 
         reason = body.reason.strip()
 
-        # Save current plan as a revision before generating a new one
-        if hasattr(service, '_plan_revisions'):
-            try:
-                service._plan_revisions.mark_status(
-                    session_id, rev_count + 1, "rejected"
-                )
-                service._plan_revisions.append_revision(
-                    session_id, rec.summary or "",
-                    parent_revision=rev_count,
-                    change_request=reason,
-                )
-            except Exception:
-                pass
-
         feedback = (
             f"[PLAN REVISION REQUEST] The previous plan was rejected. "
             f"Please revise based on the following feedback:\n\n{reason}"
         )
 
-        from llm.base import LLMMessage
-        service._storage.append_message(session_id, LLMMessage(
-            role="user", content=feedback,
-        ))
+        submitted = _submit_plan_run(
+            service,
+            session_id=session_id,
+            prompt=feedback,
+            action="reject",
+            discriminator=f"{current_revision}\n{rec.summary or ''}\n{reason}",
+        )
+        if not submitted.created:
+            return ApprovalResponse(
+                approved=False,
+                session_id=session_id,
+                status="running",
+                message=f"Revision {current_revision + 1}/{_MAX_PLAN_REVISIONS} already submitted",
+                run_id=submitted.run_id,
+                turn_id=submitted.turn_id,
+                turn_index=submitted.turn_index,
+            )
+
+        # Mark the current revision rejected only after the idempotent Run/Turn
+        # submission succeeds. A retried HTTP request must not append again.
+        if hasattr(service, '_plan_revisions'):
+            try:
+                service._plan_revisions.mark_status(
+                    session_id, current_revision, "rejected"
+                )
+            except Exception:
+                pass
 
         # Clear stale lifecycle markers from any prior approve / save / abort
         # cycle so build_plan_state() sees this as a fresh "waiting" plan.
-        _clear_plan_metadata(service, session_id)
-
-        # Restore revision counter — it was cleared above but must be
-        # maintained across reject → re-plan cycles.
-        _update_plan_revision(service, session_id, rev_count + 1)
+        _transition_plan_metadata(
+            service,
+            session_id,
+            marker=None,
+            revision=current_revision,
+            clear_contract=True,
+        )
 
         logger.info("Plan rejected for session %s (revision %d/%d) — re-running plan",
-                     session_id, rev_count + 1, _MAX_PLAN_REVISIONS)
+                     session_id, current_revision + 1, _MAX_PLAN_REVISIONS)
 
         # Ensure DB agent_name is "plan" for re-plan execution
         try:
             service.session_service.update_agent_name(session_id, "plan")
         except Exception:
             pass
-        # Ensure EventBus subscriber exists so re-plan events reach the frontend
-        if hasattr(service, "_event_bus") and service._event_bus is not None:
-            await service._event_bus.create_session(session_id)
-        service.run_chat_async(
+        await _start_submitted_plan_run(
+            service,
+            submitted=submitted,
             session_id=session_id,
             prompt=feedback,
             agent_name="plan",
             intent="analysis",
         )
 
-        return {"approved": False, "session_id": session_id, "message": f"Revision {rev_count + 1}/{_MAX_PLAN_REVISIONS} started"}
+        return ApprovalResponse(
+            approved=False,
+            session_id=session_id,
+            status="running",
+            message=f"Revision {current_revision + 1}/{_MAX_PLAN_REVISIONS} started",
+            run_id=submitted.run_id,
+            turn_id=submitted.turn_id,
+            turn_index=submitted.turn_index,
+        )
 
     # ── POST /api/sessions/{session_id}/save-plan ─────────────────────────
 
@@ -270,12 +316,13 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         if not plan_text or not plan_text.strip():
             raise HTTPException(status_code=400, detail="No plan found in session summary")
 
+        current_revision = _current_plan_revision(service, rec)
         # Mark plan revision as saved + write metadata for PlanView recognition
         if hasattr(service, '_plan_revisions'):
             try:
                 service._plan_revisions.mark_status(
                     session_id,
-                    rec.metadata.get("plan_revision", 0) + 1,
+                    current_revision,
                     "saved",
                 )
             except Exception:
@@ -283,11 +330,14 @@ def create_approvals_router(get_service: Any) -> APIRouter:
 
         # Clear old lifecycle markers first, then set only "saved" so
         # build_plan_state() see this (and not a stale "approved").
-        _clear_plan_metadata(service, session_id)
         try:
-            service.session_service.update_agent_name(session_id, "build")
-            _update_plan_metadata(service, session_id, "plan_saved_at",
-                                  datetime.now(timezone.utc).isoformat())
+            _transition_plan_metadata(
+                service,
+                session_id,
+                marker="plan_saved_at",
+                revision=current_revision,
+                clear_contract=False,
+            )
         except Exception:
             pass
 
@@ -315,12 +365,13 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
+        current_revision = _current_plan_revision(service, rec)
         # Mark plan revision as aborted + write metadata for PlanView recognition
         if hasattr(service, '_plan_revisions'):
             try:
                 service._plan_revisions.mark_status(
                     session_id,
-                    rec.metadata.get("plan_revision", 0) + 1,
+                    current_revision,
                     "aborted",
                 )
             except Exception:
@@ -329,10 +380,14 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         # Write phase transition marker so build_plan_state() can
         # briefly show lifecycle="aborted" until the next plan cycle.
         # Clear old markers first, then set only the abort marker.
-        _clear_plan_metadata(service, session_id)
         try:
-            _update_plan_metadata(service, session_id, "plan_aborted_at",
-                                  datetime.now(timezone.utc).isoformat())
+            _transition_plan_metadata(
+                service,
+                session_id,
+                marker="plan_aborted_at",
+                revision=current_revision,
+                clear_contract=True,
+            )
         except Exception:
             pass
 
@@ -432,6 +487,78 @@ class ToolApprovalBody(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _submit_plan_run(
+    service,
+    *,
+    session_id: str,
+    prompt: str,
+    action: str,
+    discriminator: str,
+):
+    """Atomically create an idempotent Run/Turn for a Plan transition."""
+    from server.services.run_submission import (
+        IdempotencyConflictError,
+        RunAlreadyActiveError,
+        submit_run_turn,
+    )
+
+    digest = hashlib.sha256(
+        f"{session_id}\0{action}\0{discriminator}".encode("utf-8")
+    ).hexdigest()[:32]
+    try:
+        return submit_run_turn(
+            service._storage,
+            session_id=session_id,
+            prompt=prompt,
+            idempotency_key=f"plan:{action}:{digest}",
+        )
+    except IdempotencyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RunAlreadyActiveError:
+        raise HTTPException(status_code=409, detail="RUN_ALREADY_ACTIVE")
+
+
+async def _start_submitted_plan_run(
+    service,
+    *,
+    submitted,
+    session_id: str,
+    prompt: str,
+    agent_name: str,
+    intent: str,
+    allowed_prompts: list[dict[str, str]] | None = None,
+) -> None:
+    """Start a previously persisted Plan transition with its RunContext."""
+    if hasattr(service, "_event_bus") and service._event_bus is not None:
+        await service._event_bus.create_session(session_id)
+
+    from agent.session.models import RunContext
+
+    context = RunContext(
+        session_id=session_id,
+        run_id=submitted.run_id,
+        turn_id=submitted.turn_id,
+        turn_index=submitted.turn_index,
+        idempotency_key="",
+    )
+    try:
+        service.run_chat_async(
+            session_id=session_id,
+            prompt=prompt,
+            agent_name=agent_name,
+            intent=intent,
+            allowed_prompts=allowed_prompts,
+            run_context=context,
+        )
+    except Exception as exc:
+        service._storage.update_run(
+            submitted.run_id,
+            status="failed",
+            error=str(exc),
+            expect_status="queued",
+        )
+        raise HTTPException(status_code=409, detail=str(exc))
+
 def _clear_plan_metadata(service, session_id: str) -> None:
     """Remove ALL plan lifecycle markers so a new plan starts fresh.
 
@@ -462,8 +589,36 @@ def _clear_plan_metadata(service, session_id: str) -> None:
         logger.exception("Failed to clear plan metadata for %s", session_id)
 
 
-def _update_plan_revision(service, session_id: str, count: int) -> None:
-    """Update the plan revision counter in session metadata."""
+def _current_plan_revision(service, rec) -> int:
+    """Resolve the current revision from durable revisions, then metadata."""
+    revision = int((rec.metadata or {}).get("plan_revision", 0))
+    if hasattr(service, "_plan_revisions"):
+        try:
+            revisions = service._plan_revisions.list_revisions(rec.id)
+            if revisions:
+                latest = revisions[-1]
+                durable = int(
+                    latest.get("revision", 0)
+                    if isinstance(latest, dict)
+                    else getattr(latest, "revision", 0)
+                )
+                revision = max(revision, durable)
+        except Exception:
+            pass
+    if revision == 0 and (rec.summary or "").strip():
+        return 1
+    return revision
+
+
+def _transition_plan_metadata(
+    service,
+    session_id: str,
+    *,
+    marker: str | None,
+    revision: int,
+    clear_contract: bool,
+) -> None:
+    """Atomically replace lifecycle markers while preserving plan facts."""
     try:
         store = service._storage.store
         with store._connect() as conn:
@@ -471,28 +626,20 @@ def _update_plan_revision(service, session_id: str, count: int) -> None:
             if rec is None:
                 return
             meta = dict(rec.metadata)
-            meta["plan_revision"] = count
+            for key in (
+                "plan_approved_at", "plan_saved_at", "plan_aborted_at",
+            ):
+                meta.pop(key, None)
+            if marker:
+                meta[marker] = datetime.now(timezone.utc).isoformat()
+            if revision:
+                meta["plan_revision"] = revision
+            if clear_contract:
+                meta.pop("plan_contract", None)
             conn.execute(
                 "UPDATE sessions SET metadata_json = ? WHERE id = ?",
                 (json.dumps(meta, ensure_ascii=True), session_id),
             )
     except Exception:
-        logger.exception("Failed to update plan revision for %s", session_id)
-
-
-def _update_plan_metadata(service, session_id: str, key: str, value: Any) -> None:
-    """Set an arbitrary key-value pair in session metadata (JSON-safe)."""
-    try:
-        store = service._storage.store
-        with store._connect() as conn:
-            rec = store.get_session(session_id)
-            if rec is None:
-                return
-            meta = dict(rec.metadata)
-            meta[key] = value
-            conn.execute(
-                "UPDATE sessions SET metadata_json = ? WHERE id = ?",
-                (json.dumps(meta, ensure_ascii=True), session_id),
-            )
-    except Exception:
-        logger.exception("Failed to update metadata %s for %s", key, session_id)
+        logger.exception("Failed to transition plan metadata for %s", session_id)
+        raise

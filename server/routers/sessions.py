@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +35,7 @@ from server.schemas.session import (
     UpdateSessionResponse,
     ModelSwitchRequest,
     SessionSettingsRequest,
+    WorktreeResolveRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -185,11 +185,19 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
     def _detail_from_record(rec) -> dict[str, Any]:
         _wt_disposition = None
+        _wt_revision = ""
+        _wt_changed_files: list[str] = []
         _result = getattr(rec, "agent_result", None)
         if _result is not None:
             _disp = getattr(_result, "worktree_disposition", None)
             if _disp is not None and hasattr(_disp, "value"):
                 _wt_disposition = _disp.value
+            _worktree = getattr(_result, "worktree", None)
+            if _worktree is not None:
+                _wt_revision = str(getattr(_worktree, "revision", "") or "")
+                _wt_changed_files = list(
+                    getattr(_worktree, "changed_files", ()) or ()
+                )
         return {
             "id": rec.id,
             "parent_id": rec.parent_id,
@@ -211,6 +219,8 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             "completed_at": rec.completed_at,
             "metadata": rec.metadata,
             "worktree_disposition": _wt_disposition,
+            "worktree_revision": _wt_revision,
+            "worktree_changed_files": _wt_changed_files,
         }
 
     # ── POST /api/sessions ───────────────────────────────────────────────
@@ -474,6 +484,21 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             "plan_state": plan_state,
         }
 
+    @router.get("/{session_id}/runs")
+    async def get_session_runs(
+        session_id: str,
+        limit: int = 20,
+        service=Depends(get_service),
+    ) -> list[dict[str, Any]]:
+        """Return structured run outcomes without parsing assistant content."""
+        _assert_valid_session_id(session_id)
+        try:
+            return service.session_service.list_runs(
+                session_id, limit=max(1, min(limit, 100)),
+            )
+        except ValueError:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
     # ── POST /api/sessions/{session_id}/messages ──────────────────────────
     #
     # ═══════════════════════════════════════════════════════════════════════
@@ -528,6 +553,18 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
         effective_agent = body.agent_name or rec.agent_name
+        execution_prompt = body.prompt
+        if body.skill_name:
+            try:
+                execution_prompt = service.resolve_user_skill(
+                    body.skill_name,
+                    body.skill_arguments,
+                    session_id=session_id,
+                )
+            except ValueError as exc:
+                detail = str(exc)
+                status = 404 if detail.startswith("Unknown Skill") else 409
+                raise HTTPException(status_code=status, detail=detail)
 
         # Update session agent_name if the effective agent differs.
         # Callers are responsible for passing the correct agent_name.
@@ -555,7 +592,6 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=409, detail="Session is already running")
 
         # ── Idempotency + concurrency + Run/Turn creation ──
-        import uuid as _uuid_mod
         _idem_key = (body.idempotency_key or "").strip()
         _run_id: str | None = None
         _turn_id: str | None = None
@@ -563,69 +599,31 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         if hasattr(service, "_storage") and service._storage is not None:
             _storage = service._storage
-
-            # 1. Idempotency check
-            if _idem_key:
-                existing = _storage.check_idempotent_run(session_id, _idem_key)
-                if existing is not None:
-                    if existing.get("prompt", "") != body.prompt:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="idempotency key reused with different prompt",
-                        )
+            try:
+                from server.services.run_submission import (
+                    IdempotencyConflictError,
+                    RunAlreadyActiveError,
+                    submit_run_turn,
+                )
+                submitted = submit_run_turn(
+                    _storage,
+                    session_id=session_id,
+                    prompt=body.prompt,
+                    idempotency_key=_idem_key,
+                )
+                _run_id = submitted.run_id
+                _turn_id = submitted.turn_id
+                _turn_index = submitted.turn_index
+                if not submitted.created:
                     return {
                         "accepted": True,
-                        "run_id": existing["id"],
-                        "turn_id": existing["turn_id"],
-                        "turn_index": existing["turn_index"],
+                        "run_id": _run_id,
+                        "turn_id": _turn_id,
+                        "turn_index": _turn_index,
                     }
-
-            # 2. Concurrency check — no parallel runs
-            active_run = _storage.get_active_run(session_id)
-            if active_run is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="RUN_ALREADY_ACTIVE",
-                )
-
-            # 3. Create Run + Turn in a single transaction
-            _run_id = str(_uuid_mod.uuid4())
-            _turn_id = str(_uuid_mod.uuid4())
-            try:
-                from datetime import datetime, timezone as _tz
-                _now = datetime.now(_tz.utc).isoformat()
-                with _storage._store._connect() as conn:
-                    conn.execute("BEGIN IMMEDIATE")
-                    # Atomic turn_index increment
-                    conn.execute(
-                        "UPDATE sessions SET run_generation = run_generation + 1 WHERE id = ?",
-                        (session_id,),
-                    )
-                    row = conn.execute(
-                        "SELECT run_generation FROM sessions WHERE id = ?",
-                        (session_id,),
-                    ).fetchone()
-                    _turn_index = int(row["run_generation"]) if row else 1
-
-                    # Create run record
-                    conn.execute(
-                        """INSERT INTO runs
-                           (id, session_id, turn_id, turn_index, idempotency_key, prompt,
-                            status, created_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
-                        (_run_id, session_id, _turn_id, _turn_index, _idem_key,
-                         body.prompt, _now, _now),
-                    )
-
-                    # Persist user message with turn_id
-                    conn.execute(
-                        """INSERT INTO session_messages
-                           (session_id, role, content, turn_id, created_at)
-                           VALUES (?, 'user', ?, ?, ?)""",
-                        (session_id, body.prompt, _turn_id, _now),
-                    )
-                    conn.execute("COMMIT")
-            except sqlite3.IntegrityError:
+            except IdempotencyConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            except RunAlreadyActiveError:
                 logger.warning("Run conflict for session %s — concurrent request", session_id)
                 raise HTTPException(status_code=409, detail="RUN_ALREADY_ACTIVE")
             except Exception:
@@ -657,7 +655,8 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             ) if _run_id else None
             service.run_chat_async(
                 session_id=session_id,
-                prompt=body.prompt,
+                prompt=execution_prompt,
+                display_prompt=body.prompt,
                 agent_name=effective_agent,
                 intent=body.intent,
                 run_context=_ctx,
@@ -1098,6 +1097,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         session_id: str,
         child_id: str,
         action: str,
+        body: WorktreeResolveRequest,
         service=Depends(get_service),
     ) -> dict[str, Any]:
         """Enqueue a worktree command for async processing.
@@ -1115,12 +1115,32 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         child = service._store.get_session(child_id)
         if child is None:
             raise HTTPException(status_code=404, detail="Child session not found")
+        if child.parent_id != session_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Worktree session must be a direct child of the caller",
+            )
         result = child.agent_result
         if result is None or result.worktree is None:
             raise HTTPException(status_code=409, detail="No worktree to resolve")
+        current_revision = str(result.worktree.revision or "")
+        if current_revision != body.expected_revision.strip():
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "WORKTREE_REVISION_STALE",
+                    "expected_revision": body.expected_revision.strip(),
+                    "current_revision": current_revision,
+                },
+            )
 
         # Enqueue async command
-        cmd_key = service._runtime.enqueue_worktree_command(session_id, child_id, action)
+        cmd_key = service._runtime.enqueue_worktree_command(
+            session_id,
+            child_id,
+            action,
+            expected_revision=body.expected_revision,
+        )
         return {"accepted": True, "command_key": cmd_key, "child_session_id": child_id,
                 "action": action, "status": "queued"}
 

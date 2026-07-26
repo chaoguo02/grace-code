@@ -39,7 +39,16 @@ class WsStatus:
     message: str = ""
     error: str = ""
     result: dict | None = None  # {summary, steps_taken, total_tokens}
+    content: str = ""           # assistant 最终回答正文（由 task_complete.summary 填充）
     timestamp: str = ""
+    # ── EventEnvelope fields ──
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
 
     def to_dict(self) -> dict:
         return _to_dict(self)
@@ -55,6 +64,14 @@ class WsThought:
     step: int = 0
     child_session_id: str = ""
     timestamp: str = ""
+    # ── EventEnvelope ──
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
 
     def to_dict(self) -> dict:
         return _to_dict(self)
@@ -68,6 +85,14 @@ class WsThoughtDelta:
     step: int = 0
     child_session_id: str = ""
     timestamp: str = ""
+    # ── EventEnvelope ──
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
 
     def to_dict(self) -> dict:
         return _to_dict(self)
@@ -85,6 +110,14 @@ class WsToolCall:
     id: str = ""
     child_session_id: str = ""
     timestamp: str = ""
+    # ── EventEnvelope ──
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""       # = tool_call_id
+    tool_call_id: str = ""   # model-assigned tool use id
 
     def to_dict(self) -> dict:
         return _to_dict(self)
@@ -105,6 +138,14 @@ class WsObservation:
     diff: str = ""
     child_session_id: str = ""
     timestamp: str = ""
+    # ── EventEnvelope ──
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""       # NOT created — observation updates tool_use block
+    tool_call_id: str = ""   # matches tool_call's id
 
     def to_dict(self) -> dict:
         return _to_dict(self)
@@ -118,6 +159,14 @@ class WsReflection:
     type: Literal["reflection"] = "reflection"
     content: str = ""
     timestamp: str = ""
+    # ── EventEnvelope ──
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
 
     def to_dict(self) -> dict:
         return _to_dict(self)
@@ -132,6 +181,14 @@ class WsSubagentStart:
     child_session_id: str = ""
     agent_name: str = ""
     timestamp: str = ""
+    # ── EventEnvelope ──
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
 
     def to_dict(self) -> dict:
         return _to_dict(self)
@@ -143,6 +200,14 @@ class WsSubagentStop:
     child_session_id: str = ""
     status: str = ""
     timestamp: str = ""
+    # ── EventEnvelope ──
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
 
     def to_dict(self) -> dict:
         return _to_dict(self)
@@ -178,6 +243,133 @@ class WsApprovalTimeout:
         return _to_dict(self)
 
 
+# ── Assistant text streaming ───────────────────────────────────────────
+
+
+@dataclass
+class WsAssistantTextStart:
+    """Start of an assistant text block — creates a new text block with block_id."""
+    type: Literal["assistant_text_start"] = "assistant_text_start"
+    block_id: str = ""
+    timestamp: str = ""
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    tool_call_id: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+@dataclass
+class WsAssistantTextDelta:
+    """Streaming token of assistant text — appends to the block identified by block_id."""
+    type: Literal["assistant_text_delta"] = "assistant_text_delta"
+    text: str = ""
+    block_id: str = ""
+    timestamp: str = ""
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    tool_call_id: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+@dataclass
+class WsAssistantTextEnd:
+    """End of an assistant text block — marks it as completed."""
+    type: Literal["assistant_text_end"] = "assistant_text_end"
+    block_id: str = ""
+    timestamp: str = ""
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    tool_call_id: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+@dataclass
+class WsAssistantTextAborted:
+    """Text block was aborted — stream error, cancel, max_tokens, etc."""
+    type: Literal["assistant_text_aborted"] = "assistant_text_aborted"
+    block_id: str = ""
+    reason: str = ""
+    timestamp: str = ""
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    tool_call_id: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+# ── Run lifecycle events ───────────────────────────────────────────────
+
+
+@dataclass
+class WsRunStarted:
+    """Run has transitioned QUEUED → RUNNING."""
+    type: Literal["run_started"] = "run_started"
+    run_id: str = ""
+    turn_id: str = ""
+    turn_index: int = 0
+    timestamp: str = ""
+    session_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+@dataclass
+class WsRunTerminal:
+    """Run has reached a terminal state (completed/failed/cancelled).
+
+    Sent only AFTER the final assistant message and Run status have been
+    committed to the database.  This is the signal that the frontend can
+    safely refresh from the DB.
+    """
+    type: Literal["run_terminal"] = "run_terminal"
+    run_id: str = ""
+    turn_id: str = ""
+    turn_index: int = 0
+    status: str = ""          # completed | failed | cancelled
+    summary: str = ""
+    steps_taken: int = 0
+    total_tokens: int = 0
+    error: str = ""
+    termination_reason: str = ""
+    verification_status: str = ""
+    verification_reason: str = ""
+    verification: dict = field(default_factory=dict)
+    workspace_delta: dict = field(default_factory=dict)
+    timestamp: str = ""
+    session_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
 # ── Plan ready ────────────────────────────────────────────────────────
 
 
@@ -205,6 +397,22 @@ class WsWorktreeResolved:
     action: str = ""
     status: str = ""
     message: str = ""
+    timestamp: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+@dataclass
+class WsReviewUpdated:
+    """A durable multi-agent review job or task changed state."""
+
+    type: Literal["review_updated"] = "review_updated"
+    job_id: str = ""
+    status: str = ""
+    task_states: dict[str, str] = field(default_factory=dict)
+    finding_count: int = 0
+    workspace_revision: str = ""
     timestamp: str = ""
 
     def to_dict(self) -> dict:
@@ -247,4 +455,6 @@ WsEvent = (
     | WsSubagentStart | WsSubagentStop
     | WsApprovalRequired | WsApprovalTimeout | WsPlanReady
     | WsWorktreeResolved | WsMemoryRecall | WsMemoryWritten
+    | WsAssistantTextStart | WsAssistantTextDelta | WsAssistantTextEnd | WsAssistantTextAborted
+    | WsRunStarted | WsRunTerminal
 )

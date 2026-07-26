@@ -73,10 +73,17 @@ export function chat(
   prompt: string,
   intent?: string,
   agentName?: string,
+  idempotencyKey?: string,
+  skill?: { name: string; arguments?: string },
 ): Promise<Record<string, unknown>> {
   const body: Record<string, unknown> = { prompt };
   if (intent) body.intent = intent;
   if (agentName) body.agent_name = agentName;
+  if (idempotencyKey) body.idempotency_key = idempotencyKey;
+  if (skill) {
+    body.skill_name = skill.name;
+    body.skill_arguments = skill.arguments || "";
+  }
   return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, body);
 }
 
@@ -159,8 +166,12 @@ export function resolveWorktree(
   sessionId: string,
   childId: string,
   action: string,
+  expectedRevision: string,
 ): Promise<{ accepted: boolean; command_key: string; child_session_id: string; action: string; status: string }> {
-  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/worktrees/${encodeURIComponent(childId)}/${encodeURIComponent(action)}`);
+  return apiPost(
+    `/api/sessions/${encodeURIComponent(sessionId)}/worktrees/${encodeURIComponent(childId)}/${encodeURIComponent(action)}`,
+    { expected_revision: expectedRevision },
+  );
 }
 
 export function resolveToolApproval(

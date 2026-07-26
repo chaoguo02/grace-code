@@ -225,6 +225,46 @@ def test_invalid_param_type_validation_maps_to_blocked():
     assert obs.outcome is ToolOutcome.BLOCKED
 
 
+def test_nested_schema_validation_rejects_invalid_array_item_and_enum():
+    from agent.task import ToolCall
+    from llm.base import LLMToolSchema
+    from llm.tool_call_validator import validate_tool_calls
+
+    schema = LLMToolSchema(
+        name="Batch",
+        description="batch",
+        parameters={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["read", "write"],
+                            },
+                        },
+                        "required": ["mode"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    )
+
+    validation = validate_tool_calls(
+        [ToolCall(name="Batch", params={"items": [{"mode": "delete"}]})],
+        [schema],
+    )
+
+    assert validation.valid is False
+    assert validation.error_type == "invalid_params"
+    assert "params.items[0].mode" in validation.error_message
+
+
 # ── Policy blocked → observation contract ──
 
 

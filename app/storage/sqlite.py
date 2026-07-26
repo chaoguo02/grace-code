@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -117,6 +118,38 @@ class SqliteStorageBackend(StorageBackend):
                     CREATE INDEX IF NOT EXISTS idx_trace_events_session_type
                         ON session_trace_events(session_id, event_type);
 
+                    CREATE TABLE IF NOT EXISTS runs (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        turn_id TEXT NOT NULL,
+                        turn_index INTEGER NOT NULL,
+                        idempotency_key TEXT NOT NULL DEFAULT '',
+                        prompt TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'queued',
+                        summary TEXT NOT NULL DEFAULT '',
+                        steps_taken INTEGER NOT NULL DEFAULT 0,
+                        total_tokens INTEGER NOT NULL DEFAULT 0,
+                        error TEXT,
+                        termination_reason TEXT NOT NULL DEFAULT 'none',
+                        verification_status TEXT NOT NULL DEFAULT 'not_applicable',
+                        verification_reason TEXT NOT NULL DEFAULT 'none',
+                        verification_checks_json TEXT NOT NULL DEFAULT '[]',
+                        workspace_delta_json TEXT NOT NULL DEFAULT '{}',
+                        started_at TEXT,
+                        completed_at TEXT,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        FOREIGN KEY (session_id) REFERENCES sessions(id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_runs_session_created
+                        ON runs(session_id, created_at);
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_idempotency
+                        ON runs(session_id, idempotency_key)
+                        WHERE idempotency_key != '';
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active
+                        ON runs(session_id)
+                        WHERE status IN ('queued', 'running');
+
                     CREATE TABLE IF NOT EXISTS daily_rollup (
                         date TEXT PRIMARY KEY,
                         session_count INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +161,33 @@ class SqliteStorageBackend(StorageBackend):
                 """)
         except Exception:
             logger.exception("Failed to create stats tables")
+        # ── Migrations ──
+        try:
+            with self._store._connect() as conn:
+                conn.execute(
+                    "ALTER TABLE session_messages ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''"
+                )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            with self._store._connect() as conn:
+                run_columns = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(runs)")
+                }
+                additions = {
+                    "termination_reason": "TEXT NOT NULL DEFAULT 'none'",
+                    "verification_status": "TEXT NOT NULL DEFAULT 'not_applicable'",
+                    "verification_reason": "TEXT NOT NULL DEFAULT 'none'",
+                    "verification_checks_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "workspace_delta_json": "TEXT NOT NULL DEFAULT '{}'",
+                }
+                for name, declaration in additions.items():
+                    if name not in run_columns:
+                        conn.execute(
+                            f"ALTER TABLE runs ADD COLUMN {name} {declaration}"
+                        )
+        except Exception:
+            logger.exception("Failed to migrate structured run outcome columns")
 
     def _init_memory_tables(self) -> None:
         """Create memory store tables if they don't exist."""
@@ -246,6 +306,251 @@ class SqliteStorageBackend(StorageBackend):
         self, session_id: str, summary: str, *, status: SessionStatus,
     ) -> None:
         self._store.set_summary(session_id, summary, status=status)
+
+    # ── Runs ────────────────────────────────────────────────────────────────
+
+    def create_run(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        turn_id: str,
+        turn_index: int,
+        prompt: str,
+        idempotency_key: str = "",
+    ) -> dict:
+        """Create a new run record. Returns the run as a dict."""
+        try:
+            from datetime import datetime, timezone
+            with self._store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    """INSERT INTO runs
+                       (id, session_id, turn_id, turn_index, idempotency_key, prompt,
+                        status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                    (run_id, session_id, turn_id, turn_index, idempotency_key, prompt,
+                     now, now),
+                )
+                conn.execute("COMMIT")
+            return {
+                "id": run_id, "session_id": session_id, "turn_id": turn_id,
+                "turn_index": turn_index, "status": "queued", "prompt": prompt,
+            }
+        except Exception:
+            logger.exception("Failed to create run %s", run_id)
+            raise
+
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        summary: str | None = None,
+        steps_taken: int | None = None,
+        total_tokens: int | None = None,
+        error: str | None = None,
+        termination_reason: str | None = None,
+        verification_status: str | None = None,
+        verification_reason: str | None = None,
+        verification_checks: list[dict] | None = None,
+        workspace_delta: dict | None = None,
+        expect_status: str | None = None,
+    ) -> bool:
+        """CAS update a run record.
+
+        When *expect_status* is set, the UPDATE is conditional on the
+        current status matching — preventing lost updates from concurrent
+        cancel vs complete races.
+
+        Returns True if a row was updated.
+        """
+        try:
+            with self._store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                parts = ["updated_at = datetime('now')"]
+                params: list = []
+
+                if status is not None:
+                    parts.append("status = ?")
+                    params.append(status)
+                    if status in {"completed", "failed", "cancelled"}:
+                        parts.append("completed_at = datetime('now')")
+
+                if summary is not None:
+                    parts.append("summary = ?")
+                    params.append(summary)
+                if steps_taken is not None:
+                    parts.append("steps_taken = ?")
+                    params.append(steps_taken)
+                if total_tokens is not None:
+                    parts.append("total_tokens = ?")
+                    params.append(total_tokens)
+                if error is not None:
+                    parts.append("error = ?")
+                    params.append(error)
+                if termination_reason is not None:
+                    parts.append("termination_reason = ?")
+                    params.append(termination_reason)
+                if verification_status is not None:
+                    parts.append("verification_status = ?")
+                    params.append(verification_status)
+                if verification_reason is not None:
+                    parts.append("verification_reason = ?")
+                    params.append(verification_reason)
+                if verification_checks is not None:
+                    parts.append("verification_checks_json = ?")
+                    params.append(json.dumps(verification_checks, ensure_ascii=False))
+                if workspace_delta is not None:
+                    parts.append("workspace_delta_json = ?")
+                    params.append(json.dumps(workspace_delta, ensure_ascii=False))
+
+                where = "id = ?"
+                params.append(run_id)
+
+                if expect_status is not None:
+                    where += " AND status = ?"
+                    params.append(expect_status)
+
+                cur = conn.execute(
+                    f"UPDATE runs SET {', '.join(parts)} WHERE {where}",
+                    params,
+                )
+                conn.execute("COMMIT")
+                return cur.rowcount == 1
+        except Exception:
+            logger.exception("Failed to update run %s", run_id)
+            return False
+
+    def get_run(self, run_id: str) -> dict | None:
+        """Get a single run by ID."""
+        try:
+            with self._store._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                return dict(row) if row else None
+        except Exception:
+            logger.exception("Failed to get run %s", run_id)
+            return None
+
+    def get_active_run(self, session_id: str) -> dict | None:
+        """Get the currently active (queued or running) run for a session."""
+        try:
+            with self._store._connect() as conn:
+                row = conn.execute(
+                    """SELECT * FROM runs
+                       WHERE session_id = ? AND status IN ('queued', 'running')
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (session_id,),
+                ).fetchone()
+                return dict(row) if row else None
+        except Exception:
+            logger.exception("Failed to get active run for %s", session_id)
+            return None
+
+    def list_runs(
+        self, session_id: str, *, limit: int = 20,
+    ) -> list[dict]:
+        """List runs for a session, newest first."""
+        try:
+            with self._store._connect() as conn:
+                rows = conn.execute(
+                    """SELECT * FROM runs WHERE session_id = ?
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (session_id, limit),
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            logger.exception("Failed to list runs for %s", session_id)
+            return []
+
+    def check_idempotent_run(
+        self, session_id: str, idempotency_key: str,
+    ) -> dict | None:
+        """Check if a run with this idempotency key already exists.
+
+        Returns the run dict if found, None otherwise.
+        """
+        try:
+            with self._store._connect() as conn:
+                row = conn.execute(
+                    """SELECT * FROM runs
+                       WHERE session_id = ? AND idempotency_key = ?""",
+                    (session_id, idempotency_key),
+                ).fetchone()
+                return dict(row) if row else None
+        except Exception:
+            logger.exception("Failed to check idempotent run %s/%s",
+                             session_id, idempotency_key)
+            return None
+
+    def transactional_finalize_run(
+        self,
+        run_id: str,
+        terminal_event: dict,
+        session_id: str,
+        *,
+        summary: str = "",
+        steps_taken: int = 0,
+        total_tokens: int = 0,
+        error: str = "",
+        expect_status: str = "running",
+    ) -> dict | None:
+        """CAS-update Run + insert run_terminal trace event in ONE transaction.
+
+        This guarantees that run_terminal is always in the EventStore when
+        the Run transitions to a terminal state — no gap between commit
+        and broadcast.
+
+        Returns the terminal_event dict with ``sequence`` injected,
+        or None if CAS failed (run already in a different state).
+        """
+        import json as _json
+        try:
+            with self._store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+
+                # 1. CAS update Run
+                cur = conn.execute(
+                    """UPDATE runs SET status = ?, summary = ?, steps_taken = ?,
+                       total_tokens = ?, error = ?, completed_at = datetime('now'),
+                       updated_at = datetime('now')
+                       WHERE id = ? AND status = ?""",
+                    (terminal_event.get("status", "completed"),
+                     summary, steps_taken, total_tokens, error,
+                     run_id, expect_status),
+                )
+                if cur.rowcount != 1:
+                    conn.execute("ROLLBACK")
+                    return None  # CAS failed
+
+                # 2. Insert run_terminal into trace_events (get atomic sequence)
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM session_trace_events WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                sequence = row[0] if row else 1
+
+                event_type = str(terminal_event.get("type") or "run_terminal")
+                timestamp = str(terminal_event.get("timestamp") or "")
+                child_session_id = str(terminal_event.get("child_session_id") or "")
+
+                stored = {**terminal_event, "seq": sequence, "sequence": sequence}
+                conn.execute(
+                    """INSERT INTO session_trace_events
+                       (session_id, seq, event_type, timestamp, event_json, source, child_session_id)
+                       VALUES (?, ?, ?, ?, ?, 'run_terminal', ?)""",
+                    (session_id, sequence, event_type, timestamp,
+                     _json.dumps(stored, ensure_ascii=False), child_session_id),
+                )
+
+                conn.execute("COMMIT")
+                return stored
+        except Exception:
+            logger.exception("Failed to transactional_finalize_run %s", run_id)
+            return None
 
     def delete_session(self, session_id: str) -> bool:
         session = self._store.get_session(session_id)
@@ -553,6 +858,10 @@ class SqliteStorageBackend(StorageBackend):
             event_type = str(event.get("type") or "event")
             timestamp = str(event.get("timestamp") or datetime.now(timezone.utc).isoformat())
             child_session_id = str(event.get("child_session_id") or "")
+            # Auto-generate event_id for synthetic events that don't come from agent.task.Event
+            if not event.get("event_id"):
+                import uuid as _uuid
+                event["event_id"] = str(_uuid.uuid4())
             with self._store._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
@@ -560,7 +869,8 @@ class SqliteStorageBackend(StorageBackend):
                     (session_id,),
                 ).fetchone()
                 seq = int(row["next_seq"] if row else 1)
-                stored = { **event, "seq": seq }
+                # Use "sequence" in the event dict (DB column stays "seq" for backward compat)
+                stored = { **event, "seq": seq, "sequence": seq }
                 conn.execute(
                     """INSERT INTO session_trace_events
                        (session_id, seq, event_type, timestamp, event_json, source, child_session_id)
@@ -598,6 +908,7 @@ class SqliteStorageBackend(StorageBackend):
                         raw = {}
                     if isinstance(raw, dict):
                         raw.setdefault("seq", row["seq"])
+                        raw.setdefault("sequence", row["seq"])
                         events.append(raw)
                 return events
         except Exception:

@@ -33,6 +33,19 @@ class AgentConfig:
     stream: bool = False
     stream_callback: object = None
     thought_callback: object = None
+    text_stream_lifecycle_callback: object = None
+    """Signature: (event_type: str, block_id: str, reason: str = "") -> None.
+
+    Called for assistant text block lifecycle:
+      - ("start", block_id)  — first non-thought TEXT_DELTA
+      - ("end", block_id)    — TOOL_USE / FINISH / stream end
+      - ("aborted", block_id, reason)  — exception / cancel / max_tokens
+    """
+    text_stream_delta_callback: object = None
+    """Signature: (block_id: str, text: str) -> None.
+
+    Called for each non-thought TEXT_DELTA chunk during streaming.
+    """
     token_callback: Callable[[int], None] | None = None
     cancellation_token: "Any | None" = None
     completion_fact_check: "Callable[[], CompletionCheckResult] | None" = None

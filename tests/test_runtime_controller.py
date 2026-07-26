@@ -83,6 +83,44 @@ class TestRuntimeController:
         assert "budget exhausted" in decision.terminate_detail.lower()
         assert decision.strip_tools is False
 
+    def test_budget_crossing_limit_allows_one_tool_free_final_turn(self):
+        from agent.runtime_controller import RuntimeController, StepAction
+        from agent.session.execution_budget import (
+            ExecutionBudget,
+            ExecutionBudgetConfig,
+        )
+
+        budget = ExecutionBudget(
+            config=ExecutionBudgetConfig(
+                token_limit=100,
+                step_limit=10,
+                time_limit_seconds=0,
+            ),
+        )
+        budget.start()
+        budget.consume(100)
+        controller = RuntimeController(budget=budget, max_steps=10)
+
+        final_turn = controller.check(
+            step=2,
+            total_tokens=100,
+            history=MagicMock(),
+            log=MagicMock(),
+        )
+
+        assert final_turn.action is StepAction.INJECT_MESSAGE
+        assert final_turn.strip_tools is True
+        assert "final summary" in final_turn.inject_message.lower()
+
+        terminal = controller.check(
+            step=3,
+            total_tokens=100,
+            history=MagicMock(),
+            log=MagicMock(),
+        )
+        assert terminal.action is StepAction.TERMINATE
+        assert terminal.terminate_reason.value == "budget_exhausted"
+
     def test_consecutive_failures_terminate_immediately(self):
         from agent.runtime_controller import RuntimeController, StepAction
 

@@ -83,6 +83,7 @@ class SessionStore:
                     tool_call_id TEXT NULL,
                     tool_name TEXT NULL,
                     tool_calls_json TEXT NULL,
+                    turn_id TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
 
@@ -113,6 +114,15 @@ class SessionStore:
             }
             if "fork_result_json" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN fork_result_json TEXT NULL")
+            message_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(session_messages)")
+            }
+            if "turn_id" not in message_columns:
+                conn.execute(
+                    "ALTER TABLE session_messages "
+                    "ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''"
+                )
             contract_columns = {
                 "agent_kind": "TEXT NOT NULL DEFAULT 'primary'",
                 "context_origin": "TEXT NOT NULL DEFAULT 'fresh'",
@@ -404,14 +414,15 @@ class SessionStore:
             )
             tool_name = ",".join(tc.name for tc in message.tool_calls)
         content = str(message.content)
+        _turn_id = getattr(message, "turn_id", "") or ""
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO session_messages (
                     session_id, role, content, tool_call_id, tool_name,
-                    tool_calls_json, created_at
+                    tool_calls_json, turn_id, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -420,6 +431,7 @@ class SessionStore:
                     message.tool_call_id,
                     tool_name,
                     tool_calls_json,
+                    _turn_id,
                     _utc_now(),
                 ),
             )
@@ -443,7 +455,7 @@ class SessionStore:
             rows = conn.execute(
                 """
                 SELECT id, session_id, role, content, tool_call_id, tool_name,
-                       tool_calls_json, created_at
+                       tool_calls_json, turn_id, created_at
                 FROM session_messages
                 WHERE session_id = ?
                 ORDER BY id
@@ -472,6 +484,10 @@ class SessionStore:
             ))
             # Attach DB id for incremental reload (subagent S4: live steering)
             result[-1].db_id = row["id"]  # type: ignore[attr-defined]
+            # Preserve durable turn ownership for timeline reconstruction.
+            # append_message() stores this column, so dropping it on read
+            # makes every refreshed message appear ungrouped.
+            result[-1].turn_id = row["turn_id"] or ""  # type: ignore[attr-defined]
         return result
 
     def list_messages_for_context(self, session_id: str) -> list[LLMMessage]:
@@ -678,6 +694,142 @@ class SessionStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"Unknown session: {session_id}")
+
+    # ── Run lifecycle ────────────────────────────────────────────────────
+
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        summary: str | None = None,
+        steps_taken: int | None = None,
+        total_tokens: int | None = None,
+        error: str | None = None,
+        termination_reason: str | None = None,
+        verification_status: str | None = None,
+        verification_reason: str | None = None,
+        verification_checks: list[dict] | None = None,
+        workspace_delta: dict | None = None,
+        expect_status: str | None = None,
+    ) -> bool:
+        """CAS update a run record. Returns True if a row was updated."""
+        try:
+            parts = ["updated_at = ?"]
+            params: list = [_utc_now()]
+
+            if status is not None:
+                parts.append("status = ?")
+                params.append(status)
+                if status in {"completed", "failed", "cancelled"}:
+                    parts.append("completed_at = ?")
+                    params.append(_utc_now())
+            if summary is not None:
+                parts.append("summary = ?")
+                params.append(summary)
+            if steps_taken is not None:
+                parts.append("steps_taken = ?")
+                params.append(steps_taken)
+            if total_tokens is not None:
+                parts.append("total_tokens = ?")
+                params.append(total_tokens)
+            if error is not None:
+                parts.append("error = ?")
+                params.append(error)
+            if termination_reason is not None:
+                parts.append("termination_reason = ?")
+                params.append(termination_reason)
+            if verification_status is not None:
+                parts.append("verification_status = ?")
+                params.append(verification_status)
+            if verification_reason is not None:
+                parts.append("verification_reason = ?")
+                params.append(verification_reason)
+            if verification_checks is not None:
+                parts.append("verification_checks_json = ?")
+                params.append(json.dumps(verification_checks, ensure_ascii=False))
+            if workspace_delta is not None:
+                parts.append("workspace_delta_json = ?")
+                params.append(json.dumps(workspace_delta, ensure_ascii=False))
+
+            where = "id = ?"
+            params.append(run_id)
+            if expect_status is not None:
+                where += " AND status = ?"
+                params.append(expect_status)
+
+            with self._connect() as conn:
+                cur = conn.execute(
+                    f"UPDATE runs SET {', '.join(parts)} WHERE {where}",
+                    params,
+                )
+                return cur.rowcount == 1
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Failed to update run %s", run_id)
+            return False
+
+    def transactional_finalize_run(
+        self,
+        run_id: str,
+        terminal_event: dict,
+        session_id: str,
+        *,
+        summary: str = "",
+        steps_taken: int = 0,
+        total_tokens: int = 0,
+        error: str = "",
+        expect_status: str = "running",
+    ) -> dict | None:
+        """CAS-update Run + insert run_terminal trace in ONE transaction.
+
+        Returns terminal_event dict with ``sequence`` injected,
+        or None if CAS failed.
+        """
+        import json as _json
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+
+                cur = conn.execute(
+                    """UPDATE runs SET status = ?, summary = ?, steps_taken = ?,
+                       total_tokens = ?, error = ?, completed_at = ?,
+                       updated_at = ?
+                       WHERE id = ? AND status = ?""",
+                    (terminal_event.get("status", "completed"),
+                     summary, steps_taken, total_tokens, error,
+                     _utc_now(), _utc_now(),
+                     run_id, expect_status),
+                )
+                if cur.rowcount != 1:
+                    conn.execute("ROLLBACK")
+                    return None
+
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM session_trace_events WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                sequence = row[0] if row else 1
+
+                stored = {**terminal_event, "seq": sequence, "sequence": sequence}
+                conn.execute(
+                    """INSERT INTO session_trace_events
+                       (session_id, seq, event_type, timestamp, event_json, source, child_session_id)
+                       VALUES (?, ?, ?, ?, ?, 'run_terminal', ?)""",
+                    (session_id, sequence,
+                     str(terminal_event.get("type") or "run_terminal"),
+                     str(terminal_event.get("timestamp") or ""),
+                     _json.dumps(stored, ensure_ascii=False),
+                     str(terminal_event.get("child_session_id") or "")),
+                )
+
+                conn.execute("COMMIT")
+                return stored
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Failed to transactional_finalize_run %s", run_id)
+            return None
 
     def update_metadata(
         self, session_id: str, extra: dict[str, Any]

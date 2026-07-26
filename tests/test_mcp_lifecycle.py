@@ -60,6 +60,78 @@ class FailingBridge(FakeBridge):
 
 
 class TestMCPLifecycle:
+    def test_deferred_schema_is_hidden_until_tool_search_activates_it(self):
+        from core.base import BaseTool, ToolRegistry, ToolResult
+        from tools.workflow_tool import ToolSearchTool
+
+        class DeferredTool(BaseTool):
+            name = "mcp__docs__lookup"
+            description = "Look up documentation"
+            parameters_schema = {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            }
+            is_mcp = True
+            should_defer = True
+            always_load = False
+
+            def execute(self, params):
+                return ToolResult(success=True, output="ok")
+
+        deferred = DeferredTool()
+        search = ToolSearchTool()
+        integration = SimpleNamespace(_tools=[deferred], _manager=None)
+        registry = ToolRegistry().register(search).register(deferred)
+        search.set_mcp_context(registry, integration)
+
+        assert [schema.name for schema in registry.get_schemas()] == ["ToolSearch"]
+
+        result = search.execute({"query": "documentation"})
+
+        assert result.success is True
+        assert deferred.should_defer is False
+        assert [schema.name for schema in registry.get_schemas()] == [
+            "ToolSearch",
+            "mcp__docs__lookup",
+        ]
+
+    def test_shared_entrypoint_initializes_and_registers_mcp(self, monkeypatch):
+        import agent.session
+        from entry.bootstrap.registry_factory import initialize_mcp_integration
+
+        calls = []
+
+        class FakeIntegration:
+            def __init__(self, raw_config):
+                calls.append(("construct", raw_config))
+
+            def initialize(self):
+                calls.append(("initialize",))
+
+            def register_into(self, registry):
+                calls.append(("register", registry))
+
+        monkeypatch.setattr(agent.session, "MCPToolIntegration", FakeIntegration)
+        registry = SimpleNamespace(_tools={})
+        config = SimpleNamespace(mcp_servers={"docs": {"command": "fake"}})
+
+        integration = initialize_mcp_integration(config, registry)
+
+        assert isinstance(integration, FakeIntegration)
+        assert calls == [
+            ("construct", {"mcp_servers": config.mcp_servers}),
+            ("initialize",),
+            ("register", registry),
+        ]
+
+    def test_shared_entrypoint_skips_empty_mcp_config(self):
+        from entry.bootstrap.registry_factory import initialize_mcp_integration
+
+        assert initialize_mcp_integration(
+            SimpleNamespace(mcp_servers={}),
+            SimpleNamespace(_tools={}),
+        ) is None
+
     def test_manager_tracks_server_ownership_and_closes_one_server(self, monkeypatch):
         from agent.mcp import sync_bridge
         from agent.mcp.sync_bridge import SyncMCPToolManager

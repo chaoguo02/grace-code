@@ -108,6 +108,28 @@ class VerificationReason(str, Enum):
     NO_NET_CHANGE = "no_net_change"
 
 
+@dataclass(frozen=True)
+class VerificationCheck:
+    """One structured verification action performed during a run."""
+
+    name: str
+    status: str
+    command: str = ""
+    detail: str = ""
+    duration_ms: int = 0
+
+
+@dataclass(frozen=True)
+class WorkspaceDelta:
+    """Run-scoped workspace facts, kept separate from assistant prose."""
+
+    has_changes: bool = False
+    changed_files: tuple[str, ...] = ()
+    patch: str = ""
+    source: str = "git"
+    is_run_scoped: bool = False
+
+
 @dataclass
 class Task:
     description: str
@@ -163,6 +185,7 @@ class RunResult:
     task_id: str
     status: RunStatus
     summary: str
+    """Final user-visible assistant content. Runtime notices are forbidden."""
     steps_taken: int
     total_tokens: int = 0
     patch: str | None = None
@@ -171,6 +194,8 @@ class RunResult:
     termination_reason: TerminationReason = TerminationReason.NONE
     verification_status: VerificationStatus = VerificationStatus.NOT_APPLICABLE
     verification_reason: VerificationReason = VerificationReason.NONE
+    verification_checks: tuple[VerificationCheck, ...] = ()
+    workspace_delta: WorkspaceDelta | None = None
     contract: dict | None = None
     """Plan contract from ExitPlanMode tool — structured, no regex needed."""
     completion_blocked: int = 0

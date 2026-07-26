@@ -515,7 +515,7 @@ def run(
         prompt_config=config.prompts,
     )
     mcp_integration = None
-    from agent.session import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration
+    from agent.session import AgentDefinitionError, AgentRegistryV2
     try:
         _agent_registry = AgentRegistryV2(project_dir=repo_path)
     except AgentDefinitionError as _ade:
@@ -556,15 +556,8 @@ def run(
             description = _spec.initial_prompt
 
         if getattr(config, "mcp_servers", None):
-            mcp_integration = MCPToolIntegration({"mcp_servers": config.mcp_servers})
-            mcp_integration.initialize()
-            mcp_integration.register_into(registry)
-
-            # Wire MCP context into ToolSearch + WaitForMcpServers tools
-            from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool
-            for _name, _tool in registry._tools.items():
-                if isinstance(_tool, (ToolSearchTool, WaitForMcpServersTool)):
-                    _tool.set_mcp_context(registry, mcp_integration)
+            from entry.bootstrap.registry_factory import initialize_mcp_integration
+            mcp_integration = initialize_mcp_integration(config, registry)
 
         # ── Per-task verify callback ──
         if verify_script:
@@ -719,18 +712,10 @@ def chat(
     registry.attach_hook_dispatcher(hook_dispatcher)
 
     # MCP integration
-    mcp_integration = None
-    if getattr(config, 'mcp_servers', None):
-        from agent.session import MCPToolIntegration
-        mcp_integration = MCPToolIntegration({'mcp_servers': config.mcp_servers})
-        mcp_integration.initialize()
-        mcp_integration.register_into(registry)
-        from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool
-        for _n, _t in registry._tools.items():
-            if isinstance(_t, (ToolSearchTool, WaitForMcpServersTool)):
-                _t.set_mcp_context(registry, mcp_integration)
+    from entry.bootstrap.registry_factory import initialize_mcp_integration
+    mcp_integration = initialize_mcp_integration(config, registry)
 
-        # SkillTool 已在 build_registry() 中注册
+    # SkillTool 已在 build_registry() 中注册
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
     from entry.renderer import create_renderer

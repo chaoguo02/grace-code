@@ -109,7 +109,7 @@ class AgentService:
         self._memory_recall_service: Any | None = None
         self._memory_context: Any | None = None
         self._hook_dispatcher: Any | None = None
-        self._mcp_registry: Any | None = None
+        self._mcp_integration: Any | None = None
         self._memory_stop_event: Any | None = None
         self._memory_maintenance_task: Any | None = None
         self._observe_retries: bool = os.environ.get("FORGE_OBSERVE_RETRIES") == "1"
@@ -156,30 +156,6 @@ class AgentService:
         # threading.Event — the exact equivalent of CC's stdin-blocking
         # control_request / control_response protocol.
         # ── Init MCP registry (connect servers, discover tools) ──
-        try:
-            from mcp.registry import McpRegistry
-            self._mcp_registry = McpRegistry(self.repo_path)
-            # Connect in background (non-blocking)
-            import asyncio as _asyncio
-            import threading as _threading
-            def _connect_mcp():
-                try:
-                    _loop = _asyncio.new_event_loop()
-                    _asyncio.set_event_loop(_loop)
-                    _loop.run_until_complete(self._mcp_registry.connect_all())
-                    _loop.run_until_complete(self._mcp_registry.fetch_all_tools())
-                    _loop.close()
-                    _total = self._mcp_registry.total_tools
-                    if _total:
-                        logger.info("MCP: %d tools from %d servers ready",
-                                    _total, len(self._mcp_registry.connected_servers))
-                except Exception as e:
-                    logger.warning("MCP init failed: %s", e)
-            _thread = _threading.Thread(target=_connect_mcp, daemon=True)
-            _thread.start()
-        except Exception as e:
-            logger.info("MCP not available: %s", e)
-
         # ── 4. Session store + StorageBackend ──
         from agent.session import default_session_db_path
         from agent.session.session_store import SessionStore
@@ -321,7 +297,11 @@ class AgentService:
             approval_mode="auto",
             memory_store=self._memory_store,
             external_store=getattr(self, "_external_store", None),
-            mcp_registry=self._mcp_registry,
+        )
+        from entry.bootstrap.registry_factory import initialize_mcp_integration
+        self._mcp_integration = initialize_mcp_integration(
+            self._config,
+            self._registry,
         )
 
         # ── Load permission rules from settings.json ──
@@ -380,6 +360,7 @@ class AgentService:
             log_dir=self._log_dir,
             memory_context=self._memory_context,
             hook_dispatcher=self._hook_dispatcher,
+            mcp_integration=self._mcp_integration,
             event_callback=self._event_bus.publish if self._event_bus is not None else None,
         )
         # Mark as Web mode — child agents use this to create web callbacks
@@ -401,6 +382,19 @@ class AgentService:
                 ))
             self._runtime.set_worktree_completion_callback(_on_worktree_done)
 
+            # ── Run lifecycle callback: run_started / run_terminal ──
+            def _on_run_terminal(session_id: str, event: dict) -> None:
+                """Publish run_started / run_terminal via EventBus.
+
+                Both go through publish_raw → _publish_msg → persist
+                (insert_trace_event, gets sequence) → WS broadcast.
+                Same code path as all other events — no skip_persist.
+                """
+                if _eb is not None:
+                    _eb.publish_raw(session_id, event)
+
+            self._runtime._publish_run_terminal = _on_run_terminal
+
             def _on_memory_written(session_id, memory, source):
                 from server.events import WsMemoryWritten
                 if not session_id:
@@ -416,6 +410,19 @@ class AgentService:
         # ── Plan revision storage (SQLite-backed) ───────────────────────
         from server.services.plan_revision_service import PlanRevisionService
         self._plan_revisions = PlanRevisionService(self._storage, self.repo_path)
+
+        # Read-only multi-agent review orchestration. It owns durable Review
+        # Job/Task/Message state while SessionRuntime executes each reviewer.
+        from server.services.review_service import ReviewService
+        self._review_service = ReviewService(
+            storage=self._storage,
+            runtime=self._runtime,
+            repo_path=self.repo_path,
+            event_callback=(
+                self._event_bus.publish_typed
+                if self._event_bus is not None else None
+            ),
+        )
 
         logger.info(
             "AgentService initialized — repo=%s, model=%s",
@@ -711,17 +718,19 @@ class AgentService:
         prompt: str,
         agent_name: str = "build",
         intent: str | None = None,
+        display_prompt: str = "",
         allowed_prompts: list[dict[str, str]] | None = None,
+        run_context: Any = None,
     ) -> None:
         """Execute chat asynchronously in a background thread.
 
         Returns immediately.  All execution events are pushed through the
-        EventBus to WebSocket subscribers.  When execution finishes, a
-        ``status: completed`` or ``status: failed`` event is pushed.
+        EventBus to WebSocket subscribers.
 
-        For plan sessions (agent_name="plan" or intent="analysis"), a
-        ``plan_ready`` event is emitted on completion so the frontend can
-        show the approve/reject UI.
+        When *run_context* is provided (from the POST /chat transaction),
+        it carries the pre-created run_id / turn_id / turn_index.  The
+        pipeline will transition the run through QUEUED → RUNNING →
+        COMPLETED / FAILED / CANCELLED.
 
         The caller should ensure the frontend has subscribed to the WS
         before calling this method.
@@ -734,14 +743,17 @@ class AgentService:
             resolved_intent = TaskIntent(intent.lower())
 
         # TOCTOU guard: atomically check-and-acquire before spawning thread.
-        if not self._runtime.try_acquire_session(session_id):
-            raise RuntimeError(f"Session {session_id} is already running")
+        # Skip when a run_context is provided — the POST handler already
+        # verified no active run exists via get_active_run().
+        if run_context is None:
+            if not self._runtime.try_acquire_session(session_id):
+                raise RuntimeError(f"Session {session_id} is already running")
 
         # MCP readiness gate: wait up to 5s for background MCP connection.
         # Prevents agent from running before MCP tools are discovered.
-        if self._mcp_registry is not None:
+        if self._mcp_integration is not None:
             _mcp_deadline = time.time() + 5.0
-            while not getattr(self._mcp_registry, '_connected', True):
+            while not getattr(self._mcp_integration, '_connected', True):
                 if time.time() > _mcp_deadline:
                     logger.warning("MCP not ready after 5s — proceeding without MCP tools")
                     break
@@ -787,13 +799,67 @@ class AgentService:
         request = ChatRequest(
             session_id=session_id,
             prompt=prompt,
+            display_prompt=display_prompt,
             agent_name=agent_name,
             intent=resolved_intent,
             permission_mode=_effective_perm,
             repo_path=self.repo_path,
             allowed_prompts=tuple(allowed_prompts or ()),
+            run_context=run_context,
         )
+
         pipeline.run_in_background(request)
+
+    def resolve_user_skill(
+        self,
+        name: str,
+        arguments: str = "",
+        *,
+        session_id: str = "",
+    ) -> str:
+        """Validate and render one user-invocable Skill for Web execution."""
+        skill_registry = getattr(self._registry, "_skill_registry", None)
+        if skill_registry is None:
+            raise ValueError("Skills are not available")
+        normalized = name.strip()
+        meta = skill_registry.get_skill_meta(normalized)
+        if meta is None:
+            raise ValueError(f"Unknown Skill: {normalized}")
+        if not meta.user_can_invoke:
+            raise ValueError(f"Skill is not user-invocable: {normalized}")
+        if meta.context == "fork":
+            raise ValueError(
+                f"Skill '{normalized}' requires fork context, which is not "
+                "supported by direct Web invocation yet"
+            )
+        rendered = skill_registry.load_and_render(
+            normalized,
+            arguments,
+            session_id=self._root_session_id or "",
+            project_dir=self.repo_path,
+        )
+        if not rendered:
+            raise ValueError(f"Skill has no executable instructions: {normalized}")
+        if session_id:
+            from skills.tool import SkillContextModifier
+            if meta.model:
+                self._runtime.set_pending_model(session_id, meta.model)
+            if meta.effort:
+                self._runtime.set_pending_effort(session_id, meta.effort)
+            self._runtime.set_pending_skill_modifier(
+                session_id,
+                SkillContextModifier(
+                    allowed_tools=meta.allowed_tools,
+                    disallowed_tools=meta.disallowed_tools,
+                    model=meta.model,
+                    effort=meta.effort,
+                    context=meta.context,
+                ),
+            )
+        return (
+            f"[USER-INVOKED SKILL: {normalized}]\n\n"
+            f"{rendered}"
+        )
 
     # ── Compression recovery helper (module-level) ──────────────────────
 
@@ -1022,19 +1088,42 @@ class AgentService:
     # ── Cancel ────────────────────────────────────────────────────────────
 
     def cancel_session(self, session_id: str, detail: str = "") -> bool:
-        """Cancel a running session via its cancellation token.
+        """Cancel the active run via its cancellation token.
 
         Args:
-            session_id: The session to cancel.
+            session_id: The session whose active run to cancel.
             detail: Human-readable reason.
 
         Returns:
             bool: True if an active cancellation token was found and signalled.
         """
+        return self.cancel_run(session_id, detail)
+
+    def cancel_run(self, session_id: str, detail: str = "") -> bool:
+        """Cancel the currently active run.
+
+        CAS-updates the run to 'cancelled' and signals the cancellation
+        token.  The agent loop will stop at the next safe point and the
+        finally block will broadcast run_terminal { status: "cancelled" }.
+        """
         # Wake any pending approval first so the agent loop can exit quickly
         broker = self._runtime.get_approval_broker(session_id)
         if broker is not None:
             broker.cancel_pending()
+
+        # CAS-update the active run → cancelled
+        active_run = self._storage.get_active_run(session_id)
+        if active_run is not None:
+            try:
+                self._storage.update_run(
+                    active_run["id"],
+                    status="cancelled",
+                    error=detail or "User cancelled",
+                    expect_status="running",
+                )
+            except Exception:
+                logger.debug("Run cancel CAS failed", exc_info=True)
+
         cancelled = self._runtime.cancel_session(session_id, detail=detail)
         if cancelled and getattr(self, "_event_bus", None) is not None:
             self._event_bus.publish_typed(
@@ -1083,10 +1172,9 @@ class AgentService:
             except Exception:
                 logger.warning("Memory maintenance shutdown failed", exc_info=True)
         # Disconnect MCP servers
-        if self._mcp_registry is not None:
+        if self._mcp_integration is not None:
             try:
-                await self._mcp_registry.disconnect_all()
-                logger.info("MCP: disconnected %d servers", len(self._mcp_registry.server_names))
+                self._mcp_integration.shutdown()
             except Exception:
                 logger.warning("MCP shutdown failed", exc_info=True)
         # Cancel background runs

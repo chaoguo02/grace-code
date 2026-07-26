@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from agent.task import RunResult, TaskIntent
+from llm.base import LLMMessage
 
 if TYPE_CHECKING:
     from agent.session.runtime import SessionRuntime
@@ -123,6 +124,8 @@ class ChatRequest:
 
     session_id: str
     prompt: str
+    display_prompt: str = ""
+    """User-visible prompt persisted to history when execution prompt differs."""
     agent_name: str = "build"
     intent: TaskIntent | None = None
     permission_mode: str = "acceptEdits"
@@ -367,8 +370,20 @@ class ChatPipeline:
         request = prepared.request
         self._ports.reload_rules()
 
-        # Apply pending effort/thinking
-        self._runtime.pop_pending_effort(request.session_id)
+        # Apply pending Skill/model runtime modifiers exactly once.
+        effort_override = (
+            self._runtime.pop_pending_effort(request.session_id) or ""
+        )
+        pop_skill_modifier = getattr(
+            self._runtime,
+            "pop_pending_skill_modifier",
+            None,
+        )
+        skill_modifier = (
+            pop_skill_modifier(request.session_id)
+            if callable(pop_skill_modifier)
+            else None
+        )
         self._runtime.pop_pending_thinking(request.session_id)
 
         # Permission mode — consumed by run_chat_async() and passed via ctx.
@@ -389,10 +404,18 @@ class ChatPipeline:
             agent_name=request.agent_name,
             task_description=self._render_prepared_prompt(prepared),
             intent=request.intent,
+            messages=(
+                [LLMMessage(role="user", content=request.display_prompt)]
+                if request.display_prompt
+                and request.display_prompt != request.prompt
+                else None
+            ),
             inject_permission_mode=request.permission_mode,
             inject_rules=inject_rules,
             session_context_text=prepared.session_context_text or "",
             allowed_prompts=list(request.allowed_prompts),
+            effort_override=effort_override,
+            skill_modifier=skill_modifier,
             run_context=request.run_context,
         )
 
@@ -426,16 +449,51 @@ class ChatPipeline:
             "ChatPipeline finished — session=%s verdict=%s steps=%d tokens=%d",
             request.session_id[:8], _verdict, result.steps_taken, result.total_tokens,
         )
-        # Save initial plan revision to PlanRevisionService (not an event, just storage)
+        # Persist each distinct generated plan revision after generation
+        # succeeds. Reject marks the prior revision rejected; it must not
+        # pre-create a duplicate "next" revision before the model responds.
         if _has_plan and result.summary and self._ports.plan_revisions is not None:
             try:
                 _existing = self._ports.plan_revisions.list_revisions(request.session_id)
-                if not _existing:
-                    self._ports.plan_revisions.append_revision(
+                _latest = _existing[-1] if _existing else None
+                _latest_content = (
+                    _latest.get("content", "")
+                    if isinstance(_latest, dict)
+                    else getattr(_latest, "content", "")
+                )
+                _latest_status = (
+                    _latest.get("status", "")
+                    if isinstance(_latest, dict)
+                    else getattr(_latest, "status", "")
+                )
+                if (
+                    _latest_content != result.summary
+                    or _latest_status in {"rejected", "aborted"}
+                ):
+                    _revision = self._ports.plan_revisions.append_revision(
                         request.session_id, result.summary,
                     )
+                    _revision_number = int(
+                        getattr(_revision, "revision", 0)
+                        or (
+                            _revision.get("revision", 0)
+                            if isinstance(_revision, dict)
+                            else 0
+                        )
+                    )
+                else:
+                    _revision_number = int(
+                        _latest.get("revision", 0)
+                        if isinstance(_latest, dict)
+                        else getattr(_latest, "revision", 0)
+                    )
+                if _revision_number:
+                    self._ports.session_service.merge_metadata(
+                        request.session_id,
+                        {"plan_revision": _revision_number},
+                    )
             except Exception:
-                pass
+                logger.debug("Plan revision persistence failed", exc_info=True)
         # Plan file is written by ExitPlanModeTool during agent execution.
         # This is a fallback only — catches cases where the agent produced
         # a contract without calling ExitPlanMode (e.g. max_turns reached).

@@ -32,6 +32,7 @@ class ToolSchemaSnapshot:
     description: str
     parameters_json: str
     prompt_contract: tuple[str, ...] = ()
+    deferred: bool = False
 
     @classmethod
     def capture(cls, schema: LLMToolSchema) -> "ToolSchemaSnapshot":
@@ -46,6 +47,7 @@ class ToolSchemaSnapshot:
                 allow_nan=False,
             ),
             prompt_contract=tuple(schema.prompt_contract),
+            deferred=schema.deferred,
         )
 
     def materialize(self) -> LLMToolSchema:
@@ -54,6 +56,7 @@ class ToolSchemaSnapshot:
             description=self.description,
             parameters=json.loads(self.parameters_json),
             prompt_contract=self.prompt_contract,
+            deferred=self.deferred,
         )
 
 

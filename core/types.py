@@ -135,6 +135,7 @@ class LLMToolSchema:
     description: str
     parameters: dict[str, Any]
     prompt_contract: tuple[str, ...] = ()
+    deferred: bool = False
 
 
 # ---------------------------------------------------------------------------

@@ -6,13 +6,11 @@
 import { describe, it, expect } from "vitest";
 import {
   blockId,
-  blockHash,
   canGroupWith,
+  reconcileFinalTextBlock,
   toolUseSummary,
-  integrityPasses,
   type ToolUseBlock,
   type ContentBlock,
-  type IntegrityCheck,
 } from "./blocks";
 
 // ── blockId ──────────────────────────────────────────────────────────────
@@ -29,32 +27,6 @@ describe("blockId", () => {
 
   it("different index → different id", () => {
     expect(blockId("x", 0)).not.toBe(blockId("x", 1));
-  });
-});
-
-// ── blockHash ────────────────────────────────────────────────────────────
-
-describe("blockHash", () => {
-  it("produces 8-char hex string", () => {
-    const b: ToolUseBlock = {
-      type: "tool_use", id: "b_x_0", name: "Read",
-      input: { file_path: "test.ts" }, status: "success",
-    };
-    const hash = blockHash(b);
-    expect(hash).toHaveLength(8);
-    expect(/^[0-9a-f]{8}$/.test(hash)).toBe(true);
-  });
-
-  it("same content → same hash", () => {
-    const a: ToolUseBlock = { type: "tool_use", id: "b_x_0", name: "Read", input: {}, status: "success" };
-    const b: ToolUseBlock = { type: "tool_use", id: "b_x_0", name: "Read", input: {}, status: "success" };
-    expect(blockHash(a)).toBe(blockHash(b));
-  });
-
-  it("different content → different hash", () => {
-    const a: ToolUseBlock = { type: "tool_use", id: "b_x_0", name: "Read", input: {}, status: "success" };
-    const b: ToolUseBlock = { type: "tool_use", id: "b_x_0", name: "Write", input: {}, status: "success" };
-    expect(blockHash(a)).not.toBe(blockHash(b));
   });
 });
 
@@ -108,31 +80,6 @@ describe("toolUseSummary", () => {
   });
 });
 
-// ── integrityPasses ──────────────────────────────────────────────────────
-
-describe("integrityPasses", () => {
-  const passing: IntegrityCheck = {
-    wsBlockCount: 5, dbBlockCount: 5,
-    wsLastBlockHash: "abc12345", dbLastBlockHash: "abc12345",
-  };
-
-  it("passes when counts and hashes match", () => {
-    expect(integrityPasses(passing)).toBe(true);
-  });
-
-  it("fails when counts differ", () => {
-    expect(integrityPasses({ ...passing, dbBlockCount: 6 })).toBe(false);
-  });
-
-  it("fails when hashes differ", () => {
-    expect(integrityPasses({ ...passing, dbLastBlockHash: "deadbeef" })).toBe(false);
-  });
-
-  it("fails when both differ", () => {
-    expect(integrityPasses({ ...passing, wsBlockCount: 3, dbLastBlockHash: "bad" })).toBe(false);
-  });
-});
-
 // ── Type narrowing (compile-time) ────────────────────────────────────────
 
 describe("ContentBlock type narrowing", () => {
@@ -155,5 +102,66 @@ describe("ContentBlock type narrowing", () => {
     if (b.type === "tool_use") {
       expect(b.id).toMatch(/^b_/);
     }
+  });
+});
+
+describe("reconcileFinalTextBlock", () => {
+  it("fills an empty trailing streaming text block", () => {
+    const blocks: ContentBlock[] = [
+      { type: "thought", content: "work", summary: "work", phase: "completed" },
+      { type: "text", content: "", blockId: "answer", phase: "streaming" },
+    ];
+
+    reconcileFinalTextBlock(blocks, "Final answer");
+
+    expect(blocks).toHaveLength(2);
+    expect(blocks[1]).toMatchObject({
+      type: "text",
+      content: "Final answer",
+      phase: "completed",
+    });
+  });
+
+  it("appends the final answer when the only text was before a tool", () => {
+    const blocks: ContentBlock[] = [
+      { type: "text", content: "I will inspect it.", phase: "completed" },
+      { type: "tool_use", id: "tc-1", name: "Read", input: {}, status: "success" },
+    ];
+
+    reconcileFinalTextBlock(blocks, "Final answer");
+
+    expect(blocks).toHaveLength(3);
+    expect(blocks[2]).toMatchObject({ type: "text", content: "Final answer" });
+  });
+
+  it("makes the durable final message authoritative for the trailing text slot", () => {
+    const blocks: ContentBlock[] = [
+      { type: "tool_use", id: "tc-1", name: "Read", input: {}, status: "success" },
+      { type: "text", content: "Partial ans", phase: "streaming" },
+    ];
+
+    reconcileFinalTextBlock(blocks, "Complete final answer");
+
+    expect(blocks).toHaveLength(2);
+    expect(blocks[1]).toMatchObject({
+      type: "text",
+      content: "Complete final answer",
+      phase: "completed",
+    });
+  });
+
+  it("strips GraceCode's legacy verification banner from persisted answers", () => {
+    const blocks: ContentBlock[] = [];
+
+    reconcileFinalTextBlock(
+      blocks,
+      "[UNVERIFIED — no test environment available. " +
+        "Code changes were made but NOT independently verified.]\n\n" +
+        "Actual answer",
+    );
+
+    expect(blocks).toEqual([
+      { type: "text", content: "Actual answer", phase: "completed" },
+    ]);
   });
 });

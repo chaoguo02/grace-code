@@ -150,7 +150,7 @@ class RuntimeController:
         1. Circuit breaker — terminates immediately
         2. Max steps — terminates immediately
         3. Loop detection — terminates immediately
-        4. Budget exhaustion — terminates immediately
+        4. Budget exhaustion — one tool-free final turn, then terminate
         5. Budget critical/warning — inject message
         6. Context window — inject warning if nearly full
         """
@@ -199,6 +199,16 @@ class RuntimeController:
             budget_status = self.budget.check()
             if budget_status.is_exhausted:
                 logger.warning("Execution budget exhausted at step %d", step)
+                # ExecutionBudget's contract is to allow exactly one final,
+                # tool-free model turn when it first crosses the hard limit.
+                # Previously this message was discarded and the fixed string
+                # "Execution budget exhausted" became the assistant answer.
+                if budget_status.inject_message:
+                    return StepDecision(
+                        action=StepAction.INJECT_MESSAGE,
+                        inject_message=budget_status.inject_message,
+                        strip_tools=True,
+                    )
                 return StepDecision(
                     action=StepAction.TERMINATE,
                     terminate_status=RunStatus.GAVE_UP,

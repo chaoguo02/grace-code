@@ -91,11 +91,32 @@ class SessionDetail(BaseModel):
     updated_at: str = Field(description="ISO-8601 last-update timestamp.")
     completed_at: str | None = Field(default=None, description="ISO-8601 completion timestamp.")
     metadata: dict = Field(default_factory=dict, description="Session metadata dict.")
+    worktree_disposition: str | None = Field(
+        default=None,
+        description="Lifecycle state for an isolated child worktree.",
+    )
+    worktree_revision: str = Field(
+        default="",
+        description="Exact workspace revision required for resolution.",
+    )
+    worktree_changed_files: list[str] = Field(
+        default_factory=list,
+        description="Files changed in the isolated child worktree.",
+    )
     message_count: int = Field(
         default=0, description="Number of messages in the session.",
     )
     total_tokens_estimate: int = Field(
         default=0, description="Rough token estimate from message lengths.",
+    )
+
+
+class WorktreeResolveRequest(BaseModel):
+    """Optimistic-concurrency contract for resolving a reviewed worktree."""
+
+    expected_revision: str = Field(
+        min_length=1,
+        description="Exact revision shown to the reviewer before this action.",
     )
 
 
@@ -143,6 +164,21 @@ class ChatRequest(BaseModel):
         description="Task intent override. "
         "'edit' = write-capable mode, 'analysis' = read-only mode. "
         "If null, auto-detected from the agent definition.",
+    )
+    idempotency_key: str | None = Field(
+        default=None,
+        description="Client-generated UUID to prevent duplicate run creation. "
+        "Reusing the same key with a different prompt returns 409.",
+    )
+    skill_name: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Optional user-invocable Skill selected by the composer.",
+    )
+    skill_arguments: str = Field(
+        default="",
+        max_length=4000,
+        description="Arguments passed to the selected Skill.",
     )
 
 
@@ -229,6 +265,10 @@ class ApprovalResponse(BaseModel):
     approved: bool = Field(description="True if approved, False if rejected.")
     session_id: str = Field(description="The session ID.")
     status: str = Field(description="Updated session status after the action.")
+    message: str = Field(default="", description="Human-readable action result.")
+    run_id: str = Field(default="", description="Submitted run identifier.")
+    turn_id: str = Field(default="", description="Submitted conversation turn identifier.")
+    turn_index: int = Field(default=0, description="Monotonic turn index.")
 
 
 # ── Batch delete ──────────────────────────────────────────────────────────────

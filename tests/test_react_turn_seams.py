@@ -56,7 +56,13 @@ from core.base import (
     ToolResult,
     ToolRole,
 )
-from llm.base import CacheStats, LLMMessage, LLMResponse, LLMToolSchema
+from llm.base import (
+    CacheStats,
+    LLMMessage,
+    LLMResponse,
+    LLMToolSchema,
+    MessageKind,
+)
 
 
 def test_prepare_turn_freezes_provider_inputs():
@@ -113,8 +119,16 @@ def test_prepare_provider_request_filters_new_spawns_during_child_phase():
     )
 
     assert [tool.name for tool in request.turn.tools] == ["Read"]
+    assert len(request.turn.messages) == 2
+    assert request.turn.messages[-1].role == "system"
+    assert request.turn.messages[-1].kind is MessageKind.RUNTIME_NOTICE
+    assert "Agent tool is intentionally unavailable" in (
+        request.turn.messages[-1].content
+    )
     assert request.state is updated_state
     assert request.spawn_context is None
+    state_messages = state.with_updates.call_args.kwargs["messages"]
+    assert len(state_messages) == 1
 
 
 def test_prepare_provider_request_binds_delegation_snapshot():

@@ -403,6 +403,10 @@ class BaseTool(ABC):
             description=self.description,
             parameters=self.parameters_schema,
             prompt_contract=self.prompt_contract,
+            deferred=(
+                bool(getattr(self, "should_defer", False))
+                and not bool(getattr(self, "always_load", False))
+            ),
         )
 
 
@@ -671,7 +675,11 @@ class ToolRegistry:
 
     def get_schemas(self) -> list[LLMToolSchema]:
         """返回所有已注册工具的 schema（按 name 排序，确保 prompt caching 稳定性）。"""
-        schemas = [tool.to_llm_schema() for tool in self._tools.values()]
+        schemas = [
+            schema
+            for tool in self._tools.values()
+            if not (schema := tool.to_llm_schema()).deferred
+        ]
         schemas.sort(key=lambda s: s.name)
         return schemas
 

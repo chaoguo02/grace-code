@@ -236,3 +236,32 @@ class TestGitStateLikeProtocol:
 
         result = guard.check(ctx=ctx, task_intent="edit", git_state=state)
         assert isinstance(result, CompletionCheckResult)
+
+
+def test_refresh_detects_second_edit_to_file_dirty_at_run_start(tmp_path):
+    """A pre-existing dirty file still counts when this run changes it again."""
+    import git
+
+    from agent.core import _capture_git_state, _refresh_git_state
+
+    repo = git.Repo.init(tmp_path)
+    with repo.config_writer() as config:
+        config.set_value("user", "name", "Grace Test")
+        config.set_value("user", "email", "grace@example.invalid")
+    target = tmp_path / "tracked.txt"
+    target.write_text("committed\n", encoding="utf-8")
+    repo.index.add(["tracked.txt"])
+    repo.index.commit("initial")
+
+    target.write_text("dirty before run\n", encoding="utf-8")
+    state = _capture_git_state(str(tmp_path))
+    assert "tracked.txt" in state._baseline_dirty_files
+
+    _refresh_git_state(state, str(tmp_path))
+    assert state.has_changes is False
+
+    target.write_text("changed by this run\n", encoding="utf-8")
+    _refresh_git_state(state, str(tmp_path))
+
+    assert state.has_changes is True
+    assert state._run_changed_files == {"tracked.txt"}

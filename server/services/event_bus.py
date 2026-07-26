@@ -132,41 +132,22 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
     child_id = getattr(event, "child_session_id", "")
 
     if ev_type == "task_start":
-        return [WsStatus(status="running", timestamp=ts).to_dict()]
+        # run_started is now emitted by run_session() after CAS QUEUED→RUNNING.
+        # Suppress to avoid duplicate start events.
+        return []
 
     if ev_type == "task_complete":
-        # Always emit status:completed so the frontend has an explicit
-        # completion signal (clears isRunning, watchdog, etc.).
-        _result: dict = {
-            "summary": payload.get("summary", ""),
-            "steps_taken": payload.get("steps", 0),
-        }
-        # Forward cache stats if present (prompt caching hit rate)
-        _cache = payload.get("cache")
-        if _cache:
-            _result["cache"] = _cache
-        msgs: list[dict] = [WsStatus(status="completed", result=_result, timestamp=ts).to_dict()]
-        # When a plan contract was produced (ExitPlanMode), also emit
-        # plan_ready so it can be recovered from /trace/events after refresh.
-        _contract = payload.get("contract")
-        if _contract:
-            msgs.append(WsPlanReady(
-                plan_text=payload.get("summary", ""),
-                contract=_contract,
-                result={
-                    "summary": payload.get("summary", ""),
-                    "steps_taken": payload.get("steps", 0),
-                },
-                timestamp=ts,
-            ).to_dict())
-        return msgs
+        # task_complete is internal-only — the agent loop has finished but
+        # messages and Run status are not yet committed to DB.  The real
+        # run_terminal event is emitted by run_session()'s finally block
+        # AFTER the transaction commits.
+        return []
 
     if ev_type == "task_failed":
-        error_text = payload.get("error", str(payload.get("reason", "unknown")))
-        status = "cancelled" if "cancel" in str(error_text).lower() else "failed"
-        return [WsStatus(status=status,
-            error=error_text,
-            timestamp=ts).to_dict()]
+        # Suppressed — the finally block in run_session() handles all
+        # terminal states via _finalize_run() which emits run_terminal
+        # AFTER the DB transaction commits.
+        return []
 
     if ev_type == "action":
         action = payload.get("action", {}) or {}
@@ -184,20 +165,22 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
                 step=step, id=tc.get("id", ""),
                 child_session_id=child_id, timestamp=ts).to_dict())
 
-        atype = action.get("action_type", "")
-        msg_text = action.get("message", "")
-        if atype in ("finish", "give_up") and msg_text:
-            msgs.append(WsStatus(status=atype, message=msg_text, timestamp=ts).to_dict())
-
+        # P0: finish / give_up status events are suppressed.
+        # The final turn lifecycle is now handled by run_terminal
+        # (emitted AFTER DB commit in run_session's finally block).
+        # The assistant answer text is streamed via assistant_text_delta
+        # during _stream_and_dispatch.
         return msgs
 
     if ev_type == "observation":
         obs = payload.get("observation", {}) or {}
         _obs_meta = obs.get("metadata", {}) or {}
+        _tc_id = payload.get("tool_call_id") or obs.get("tool_call_id") or ""
         return [WsObservation(
             tool_name=obs.get("tool_name", ""), output=obs.get("output", ""),
             error=obs.get("error"), status=obs.get("status", ""),
-            step=payload.get("step", 0), id=payload.get("tool_call_id"),
+            step=payload.get("step", 0), id=_tc_id,
+            tool_call_id=_tc_id,  # explicit tool_call_id for frontend matching
             diff=_obs_meta.get("diff", ""),
             child_session_id=child_id, timestamp=ts).to_dict()]
 
@@ -279,67 +262,91 @@ class EventBus:
                 logger.debug("Trace cache append failed", exc_info=True)
         return stored
 
-    def _publish_msg(self, session_id: str, msg: dict[str, Any], *, source: str = "event_bus") -> None:
+    def _publish_msg(
+        self,
+        session_id: str,
+        msg: dict[str, Any],
+        *,
+        source: str = "event_bus",
+        run_context: Any = None,
+    ) -> None:
+        # ── Inject EventEnvelope: run_id / turn_id / turn_index ──
+        # Passed explicitly per-call — NO shared mutable state on EventBus.
+        if run_context is not None:
+            # Typed event dataclasses deliberately serialize empty envelope
+            # fields.  ``setdefault`` therefore leaves those empty strings in
+            # place and the persisted event can no longer be assigned to a
+            # turn during timeline replay.  Fill values that are absent *or*
+            # empty while preserving an explicitly populated child context.
+            if not msg.get("session_id"):
+                msg["session_id"] = session_id
+            if not msg.get("run_id"):
+                msg["run_id"] = getattr(run_context, "run_id", "")
+            if not msg.get("turn_id"):
+                msg["turn_id"] = getattr(run_context, "turn_id", "")
+            if not msg.get("turn_index"):
+                msg["turn_index"] = getattr(run_context, "turn_index", 0)
         stored = self._persist_trace_event(session_id, msg, source=source)
         with self._publish_lock:
             sub = self._sessions.get(session_id)
         if sub is not None and sub.has_subscribers:
             sub.publish(stored)
 
-    def publish(self, event: Any) -> None:
+    def publish(self, event: Any, *, run_context: Any = None) -> None:
         """Synchronous callback — called from SessionRuntime thread.
 
         Translates ``agent.task.Event`` objects into the standardized WS
         message format and pushes them to session subscribers.
 
-        Routes events to the correct session when ``event.session_id`` is set.
-        Falls back to broadcast (all sessions) only when no session_id is
-        available (backward compatibility for code paths that haven't been
-        updated yet).
-
-        Standard WS message types:
-            status          — session state change (running/completed/failed)
-            thought         — model's thinking text
-            tool_call       — tool invocation (name + params)
-            observation     — tool result (output/error)
-            reflection      — model reflection
-            subagent_start  — child session spawned
-            subagent_stop   — child session finished
+        When *run_context* is provided, its run_id / turn_id / turn_index
+        are injected into every translated message as envelope fields.
         """
         try:
             msgs = _translate_event(event)
             target_session_id = getattr(event, "session_id", None)
             if target_session_id:
-                # Route to the specific session that generated this event
                 for msg in msgs:
                     logger.info("EVENT → %s | type=%s step=%s",
                                  target_session_id[:8], msg.get("type"), msg.get("step", ""))
-                    self._publish_msg(target_session_id, msg)
+                    self._publish_msg(target_session_id, msg, run_context=run_context)
                 if target_session_id not in self._sessions:
                     logger.debug("EVENT persisted without subscriber: session=%s", target_session_id[:8])
             else:
-                # Drop unroutable events silently — broadcasting to all sessions
-                # is a correctness risk (information leak) and cannot be triggered
-                # by any current code path.  Events always carry a session_id.
                 logger.debug("EVENT dropped (no session_id): type=%s",
                                getattr(event, "event_type", "?"))
-            # Stats recording moved to first-party instrumentation in agent/core.py.
-            # The recorder field is kept for backward compat but no longer called here.
         except Exception:
             logger.exception("EventBus.publish failed")
 
-    def publish_raw(self, session_id: str, msg: dict[str, Any]) -> None:
+    def publish_raw(
+        self,
+        session_id: str,
+        msg: dict[str, Any],
+        *,
+        run_context: Any = None,
+        skip_persist: bool = False,
+    ) -> None:
         """Push a pre-formatted WS message to one session's subscribers.
 
-        Prefer ``publish_typed()`` for new code — it enforces the
-        event schema via server.events dataclasses.
+        When *skip_persist* is True, the message is broadcast directly
+        without inserting into session_trace_events.  Use this when the
+        event has already been persisted (e.g. run_terminal from
+        transactional_finalize_run).
         """
         try:
-            self._publish_msg(session_id, msg, source="raw")
+            if skip_persist:
+                # ── Broadcast only — event already persisted ──
+                with self._publish_lock:
+                    sub = self._sessions.get(session_id)
+                if sub is not None and sub.has_subscribers:
+                    sub.publish(msg)
+            else:
+                self._publish_msg(session_id, msg, source="raw", run_context=run_context)
         except Exception:
             logger.exception("EventBus.publish_raw failed")
 
-    def publish_typed(self, session_id: str, event: Any) -> None:
+    def publish_typed(
+        self, session_id: str, event: Any, *, run_context: Any = None,
+    ) -> None:
         """Push a typed WS event (from server.events) to one session.
 
         The event must be a dataclass with a ``to_dict()`` method.
@@ -347,7 +354,7 @@ class EventBus:
         schema matches the frontend's expected shape.
         """
         try:
-            self._publish_msg(session_id, event.to_dict(), source="typed")
+            self._publish_msg(session_id, event.to_dict(), source="typed", run_context=run_context)
         except Exception:
             logger.exception("EventBus.publish_typed failed")
 

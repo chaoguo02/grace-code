@@ -9,6 +9,8 @@
  * Stable across streaming → DB transition, survives remount.
  */
 
+import type { RunVerification, RunWorkspaceDelta } from "./events";
+
 // ── Block types ──────────────────────────────────────────────────────────
 
 export interface TextBlock {
@@ -53,7 +55,7 @@ export interface ToolUseBlock {
 export type ContentBlock = TextBlock | ThoughtBlock | ToolUseBlock;
 
 const LEGACY_UNVERIFIED_PREFIX =
-  /^\[UNVERIFIED — [^\]]*Code changes were made but NOT independently verified\.\]\s*/;
+  /^\[UNVERIFIED — (?:no test environment available|project has no Git fact source|tests ran but failed|test\/validation did not run or was unavailable)\. Code changes were made but NOT independently verified\.\]\r?\n\r?\n/;
 
 /**
  * Reconcile the durable final assistant message into an ordered block list.
@@ -190,7 +192,17 @@ export interface StreamingTurn {
     completedAt?: number;
     eventSeq: number;
     hasGap: boolean;
+    outcome?: RunOutcome;
   };
+}
+
+export interface RunOutcome {
+  status: "completed" | "failed" | "cancelled";
+  terminationReason?: string;
+  verification?: RunVerification;
+  workspaceDelta?: RunWorkspaceDelta;
+  error?: string;
+  runId?: string;
 }
 
 /** Create a fresh StreamingTurn for a new chat request. */

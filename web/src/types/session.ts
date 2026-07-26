@@ -37,6 +37,8 @@ export interface SessionDetail {
   completed_at: string | null;
   metadata: Record<string, unknown>;
   worktree_disposition: string | null;
+  worktree_revision: string;
+  worktree_changed_files: string[];
   message_count?: number;
   total_tokens_estimate?: number;
 }
@@ -123,6 +125,10 @@ export interface TurnTimeline {
     status: string;
     started_at: string;
     completed_at: string;
+    error?: string;
+    termination_reason?: string;
+    verification?: import("./events").RunVerification;
+    workspace_delta?: import("./events").RunWorkspaceDelta;
   };
 }
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 import threading
-from dataclasses import replace
+from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -306,6 +306,27 @@ class SessionRuntime:
                 f"registry={self._agent_registry.project_dir!r}, repo={normalized!r}"
             )
         return normalized
+
+    def _require_review_snapshot_scope(
+        self,
+        parent_repo_path: str,
+        snapshot_repo_path: str,
+    ) -> str:
+        """Allow an execution root only inside this project's managed snapshots."""
+        parent_repo = self._require_project_scope(parent_repo_path)
+        from core.state_paths import ProjectStatePaths
+
+        root = ProjectStatePaths.for_project(parent_repo).review_snapshots.resolve()
+        target = Path(snapshot_repo_path).expanduser().resolve()
+        try:
+            relative = target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                "Review execution repo is outside managed runtime state"
+            ) from exc
+        if len(relative.parts) != 1 or not target.is_dir():
+            raise ValueError("Review execution repo is not a materialized snapshot")
+        return str(target)
 
     def get_session_repo_path(self, session_id: str) -> str:
         """Return a verified parent-session project root or fail closed."""
@@ -615,13 +636,19 @@ class SessionRuntime:
                     cmd = self._worktree_queue.get()
                     if cmd is None:
                         break
-                    parent_id, child_id, action = cmd
+                    parent_id, child_id, action, expected_revision = cmd
                     cmd_key = f"{child_id}_{action}"
                     self._worktree_results[cmd_key] = {
                         "status": "processing", "child_session_id": child_id,
                         "action": action,
+                        "expected_revision": expected_revision,
                     }
-                    result = self._resolve_worktree_sync(parent_id, child_id, action)
+                    result = self._resolve_worktree_sync(
+                        parent_id,
+                        child_id,
+                        action,
+                        expected_revision=expected_revision,
+                    )
                     self._worktree_results[cmd_key] = result
                     # Notify server layer via injected callback — clean layering.
                     _cb = getattr(self, '_worktree_completion_callback', None)
@@ -637,35 +664,92 @@ class SessionRuntime:
         _t.start()
 
     def enqueue_worktree_command(
-        self, parent_session_id: str, child_session_id: str, action: str,
+        self,
+        parent_session_id: str,
+        child_session_id: str,
+        action: str,
+        *,
+        expected_revision: str,
     ) -> str:
         """Enqueue a worktree command for async processing. Returns command_key.
 
         Idempotent: duplicate (child_id, action) pairs are rejected.
         """
         self._ensure_worktree_worker()
+        if action not in {"apply", "discard", "retain"}:
+            raise ValueError(f"Unsupported worktree action: {action}")
+        if not isinstance(expected_revision, str) or not expected_revision.strip():
+            raise ValueError("expected_revision is required")
+        expected_revision = expected_revision.strip()
         cmd_key = f"{child_session_id}_{action}"
         _existing = getattr(self, '_worktree_results', {}).get(cmd_key)
-        if _existing and _existing.get("status") in ("queued", "processing"):
+        if (
+            _existing
+            and _existing.get("expected_revision") == expected_revision
+            and _existing.get("status") in {
+                "queued", "processing", "applied", "discarded",
+                "retained", "no_changes",
+            }
+        ):
             return cmd_key  # already enqueued — idempotent
-        self._worktree_queue.put((parent_session_id, child_session_id, action))
+        self._worktree_queue.put(
+            (parent_session_id, child_session_id, action, expected_revision)
+        )
         self._worktree_results[cmd_key] = {
             "status": "queued", "child_session_id": child_session_id,
             "action": action,
+            "expected_revision": expected_revision,
         }
         return cmd_key
 
     def get_worktree_command_status(self, child_session_id: str, action: str) -> dict | None:
         return getattr(self, '_worktree_results', {}).get(f"{child_session_id}_{action}")
 
-    def _resolve_worktree_sync(self, parent_session_id: str, child_session_id: str,
-                                action: str) -> dict:
-        """Internal: perform the actual worktree operation (called from worker thread)."""
-        return self.resolve_worktree(parent_session_id, child_session_id, action)
+    def _resolve_worktree_sync(
+        self,
+        parent_session_id: str,
+        child_session_id: str,
+        action: str,
+        *,
+        expected_revision: str,
+    ) -> dict:
+        """Resolve one reviewed revision through the canonical safe methods."""
+        if action == "apply":
+            operation = self.apply_subagent_worktree(
+                parent_session_id,
+                child_session_id,
+                expected_revision=expected_revision,
+            )
+        elif action == "discard":
+            operation = self.discard_subagent_worktree(
+                parent_session_id,
+                child_session_id,
+                expected_revision=expected_revision,
+            )
+        elif action == "retain":
+            operation = self.retain_subagent_worktree(
+                parent_session_id,
+                child_session_id,
+                expected_revision=expected_revision,
+            )
+        else:
+            raise ValueError(f"Unsupported worktree action: {action}")
+
+        return {
+            "resolved": operation.is_success,
+            "action": action,
+            "child_session_id": child_session_id,
+            "status": operation.status.value,
+            "message": operation.error or operation.status.value,
+            "expected_revision": expected_revision,
+            "current_revision": operation.evidence.revision,
+        }
 
     def resolve_worktree(
         self, parent_session_id: str, child_session_id: str,
         action: str,  # "apply" | "discard" | "retain"
+        *,
+        expected_revision: str,
     ) -> dict:
         """Resolve a preserved child worktree with the given action.
 
@@ -679,67 +763,12 @@ class SessionRuntime:
           - status: "applied" | "discarded" | "retained" | "error"
           - message: str
         """
-        child = self._store.get_session(child_session_id)
-        if child is None:
-            return {"resolved": False, "action": action,
-                    "child_session_id": child_session_id,
-                    "status": "error", "message": "Child session not found"}
-
-        result = child.agent_result
-        if result is None or result.worktree is None:
-            return {"resolved": False, "action": action,
-                    "child_session_id": child_session_id,
-                    "status": "error", "message": "No worktree to resolve"}
-
-        from agent.session.models import WorktreeDisposition
-        if result.worktree_disposition is not WorktreeDisposition.PRESERVED:
-            return {"resolved": False, "action": action,
-                    "child_session_id": child_session_id,
-                    "status": "error", "message": "Worktree already resolved"}
-
-        worktree = result.worktree
-        import logging as _logging
-        _logger = _logging.getLogger(__name__)
-
-        try:
-            if action == "apply":
-                from agent.session.worktree_service import apply_worktree
-                apply_worktree(worktree, parent_session_id)
-                result.worktree_disposition = WorktreeDisposition.APPLIED
-                _logger.info("Worktree applied: %s → %s", child_session_id[:8], parent_session_id[:8])
-                return {"resolved": True, "action": "apply",
-                        "child_session_id": child_session_id,
-                        "status": "applied",
-                        "message": f"Worktree changes merged to parent workspace"}
-
-            elif action == "discard":
-                from agent.session.worktree_service import discard_worktree
-                discard_worktree(worktree)
-                result.worktree_disposition = WorktreeDisposition.DISCARDED
-                _logger.info("Worktree discarded: %s", child_session_id[:8])
-                return {"resolved": True, "action": "discard",
-                        "child_session_id": child_session_id,
-                        "status": "discarded",
-                        "message": "Worktree discarded"}
-
-            elif action == "retain":
-                result.worktree_disposition = WorktreeDisposition.RETAINED
-                _logger.info("Worktree retained: %s", child_session_id[:8])
-                return {"resolved": True, "action": "retain",
-                        "child_session_id": child_session_id,
-                        "status": "retained",
-                        "message": "Worktree retained for manual handling"}
-
-            else:
-                return {"resolved": False, "action": action,
-                        "child_session_id": child_session_id,
-                        "status": "error", "message": f"Unknown action: {action}"}
-
-        except Exception as e:
-            _logger.exception("Worktree %s failed for %s", action, child_session_id[:8])
-            return {"resolved": False, "action": action,
-                    "child_session_id": child_session_id,
-                    "status": "error", "message": str(e)}
+        return self._resolve_worktree_sync(
+            parent_session_id,
+            child_session_id,
+            action,
+            expected_revision=expected_revision,
+        )
 
     # ── Root session ──
 
@@ -776,6 +805,9 @@ class SessionRuntime:
         request: ExplicitDelegationRequest,
         parent_intent: TaskIntent,
         contract: "TaskContract",
+        execution_repo_path: str | None = None,
+        child_metadata: dict[str, object] | None = None,
+        child_created_callback=None,
     ) -> AgentRunResult:
         """Guarantee one named child run without asking the parent model to route it."""
         from core.policy import PhasePolicy, READ_ONLY_EFFECTS
@@ -798,6 +830,13 @@ class SessionRuntime:
             raise ExplicitDelegationError(
                 "Explicit delegation requires a primary parent session"
             )
+        if execution_repo_path is not None:
+            execution_repo_path = self._require_review_snapshot_scope(
+                parent.repo_path,
+                execution_repo_path,
+            )
+        if child_metadata is not None and not isinstance(child_metadata, dict):
+            raise TypeError("child_metadata must be a dict when provided")
         parent_definition = self._agent_registry.get(parent.agent_name)
         allowed = {
             child.name: child
@@ -845,6 +884,9 @@ class SessionRuntime:
                 allowed_effects=frozenset(allowed_effects)
             ),
             origin=DelegationOrigin.EXPLICIT,
+            execution_repo_path=execution_repo_path,
+            child_metadata=child_metadata,
+            child_created_callback=child_created_callback,
         )
 
     def finalize_parent_from_explicit_child(
@@ -880,6 +922,8 @@ class SessionRuntime:
         inject_permission_mode: str | None = None,     # Web: "acceptEdits" / "default" / etc.
         session_context_text: str = "",                 # Web: session summary for Runtime injection (NOT persisted)
         allowed_prompts: list[dict[str, str]] | None = None,  # CC: ExitPlanMode pre-approvals
+        effort_override: str = "",
+        skill_modifier: Any = None,
         run_context: Any = None,  # RunContext from POST /chat transaction
     ) -> RunResult:
         session = self._store.get_session(session_id)
@@ -987,6 +1031,16 @@ class SessionRuntime:
             _eff_contract = contract if contract is not None else _assembly.contract
             agent = _assembly.agent
             agent_cfg = _assembly.agent_cfg
+            if effort_override:
+                agent_cfg.effort = effort_override
+            if skill_modifier is not None:
+                apply_modifier = getattr(
+                    agent._full_registry,
+                    "_apply_skill_modifier",
+                    None,
+                )
+                if callable(apply_modifier):
+                    apply_modifier(skill_modifier)
 
             # ── Inject stream_callback for real-time thought streaming ──
             _stream_cb = self._stream_callbacks.pop(session_id, None)
@@ -1228,9 +1282,11 @@ class SessionRuntime:
                             session_id, SessionStatus.CANCELLED,
                             error=result.error or result.summary,
                         )
-                        self._store.set_summary(
-                            session_id, result.summary, status=SessionStatus.CANCELLED,
-                        )
+                        if result.summary:
+                            self._store.set_summary(
+                                session_id, result.summary,
+                                status=SessionStatus.CANCELLED,
+                            )
                         # ── Run lifecycle: CANCELLED ──
                         self._finalize_run(_run_ctx, result, "cancelled",
                                           error=result.error or result.summary)
@@ -1261,9 +1317,11 @@ class SessionRuntime:
                             SessionStatus.FAILED,
                             error=result.error or result.summary,
                         )
-                        self._store.set_summary(
-                            session_id, result.summary, status=SessionStatus.FAILED
-                        )
+                        if result.summary:
+                            self._store.set_summary(
+                                session_id, result.summary,
+                                status=SessionStatus.FAILED,
+                            )
                         # ── Run lifecycle: FAILED ──
                         self._finalize_run(_run_ctx, result, "failed",
                                           error=result.error or result.summary)
@@ -1272,19 +1330,11 @@ class SessionRuntime:
                     self._store.update_status(
                         session_id, SessionStatus.CANCELLED, error=detail,
                     )
-                    self._store.set_summary(
-                        session_id, f"Task cancelled: {detail}",
-                        status=SessionStatus.CANCELLED,
-                    )
                     self._finalize_run(_run_ctx, None, "cancelled", error=detail)
                 elif execution_error is not None:
                     detail = str(execution_error) or type(execution_error).__name__
                     self._store.update_status(
                         session_id, SessionStatus.FAILED, error=detail,
-                    )
-                    self._store.set_summary(
-                        session_id, "Session execution failed before producing a result",
-                        status=SessionStatus.FAILED,
                     )
                     self._finalize_run(_run_ctx, None, "failed", error=detail)
             except ValueError:
@@ -1323,6 +1373,31 @@ class SessionRuntime:
             _summary = result.summary if result is not None else ""
             _steps = result.steps_taken if result is not None else 0
             _tokens = result.total_tokens if result is not None else 0
+            _termination_reason = (
+                result.termination_reason.value
+                if result is not None and hasattr(result.termination_reason, "value")
+                else str(getattr(result, "termination_reason", "") or "none")
+            )
+            _verification_status = (
+                result.verification_status.value
+                if result is not None and hasattr(result.verification_status, "value")
+                else str(getattr(result, "verification_status", "") or "not_applicable")
+            )
+            _verification_reason = (
+                result.verification_reason.value
+                if result is not None and hasattr(result.verification_reason, "value")
+                else str(getattr(result, "verification_reason", "") or "none")
+            )
+            _checks = [
+                asdict(check) if is_dataclass(check) else dict(check)
+                for check in (getattr(result, "verification_checks", ()) or ())
+            ] if result is not None else []
+            _delta_obj = getattr(result, "workspace_delta", None)
+            _workspace_delta = (
+                asdict(_delta_obj)
+                if is_dataclass(_delta_obj)
+                else dict(_delta_obj or {})
+            )
             _session_id = getattr(run_ctx, "session_id", "")
             import uuid as _uuid_mod
             from datetime import datetime as _dt, timezone as _tz
@@ -1335,6 +1410,11 @@ class SessionRuntime:
                 steps_taken=_steps,
                 total_tokens=_tokens,
                 error=error,
+                termination_reason=_termination_reason,
+                verification_status=_verification_status,
+                verification_reason=_verification_reason,
+                verification_checks=_checks,
+                workspace_delta=_workspace_delta,
                 expect_status="running",
             )
             if not _updated:
@@ -1354,24 +1434,21 @@ class SessionRuntime:
                     "steps_taken": _steps,
                     "total_tokens": _tokens,
                     "error": error,
-                    "termination_reason": (
-                        result.termination_reason.value
-                        if result is not None
-                        and hasattr(result.termination_reason, "value")
-                        else str(getattr(result, "termination_reason", "") or "")
-                    ),
-                    "verification_status": (
-                        result.verification_status.value
-                        if result is not None
-                        and hasattr(result.verification_status, "value")
-                        else str(getattr(result, "verification_status", "") or "")
-                    ),
-                    "verification_reason": (
-                        result.verification_reason.value
-                        if result is not None
-                        and hasattr(result.verification_reason, "value")
-                        else str(getattr(result, "verification_reason", "") or "")
-                    ),
+                    "termination_reason": _termination_reason,
+                    "verification_status": _verification_status,
+                    "verification_reason": _verification_reason,
+                    "verification": {
+                        "status": _verification_status,
+                        "reason": _verification_reason,
+                        "checks": _checks,
+                    },
+                    "workspace_delta": ({
+                        key: value
+                        for key, value in _workspace_delta.items()
+                        if key != "patch"
+                    } | {
+                        "patch_available": bool(_workspace_delta.get("patch")),
+                    }) if _workspace_delta else {},
                     "timestamp": _dt.now(_tz.utc).isoformat(),
                     "event_id": str(_uuid_mod.uuid4()),
                 }
@@ -2151,6 +2228,9 @@ class SessionRuntime:
         parent_policy: "PhasePolicy",
         origin: DelegationOrigin = DelegationOrigin.TOOL,
         spawn_context: AgentSpawnContext | None = None,
+        execution_repo_path: str | None = None,
+        child_metadata: dict[str, object] | None = None,
+        child_created_callback=None,
     ) -> AgentRunResult:
         """Compatibility entrypoint for a fresh named child."""
         return self.spawn_agent(
@@ -2159,6 +2239,7 @@ class SessionRuntime:
                 definition=definition,
                 description=description,
                 prompt=prompt,
+                execution_placement=ExecutionPlacement.FOREGROUND,
             ),
             budget_tokens=budget_tokens,
             parent_max_steps=parent_max_steps,
@@ -2166,6 +2247,9 @@ class SessionRuntime:
             parent_policy=parent_policy,
             origin=origin,
             spawn_context=spawn_context,
+            execution_repo_path=execution_repo_path,
+            child_metadata=child_metadata,
+            child_created_callback=child_created_callback,
         )
 
     def _fire_hook(self, context: HookContext) -> DispatchResult:
@@ -2378,6 +2462,17 @@ class SessionRuntime:
 
     def pop_pending_effort(self, session_id: str) -> str | None:
         return getattr(self, '_pending_effort', {}).pop(session_id, None)
+
+    def set_pending_skill_modifier(self, session_id: str, modifier: Any) -> None:
+        if not hasattr(self, "_pending_skill_modifiers"):
+            self._pending_skill_modifiers: dict[str, Any] = {}
+        self._pending_skill_modifiers[session_id] = modifier
+
+    def pop_pending_skill_modifier(self, session_id: str) -> Any:
+        return getattr(self, "_pending_skill_modifiers", {}).pop(
+            session_id,
+            None,
+        )
 
     def set_pending_thinking(self, session_id: str, enabled: bool) -> None:
         if not hasattr(self, '_pending_thinking'):

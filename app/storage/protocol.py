@@ -87,6 +87,12 @@ class StorageBackend(Protocol):
         """Set session summary, status, and completed_at. Raises ValueError if not found."""
         ...
 
+    # ── Run outcomes ─────────────────────────────────────────────────────
+
+    def list_runs(self, session_id: str, *, limit: int = 20) -> list[dict]:
+        """List structured run outcomes for a session, newest first."""
+        ...
+
     def delete_session(self, session_id: str) -> bool:
         """Permanently delete a session and all its messages. Returns True if deleted."""
         ...

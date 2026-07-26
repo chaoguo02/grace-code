@@ -7,9 +7,15 @@ Verifies:
   M3: task_obs_closed mutates correctly (nonlocal semantics preserved)
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.core import ReActAgent
+from agent.task import (
+    RunStatus,
+    TerminationReason,
+    VerificationReason,
+    VerificationStatus,
+)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -87,6 +93,46 @@ class TestBuildRunResult:
             summary="ok", steps_taken=1, total_tokens_used=100, ctx=ctx,
         )
         assert ctx.task_obs_closed is True
+
+    def test_unverified_status_remains_metadata_not_answer_text(self):
+        from agent.core import _FinishRunContext, _GitState
+
+        git_state = _GitState()
+        git_state.has_changes = True
+        ctx = _FinishRunContext(
+            git_state=git_state,
+            task=MagicMock(task_id="t-unverified", repo_path="/tmp/r"),
+            completion_ctx=MagicMock(had_any_write=True),
+            tsm=MagicMock(
+                termination_reason=TerminationReason.NONE,
+                verification_status=VerificationStatus.UNAVAILABLE,
+                verification_reason=VerificationReason.NO_TEST_ENVIRONMENT,
+            ),
+            reflection_counts={},
+            get_consecutive_failures=lambda: 0,
+            log=MagicMock(),
+            task_obs=MagicMock(),
+            task_context=MagicMock(),
+        )
+        agent = ReActAgent.__new__(ReActAgent)
+        agent._accumulated_plan_contract = None
+        agent._cfg = MagicMock(stats_collector=None)
+
+        with patch("agent.core._refresh_git_state"):
+            result = agent._build_run_result(
+                status=RunStatus.SUCCESS,
+                summary="The requested change is complete.",
+                steps_taken=2,
+                total_tokens_used=100,
+                ctx=ctx,
+            )
+
+        assert result.summary == "The requested change is complete."
+        assert result.verification_status is VerificationStatus.UNAVAILABLE
+        assert result.verification_reason is VerificationReason.NO_TEST_ENVIRONMENT
+        assert result.workspace_delta is not None
+        assert result.workspace_delta.has_changes is True
+        assert result.workspace_delta.is_run_scoped is False
 
     def test_finish_run_context_holds_all_fields(self):
         """_FinishRunContext has all expected fields (10 total — reference types only)."""

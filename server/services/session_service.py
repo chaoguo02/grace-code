@@ -32,8 +32,10 @@ from app.storage.protocol import StorageBackend
 logger = logging.getLogger(__name__)
 
 _LEGACY_UNVERIFIED_PREFIX = re.compile(
-    r"^\[UNVERIFIED — [^\]]*"
-    r"Code changes were made but NOT independently verified\.\]\s*",
+    r"^\[UNVERIFIED — (?:no test environment available|"
+    r"project has no Git fact source|tests ran but failed|"
+    r"test/validation did not run or was unavailable)\. "
+    r"Code changes were made but NOT independently verified\.\]\r?\n\r?\n",
 )
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -313,6 +315,16 @@ class SessionService:
         """
         return self._storage.list_child_sessions(parent_id)
 
+    def merge_metadata(self, session_id: str, extra: dict[str, Any]) -> None:
+        """Merge session metadata without discarding unrelated runtime facts."""
+        rec = self._storage.get_session(session_id)
+        if rec is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        metadata = dict(rec.metadata or {})
+        metadata.update(extra)
+        if not self._storage.update_metadata(session_id, metadata):
+            raise ValueError(f"Unknown session: {session_id}")
+
     # ── Messages ──────────────────────────────────────────────────────────
 
     def get_messages(self, session_id: str) -> list[dict[str, Any]]:
@@ -373,7 +385,10 @@ class SessionService:
                 with store._connect() as conn:
                     rows = conn.execute(
                         """SELECT turn_id, id AS run_id, turn_index, status,
-                                  steps_taken, total_tokens, started_at, completed_at
+                                  steps_taken, total_tokens, started_at, completed_at,
+                                  error, termination_reason, verification_status,
+                                  verification_reason, verification_checks_json,
+                                  workspace_delta_json
                            FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY turn_id ORDER BY created_at DESC) AS rn
                                  FROM runs WHERE session_id = ?)
                            WHERE rn = 1""",
@@ -388,6 +403,18 @@ class SessionService:
                             "total_tokens": row["total_tokens"] or 0,
                             "started_at": row["started_at"] or "",
                             "completed_at": row["completed_at"] or "",
+                            "error": row["error"] or "",
+                            "termination_reason": row["termination_reason"] or "none",
+                            "verification": {
+                                "status": row["verification_status"] or "not_applicable",
+                                "reason": row["verification_reason"] or "none",
+                                "checks": _json.loads(
+                                    row["verification_checks_json"] or "[]"
+                                ),
+                            },
+                            "workspace_delta": _json.loads(
+                                row["workspace_delta_json"] or "{}"
+                            ),
                         }
         except Exception:
             logger.debug("Failed to query runs for turn timeline", exc_info=True)
@@ -479,6 +506,12 @@ class SessionService:
                     "status": run_meta.get("status", ""),
                     "started_at": run_meta.get("started_at", ""),
                     "completed_at": run_meta.get("completed_at", ""),
+                    "error": run_meta.get("error", ""),
+                    "termination_reason": run_meta.get("termination_reason", "none"),
+                    "verification": run_meta.get("verification", {
+                        "status": "not_applicable", "reason": "none", "checks": [],
+                    }),
+                    "workspace_delta": run_meta.get("workspace_delta", {}),
                 },
             })
 
@@ -502,6 +535,12 @@ class SessionService:
                     "status": run_meta.get("status", ""),
                     "started_at": run_meta.get("started_at", ""),
                     "completed_at": run_meta.get("completed_at", ""),
+                    "error": run_meta.get("error", ""),
+                    "termination_reason": run_meta.get("termination_reason", "none"),
+                    "verification": run_meta.get("verification", {
+                        "status": "not_applicable", "reason": "none", "checks": [],
+                    }),
+                    "workspace_delta": run_meta.get("workspace_delta", {}),
                 },
             })
 
@@ -568,6 +607,20 @@ class SessionService:
         return self._storage.list_trace_events(
             session_id, after_seq=after_seq, limit=limit,
         )
+
+    def list_runs(self, session_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Return structured run outcomes for debug, stats, and audit views."""
+        if self._storage.get_session(session_id) is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        rows = self._storage.list_runs(session_id, limit=limit)
+        for row in rows:
+            row["verification_checks"] = json.loads(
+                row.pop("verification_checks_json", "[]") or "[]"
+            )
+            row["workspace_delta"] = json.loads(
+                row.pop("workspace_delta_json", "{}") or "{}"
+            )
+        return rows
 
     def get_events(
         self, session_id: str, *, after: int = 0, limit: int = 1000,

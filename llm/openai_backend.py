@@ -120,7 +120,9 @@ class OpenAIBackend(LLMBackend):
             messages=api_messages,
         )
         if tools:
-            kwargs["tools"] = [_to_openai_tool(t) for t in tools]
+            kwargs["tools"] = [
+                _to_openai_tool(t) for t in tools if not t.deferred
+            ]
             kwargs["tool_choice"] = "auto"
 
         response = self._client.chat.completions.create(**kwargs)
@@ -178,6 +180,8 @@ class OpenAIBackend(LLMBackend):
                 "role": "system",
                 "content": augmented[0]["content"] + "\n\n" + tool_desc,
             }
+        elif tool_desc:
+            augmented.insert(0, {"role": "system", "content": tool_desc})
 
         response = self._client.chat.completions.create(
             model=self._model,
@@ -473,7 +477,15 @@ def _build_tool_description_for_text(tools: list[LLMToolSchema]) -> str:
         "Tools:",
     ]
     for t in tools:
+        if t.deferred:
+            continue
         lines.append(f"- {t.name}: {t.description}")
+        lines.append(
+            "  Input schema: "
+            + json.dumps(t.parameters, ensure_ascii=False, sort_keys=True)
+        )
+        for rule in t.prompt_contract:
+            lines.append(f"  Rule: {rule}")
     return "\n".join(lines)
 
 
@@ -591,7 +603,9 @@ def _openai_stream(
             return
 
         api_messages = _to_openai_messages(messages)
-        api_tools = [_to_openai_tool(t) for t in tools] if tools else None
+        api_tools = [
+            _to_openai_tool(t) for t in tools if not t.deferred
+        ] if tools else None
 
         kwargs = dict(
             model=self._model,
@@ -701,7 +715,9 @@ def _openai_stream(
 
 
 def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
-    api_tools = [_to_openai_tool(t) for t in tools] if tools else None
+    api_tools = [
+        _to_openai_tool(t) for t in tools if not t.deferred
+    ] if tools else None
 
     kwargs = dict(
         model=self._model,

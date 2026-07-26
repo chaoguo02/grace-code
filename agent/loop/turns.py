@@ -35,7 +35,13 @@ from core.base import (
     ToolRole,
 )
 from core.streaming_executor import StreamingToolExecutor, partition_tool_calls
-from llm.base import CacheStats, LLMMessage, LLMResponse, LLMToolSchema
+from llm.base import (
+    CacheStats,
+    LLMMessage,
+    LLMResponse,
+    LLMToolSchema,
+    MessageKind,
+)
 from llm.tool_call_validator import validate_tool_calls
 
 if TYPE_CHECKING:
@@ -44,6 +50,12 @@ if TYPE_CHECKING:
     from agent.session.run_context import RunContext
 
 logger = logging.getLogger(__name__)
+
+_CHILD_PHASE_TOOL_NOTICE = (
+    "Delegated child results are currently being synthesized. The Agent tool is "
+    "intentionally unavailable for this provider turn. Resolve the available "
+    "child results before attempting to spawn another agent."
+)
 
 
 class PreStepOutcome(str, Enum):
@@ -179,8 +191,16 @@ def prepare_provider_request(
 ) -> ProviderRequest:
     """Freeze visible tools, delegation snapshot, authority, and turn state."""
     tools = [] if strip_tools else list(registry.get_schemas())
+    provider_messages = list(messages)
     if child_phase_active:
         tools = [tool for tool in tools if tool.name != "Agent"]
+        provider_messages.append(
+            LLMMessage(
+                role="system",
+                content=_CHILD_PHASE_TOOL_NOTICE,
+                kind=MessageKind.RUNTIME_NOTICE,
+            )
+        )
 
     next_state = state.with_updates(
         turn_count=step,
@@ -223,7 +243,7 @@ def prepare_provider_request(
 
     return ProviderRequest(
         turn=prepare_turn(
-            messages,
+            provider_messages,
             tools,
             registry,
             execution_context,

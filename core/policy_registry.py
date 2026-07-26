@@ -101,6 +101,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
         repo_path: str,
         phase_name: str,
         base_allowed_tools: set[str] | frozenset[str] | None = None,
+        modifier_owner: "PolicyAwareToolRegistry | None" = None,
     ) -> None:
         super().__init__(hook_dispatcher=base.hook_dispatcher)
         self._base = base
@@ -108,6 +109,8 @@ class PolicyAwareToolRegistry(ToolRegistry):
         self._repo_path = repo_path
         self._phase_name = phase_name
         self._base_allowed_tools = frozenset(base_allowed_tools) if base_allowed_tools is not None else None
+        self._modifier_owner = modifier_owner
+        self._skill_runtime_overrides: dict[str, str] = {}
         self._artifact_store_ref = getattr(base, "_artifact_store_ref", None)
         self._evidence_ledger_ref = getattr(base, "_evidence_ledger_ref", None)
         for name, tool in base._tools.items():
@@ -153,6 +156,22 @@ class PolicyAwareToolRegistry(ToolRegistry):
             repo_path=self._repo_path,
             phase_name=self._phase_name,
             base_allowed_tools=allowed_tools,
+            modifier_owner=self._modifier_owner or self,
+        )
+
+    def with_pre_approved_tools(
+        self, tools: set[str] | frozenset[str],
+    ) -> "PolicyAwareToolRegistry":
+        """Return a registry with additional approval-free tools."""
+        return PolicyAwareToolRegistry(
+            base=self._base,
+            phase_policy=self._phase_policy.with_pre_approved_tools(
+                frozenset(tools),
+            ),
+            repo_path=self._repo_path,
+            phase_name=self._phase_name,
+            base_allowed_tools=self._base_allowed_tools,
+            modifier_owner=self._modifier_owner or self,
         )
 
     # ── SK-05 / SK-06: Skill tool restrictions ──────────────────────
@@ -181,6 +200,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
             repo_path=self._repo_path,
             phase_name=self._phase_name,
             base_allowed_tools=self._base_allowed_tools,
+            modifier_owner=self._modifier_owner or self,
         )
 
     def with_phase_policy(self, phase_policy: PhasePolicy) -> "PolicyAwareToolRegistry":
@@ -201,6 +221,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
             repo_path=self._repo_path,
             phase_name=self._phase_name,
             base_allowed_tools=self._base_allowed_tools,
+            modifier_owner=self._modifier_owner or self,
         )
 
     def scoped(self, context: ExecutionContext) -> "PolicyAwareToolRegistry":
@@ -211,6 +232,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
             repo_path=context.repo_path or context.workspace_root,
             phase_name=self._phase_name,
             base_allowed_tools=self._base_allowed_tools,
+            modifier_owner=self._modifier_owner or self,
         )
 
     def _is_tool_enabled(self, name: str) -> bool:
@@ -263,9 +285,10 @@ class PolicyAwareToolRegistry(ToolRegistry):
 
     def get_schemas(self):
         schemas = [
-            tool.to_llm_schema()
+            schema
             for name, tool in self._tools.items()
             if self._is_tool_visible(name) and self._is_tool_enabled(name)
+            if not (schema := tool.to_llm_schema()).deferred
         ]
         schemas.sort(key=lambda s: s.name)
         return schemas
@@ -292,29 +315,38 @@ class PolicyAwareToolRegistry(ToolRegistry):
         return result
 
     def _apply_skill_modifier(self, modifier) -> None:
-        """Apply skill contextModifier: update PhasePolicy for SK-05/SK-06."""
+        """Persist a skill modifier on this run's registry and bound clones."""
         from skills.tool import SkillContextModifier
         if not isinstance(modifier, SkillContextModifier):
             return
-        if modifier.allowed_tools or modifier.disallowed_tools:
-            fake_skill = type("_Skill", (), {
-                "allowed_tools": modifier.allowed_tools,
-                "disallowed_tools": modifier.disallowed_tools,
-            })()
-            new_policy = self._phase_policy
+
+        owner = self._modifier_owner or self
+        targets = (self,) if owner is self else (self, owner)
+        for target in targets:
+            new_policy = target._phase_policy
             if modifier.allowed_tools:
                 new_policy = new_policy.with_pre_approved_tools(modifier.allowed_tools)
             if modifier.disallowed_tools:
                 new_policy = new_policy.with_denied_tools(modifier.disallowed_tools)
-            # Rebuild registry with new policy
-            rebuilt = PolicyAwareToolRegistry(
-                base=self._base,
-                phase_policy=new_policy,
-                repo_path=self._repo_path,
-                phase_name=self._phase_name,
-                base_allowed_tools=self._base_allowed_tools,
-            )
-            self._phase_policy = rebuilt._phase_policy
+            target._phase_policy = new_policy
+            target._skill_runtime_overrides = {
+                **target._skill_runtime_overrides,
+                **{
+                    key: value
+                    for key, value in {
+                        "model": modifier.model,
+                        "effort": modifier.effort,
+                        "context": modifier.context,
+                    }.items()
+                    if value
+                },
+            }
+
+    @property
+    def skill_runtime_overrides(self) -> dict[str, str]:
+        """Active non-policy Skill overrides for the current run."""
+        owner = self._modifier_owner or self
+        return dict(owner._skill_runtime_overrides)
 
     def _check_tool_call(self, name: str, params: dict[str, Any]) -> str | None:
         # ── Scoped rules (Claude Code pattern: Deny→Allow order) ──

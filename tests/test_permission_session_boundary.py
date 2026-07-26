@@ -19,6 +19,7 @@ from hitl.pipeline import (
 )
 from hooks.events import HookEvent
 from hooks.protocol import DispatchResult
+from skills.tool import SkillContextModifier
 
 
 class _WriteTool(BaseTool):
@@ -74,6 +75,37 @@ def test_permission_mode_is_authorized_once_at_permission_boundary():
     assert [schema.name for schema in schemas] == ["Write"]
     assert not result.success
     assert "plan mode" in (result.error or "")
+
+
+def test_skill_modifier_from_bound_registry_persists_on_run_owner():
+    base = ToolRegistry().register(_WriteTool())
+    owner = PolicyAwareToolRegistry(
+        base=base,
+        phase_policy=PhasePolicy(),
+        repo_path=".",
+        phase_name="execution",
+    )
+    bound = PolicyAwareToolRegistry(
+        base=base,
+        phase_policy=owner.phase_policy,
+        repo_path=".",
+        phase_name="execution",
+        modifier_owner=owner,
+    )
+
+    bound._apply_skill_modifier(SkillContextModifier(
+        disallowed_tools=frozenset({"Write"}),
+        model="special-model",
+        effort="high",
+        context="fork",
+    ))
+
+    assert owner.get_schemas() == []
+    assert owner.skill_runtime_overrides == {
+        "model": "special-model",
+        "effort": "high",
+        "context": "fork",
+    }
 
 
 def test_permission_request_event_fires_before_interactive_approval():

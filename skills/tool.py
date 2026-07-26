@@ -115,6 +115,26 @@ class SkillTool(BaseTool):
                 error="'skill_name' is required",
             )
 
+        meta = self._skill_registry.get_skill_meta(skill_name)
+        if meta is not None and not meta.model_invocable:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Skill '{skill_name}' cannot be invoked by the model; "
+                    "the user must invoke it directly."
+                ),
+            )
+        if meta is not None and meta.context == "fork":
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Skill '{skill_name}' requires fork context; inline Skill "
+                    "execution cannot safely emulate an isolated subagent."
+                ),
+            )
+
         rendered = self._skill_registry.load_and_render(
             skill_name,
             arguments,
@@ -133,7 +153,6 @@ class SkillTool(BaseTool):
             rendered = self._buffer.activate(skill_name, rendered)
 
         # Build CC-aligned SkillContextModifier (consumed by PolicyAwareToolRegistry)
-        meta = self._skill_registry.get_skill_meta(skill_name)
         modifier = SkillContextModifier()
         if meta is not None:
             modifier = SkillContextModifier(

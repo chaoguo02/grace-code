@@ -214,8 +214,13 @@ class TaskCompletionGuard:
             if ctx.had_any_write and git_state.has_changes and ctx.files_written:
                 _changed = git_state.files_changed
                 if _changed:
+                    _run_changed = getattr(git_state, "_run_changed_files", None)
                     _baseline_dirty = getattr(git_state, '_baseline_dirty_files', set())
-                    _incremental = _changed - _baseline_dirty
+                    _incremental = (
+                        set(_run_changed)
+                        if _run_changed is not None
+                        else _changed - _baseline_dirty
+                    )
                     # If nothing changed incrementally, the agent's writes had no
                     # net effect on the working tree — block.
                     if not _incremental:

@@ -63,20 +63,23 @@ class AnthropicBackend(LLMBackend):
         tools: list[LLMToolSchema],
     ) -> LLMResponse:
         # 提取 system prompt（Anthropic 单独传）
-        system_content: str | list = ""
+        system_parts: list[str | list] = []
         non_system: list[LLMMessage] = []
         for msg in messages:
             if msg.role == "system":
                 # 支持字符串或结构体（含 cache_control 的列表）
-                system_content = msg.content
+                system_parts.append(msg.content)
             else:
                 non_system.append(msg)
+        system_content = _merge_anthropic_system(system_parts)
 
         # 转换 messages 格式
         api_messages = _to_anthropic_messages(non_system)
 
         # 转换 tools 格式
-        api_tools = [_to_anthropic_tool(t) for t in tools]
+        api_tools = [
+            _to_anthropic_tool(t) for t in tools if not t.deferred
+        ]
 
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -162,6 +165,24 @@ def _to_anthropic_messages(messages: list[LLMMessage]) -> list[dict]:
             safe_role = "user" if msg.role == "tool" else msg.role
             result.append({"role": safe_role, "content": msg.content})
     return result
+
+
+def _merge_anthropic_system(parts: list[str | list]) -> str | list:
+    """Merge every system message without losing structured cache blocks."""
+    if not parts:
+        return ""
+    if all(isinstance(part, str) for part in parts):
+        return "\n\n".join(part for part in parts if part)
+
+    blocks: list[dict[str, Any]] = []
+    for part in parts:
+        if isinstance(part, list):
+            blocks.extend(
+                block for block in part if isinstance(block, dict)
+            )
+        elif part:
+            blocks.append({"type": "text", "text": str(part)})
+    return blocks
 
 
 def _to_anthropic_tool(schema: LLMToolSchema) -> dict:
@@ -273,16 +294,19 @@ def _anthropic_stream(
     边收 text_delta 边调用 on_text 回调实时打印。
     """
     # 提取 system prompt
-    system_content: str | list = ""
+    system_parts: list[str | list] = []
     non_system = []
     for msg in messages:
         if msg.role == "system":
-            system_content = msg.content
+            system_parts.append(msg.content)
         else:
             non_system.append(msg)
+    system_content = _merge_anthropic_system(system_parts)
 
     api_messages = _to_anthropic_messages(non_system)
-    api_tools = [_to_anthropic_tool(t) for t in tools]
+    api_tools = [
+        _to_anthropic_tool(t) for t in tools if not t.deferred
+    ]
 
     kwargs: dict = {
         "model": self._model,

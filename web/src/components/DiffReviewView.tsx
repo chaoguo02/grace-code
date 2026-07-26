@@ -1,9 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
 import { getSessionDiffs, getPendingDiffs, updateDiffStatus } from "../api/diffs";
 import { getSessionStats, getSessionSteps } from "../api/stats";
+import {
+  cancelReview,
+  getLatestReview,
+  getReview,
+  releaseReviewSnapshot,
+  retryReview,
+  retryReviewTask,
+  startMultiAgentReview,
+} from "../api/reviews";
 import { DiffBlock } from "./DiffBlock";
 import { useSessionStore } from "../stores/sessionStore";
+import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import type { SessionDiff, SessionStats, StepLog } from "../types/stats";
+import type { ReviewJob, ReviewTaskAttempt } from "../api/reviews";
 
 function EmptyState({ title, body }: { title: string; body: string }) {
   return (
@@ -40,6 +51,26 @@ function statusTone(status?: string | null) {
   return "neutral";
 }
 
+function attemptMetrics(attempt: ReviewTaskAttempt) {
+  const metrics: string[] = [];
+  const startedAt = Date.parse(attempt.started_at);
+  const completedAt = attempt.completed_at
+    ? Date.parse(attempt.completed_at)
+    : Number.NaN;
+  if (
+    Number.isFinite(startedAt)
+    && Number.isFinite(completedAt)
+    && completedAt >= startedAt
+  ) {
+    metrics.push(`${Math.max(1, Math.round((completedAt - startedAt) / 1000))}s`);
+  }
+  const tokens = attempt.result.tokens_used;
+  if (typeof tokens === "number" && Number.isFinite(tokens)) {
+    metrics.push(`${tokens.toLocaleString()} tokens`);
+  }
+  return metrics.join(" · ");
+}
+
 function collectVerificationSignals(steps: StepLog[]) {
   const signals = steps.filter((step) => {
     const tool = (step.tool_name || "").toLowerCase();
@@ -59,6 +90,15 @@ function collectVerificationSignals(steps: StepLog[]) {
 export function DiffReviewView() {
   const activeId = useSessionStore((s) => s.activeId);
   const activeDetail = useSessionStore((s) => s.activeDetail);
+  const reviewEventKey = useChatStore((state) => {
+    if (!activeId) return "";
+    const event = selectSessionUi(state, activeId).events.find(
+      (candidate) => candidate.type === "review_updated",
+    );
+    return event?.type === "review_updated"
+      ? `${event.job_id}:${event.status}`
+      : "";
+  });
 
   const [globalDiffs, setGlobalDiffs] = useState<SessionDiff[]>([]);
   const [sessionDiffs, setSessionDiffs] = useState<SessionDiff[]>([]);
@@ -70,26 +110,121 @@ export function DiffReviewView() {
   const [comments, setComments] = useState<Record<number, string>>({});
   const [expandedDiffs, setExpandedDiffs] = useState<Set<number>>(new Set());
   const [errors, setErrors] = useState<Record<number, string>>({});
+  const [reviewJob, setReviewJob] = useState<ReviewJob | null>(null);
+  const [reviewFocus, setReviewFocus] = useState("");
+  const [reviewStarting, setReviewStarting] = useState(false);
+  const [reviewTaskRetrying, setReviewTaskRetrying] = useState("");
+  const [reviewError, setReviewError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
+    setReviewJob(null);
+    setReviewError("");
     Promise.all([
       getPendingDiffs().catch(() => []),
       activeId ? getSessionDiffs(activeId).catch(() => []) : Promise.resolve([]),
       activeId ? getSessionStats(activeId).catch(() => null) : Promise.resolve(null),
       activeId ? getSessionSteps(activeId).catch(() => []) : Promise.resolve([]),
-    ]).then(([pendingData, sessionDiffData, statsData, stepsData]) => {
+      activeId ? getLatestReview(activeId).catch(() => null) : Promise.resolve(null),
+    ]).then(([pendingData, sessionDiffData, statsData, stepsData, latestReview]) => {
       if (cancelled) return;
       setGlobalDiffs(pendingData as SessionDiff[]);
       setSessionDiffs(sessionDiffData as SessionDiff[]);
       setStats(statsData as SessionStats | null);
       setSteps(stepsData as StepLog[]);
+      setReviewJob(latestReview as ReviewJob | null);
     }).finally(() => {
       if (!cancelled) setLoading(false);
     });
     return () => { cancelled = true; };
   }, [activeId]);
+
+  useEffect(() => {
+    if (
+      !activeId
+      || !reviewJob
+      || reviewJob.session_id !== activeId
+      || !["queued", "running", "aggregating", "cancelling"].includes(reviewJob.status)
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      getReview(reviewJob.id)
+        .then(setReviewJob)
+        .catch((error) => {
+          setReviewError(
+            error instanceof Error ? error.message : "Review status refresh failed",
+          );
+        });
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [activeId, reviewJob?.id, reviewJob?.session_id, reviewJob?.status]);
+
+  useEffect(() => {
+    const jobId = reviewEventKey.split(":", 1)[0];
+    if (!jobId || !activeId) return;
+    getReview(jobId)
+      .then((job) => {
+        if (job.session_id === activeId) setReviewJob(job);
+      })
+      .catch(() => {});
+  }, [activeId, reviewEventKey]);
+
+  const handleStartReview = async () => {
+    if (!activeId || reviewStarting) return;
+    setReviewStarting(true);
+    setReviewError("");
+    try {
+      setReviewJob(
+        await startMultiAgentReview(activeId, reviewFocus.trim(), 3),
+      );
+    } catch (error) {
+      setReviewError(
+        error instanceof Error ? error.message : "Unable to start review",
+      );
+    } finally {
+      setReviewStarting(false);
+    }
+  };
+
+  const handleReviewLifecycle = async (
+    action: "cancel" | "retry" | "release",
+  ) => {
+    if (!reviewJob || reviewStarting) return;
+    setReviewStarting(true);
+    setReviewError("");
+    try {
+      setReviewJob(
+        action === "cancel"
+          ? await cancelReview(reviewJob.id)
+          : action === "retry"
+            ? await retryReview(reviewJob.id)
+            : await releaseReviewSnapshot(reviewJob.id),
+      );
+    } catch (error) {
+      setReviewError(
+        error instanceof Error ? error.message : `Unable to ${action} review`,
+      );
+    } finally {
+      setReviewStarting(false);
+    }
+  };
+
+  const handleTaskRetry = async (taskId: string) => {
+    if (!reviewJob || reviewStarting || reviewTaskRetrying) return;
+    setReviewTaskRetrying(taskId);
+    setReviewError("");
+    try {
+      setReviewJob(await retryReviewTask(reviewJob.id, taskId));
+    } catch (error) {
+      setReviewError(
+        error instanceof Error ? error.message : "Unable to retry reviewer",
+      );
+    } finally {
+      setReviewTaskRetrying("");
+    }
+  };
 
   const pendingQueue = useMemo(
     () => globalDiffs
@@ -169,6 +304,220 @@ export function DiffReviewView() {
               <div className="meta-pill-value">{pendingQueue.length}</div>
             </div>
           </div>
+        </div>
+
+        <div className="stats-card stats-card-wide multi-review-panel">
+          <div className="stats-card-header multi-review-header">
+            <div>
+              <div className="summary-label">Multi-agent review</div>
+              <h3 className="stats-card-title">
+                Independent review lenses, one verified result
+              </h3>
+            </div>
+            <div className="multi-review-actions">
+              <input
+                className="review-comment-input multi-review-focus"
+                value={reviewFocus}
+                onChange={(event) => setReviewFocus(event.target.value)}
+                placeholder="Optional review focus"
+                disabled={!activeId || reviewStarting}
+              />
+              <button
+                className="btn-approve"
+                type="button"
+                disabled={
+                  !activeId
+                  || reviewStarting
+                  || Boolean(
+                    reviewJob
+                    && ["queued", "running", "aggregating", "cancelling"].includes(reviewJob.status),
+                  )
+                }
+                onClick={handleStartReview}
+              >
+                {reviewStarting ? "Starting..." : "Run review"}
+              </button>
+              {reviewJob && ["queued", "running", "aggregating", "cancelling"].includes(reviewJob.status) && (
+                <button
+                  className="btn-reject multi-review-lifecycle"
+                  type="button"
+                  disabled={reviewStarting || reviewJob.status === "cancelling"}
+                  onClick={() => handleReviewLifecycle("cancel")}
+                >
+                  {reviewJob.status === "cancelling" ? "Cancelling..." : "Cancel"}
+                </button>
+              )}
+              {reviewJob && ["completed", "partial", "stale", "failed", "cancelled"].includes(reviewJob.status) && (
+                <>
+                  <button
+                    className="multi-review-lifecycle multi-review-retry"
+                    type="button"
+                    disabled={reviewStarting}
+                    onClick={() => handleReviewLifecycle("retry")}
+                  >
+                    Retry current code
+                  </button>
+                  {reviewJob.snapshot_available && (
+                    <button
+                      className="multi-review-lifecycle multi-review-release"
+                      type="button"
+                      disabled={reviewStarting}
+                      onClick={() => handleReviewLifecycle("release")}
+                    >
+                      Release snapshot
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+
+          {reviewError && <div className="multi-review-error">{reviewError}</div>}
+          {!reviewJob ? (
+            <EmptyState
+              title="No multi-agent review yet"
+              body="Run three read-only reviewers against one immutable workspace snapshot."
+            />
+          ) : (
+            <>
+              <div className="multi-review-meta">
+                <span className={`trace-pill multi-review-status ${reviewJob.status}`}>
+                  {reviewJob.status}
+                </span>
+                <span>Revision {reviewJob.workspace_revision.slice(0, 10)}</span>
+                <span>
+                  {reviewJob.snapshot_available
+                    ? "Frozen snapshot retained"
+                    : "Snapshot released"}
+                </span>
+                <span>{reviewJob.changed_files.length} files</span>
+                <span>{reviewJob.result.total_tokens?.toLocaleString() || 0} tokens</span>
+              </div>
+
+              <div className="multi-review-tasks">
+                {reviewJob.tasks.map((task) => (
+                  <div key={task.id} className="multi-review-task">
+                    <span className={`summary-status-dot ${statusTone(task.status)}`} />
+                    <div>
+                      <strong>{task.title}</strong>
+                      <span>{task.status}</span>
+                      {task.error && <small>{task.error}</small>}
+                      {task.attempts.length > 0 && (
+                        <details className="review-attempts">
+                          <summary>
+                            {task.attempts.length} attempt
+                            {task.attempts.length === 1 ? "" : "s"}
+                          </summary>
+                          <ol>
+                            {[...task.attempts].reverse().map((attempt) => (
+                              <li key={attempt.id}>
+                                <span>
+                                  #{attempt.attempt_number} · {attempt.status}
+                                </span>
+                                {attemptMetrics(attempt) && (
+                                  <small>{attemptMetrics(attempt)}</small>
+                                )}
+                                {attempt.error && <small>{attempt.error}</small>}
+                                {attempt.child_session_id && (
+                                  <button
+                                    type="button"
+                                    onClick={() => useSessionStore.getState().openSession(
+                                      attempt.child_session_id,
+                                    )}
+                                  >
+                                    View run
+                                  </button>
+                                )}
+                              </li>
+                            ))}
+                          </ol>
+                        </details>
+                      )}
+                    </div>
+                    {task.child_session_id && (
+                      <button
+                        type="button"
+                        className="review-session-link"
+                        onClick={() => useSessionStore.getState().openSession(task.child_session_id)}
+                      >
+                        View agent
+                      </button>
+                    )}
+                    {["completed", "partial", "stale", "failed", "cancelled"].includes(reviewJob.status)
+                      && ["partial", "failed", "cancelled"].includes(task.status)
+                      && reviewJob.snapshot_available && (
+                        <button
+                          type="button"
+                          className="review-task-retry"
+                          disabled={Boolean(reviewTaskRetrying) || reviewStarting}
+                          onClick={() => handleTaskRetry(task.id)}
+                        >
+                          {reviewTaskRetrying === task.id ? "Retrying..." : "Retry reviewer"}
+                        </button>
+                      )}
+                  </div>
+                ))}
+              </div>
+
+              {reviewJob.status === "stale" && (
+                <div className="multi-review-stale">
+                  The workspace changed during review. These findings are not
+                  authoritative for the current code; run the review again.
+                </div>
+              )}
+              {reviewJob.error && (
+                <div className="multi-review-error">{reviewJob.error}</div>
+              )}
+              {(reviewJob.result.invalid_finding_count || 0) > 0 && (
+                <div className="multi-review-invalid">
+                  {reviewJob.result.invalid_finding_count} reviewer finding
+                  {reviewJob.result.invalid_finding_count === 1 ? " was" : "s were"} excluded:
+                  its file, line, snippet, or verification evidence did not match
+                  the frozen snapshot.
+                </div>
+              )}
+
+              {(reviewJob.result.findings || []).length > 0 ? (
+                <div className="multi-review-findings">
+                  {(reviewJob.result.findings || []).map((finding, index) => (
+                    <article
+                      key={`${finding.file_path || "general"}-${finding.line_start || 0}-${index}`}
+                      className={`multi-review-finding severity-${finding.severity.toLowerCase()}`}
+                    >
+                      <div className="multi-review-finding-header">
+                        <span>{finding.severity}</span>
+                        <strong>{finding.title}</strong>
+                        {(finding.corroboration_count || 0) > 1 && (
+                          <span className="trace-pill">
+                            {finding.corroboration_count} reviewers
+                          </span>
+                        )}
+                        {finding.evidence_status && (
+                          <span className={`multi-review-evidence ${finding.evidence_status}`}>
+                            {finding.evidence_status === "verified"
+                              ? "Evidence verified"
+                              : "Hypothesis"}
+                          </span>
+                        )}
+                      </div>
+                      <div className="multi-review-location">
+                        {finding.file_path || "General"}
+                        {finding.line_start ? `:${finding.line_start}` : ""}
+                      </div>
+                      <p>{finding.description}</p>
+                      {finding.verification && (
+                        <small>Verified: {finding.verification}</small>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              ) : ["completed", "partial"].includes(reviewJob.status) ? (
+                <div className="multi-review-clean">
+                  No evidence-backed findings were reported for this snapshot.
+                </div>
+              ) : null}
+            </>
+          )}
         </div>
 
         <div className="stats-grid">

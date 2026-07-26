@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agent.task import ToolCall
@@ -82,43 +82,15 @@ def validate_tool_calls(
                 )
 
     # ── Check 2b: Parameter type validation (P2-40) ──
-        schema_props: dict[str, dict] = (
-            schema.parameters.get("properties", {})
-            if hasattr(schema, "parameters") else {}
-        )
-        for key, value in params.items():
-            prop = schema_props.get(key, {})
-            expected_type = prop.get("type", "")
-            if expected_type == "string" and not isinstance(value, str):
-                return ValidationResult(
-                    valid=False,
-                    error_type="invalid_params",
-                    error_message=(
-                        f"Tool '{name}' parameter '{key}' must be a string, "
-                        f"got {type(value).__name__}."
-                    ),
-                    offending_tool=name,
-                )
-            elif expected_type == "integer" and not isinstance(value, int):
-                return ValidationResult(
-                    valid=False,
-                    error_type="invalid_params",
-                    error_message=(
-                        f"Tool '{name}' parameter '{key}' must be an integer, "
-                        f"got {type(value).__name__}."
-                    ),
-                    offending_tool=name,
-                )
-            elif expected_type == "number" and not isinstance(value, (int, float)):
-                return ValidationResult(
-                    valid=False,
-                    error_type="invalid_params",
-                    error_message=(
-                        f"Tool '{name}' parameter '{key}' must be a number, "
-                        f"got {type(value).__name__}."
-                    ),
-                    offending_tool=name,
-                )
+        if not isinstance(params, dict):
+            return _invalid_params(
+                name,
+                "parameters must be an object",
+            )
+        root_schema = schema.parameters if hasattr(schema, "parameters") else {}
+        error = _validate_json_value(params, root_schema, path="params")
+        if error:
+            return _invalid_params(name, error)
 
     # ── Check 3: Duplicate detection ──
     if len(tool_calls) > 1:
@@ -143,3 +115,75 @@ def validate_tool_calls(
             seen.add(key)
 
     return ValidationResult(valid=True)
+
+
+def _invalid_params(tool_name: str, detail: str) -> ValidationResult:
+    return ValidationResult(
+        valid=False,
+        error_type="invalid_params",
+        error_message=f"Tool '{tool_name}' has invalid parameters: {detail}.",
+        offending_tool=tool_name,
+    )
+
+
+def _validate_json_value(value: Any, schema: dict, *, path: str) -> str:
+    """Validate the JSON-Schema subset used by tool contracts."""
+    if not isinstance(schema, dict):
+        return ""
+
+    expected = schema.get("type")
+    if isinstance(expected, list):
+        errors = [
+            _validate_json_value(value, {**schema, "type": item}, path=path)
+            for item in expected
+        ]
+        if all(errors):
+            return f"{path} must match one of {expected}"
+        return ""
+
+    type_checks = {
+        "string": lambda item: isinstance(item, str),
+        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+        "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+        "boolean": lambda item: isinstance(item, bool),
+        "object": lambda item: isinstance(item, dict),
+        "array": lambda item: isinstance(item, list),
+        "null": lambda item: item is None,
+    }
+    if expected in type_checks and not type_checks[expected](value):
+        return f"{path} must be {expected}, got {type(value).__name__}"
+
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{path} must be one of {schema['enum']}"
+
+    if expected == "object" and isinstance(value, dict):
+        properties = schema.get("properties", {})
+        for required in schema.get("required", []):
+            if required not in value:
+                return f"{path}.{required} is required"
+        if schema.get("additionalProperties") is False:
+            unknown = sorted(set(value) - set(properties))
+            if unknown:
+                return f"{path} contains unknown field '{unknown[0]}'"
+        for key, item in value.items():
+            if key in properties:
+                error = _validate_json_value(
+                    item,
+                    properties[key],
+                    path=f"{path}.{key}",
+                )
+                if error:
+                    return error
+
+    if expected == "array" and isinstance(value, list):
+        item_schema = schema.get("items", {})
+        for index, item in enumerate(value):
+            error = _validate_json_value(
+                item,
+                item_schema,
+                path=f"{path}[{index}]",
+            )
+            if error:
+                return error
+
+    return ""

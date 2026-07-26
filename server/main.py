@@ -183,6 +183,7 @@ def create_app(service: AgentService) -> FastAPI:
     from server.routers.diffs import create_diffs_router
     from server.routers.memory import create_memory_router
     from server.routers.plans import create_plans_router
+    from server.routers.reviews import create_reviews_router
 
     app.include_router(create_sessions_router(get_service))
     app.include_router(create_approvals_router(get_service))
@@ -193,6 +194,7 @@ def create_app(service: AgentService) -> FastAPI:
     app.include_router(create_diffs_router(get_service))
     app.include_router(create_memory_router(get_service))
     app.include_router(create_plans_router(get_service))
+    app.include_router(create_reviews_router(get_service))
 
     # ── GET /api/skills ──────────────────────────────────────────────────
 
@@ -204,12 +206,12 @@ def create_app(service: AgentService) -> FastAPI:
             return []
         return [
             {
-                "name": m.name,
+                "name": name,
                 "display_name": m.display_name,
                 "description": m.description[:200],
                 "user_invocable": m.user_can_invoke,
             }
-            for m in skill_registry.list_skills()
+            for name, m in skill_registry.list_skill_entries()
         ]
 
     # ── Static / built frontend ─────────────────────────────────────────

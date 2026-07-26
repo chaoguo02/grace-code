@@ -302,6 +302,10 @@ class SkillRegistry:
         """返回所有已发现的 skill metadata（含嵌套 skills）。"""
         return list(self._metadata.values()) + list(self._nested_metadata.values())
 
+    def list_skill_entries(self) -> list[tuple[str, SkillMetadata]]:
+        """Return canonical invocation names paired with metadata."""
+        return list(self._metadata.items()) + list(self._nested_metadata.items())
+
     def has_skill(self, name: str) -> bool:
         """检查是否存在指定名称的 skill（含嵌套 skills）。"""
         return name in self._metadata or name in self._nested_metadata
@@ -579,12 +583,20 @@ class SkillRegistry:
             llm_invocable_only: if True (default), exclude skills that set
                                disable-model-invocation: true.
         """
-        if not self._metadata:
+        entries = self.list_skill_entries()
+        if not entries:
             return ""
 
-        all_meta = list(self._metadata.values()) + list(self._nested_metadata.values())
-        user_skills = [m for m in all_meta if m.user_can_invoke]
-        model_skills = [m for m in all_meta if m.model_invocable]
+        user_skills = [
+            (name, meta)
+            for name, meta in entries
+            if meta.user_can_invoke
+        ]
+        model_skills = [
+            (name, meta)
+            for name, meta in entries
+            if meta.model_invocable
+        ]
 
         lines = [
             "## Available Skills",
@@ -592,19 +604,21 @@ class SkillRegistry:
 
         # Skills the user can invoke via /name
         if user_skills:
-            names = ", ".join(f"/{m.name}" for m in user_skills)
+            names = ", ".join(f"/{name}" for name, _ in user_skills)
             lines.append(f"User-invocable: {names}")
 
         # Skills the LLM can auto-load (respects disable_model_invocation)
-        visible = model_skills if llm_invocable_only else list(self._metadata.values())
+        visible = model_skills if llm_invocable_only else entries
 
         if visible:
             lines.append("Use the `Skill` tool to load a skill (PREFERRED — saves context by injecting instructions without duplicating):")
-            for meta in visible:
+            for name, meta in visible:
                 desc = meta.description or "(no description)"
                 if meta.when_to_use:
                     desc += f" (Use when: {meta.when_to_use})"
-                lines.append(f"- **{meta.name}**: {desc}")
+                if meta.paths:
+                    desc += f" (Path scope: {', '.join(meta.paths)})"
+                lines.append(f"- **{name}**: {desc}")
 
         return "\n".join(lines)
 

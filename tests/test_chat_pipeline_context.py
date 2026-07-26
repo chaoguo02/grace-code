@@ -9,6 +9,7 @@ from server.services.chat_pipeline import (
     ChatPipeline,
     ChatPipelinePorts,
     ChatRequest,
+    PreparedChatRun,
 )
 from server.services.session_service import SessionService
 from hooks.events import HookEvent
@@ -186,3 +187,37 @@ def test_background_pipeline_dispatches_prompt_hook_before_mentions(
         HookEvent.USER_PROMPT_SUBMIT.value,
         "resolve_mentions",
     ]
+
+
+def test_skill_execution_persists_command_but_runs_rendered_instructions():
+    calls = []
+
+    class _Runtime:
+        hook_dispatcher = None
+
+        def pop_pending_effort(self, _session_id):
+            return None
+
+        def pop_pending_thinking(self, _session_id):
+            return None
+
+        def run_session(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace()
+
+    pipeline = ChatPipeline(_pipeline_ports(runtime=_Runtime()))
+    request = ChatRequest(
+        session_id="s",
+        prompt="[USER-INVOKED SKILL: review]\n\nInspect the diff.",
+        display_prompt="/review auth",
+    )
+
+    pipeline.execute(PreparedChatRun(
+        request=request,
+        resolved_prompt=request.prompt,
+    ))
+
+    assert calls[0]["task_description"] == request.prompt
+    assert len(calls[0]["messages"]) == 1
+    assert calls[0]["messages"][0].role == "user"
+    assert calls[0]["messages"][0].content == "/review auth"

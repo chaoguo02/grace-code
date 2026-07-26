@@ -7,7 +7,7 @@ import type {
   WsAssistantTextStartEvent, WsAssistantTextDeltaEvent, WsAssistantTextEndEvent,
   WsAssistantTextAbortedEvent,
 } from "../types/events";
-import type { ContentBlock, StreamingTurn } from "../types/blocks";
+import type { ContentBlock, RunOutcome, StreamingTurn } from "../types/blocks";
 import {
   blockId,
   createStreamingTurn,
@@ -28,6 +28,7 @@ export interface PlanApproval {
   contract?: Record<string, unknown> | null;
   revision?: number;
   maxRevisions?: number;
+  lifecycle?: "waiting" | "saved";
 }
 
 export interface ToolApproval {
@@ -102,7 +103,12 @@ interface ChatState {
   clear: (sessionId?: string | null) => void;
   forgetSession: (sessionId: string) => void;
   pruneSessions: (validSessionIds: string[]) => void;
-  sendChat: (sessionId: string, prompt: string, intent?: string) => Promise<void>;
+  sendChat: (
+    sessionId: string,
+    prompt: string,
+    intent?: string,
+    skill?: { name: string; arguments?: string },
+  ) => Promise<void>;
   loadMessages: (sessionId: string, signal?: AbortSignal) => Promise<void>;
   loadTimeline: (sessionId: string, signal?: AbortSignal, afterSeq?: number, reconcileTurnId?: string) => Promise<void>;
   loadTraceEvents: (sessionId: string, signal?: AbortSignal, afterSeq?: number) => Promise<void>;
@@ -299,7 +305,7 @@ function applyWsToBlocks(
   // final summary from run_terminal as a text block.
   if (ev.type === "run_terminal") {
     const re = ev as WsRunTerminalEvent;
-    if (re.status === "completed") {
+    if (re.summary) {
       reconcileFinalTextBlock(blocks, re.summary || "");
     }
     return;
@@ -309,6 +315,26 @@ function applyWsToBlocks(
   // plan_ready, memory_*, etc.) are NOT mapped to ContentBlocks.
   // They drive UI state changes (isRunning, toolApprovals, planApproval)
   // via their dedicated handleWsEvent branches — not through blocks.
+}
+
+function runOutcomeFromTerminal(re: WsRunTerminalEvent): RunOutcome {
+  const verification = re.verification ?? (
+    re.verification_status || re.verification_reason
+      ? {
+          status: re.verification_status || "not_applicable",
+          reason: re.verification_reason || "none",
+          checks: [],
+        }
+      : undefined
+  );
+  return {
+    status: re.status,
+    terminationReason: re.termination_reason,
+    verification,
+    workspaceDelta: re.workspace_delta,
+    error: re.error,
+    runId: re.run_id,
+  };
 }
 
 /** Extract first sentence as thought summary. Fallback: generic label. */
@@ -497,6 +523,7 @@ function restorePlanApprovalFromEvents(
     contract: planEvent.contract ?? null,
     revision: planEvent.revision ?? 0,
     maxRevisions: planEvent.max_revisions ?? 5,
+    lifecycle: "waiting",
   };
 }
 
@@ -664,7 +691,11 @@ export const useChatStore = create<ChatState>((set, get) => {
                   blocks,
                   status: "completed" as const,
                 },
-                meta: { ...matching.meta, completedAt: Date.now() },
+                meta: {
+                  ...matching.meta,
+                  completedAt: Date.now(),
+                  outcome: runOutcomeFromTerminal(re),
+                },
               };
               return {
                 ...prev,
@@ -685,7 +716,11 @@ export const useChatStore = create<ChatState>((set, get) => {
               turnId: re.turn_id || prev.activeTurn.turnId,
               runId: re.run_id || prev.activeTurn.runId,
               assistantResponse: { ...prev.activeTurn.assistantResponse, blocks, status: "completed" as const },
-              meta: { ...prev.activeTurn.meta, completedAt: Date.now() },
+              meta: {
+                ...prev.activeTurn.meta,
+                completedAt: Date.now(),
+                outcome: runOutcomeFromTerminal(re),
+              },
             };
 
             return {
@@ -705,6 +740,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         } else {
           patchSession(sid, (prev) => {
             const turn = prev.activeTurn;
+            const blocks = turn
+              ? [...turn.assistantResponse.blocks]
+              : [];
+            if (turn) {
+              applyWsToBlocks(blocks, ev, turn.assistantResponse.id);
+            }
             return {
               ...prev,
               isRunning: false,
@@ -712,11 +753,24 @@ export const useChatStore = create<ChatState>((set, get) => {
               planApproval: null,
               streamingThought: "",
               completedTurns: turn
-                ? [...prev.completedTurns, { ...turn, assistantResponse: { ...turn.assistantResponse, status: "error" as const }, meta: { ...turn.meta, completedAt: Date.now() } }]
+                ? [...prev.completedTurns, {
+                    ...turn,
+                    assistantResponse: {
+                      ...turn.assistantResponse,
+                      blocks,
+                      status: "error" as const,
+                    },
+                    meta: {
+                      ...turn.meta,
+                      completedAt: Date.now(),
+                      outcome: runOutcomeFromTerminal(re),
+                    },
+                  }]
                 : prev.completedTurns,
               activeTurn: null,
             };
           });
+          void get().loadTimeline(sid, undefined, 0);
         }
         return;
       }
@@ -839,6 +893,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             contract: (ev.contract || null) as Record<string, unknown> | null,
             revision: typeof ev.revision === "number" ? ev.revision : 0,
             maxRevisions: typeof ev.max_revisions === "number" ? ev.max_revisions : 5,
+            lifecycle: "waiting",
           },
           timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
         }));
@@ -1001,7 +1056,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
     },
 
-    sendChat: async (sessionId, prompt, intent) => {
+    sendChat: async (sessionId, prompt, intent, skill) => {
       if (get()._wsSessionId !== sessionId) return;
       ensureSession(sessionId);
 
@@ -1059,7 +1114,14 @@ export const useChatStore = create<ChatState>((set, get) => {
           }
         }
         const { currentMode } = selectSessionUi(get(), sessionId);
-        const result = await api.chat(sessionId, prompt, intent, currentMode, clientRequestId);
+        const result = await api.chat(
+          sessionId,
+          prompt,
+          intent,
+          currentMode,
+          clientRequestId,
+          skill,
+        );
 
         // ── Bind server turn_id / run_id to the optimistic activeTurn ──
         if (get()._wsSessionId === sessionId && result) {
@@ -1197,6 +1259,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             contract: planState.contract ?? null,
             revision: planState.revision,
             maxRevisions: planState.max_revisions,
+            lifecycle: planState.lifecycle === "saved" ? "saved" : "waiting",
           };
         }
 
@@ -1241,6 +1304,18 @@ export const useChatStore = create<ChatState>((set, get) => {
               completedAt: turn.meta.completed_at ? new Date(turn.meta.completed_at).getTime() : undefined,
               eventSeq: 0,
               hasGap: false,
+              outcome: {
+                status: (
+                  turn.meta.status === "failed" || turn.meta.status === "cancelled"
+                    ? turn.meta.status
+                    : "completed"
+                ),
+                terminationReason: turn.meta.termination_reason,
+                verification: turn.meta.verification,
+                workspaceDelta: turn.meta.workspace_delta,
+                error: turn.meta.error,
+                runId: turn.run_id || "",
+              },
             },
           };
         });
@@ -1294,12 +1369,14 @@ export const useChatStore = create<ChatState>((set, get) => {
               ? [...events.slice().reverse(), ...prev.events].slice(0, 100)
               : events.slice().reverse().slice(0, 100),
             timeline: mergeTimelineItems(afterSeq > 0 ? prev.timeline : [], timelineItems),
-            planApproval: afterSeq > 0 ? prev.planApproval : (planApproval ?? prev.planApproval),
+            planApproval: afterSeq > 0
+              ? prev.planApproval
+              : (planState ? planApproval : prev.planApproval),
             lastTraceSeq: Math.max(prev.lastTraceSeq, response.last_seq || 0),
             lastAppliedSequence: afterSeq > 0
               ? prev.lastAppliedSequence
               : Math.max(prev.lastAppliedSequence, response.last_seq || 0),
-            isRunning: activeRun ? true : prev.isRunning,
+            isRunning: Boolean(activeRun),
             activeRunId: activeRun?.run_id || "",
             activeTurn,
             completedTurns: afterSeq > 0
@@ -1511,8 +1588,20 @@ export const useChatStore = create<ChatState>((set, get) => {
           planApproval: { ...planApproval, isWaiting: false },
         }));
         await api.savePlan(sid);
-        // Defensive: refresh state from backend (P4).
-        try { void get().loadTimeline(sid, undefined, 0); } catch { /* best-effort */ }
+        patchSession(sid, (prev) => ({
+          ...prev,
+          isRunning: false,
+          planApproval: prev.planApproval
+            ? {
+                ...prev.planApproval,
+                isWaiting: true,
+                lifecycle: "saved",
+              }
+            : prev.planApproval,
+        }));
+        // Refresh from the durable saved lifecycle. loadTimeline also
+        // converges isRunning=false when no active run exists.
+        await get().loadTimeline(sid, undefined, 0);
       } catch (e: unknown) {
         if (e instanceof ApiError && e.status === 404) {
           invalidateSession(sid);

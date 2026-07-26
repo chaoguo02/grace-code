@@ -16,6 +16,28 @@ from hitl.pipeline import ToolApprovalMode
 logger = logging.getLogger(__name__)
 
 
+def initialize_mcp_integration(cfg: Any, registry: Any) -> Any | None:
+    """Initialize the canonical MCP runtime and attach it to a registry.
+
+    CLI and Web share this boundary so transport handling, tool adapters,
+    ToolSearch wiring, and lifecycle semantics stay consistent.
+    """
+    server_configs = getattr(cfg, "mcp_servers", None)
+    if not server_configs:
+        return None
+
+    from agent.session import MCPToolIntegration
+    from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool
+
+    integration = MCPToolIntegration({"mcp_servers": server_configs})
+    integration.initialize()
+    integration.register_into(registry)
+    for tool in getattr(registry, "_tools", {}).values():
+        if isinstance(tool, (ToolSearchTool, WaitForMcpServersTool)):
+            tool.set_mcp_context(registry, integration)
+    return integration
+
+
 def build_registry(
     cfg: Any,
     confirm_callback: Any = None,
@@ -25,7 +47,6 @@ def build_registry(
     repo_path: Any = None,
     skill_registry: Any = None,
     approval_mode: ToolApprovalMode = ToolApprovalMode.PROMPT,
-    mcp_registry: Any = None,
 ) -> Any:
     """Build the complete ToolRegistry with all built-in tools + permission pipeline."""
     from core.base import ToolRegistry
@@ -135,22 +156,4 @@ def build_registry(
             registry.register(MemorySearchTool(external_store))
 
     # ── MCP tools ──────────────────────────────────────────────────────
-    if mcp_registry is not None:
-        from tools.mcp_tool import McpToolWrapper
-        _mcp_count = 0
-        for _server_name, _tools in mcp_registry.get_all_tools().items():
-            _client = mcp_registry.get_client(_server_name)
-            if _client is None:
-                continue
-            for _tool_def in _tools:
-                try:
-                    registry.register(McpToolWrapper(_server_name, _tool_def, _client))
-                    _mcp_count += 1
-                except Exception:
-                    logger.warning("Failed to register MCP tool: %s/%s",
-                                   _server_name, _tool_def.get("name", "?"))
-        if _mcp_count:
-            logger.info("Registered %d MCP tools from %d servers",
-                        _mcp_count, len(mcp_registry.connected_servers))
-
     return registry

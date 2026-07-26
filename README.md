@@ -1,6 +1,6 @@
 # Grace Code
 
-*上次更新：2026-07-23*
+*上次更新：2026-07-26 10:56*
 
 Claude Code 架构对齐的自主编程智能体框架。支持 ReAct 循环、流式工具执行、子代理编排、MCP 协议、权限管线、上下文压缩和持久记忆。
 
@@ -71,6 +71,53 @@ python -m entry.cli chat --repo .
 | `/compact` | 压缩上下文 |
 | `/clear` | 清空当前会话历史 |
 | `/exit` | 退出 |
+
+### 5. Web 界面（npm 启动）
+
+项目包含一个 Vite + React 构建的 Web 前端，通过 npm 管理。
+
+#### 安装 Node.js 依赖
+
+```bash
+# 安装 Web 前端依赖
+cd web
+npm install
+```
+
+#### 开发模式（热重载）
+
+需要同时启动后端和前端两个进程：
+
+```bash
+# 终端 1：启动 Python 后端 API 服务（默认端口 8765）
+python -m server.main --repo .
+
+# 终端 2：启动 Vite 开发服务器（HMR 热重载）
+cd web && npm run dev
+```
+
+前端开发服务器默认运行在 `http://localhost:5173`，API 请求会自动代理到后端。
+
+#### 生产模式
+
+构建前端产物并启动后端服务（由后端统一提供静态文件服务）：
+
+```bash
+# 构建前端 + 启动后端（一行命令）
+npm start
+```
+
+或者分步执行：
+
+```bash
+# 先构建前端
+npm run build:web
+
+# 再启动后端（前端产物由后端 / 路由提供）
+npm run server
+```
+
+访问 `http://localhost:8765` 即可使用 Web 界面。
 
 ---
 

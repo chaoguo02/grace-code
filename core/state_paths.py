@@ -83,6 +83,11 @@ class ProjectStatePaths:
     def worktrees(self) -> Path:
         return self.root / "worktrees"
 
+    @property
+    def review_snapshots(self) -> Path:
+        """Immutable workspace copies used by read-only review agents."""
+        return self.root / "review-snapshots"
+
 
 def migrate_legacy_session_db(
     project_root: str | Path,

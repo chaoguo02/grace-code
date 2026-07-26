@@ -56,10 +56,15 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
   const worktreeStates = useChatStore((s) => selectSessionUi(s, activeId).worktreeStates);
 
   async function handleWorktree(action: string) {
-    if (!activeId) return;
+    if (!activeId || !detail?.worktree_revision) return;
     setWorktreeAction(action);
     try {
-      await api.resolveWorktree(activeId, childSessionId, action);
+      await api.resolveWorktree(
+        activeId,
+        childSessionId,
+        action,
+        detail.worktree_revision,
+      );
     } catch {
       setWorktreeAction(null);
     }
@@ -72,7 +77,8 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
     worktreeStates[`${childSessionId}_discard`] ||
     worktreeStates[`${childSessionId}_retain`];
   const isResolved =
-    resolvedStatus === "applied" || resolvedStatus === "discarded" || resolvedStatus === "retained";
+    resolvedStatus === "applied" || resolvedStatus === "discarded"
+    || resolvedStatus === "retained" || resolvedStatus === "no_changes";
   const isFailed = resolvedStatus === "error";
 
   useEffect(() => {
@@ -239,9 +245,13 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
       {hasWorktree && !isResolved && !isFailed && (
         <div className="subagent-detail-footer">
           <span className="subagent-detail-footer-msg">
-            {worktreeAction ? `${worktreeAction}ing...` : "Worktree has unmerged changes"}
+            {worktreeAction
+              ? `${worktreeAction}ing...`
+              : detail.worktree_revision
+                ? `Reviewed revision ${detail.worktree_revision.slice(0, 10)}`
+                : "Worktree revision unavailable"}
           </span>
-          {!worktreeAction && (
+          {!worktreeAction && detail.worktree_revision && (
             <>
               <button
                 type="button"
@@ -270,6 +280,7 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
       )}
       {isResolved && (
         <div className="subagent-detail-status">
+          {resolvedStatus === "no_changes" && "No worktree changes to apply"}
           {resolvedStatus === "applied" && "✓ Worktree applied — changes merged"}
           {resolvedStatus === "discarded" && "✓ Worktree discarded — changes removed"}
           {resolvedStatus === "retained" && "✓ Worktree retained — kept on disk"}

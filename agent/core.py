@@ -19,6 +19,7 @@ ReAct 主循环。整个 agent 的大脑。
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import logging
 import re
@@ -42,7 +43,7 @@ from prompts.builder import (
 from agent.task import (
     Action, ActionType, Event, EventType,
     Observation, ObservationStatus, RunResult, RunStatus, Task, TaskIntent, ToolCall,
-    TerminationReason, ToolOutcome, VerificationReason, VerificationStatus,
+    TerminationReason, ToolOutcome, VerificationStatus, WorkspaceDelta,
 )
 from context.artifacts import ArtifactStore
 from context.compaction import ConversationCompactor
@@ -359,6 +360,8 @@ class _GitState:
     files_changed: set[str] = field(default_factory=set)
     _baseline_revision: str = ""
     _baseline_dirty_files: set[str] = field(default_factory=set)
+    _baseline_file_hashes: dict[str, str] = field(default_factory=dict)
+    _run_changed_files: set[str] = field(default_factory=set)
     _last_git_error: str = ""
     _refresh_error_logged: bool = False
 
@@ -472,6 +475,27 @@ class _StepGateApplication:
     result: RunResult | None = None
 
 
+def _workspace_file_hash(repo_path: str, relative_path: str) -> str:
+    """Hash one workspace path, including a stable marker for deletion."""
+    path = Path(repo_path) / relative_path
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return "<missing>"
+    except OSError:
+        return "<unreadable>"
+
+
+def _dirty_git_files(repo: Any) -> set[str]:
+    """Return staged, unstaged, deleted, and untracked paths."""
+    files: set[str] = set(repo.untracked_files)
+    for diff in tuple(repo.index.diff(None)) + tuple(repo.index.diff("HEAD")):
+        path = diff.b_path or diff.a_path
+        if path:
+            files.add(str(path))
+    return files
+
+
 def _capture_git_state(repo_path: str) -> _GitState:
     """Capture git baseline before the agent run starts.
 
@@ -497,10 +521,11 @@ def _capture_git_state(repo_path: str) -> _GitState:
         state._baseline_revision = repo.head.commit.hexsha
         # Snapshot which files were ALREADY dirty before this run started.
         # The completion guard uses this to compute the run's incremental delta.
-        _dirty = repo.git.diff("--name-only", "HEAD").strip()
-        state._baseline_dirty_files = set(
-            f for f in _dirty.split("\n") if f
-        ) if _dirty else set()
+        state._baseline_dirty_files = _dirty_git_files(repo)
+        state._baseline_file_hashes = {
+            path: _workspace_file_hash(repo_path, path)
+            for path in state._baseline_dirty_files
+        }
         state.files_changed = set()
         state.current_diff = ""
         state.has_changes = False
@@ -542,16 +567,17 @@ def _refresh_git_state(state: _GitState, repo_path: str) -> None:
         import git
         from git.exc import GitError, InvalidGitRepositoryError  # noqa: F811
         repo = git.Repo(repo_path)
-        # Diff working tree against the baseline commit (not HEAD).
-        # This catches ALL uncommitted changes including files that were
-        # already dirty when the run started — the completion guard's
-        # ctx.had_any_write filter ensures we only care about files the
-        # agent actually touched.
-        diff = repo.git.diff(state._baseline_revision, name_only=True) or ""
-        files = {line.strip() for line in diff.split("\n") if line.strip()}
-        state.files_changed = files
+        current_dirty = _dirty_git_files(repo)
+        newly_dirty = current_dirty - state._baseline_dirty_files
+        baseline_changed = {
+            path
+            for path, baseline_hash in state._baseline_file_hashes.items()
+            if _workspace_file_hash(repo_path, path) != baseline_hash
+        }
+        state._run_changed_files = newly_dirty | baseline_changed
+        state.files_changed = set(state._run_changed_files)
         state.current_diff = repo.git.diff(state._baseline_revision) or ""
-        state.has_changes = bool(files) or bool(state.current_diff)
+        state.has_changes = bool(state._run_changed_files)
         # Refresh succeeded — reset error state for the next failure cycle
         if state._refresh_error_logged:
             state._refresh_error_logged = False
@@ -814,34 +840,29 @@ class ReActAgent:
         # and forces every downstream consumer to strip it.
         _refresh_git_state(ctx.git_state, ctx.task.repo_path)
 
-        # Verification outcome is read from TSM — the single source of
-        # truth, computed in the FINISH path (lines 1546-1585).
-        # _FinishRunContext contains only reference types; value-type
-        # fields that change during execution are explicit parameters.
-        _v_needs_tag = ctx.tsm.verification_status in (
-            VerificationStatus.UNVERIFIED,
-            VerificationStatus.UNAVAILABLE,
-            VerificationStatus.FAILED,
+        # Verification is structured run metadata.  Never prepend it to the
+        # assistant's answer: doing so pollutes persisted conversation content
+        # and forces every UI/consumer to parse display diagnostics from prose.
+        _written_files = tuple(sorted(
+            str(path) for path in ctx.completion_ctx.files_written if path
+        ))
+        _had_any_write = bool(ctx.completion_ctx.had_any_write)
+        _run_changed_files = tuple(sorted(ctx.git_state._run_changed_files))
+        _delta_patch = (
+            patch or ctx.git_state.current_diff or ""
+        ) if not ctx.git_state._baseline_dirty_files else ""
+        _workspace_delta = WorkspaceDelta(
+            has_changes=(
+                _had_any_write
+                and (ctx.git_state.has_changes or not ctx.git_state.is_git_repo)
+            ),
+            changed_files=(
+                _run_changed_files if ctx.git_state.is_git_repo else _written_files
+            ),
+            patch=_delta_patch,
+            source="git" if ctx.git_state.is_git_repo else "tool_journal",
+            is_run_scoped=ctx.git_state.is_git_repo,
         )
-        _needs_unverified_tag = ctx.git_state.has_changes or (
-            ctx.completion_ctx.had_any_write and not ctx.git_state.is_git_repo
-        )
-        if status == RunStatus.SUCCESS and _needs_unverified_tag and _v_needs_tag:
-            _reason = ctx.tsm.verification_reason
-            if _reason == VerificationReason.NO_TEST_ENVIRONMENT:
-                _tag = "UNVERIFIED — no test environment available"
-            elif _reason == VerificationReason.NO_VERSION_CONTROL:
-                _tag = "UNVERIFIED — project has no Git fact source"
-            elif _reason == VerificationReason.TEST_FAILED:
-                _tag = "UNVERIFIED — tests ran but failed"
-            else:
-                _tag = "UNVERIFIED — test/validation did not run or was unavailable"
-            summary = (
-                f"[{_tag}. "
-                f"Code changes were made but NOT independently verified.]\n\n"
-                f"{summary}"
-            )
-
         result = RunResult(
             task_id=ctx.task.task_id,
             status=status,
@@ -855,6 +876,7 @@ class ReActAgent:
             termination_reason=ctx.tsm.termination_reason,
             verification_status=ctx.tsm.verification_status,
             verification_reason=ctx.tsm.verification_reason,
+            workspace_delta=_workspace_delta,
             completion_blocked=completion_blocked,
         )
         run_stats = summarize_run(ctx.log)
@@ -3187,6 +3209,7 @@ class ReActAgent:
         tools: list[LLMToolSchema],
     ):
         """委托给 LLMInvoker。prompt_metadata 在此层消费后传入 llm/。"""
+        self._apply_active_skill_runtime_overrides()
         from llm.invoker import LLMInvoker
         from prompts.builder import consume_prompt_usage_metadata
         _invoker = getattr(self, "_llm_invoker", None)
@@ -3203,6 +3226,22 @@ class ReActAgent:
         )
         return result.response
 
+    def _apply_active_skill_runtime_overrides(self) -> None:
+        """Apply model/effort overrides persisted by the active Skill."""
+        overrides = getattr(
+            self._registry,
+            "skill_runtime_overrides",
+            {},
+        )
+        if not overrides:
+            return
+        effort = overrides.get("effort", "")
+        if effort:
+            self._cfg.effort = effort
+        model = overrides.get("model", "")
+        if model and hasattr(self._backend, "_model"):
+            self._backend._model = model
+
     def _stream_and_dispatch(
         self,
         messages: list[LLMMessage],
@@ -3212,7 +3251,8 @@ class ReActAgent:
         """CC-aligned streaming dispatch: yield tool_use blocks during LLM stream.
 
         Calls backend.stream_iter() and processes events mid-stream:
-          - TEXT_DELTA → forwarded to stream_callback (user-visible rendering)
+          - TEXT_DELTA (thought)  → stream_callback for thought_delta
+          - TEXT_DELTA (no thought) → text_stream callbacks for assistant_text_delta
           - TOOL_USE   → enqueued in executor, starts immediately if safe
           - FINISH     → build Action from finish event
           - ERROR      → raise
@@ -3221,51 +3261,80 @@ class ReActAgent:
         (speculative execution). The caller must call executor.dispatch() then
         executor.collect() to get all results.
         """
+        self._apply_active_skill_runtime_overrides()
+        import uuid as _uuid_mod
         from llm.base import StreamEventKind
 
         accumulated_text = ""
         accumulated_thought = ""
         tool_calls_raw: list[ToolCall] = []
+        current_text_block_id: str = ""  # local state, NOT in AgentConfig
 
-        for event in self._backend.stream_iter(messages, tools):
-            if event.kind == StreamEventKind.ERROR:
-                raise RuntimeError(f"LLM stream error: {event.text}")
+        _text_lifecycle = self._cfg.text_stream_lifecycle_callback
+        _text_delta_cb = self._cfg.text_stream_delta_callback
 
-            elif event.kind == StreamEventKind.TEXT_DELTA:
-                accumulated_text += event.text
-                if event.thought:
-                    accumulated_thought += event.thought
-                # Forward to user-visible rendering
-                if self._cfg.stream_callback:
-                    self._cfg.stream_callback(event.text)
-                # Advance the tool queue during text streaming — tools that
-                # completed speculatively may unblock queued successors.
-                executor.process_queue()
+        try:
+            for event in self._backend.stream_iter(messages, tools):
+                if event.kind == StreamEventKind.ERROR:
+                    raise RuntimeError(f"LLM stream error: {event.text}")
 
-            elif event.kind == StreamEventKind.TOOL_USE:
-                if event.tool_call:
-                    tool_calls_raw.append(event.tool_call)
-                    executor.enqueue(event.tool_call)
-                    # After each enqueue, check for newly completed tools
+                elif event.kind == StreamEventKind.TEXT_DELTA:
+                    accumulated_text += event.text
+                    if event.thought:
+                        accumulated_thought += event.thought
+                    # Forward to user-visible rendering
+                    if self._cfg.stream_callback:
+                        self._cfg.stream_callback(event.text)
+                    # ── Differentiate thought vs assistant text ──
+                    if event.thought:
+                        # Reasoning/thinking content → existing thought_delta path
+                        pass
+                    else:
+                        # Assistant text → new text_delta path
+                        if not current_text_block_id:
+                            current_text_block_id = str(_uuid_mod.uuid4())
+                            if _text_lifecycle is not None:
+                                _text_lifecycle("start", current_text_block_id)
+                        if _text_delta_cb is not None:
+                            _text_delta_cb(current_text_block_id, event.text)
+                    # Advance the tool queue during text streaming
                     executor.process_queue()
 
-            elif event.kind == StreamEventKind.FINISH:
-                self._stream_usage = (event.input_tokens, event.output_tokens)
-                if tool_calls_raw:
+                elif event.kind == StreamEventKind.TOOL_USE:
+                    # ── End current text block when tool starts ──
+                    if current_text_block_id and _text_lifecycle is not None:
+                        _text_lifecycle("end", current_text_block_id)
+                        current_text_block_id = ""
+                    if event.tool_call:
+                        tool_calls_raw.append(event.tool_call)
+                        executor.enqueue(event.tool_call)
+                        executor.process_queue()
+
+                elif event.kind == StreamEventKind.FINISH:
+                    # ── End current text block ──
+                    if current_text_block_id and _text_lifecycle is not None:
+                        _text_lifecycle("end", current_text_block_id)
+                        current_text_block_id = ""
+                    self._stream_usage = (event.input_tokens, event.output_tokens)
+                    if tool_calls_raw:
+                        return Action(
+                            action_type=ActionType.TOOL_CALL,
+                            thought=accumulated_thought or event.thought,
+                            tool_calls=tool_calls_raw,
+                        )
                     return Action(
-                        action_type=ActionType.TOOL_CALL,
+                        action_type=ActionType.FINISH,
                         thought=accumulated_thought or event.thought,
-                        tool_calls=tool_calls_raw,
+                        message=event.finish_message or accumulated_text,
                     )
-                return Action(
-                    action_type=ActionType.FINISH,
-                    thought=accumulated_thought or event.thought,
-                    message=event.finish_message or accumulated_text,
-                )
+
+        finally:
+            # ── Guarantee text block is not left streaming ──
+            if current_text_block_id and _text_lifecycle is not None:
+                _text_lifecycle("aborted", current_text_block_id, "stream_ended")
+                current_text_block_id = ""
 
         # Stream ended without FINISH (network disruption, backend error, etc.).
-        # If speculative tool execution produced tool calls, return them;
-        # otherwise report the incomplete stream as a structured finish.
         self._stream_usage = None
         if tool_calls_raw:
             return Action(
