@@ -28,6 +28,15 @@ const STATES: StateNode[] = [
   { label: "Cancelled", key: "cancelled", active: false, past: false },
 ];
 
+const STATE_FLOW: Array<{ label: string; key: string }> = [
+  { label: "Pending", key: "queued" },
+  { label: "Running", key: "running" },
+  { label: "Completing", key: "completing" },
+  { label: "Completed", key: "completed" },
+  { label: "Failed", key: "failed" },
+  { label: "Cancelled", key: "cancelled" },
+];
+
 export function StateMachineInspector() {
   const activeId = useSessionStore((s) => s.activeId);
   const activeDetail = useSessionStore((s) => s.activeDetail);
