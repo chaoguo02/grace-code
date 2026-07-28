@@ -108,10 +108,22 @@ function modeTitle(mode: ModeKey) {
   return MODE_OPTIONS.find((option) => option.key === mode)?.title ?? mode;
 }
 
+/** Best-effort context window estimates per model family. */
+function estimateContextWindow(model?: string): number {
+  if (!model) return 200_000;
+  const m = model.toLowerCase();
+  if (m.includes("gpt-5") || m.includes("gpt-4")) return 200_000;
+  if (m.includes("deepseek")) return 128_000;
+  if (m.includes("claude")) return 200_000;
+  if (m.includes("gemini")) return 1_000_000;
+  return 200_000; // conservative default
+}
+
 function ContextUsageBar() {
   const activeId = useSessionStore((s) => s.activeId);
   const activeDetail = useSessionStore((s) => s.activeDetail);
-  const contextTotal = useChatStore((s) => selectSessionUi(s, activeId).contextTotal);
+  const currentModel = useChatStore((s) => selectSessionUi(s, activeId).currentModel);
+  const contextTotal = estimateContextWindow(currentModel || undefined);
 
   const used = activeDetail?.total_tokens_estimate ?? 0;
   const ratio = contextTotal > 0 ? Math.min(100, Math.round((used / contextTotal) * 100)) : 0;

@@ -1084,7 +1084,7 @@ class AgentService:
 
     def _memory_maintenance_loop(self) -> None:
         """Background daemon: periodically prune expired + decay stale memories."""
-        _INTERVAL = 6 * 3600  # every 6 hours
+        _INTERVAL = int(os.environ.get("GRACE_MEMORY_MAINTENANCE_SECONDS", str(6 * 3600)))
         while not self._memory_maintenance_stop.wait(_INTERVAL):
             self._do_memory_maintenance()
 
