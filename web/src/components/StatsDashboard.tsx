@@ -46,6 +46,9 @@ export function StatsDashboard() {
       })
       .catch((e: unknown) => {
         if (cancelled) return;
+        setDaily([]);
+        setToolRankings({});
+        setSessions([]);
         setError(e instanceof Error ? e.message : "Failed to load statistics");
       })
       .finally(() => {

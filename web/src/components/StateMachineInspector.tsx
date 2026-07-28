@@ -3,7 +3,6 @@
  *
  * Derives state from session status + trace events without a dedicated API.
  */
-import { useMemo } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 
@@ -37,17 +36,8 @@ export function StateMachineInspector() {
   const status = activeDetail?.status || "idle";
   const currentState = isRunning ? "running" : status;
 
-  const stateNodes = useMemo(() =>
-    STATES.map((s) => ({
-      ...s,
-      active: s.key === currentState,
-      past: s.key === "queued" || (s.key === "running" && !isRunning && status === "completed"),
-    })),
-    [currentState, isRunning, status],
-  );
-
-  // Derive guards from session data
-  const guards = useMemo((): GuardInfo[] => {
+  // Derive guards from session data (computed on every render — cheap, no hooks needed)
+  const guards = ((): GuardInfo[] => {
     const list: GuardInfo[] = [];
     if (!activeDetail) return list;
 
@@ -84,7 +74,14 @@ export function StateMachineInspector() {
     });
 
     return list;
-  }, [activeDetail, status]);
+  })();
+
+  // Compute display states (cheap in-line, no useMemo needed)
+  const stateNodes = STATES.map((s) => ({
+    ...s,
+    active: s.key === currentState,
+    past: s.key === "queued" || (s.key === "running" && !isRunning && status === "completed"),
+  }));
 
   if (!activeId) return null;
 

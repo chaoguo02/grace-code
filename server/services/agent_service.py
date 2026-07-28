@@ -110,6 +110,8 @@ class AgentService:
         self._memory_context: Any | None = None
         self._hook_dispatcher: Any | None = None
         self._mcp_integration: Any | None = None
+        self._memory_maintenance_stop: Any = None
+        self._memory_maintenance_thread: Any = None
         self._memory_stop_event: Any | None = None
         self._memory_maintenance_task: Any | None = None
         self._observe_retries: bool = os.environ.get("FORGE_OBSERVE_RETRIES") == "1"

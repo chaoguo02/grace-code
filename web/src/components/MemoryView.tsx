@@ -152,8 +152,8 @@ export function MemoryView() {
   useEffect(() => {
     if (!selectedName) { setSelectedDetail(null); setMemoryEdges([]); setMemoryRevisions([]); return; }
     getMemoryDetail(selectedName).then(setSelectedDetail).catch(() => {});
-    getMemoryEdges(selectedName).then(setMemoryEdges).catch(() => {});
-    getMemoryRevisions(selectedName).then(setMemoryRevisions).catch(() => {});
+    getMemoryEdges(selectedName).then(setMemoryEdges).catch(() => setMemoryEdges([]));
+    getMemoryRevisions(selectedName).then(setMemoryRevisions).catch(() => setMemoryRevisions([]));
   }, [selectedName]);
 
   useEffect(() => { loadData(); }, [loadData]);

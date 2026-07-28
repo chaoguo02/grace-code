@@ -206,20 +206,21 @@ class MemoryContext:
         self._cached_section_by_session[sid] = section
         return section
 
-    @staticmethod
-    def _validate_anchors_stale(mem: Memory) -> bool:
+    def _validate_anchors_stale(self, mem: Memory) -> bool:
         """Return True if any anchor's content_hash mismatches the current file.
 
         Code is Truth: when the anchored file has been edited since the memory
         was written, the memory is considered stale and should be deprecated.
+        Anchors store repo-relative paths; resolve against repo_path.
         """
         import hashlib
         for anchor in mem.anchors:
             if not anchor.path or not anchor.content_hash:
                 continue
             try:
+                full_path = Path(self._repo_path) / anchor.path
                 current_hash = hashlib.sha256(
-                    Path(anchor.path).read_bytes()
+                    full_path.read_bytes()
                 ).hexdigest()
                 if current_hash != anchor.content_hash:
                     logger.debug(
@@ -228,7 +229,6 @@ class MemoryContext:
                     )
                     return True
             except (OSError, IOError):
-                # File deleted or unreadable — anchor is invalid
                 logger.debug(
                     "Memory %s anchor %s no longer readable — marking stale",
                     mem.name, anchor.path,
