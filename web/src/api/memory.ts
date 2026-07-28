@@ -23,7 +23,7 @@ export async function getMemoryDetail(name: string): Promise<Record<string, unkn
 
 /** Create a new memory. */
 export async function createMemory(data: {
-  name: string; description: string; content?: string; type?: string;
+  name: string; description: string; content?: string; type?: string; ttl_seconds?: number;
 }): Promise<{ name: string; status: string }> {
   return apiPost("/api/memory", data);
 }

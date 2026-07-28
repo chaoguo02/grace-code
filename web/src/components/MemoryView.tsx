@@ -108,6 +108,7 @@ export function MemoryView() {
   const [newDesc, setNewDesc] = useState("");
   const [newContent, setNewContent] = useState("");
   const [newType, setNewType] = useState<string>("project");
+  const [newTTL, setNewTTL] = useState<string>("permanent");
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editDesc, setEditDesc] = useState("");
@@ -790,6 +791,16 @@ export function MemoryView() {
                 </select>
               </div>
               <div>
+                <label>TTL (auto-expire)</label>
+                <select className="form-select" value={newTTL} onChange={(e) => setNewTTL(e.target.value)}>
+                  <option value="permanent">Permanent</option>
+                  <option value="3600">1 hour</option>
+                  <option value="86400">1 day</option>
+                  <option value="604800">7 days</option>
+                  <option value="2592000">30 days</option>
+                </select>
+              </div>
+              <div>
                 <label>Content (Markdown)</label>
                 <textarea className="form-textarea" value={newContent}
                   onChange={(e) => setNewContent(e.target.value)}
@@ -805,7 +816,8 @@ export function MemoryView() {
                   setCreating(true);
                   try {
                     await createMemory({ name: newName.trim(), description: newDesc.trim(),
-                      content: newContent, type: newType });
+                      content: newContent, type: newType,
+                      ttl_seconds: newTTL === "permanent" ? undefined : parseInt(newTTL) });
                     setShowNewModal(false);
                     setNewName(""); setNewDesc(""); setNewContent(""); setNewType("project");
                     showToast("Memory created");
