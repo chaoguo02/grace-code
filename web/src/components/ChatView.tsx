@@ -146,6 +146,16 @@ function ContextUsageBar() {
           Updated {lastUpdated}
         </div>
       )}
+      {isCritical && (
+        <div style={{ fontSize: 10, color: "var(--error)", marginTop: 2, fontWeight: 600 }}>
+          Context nearly full — use /compact to free space
+        </div>
+      )}
+      {isHigh && !isCritical && (
+        <div style={{ fontSize: 10, color: "var(--accent)", marginTop: 2 }}>
+          Consider /compact to reduce context
+        </div>
+      )}
     </div>
   );
 }
