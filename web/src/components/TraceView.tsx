@@ -8,6 +8,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { WsEventBlock } from "./WsEventBlock";
+import { StateMachineInspector } from "./StateMachineInspector";
 import type { WsMessage } from "../types";
 
 type FilterValue = "all" | "thought" | "tool_call" | "observation" | "status" | "subagent";
@@ -153,13 +154,16 @@ export function TraceView({
           </div>
 
           {/* Quick stats */}
-          <div style={{ display: "flex", gap: 16, fontSize: 12, color: "var(--text-muted)" }}>
+          <div style={{ display: "flex", gap: 16, fontSize: 12, color: "var(--text-muted)", flexWrap: "wrap" }}>
             <span>Steps: <strong style={{ color: "var(--text)" }}>{totalSteps}</strong></span>
             <span>Events: <strong style={{ color: "var(--text)" }}>{events.length}</strong></span>
             <span>Tools: <strong style={{ color: "var(--text)" }}>{toolEvents}</strong></span>
             <span>Observations: <strong style={{ color: "var(--text)" }}>{observationEvents}</strong></span>
             <span>Duration: <strong style={{ color: "var(--text)" }}>{formatDuration(durationSeconds)}</strong></span>
             {tokens > 0 && <span>Tokens: <strong style={{ color: "var(--text)" }}>{tokens.toLocaleString()}</strong></span>}
+            {activeDetail?.total_tokens_estimate != null && activeDetail.total_tokens_estimate > 0 && (
+              <span>Context: <strong style={{ color: "var(--text)" }}>{(activeDetail.total_tokens_estimate / 1000).toFixed(1)}K</strong></span>
+            )}
           </div>
         </div>
 
@@ -263,6 +267,8 @@ export function TraceView({
             </div>
           ))}
 
+          {/* TSM State Inspector (collapsible) */}
+          <StateMachineInspector />
           <div id="trace-timeline-end" />
         </div>
       </div>
