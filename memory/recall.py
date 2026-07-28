@@ -267,10 +267,49 @@ class MemoryRecallService:
                     tokens.add(token)
         matches = [t for t in tokens if t in haystack]
         confidence = float(getattr(mem.metadata, "confidence", 0.5))
+        importance = float(getattr(mem.metadata, "importance", 0.5))
+        relevance = min(1.0, len(matches) / 5.0)
+        freshness = self._freshness(mem.updated_at)
+        score = (
+            relevance * 0.45
+            + importance * 0.25
+            + confidence * 0.20
+            + freshness * 0.10
+        )
+        relation_boost = self._relation_boost(mem.name, tokens)
+        score = min(1.0, score + relation_boost)
         if matches:
-            score = min(0.9, 0.35 + 0.08 * len(matches) + confidence * 0.25)
             return score, f"Matched terms: {', '.join(matches[:5])}"
-        return confidence * 0.2, "High-confidence scoped memory"
+        return score, "Importance, confidence, and freshness score"
+
+    @staticmethod
+    def _freshness(updated_at: str) -> float:
+        if not updated_at:
+            return 0.5
+        try:
+            updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            age_days = max(0.0, (datetime.now(timezone.utc) - updated).total_seconds() / 86400)
+            return max(0.0, 1.0 - min(age_days, 365.0) / 365.0)
+        except (TypeError, ValueError):
+            return 0.5
+
+    def _relation_boost(self, name: str, query_tokens: set[str]) -> float:
+        try:
+            edges = self._store.list_edges(name)
+        except Exception:
+            return 0.0
+        boost = 0.0
+        for edge in edges:
+            related = (
+                edge.get("target_name")
+                if edge.get("source_name") == name
+                else edge.get("source_name")
+            )
+            if related and any(token in str(related).lower() for token in query_tokens):
+                boost += 0.03 * float(edge.get("confidence", 0.5))
+        return min(0.10, boost)
 
     def _select_for_injection(
         self,

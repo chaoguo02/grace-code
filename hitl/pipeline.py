@@ -453,6 +453,9 @@ class PermissionPipeline:
         tool: "BaseTool",
         params: dict[str, Any],
         thought: str = "",
+        *,
+        force_interactive_override: bool = False,
+        decision_reason_override: str = "",
     ) -> PermissionResult:
         """CC-aligned 6-layer permission evaluation.
 
@@ -532,9 +535,15 @@ class PermissionPipeline:
         required_permissions = frozenset(
             getattr(_tool_meta, "required_permissions", frozenset()),
         )
-        if getattr(_tool_meta, 'requires_user_interaction', False):
+        if (
+            getattr(_tool_meta, 'requires_user_interaction', False)
+            or force_interactive_override
+        ):
             force_interactive = True
-            decision_reason = "Tool requires user interaction (bypass-immune)"
+            decision_reason = (
+                decision_reason_override
+                or "Tool requires user interaction (bypass-immune)"
+            )
             tier, _matched_raw = (None, None)  # skip Layer 3, fall through to Layer 4
         else:
             force_interactive = False

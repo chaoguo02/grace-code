@@ -100,6 +100,23 @@ function timelinePayload(sessionId: string, messages: Array<Record<string, unkno
     items,
     last_seq: eventItems.reduce((max, item) => Math.max(max, item.seq), 0),
     has_more: false,
+    turns: [{
+      turn_id: "fixture-turn",
+      run_id: "fixture-run",
+      turn_index: 0,
+      user_message: messages.find((item) => item.role === "user") || null,
+      assistant_message: messages.find((item) => item.role === "assistant") || null,
+      trace_events: events,
+      meta: {
+        steps: events.length, tokens: 1200, status: "completed",
+        started_at: "2026-07-22T10:00:00.000Z",
+        completed_at: "2026-07-22T10:01:00.000Z",
+        termination_reason: "goal_achieved",
+        verification: { status: "verified", reason: "tests_passed", checks: [] },
+        workspace_delta: {},
+      },
+    }],
+    active_run: null,
     plan_state: planState || { lifecycle: "none", plan_text: "", revision: 0, max_revisions: 5 },
   };
 }
@@ -196,6 +213,7 @@ async function setupCommonRoutes(page: import("playwright").Page) {
 test("navigation: plan workflow stays inside chat", async ({ page }) => {
   await setupCommonRoutes(page);
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
 
   await expect(page.locator("button[data-view='plan']")).toHaveCount(0);
   await expect(page.locator("button[data-view='chat']")).toBeVisible();
@@ -221,14 +239,15 @@ test("chat: renders plan approval UI for a plan_ready session", async ({ page })
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Plan session test").click();
 
   // The plan should render inline in Chat, with approval actions in the composer.
-  await expect(page.locator(".trace-block-plan_ready")).toBeVisible();
-  await expect(page.locator(".trace-card-plan")).toContainText("Execution plan is ready");
-  await expect(page.locator(".trace-detail-plan_ready")).toContainText("Architecture Plan");
-  await expect(page.locator(".plan-actions button:has-text('Approve & Build')")).toBeVisible();
-  await expect(page.locator(".plan-actions button:has-text('Reject')")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Plan approval" })).toContainText(
+    "Design and implement the API layer",
+  );
+  await expect(page.getByRole("button", { name: /Approve & Build/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Reject/ })).toBeVisible();
 });
 
 test("chat: approve plan sends POST to approve endpoint", async ({ page }) => {
@@ -260,9 +279,10 @@ test("chat: approve plan sends POST to approve endpoint", async ({ page }) => {
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Plan session test").click();
 
-  await page.locator(".plan-actions button:has-text('Approve & Build')").click();
+  await page.getByRole("button", { name: /Approve & Build/ }).click();
 
   // Verify POST was sent
   expect(approvedRequest).not.toBeNull();
@@ -297,9 +317,10 @@ test("chat: reject plan sends POST to reject endpoint", async ({ page }) => {
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Plan session test").click();
 
-  await page.locator(".plan-actions button:has-text('Reject')").click();
+  await page.getByRole("button", { name: /Reject/ }).click();
 
   expect(rejectRequest).not.toBeNull();
 });
@@ -313,6 +334,7 @@ test("review tab: shows diffs and can toggle expand", async ({ page }) => {
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.locator("button[data-view='reviews']").click();
 
   // Should see the review hero
@@ -353,6 +375,7 @@ test("review tab: approve diff removes it from list", async ({ page }) => {
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.locator("button[data-view='reviews']").click();
 
   await expect(page.locator(".review-card")).toHaveCount(1);
@@ -381,6 +404,7 @@ test("review tab: reject diff sends PATCH with rejected status", async ({ page }
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.locator("button[data-view='reviews']").click();
 
   await page.locator("button:has-text('Reject')").first().click();
@@ -411,6 +435,7 @@ test("session sidebar: lists sessions and navigates on click", async ({ page }) 
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
 
   // Should list 3 sessions
   await expect(page.locator(".session-item")).toHaveCount(3);
@@ -456,7 +481,8 @@ test("session sidebar: create session via + Build button", async ({ page }) => {
   });
 
   await page.goto("/");
-  await page.locator("button:has-text('+ Build')").click();
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
+  await page.getByRole("button", { name: "+ New Session" }).click();
 
   await expect.poll(() => createCalled).toBe(true);
 });
@@ -465,8 +491,10 @@ test("session sidebar: shows delete confirmation modal", async ({ page }) => {
   await setupCommonRoutes(page);
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   // Click the × delete button on the third session
-  const deleteBtn = page.locator(".session-delete").first();
+  await page.locator(".session-item").first().hover();
+  const deleteBtn = page.locator(".session-action-delete").first();
   await deleteBtn.click();
 
   // Confirm modal should appear
@@ -500,11 +528,13 @@ test("trace sidebar: renders events in timeline", async ({ page }) => {
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Plan session test").click();
 
-  // Event sidebar should render timeline cards
+  // Compact sidebar remains visible while the turn renders inline evidence.
   await expect(page.locator("#event-sidebar")).toBeVisible();
-  await expect(page.locator(".timeline-card")).toHaveCount(4); // thought + tool_call + observation + status
+  await expect(page.locator(".inline-thought")).toHaveCount(1);
+  await expect(page.locator(".inline-tool")).toHaveCount(1);
 
   // The execution stats card should show step count
   await expect(page.locator(".execution-stats-card")).toBeVisible();
@@ -531,24 +561,34 @@ test("trace sidebar: filter buttons switch visible events", async ({ page }) => 
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Plan session test").click();
 
-  // All events visible
-  await expect(page.locator(".timeline-card")).toHaveCount(4);
+  await page.getByRole("button", { name: "Inspect", exact: true }).click();
+  await page.locator("button[data-view='events']").click();
+  const timeline = page.locator(".trace-timeline:visible");
+  await expect.poll(() => timeline.locator(".trace-block").count()).toBeGreaterThanOrEqual(
+    tracePayload().length,
+  );
 
-  // Click Steps filter
-  await page.locator(".event-filter-row button:has-text('Steps')").click();
-  // Should only show tool_call + observation (2 events)
-  await expect(page.locator(".timeline-card")).toHaveCount(2);
+  await page.locator("button.event-filter:has-text('Actions')").click();
+  await expect(timeline.locator(".trace-block-tool_call").first()).toBeVisible();
+  await expect(page.locator("button.event-filter:has-text('Actions')")).toHaveClass(/active/);
+  await expect(timeline.locator(".trace-block-observation")).toHaveCount(0);
+  await expect(timeline.locator(".trace-block-thought")).toHaveCount(0);
+  await expect(timeline.locator(".trace-block-status")).toHaveCount(0);
 
-  // Click Logs filter
-  await page.locator(".event-filter-row button:has-text('Logs')").click();
-  // Should show thought + status
-  await expect(page.locator(".timeline-card")).toHaveCount(2);
+  await page.locator("button.event-filter:has-text('Results')").click();
+  await expect(timeline.locator(".trace-block-observation").first()).toBeVisible();
+  await expect(page.locator("button.event-filter:has-text('Results')")).toHaveClass(/active/);
+  await expect(timeline.locator(".trace-block-tool_call")).toHaveCount(0);
+  await expect(timeline.locator(".trace-block-thought")).toHaveCount(0);
+  await expect(timeline.locator(".trace-block-status")).toHaveCount(0);
 
-  // Back to All
-  await page.locator(".event-filter-row button:has-text('All')").click();
-  await expect(page.locator(".timeline-card")).toHaveCount(4);
+  await page.locator("button.event-filter:has-text('All')").click();
+  await expect.poll(() => timeline.locator(".trace-block").count()).toBeGreaterThanOrEqual(
+    tracePayload().length,
+  );
 });
 
 /* ── 5. Tab navigation ────────────────────────────────────────── */
@@ -575,6 +615,7 @@ test("tab navigation: all 5 tabs render their content", async ({ page }) => {
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
 
   // Chat tab (default)
   await expect(page.locator(".view-tab.active")).toContainText("Chat");
@@ -627,12 +668,13 @@ test("regression: markdown rendering still works in message bubbles", async ({ p
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Plan session test").click();
 
   // Batch 1 assertions: code blocks, tables, links in message bubbles
-  await expect(page.locator(".message-bubble pre code")).toContainText("const x = 1;");
-  await expect(page.locator(".message-bubble table")).toContainText("Col");
-  await expect(page.locator(".message-bubble a")).toHaveAttribute("href", "https://x.com");
+  await expect(page.locator(".blocks-text pre code")).toContainText("const x = 1;");
+  await expect(page.locator(".blocks-text table")).toContainText("Col");
+  await expect(page.locator(".blocks-text a")).toHaveAttribute("href", "https://x.com");
 });
 
 /* ── 7. Regression smoke — Batch 2 guard ───────────────────────── */
@@ -650,13 +692,18 @@ test("regression: no content truncation — tool output shows full content", asy
     }
     await route.fulfill({ json: [] });
   });
-  await routeTimeline(page, S1, [{
-    role: "tool",
-    content: longOutput,
-    tool_call_id: "call-abc-123",
-    created_at: "2026-07-22T10:00:30Z",
-    tool_calls: [],
-  }]);
+  await routeTimeline(page, S1, [], [
+    {
+      type: "tool_call", name: "Read", params: { path: "large.txt" },
+      tool_call_id: "call-abc-123", step: 1,
+      timestamp: "2026-07-22T10:00:29Z",
+    },
+    {
+      type: "observation", tool_name: "Read", output: longOutput,
+      tool_call_id: "call-abc-123", status: "success", step: 1,
+      timestamp: "2026-07-22T10:00:30Z",
+    },
+  ]);
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });
@@ -668,10 +715,11 @@ test("regression: no content truncation — tool output shows full content", asy
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Plan session test").click();
 
-  // The obs-output should contain the full 600-char content
-  const obsText = await page.locator(".obs-output").textContent();
+  await page.locator(".inline-tool-header").click();
+  const obsText = await page.locator(".inline-tool-output").textContent();
   expect(obsText).toContain(longOutput);
 });
 
@@ -703,11 +751,13 @@ test("regression: ExpandableText toggle works on plan contract", async ({ page }
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Plan session test").click();
 
-  // The plan approval should show in the composer area
-  await expect(page.locator(".plan-actions")).toBeVisible();
-  // The expandable-text-toggle should be present for the plan contract
-  // (if contract goal is long enough, or always shown per Batch 2)
-  await expect(page.locator(".expandable-text-toggle")).toBeVisible();
+  const region = page.getByRole("region", { name: "Plan approval" });
+  await expect(region).toBeVisible();
+  await region.getByRole("button", { name: "Design and implement the API layer" }).click();
+  await expect(region.locator(".plan-hitl-details")).toContainText(
+    "Design and implement the API layer",
+  );
 });

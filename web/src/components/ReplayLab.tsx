@@ -1,10 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { getSessionReplay } from "../api/replay";
+import {
+  deleteReplayWorkspace,
+  getReplayExecution,
+  getSessionReplay,
+  pinReplayExecution,
+  startReplayExecution,
+} from "../api/replay";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { useSessionStore } from "../stores/sessionStore";
 import type {
   ReplayRun,
+  ReplayExecution,
   ReplayStep,
   ReplayToolVisibility,
   SessionReplay,
@@ -284,6 +291,9 @@ export function ReplayLab({
   const [reloadKey, setReloadKey] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [execution, setExecution] = useState<ReplayExecution | null>(null);
+  const [playbackMode, setPlaybackMode] = useState<"realtime" | "accelerated" | "step">("step");
+  const [playing, setPlaying] = useState(false);
 
   useEffect(() => {
     if (!activeId) {
@@ -332,6 +342,31 @@ export function ReplayLab({
   );
 
   useEffect(() => setSelectedStep(0), [selectedRunId]);
+
+  useEffect(() => {
+    if (!execution || !["queued", "running"].includes(execution.status)) return;
+    const timer = window.setInterval(() => {
+      getReplayExecution(execution.id)
+        .then(setExecution)
+        .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [execution?.id, execution?.status]);
+
+  useEffect(() => {
+    if (!playing || playbackMode === "step" || !selectedRun) return;
+    const delay = playbackMode === "accelerated" ? 350 : 1200;
+    const timer = window.setInterval(() => {
+      setSelectedStep((current) => {
+        if (current >= selectedRun.record.steps.length - 1) {
+          setPlaying(false);
+          return current;
+        }
+        return current + 1;
+      });
+    }, delay);
+    return () => window.clearInterval(timer);
+  }, [playing, playbackMode, selectedRun]);
 
   if (!activeId) {
     return (
@@ -421,6 +456,67 @@ export function ReplayLab({
           </nav>
 
           <RunGate run={selectedRun} />
+
+          <section className="replay-card replay-execution-control">
+            <div className="replay-section-heading">
+              <div>
+                <span className="replay-eyebrow">Isolated real execution</span>
+                <h2>Replay frozen tool actions</h2>
+              </div>
+              <button
+                type="button"
+                disabled={!selectedRun.evidence_complete || execution?.status === "running"}
+                onClick={async () => {
+                  setError("");
+                  try {
+                    setExecution(await startReplayExecution(data.session_id, selectedRun.run_id));
+                  } catch (reason) {
+                    setError(reason instanceof Error ? reason.message : String(reason));
+                  }
+                }}
+              >
+                {execution?.status === "running" ? "Executing…" : "Execute in worktree"}
+              </button>
+            </div>
+            <div className="replay-step-rail">
+              {(["realtime", "accelerated", "step"] as const).map((mode) => (
+                <button
+                  type="button"
+                  key={mode}
+                  className={playbackMode === mode ? "active" : ""}
+                  onClick={() => {
+                    setPlaybackMode(mode);
+                    setPlaying(mode !== "step");
+                  }}
+                >
+                  {mode === "realtime" ? "实时" : mode === "accelerated" ? "加速" : "逐事件"}
+                </button>
+              ))}
+            </div>
+            {execution && (
+              <div className="replay-executions">
+                <p>
+                  <strong>{titleCase(execution.status)}</strong>
+                  {" · "}{titleCase(execution.classification)}
+                  {execution.error && ` · ${execution.error}`}
+                </p>
+                {(execution.attempts || []).map((attempt, index) => (
+                  <article key={`${attempt.tool_call_id}-${index}`} className={attempt.success ? "success" : "failure"}>
+                    <code>{attempt.tool_name}</code>
+                    <span>step {attempt.step} · {attempt.attempt_count || 1} attempt(s)</span>
+                    <strong>{titleCase(attempt.classification)}</strong>
+                  </article>
+                ))}
+                {execution.diff && <pre>{execution.diff}</pre>}
+                <button type="button" onClick={async () => setExecution(await pinReplayExecution(execution.id))}>
+                  {execution.pinned ? "Pinned" : "Pin workspace"}
+                </button>
+                <button type="button" onClick={async () => setExecution(await deleteReplayWorkspace(execution.id))}>
+                  Delete workspace
+                </button>
+              </div>
+            )}
+          </section>
 
           <section className="replay-card replay-provenance">
             <div className="replay-section-heading">

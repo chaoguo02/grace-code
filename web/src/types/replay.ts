@@ -136,3 +136,28 @@ export interface SessionReplay {
     tool_outputs_are_runtime_truncated: boolean;
   };
 }
+
+export interface ReplayExecutionAttempt {
+  step: number;
+  tool_call_id: string;
+  tool_name: string;
+  success: boolean;
+  classification: string;
+  attempt_count?: number;
+  eventual_success?: boolean;
+  error?: string;
+  output_fingerprint?: string;
+}
+
+export interface ReplayExecution {
+  id: string;
+  session_id: string;
+  run_id: string;
+  status: "queued" | "running" | "completed" | "failed" | string;
+  classification: "matched" | "expected_divergence" | "unexpected_divergence" | "blocked" | string;
+  pinned: boolean;
+  workspace_path?: string;
+  diff?: string;
+  error?: string;
+  attempts?: ReplayExecutionAttempt[];
+}

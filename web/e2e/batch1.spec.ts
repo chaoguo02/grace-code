@@ -96,6 +96,23 @@ test.beforeEach(async ({ page }) => {
       ].sort((a: Record<string, unknown>, b: Record<string, unknown>) => String(a.timestamp || "").localeCompare(String(b.timestamp || ""))),
       last_seq: tracePayload().length,
       has_more: false,
+      turns: [{
+        turn_id: "fixture-turn",
+        run_id: "fixture-run",
+        turn_index: 0,
+        user_message: null,
+        assistant_message: messagesPayload()[0],
+        trace_events: tracePayload(),
+        meta: {
+          steps: 3, tokens: 1200, status: "completed",
+          started_at: "2026-07-22T10:00:00.000Z",
+          completed_at: "2026-07-22T10:01:00.000Z",
+          termination_reason: "goal_achieved",
+          verification: { status: "verified", reason: "tests_passed", checks: [] },
+          workspace_delta: {},
+        },
+      }],
+      active_run: null,
       plan_state: { lifecycle: "none", plan_text: "", revision: 0, max_revisions: 5 },
     };
     await route.fulfill({ json: timelinePayload });
@@ -149,14 +166,10 @@ test("renders markdown code blocks, tables, and links", async ({ page }) => {
   await page.goto("/");
   await page.getByText("Batch 1 Markdown Session").click();
 
-  await expect(page.locator(".message-bubble pre code")).toContainText("const answer = 42;");
-  await expect(page.locator(".message-bubble table")).toContainText("Foo");
-  await expect(page.locator(".message-bubble a")).toHaveAttribute("href", "https://example.com");
+  await expect(page.locator(".blocks-text pre code")).toContainText("const answer = 42;");
+  await expect(page.locator(".blocks-text table")).toContainText("Foo");
+  await expect(page.locator(".blocks-text a")).toHaveAttribute("href", "https://example.com");
 
-  // Plan content now renders inline in Chat (Plan tab removed — Phase 17 IA refactor).
-  // Verify the plan-ready block appears in the chat timeline.
-  await expect(page.locator(".trace-block-plan_ready")).toBeVisible();
-  await expect(page.locator(".trace-block-plan_ready")).toContainText("batch 1");
 });
 
 test("sends the expected chat request payload", async ({ page }) => {

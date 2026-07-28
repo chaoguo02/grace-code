@@ -206,6 +206,36 @@ class MemoryContext:
         self._cached_section_by_session[sid] = section
         return section
 
+    @staticmethod
+    def _validate_anchors_stale(mem: Memory) -> bool:
+        """Return True if any anchor's content_hash mismatches the current file.
+
+        Code is Truth: when the anchored file has been edited since the memory
+        was written, the memory is considered stale and should be deprecated.
+        """
+        import hashlib
+        for anchor in mem.anchors:
+            if not anchor.path or not anchor.content_hash:
+                continue
+            try:
+                current_hash = hashlib.sha256(
+                    Path(anchor.path).read_bytes()
+                ).hexdigest()
+                if current_hash != anchor.content_hash:
+                    logger.debug(
+                        "Memory %s anchor %s hash mismatch — marking stale",
+                        mem.name, anchor.path,
+                    )
+                    return True
+            except (OSError, IOError):
+                # File deleted or unreadable — anchor is invalid
+                logger.debug(
+                    "Memory %s anchor %s no longer readable — marking stale",
+                    mem.name, anchor.path,
+                )
+                return True
+        return False
+
     def _build_always_inject_section(self) -> str:
         """Load full content of all user/feedback memories (always injected)."""
         from memory.models import ALWAYS_INJECT_TYPES
@@ -218,11 +248,23 @@ class MemoryContext:
         for s in always_mems:
             try:
                 mem = self._store.read_memory(s.name)
+                if not mem or not mem.content.strip():
+                    continue
                 # P1: skip deprecated memories — Code is Truth
-                if mem and mem.content.strip() and mem.metadata.status is MemoryStatus.ACTIVE:
-                    lines.append(f"### {s.name} ({s.type})")
-                    lines.append(mem.content.strip())
-                    lines.append("")
+                if mem.metadata.status is not MemoryStatus.ACTIVE:
+                    continue
+                # P1: anchor content_hash validation — if the anchored file
+                # has changed, the memory is stale. Auto-deprecate and skip.
+                if self._validate_anchors_stale(mem):
+                    try:
+                        mem.metadata.status = MemoryStatus.DEPRECATED
+                        self._store.write_memory(mem, source="anchor-stale-check")
+                    except Exception:
+                        pass
+                    continue
+                lines.append(f"### {s.name} ({s.type})")
+                lines.append(mem.content.strip())
+                lines.append("")
             except Exception:
                 continue
 

@@ -173,6 +173,28 @@ class SqliteStorageBackend(StorageBackend):
                         tool_summary TEXT NOT NULL DEFAULT '{}',
                         status_summary TEXT NOT NULL DEFAULT '{}'
                     );
+
+                    CREATE TABLE IF NOT EXISTS llm_turn_metrics (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL DEFAULT '',
+                        turn_id TEXT NOT NULL DEFAULT '',
+                        step_number INTEGER NOT NULL,
+                        input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens INTEGER NOT NULL DEFAULT 0,
+                        billable_tokens INTEGER NOT NULL DEFAULT 0,
+                        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                        cache_create_tokens INTEGER NOT NULL DEFAULT 0,
+                        non_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        token_source TEXT NOT NULL DEFAULT 'estimate',
+                        attempts INTEGER NOT NULL DEFAULT 1,
+                        retries INTEGER NOT NULL DEFAULT 0,
+                        backoff_ms REAL NOT NULL DEFAULT 0,
+                        timed_out INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_llm_turn_metrics_session
+                        ON llm_turn_metrics(session_id, id);
                 """)
         except Exception:
             logger.exception("Failed to create stats tables")
@@ -717,6 +739,19 @@ class SqliteStorageBackend(StorageBackend):
 
     def list_messages(self, session_id: str) -> list[LLMMessage]:
         return self._store.list_messages(session_id)
+
+    def replace_messages_with_compaction(
+        self, session_id: str, messages: list[dict], **metadata,
+    ) -> dict:
+        return self._store.replace_messages_with_compaction(
+            session_id, messages, **metadata
+        )
+
+    def list_compaction_runs(self, session_id: str) -> list[dict]:
+        return self._store.list_compaction_runs(session_id)
+
+    def list_archived_messages(self, session_id: str) -> list[dict]:
+        return self._store.list_archived_messages(session_id)
 
     def count_messages(self, session_id: str) -> int:
         session = self._store.get_session(session_id)

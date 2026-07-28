@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.storage.protocol import StorageBackend
@@ -22,6 +22,101 @@ class StatsService:
 
     def __init__(self, storage: StorageBackend) -> None:
         self._storage = storage
+
+    def record_llm_turn(self, payload: dict[str, Any]) -> int:
+        store = getattr(self._storage, "_store", None)
+        connect = getattr(store, "_connect", None)
+        if not callable(connect):
+            return 0
+        with connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO llm_turn_metrics
+                   (session_id, run_id, turn_id, step_number, input_tokens,
+                    output_tokens, billable_tokens, cache_read_tokens,
+                    cache_create_tokens, non_cached_input_tokens, token_source,
+                    attempts, retries, backoff_ms, timed_out)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    payload.get("session_id", ""), payload.get("run_id", ""),
+                    payload.get("turn_id", ""), int(payload.get("step_number", 0)),
+                    int(payload.get("input_tokens", 0)), int(payload.get("output_tokens", 0)),
+                    int(payload.get("billable_tokens", 0)),
+                    int(payload.get("cache_read_tokens", 0)),
+                    int(payload.get("cache_create_tokens", 0)),
+                    int(payload.get("non_cached_input_tokens", 0)),
+                    payload.get("token_source", "estimate"),
+                    int(payload.get("attempts", 1)), int(payload.get("retries", 0)),
+                    float(payload.get("backoff_ms", 0)), int(bool(payload.get("timed_out"))),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def get_llm_turns(self, session_id: str = "", limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
+        store = getattr(self._storage, "_store", None)
+        connect = getattr(store, "_connect", None)
+        if not callable(connect):
+            return []
+        query = "SELECT * FROM llm_turn_metrics"
+        params: list[Any] = []
+        if session_id:
+            query += " WHERE session_id=?"
+            params.append(session_id)
+        query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend([max(1, min(limit, 1000)), max(0, offset)])
+        with connect() as conn:
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    @staticmethod
+    def llm_overview(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        cache_read = sum(int(row.get("cache_read_tokens", 0)) for row in rows)
+        uncached = sum(int(row.get("non_cached_input_tokens", 0)) for row in rows)
+        denominator = cache_read + uncached
+        return {
+            "turns": len(rows),
+            "input_tokens": sum(int(row.get("input_tokens", 0)) for row in rows),
+            "output_tokens": sum(int(row.get("output_tokens", 0)) for row in rows),
+            "billable_tokens": sum(int(row.get("billable_tokens", 0)) for row in rows),
+            "cache_read_tokens": cache_read,
+            "cache_create_tokens": sum(int(row.get("cache_create_tokens", 0)) for row in rows),
+            "non_cached_input_tokens": uncached,
+            "cache_hit_rate": cache_read / denominator if denominator else None,
+            "attempts": sum(int(row.get("attempts", 1)) for row in rows),
+            "retries": sum(int(row.get("retries", 0)) for row in rows),
+            "token_sources": sorted({str(row.get("token_source", "estimate")) for row in rows}),
+        }
+
+    def prune_raw_telemetry(self, retention_days: int = 90) -> dict[str, int]:
+        """Delete expired fine-grained telemetry while preserving daily rollups."""
+        store = getattr(self._storage, "_store", None)
+        connect = getattr(store, "_connect", None)
+        if not callable(connect):
+            return {}
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(days=max(1, int(retention_days)))
+        ).isoformat()
+        deleted: dict[str, int] = {}
+        with connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for table, timestamp_column in (
+                    ("step_log", "timestamp"),
+                    ("context_snapshot", "created_at"),
+                    ("llm_turn_metrics", "created_at"),
+                ):
+                    cursor = conn.execute(
+                        f"DELETE FROM {table} "
+                        f"WHERE datetime({timestamp_column}) < datetime(?)",
+                        (cutoff,),
+                    )
+                    deleted[table] = max(0, int(cursor.rowcount))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        if any(deleted.values()):
+            logger.info("Telemetry retention deleted expired rows: %s", deleted)
+        return deleted
 
     # ── Session stats ────────────────────────────────────────────────────
 

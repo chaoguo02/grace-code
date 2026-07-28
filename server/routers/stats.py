@@ -97,4 +97,19 @@ def create_stats_router(get_service: Any) -> APIRouter:
                     merged[tool] = merged.get(tool, 0) + count
         return dict(sorted(merged.items(), key=lambda x: -x[1]))
 
+    @router.get("/llm")
+    async def get_llm_metrics(
+        session_id: str = "",
+        limit: int = 200,
+        offset: int = 0,
+        service=Depends(get_service),
+    ) -> dict:
+        rows = _ss(service).get_llm_turns(session_id, limit=limit, offset=offset)
+        return {
+            "overview": _ss(service).llm_overview(rows),
+            "items": rows,
+            "limit": max(1, min(limit, 1000)),
+            "offset": max(0, offset),
+        }
+
     return router

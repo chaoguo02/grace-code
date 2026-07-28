@@ -28,7 +28,13 @@ function statusClass(status: string) {
   return "status-neutral";
 }
 
-export function SessionSidebar({ onToggleCollapse }: { onToggleCollapse?: () => void }) {
+export function SessionSidebar({
+  onToggleCollapse,
+  onOpenSession,
+}: {
+  onToggleCollapse?: () => void;
+  onOpenSession?: (sessionId: string) => void;
+}) {
   const {
     sessions,
     activeId,
@@ -66,6 +72,7 @@ export function SessionSidebar({ onToggleCollapse }: { onToggleCollapse?: () => 
 
   const handleOpen = async (id: string) => {
     await openSession(id);
+    onOpenSession?.(id);
   };
 
   const handleDelete = async (e: React.MouseEvent, id: string) => {

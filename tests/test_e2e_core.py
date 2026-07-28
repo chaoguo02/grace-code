@@ -553,7 +553,7 @@ class TestEventTyping:
             session_id="sess-1",
         )
         observation_msgs = _translate_event(observation)
-        assert observation_msgs == [{
+        assert observation_msgs[0] == {
             "type": "observation",
             "tool_name": "Read",
             "output": "content",
@@ -563,7 +563,14 @@ class TestEventTyping:
             "diff": "",
             "child_session_id": "",
             "timestamp": "2026-07-24T00:00:01Z",
-        }]
+            "session_id": "",
+            "run_id": "",
+            "turn_id": "",
+            "event_id": "",
+            "sequence": 0,
+            "block_id": "",
+            "tool_call_id": "call-1",
+        }
 
     def test_translate_cancelled_failure(self):
         """Cancelled task failures should become status:cancelled, not failed."""

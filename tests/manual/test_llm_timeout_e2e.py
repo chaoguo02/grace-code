@@ -9,6 +9,10 @@ Usage: python tests/manual/test_llm_timeout_e2e.py
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.e2e
+
 import http.server
 import os
 import socket

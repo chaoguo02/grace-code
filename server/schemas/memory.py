@@ -16,6 +16,7 @@ class MemoryItemResponse(BaseModel):
     status: str = Field(description="active | deprecated.")
     scope: str = Field(description="session | project | global.")
     confidence: float = Field(description="0.0-1.0.")
+    importance: float = Field(default=0.5, description="0.0-1.0.")
     access_count: int = Field(description="Times accessed.")
     created_at: str = Field(default="", description="ISO-8601.")
     updated_at: str = Field(description="ISO-8601.")
@@ -31,6 +32,8 @@ class MemoryDetailResponse(BaseModel):
     status: str = Field(description="active | deprecated.")
     scope: str = Field(description="session | project | global.")
     confidence: float = Field(description="0.0-1.0.")
+    importance: float = Field(default=0.5, description="0.0-1.0.")
+    current_revision: int = Field(default=1, ge=1)
     access_count: int = Field(description="Times accessed.")
     content: str = Field(description="Markdown body.")
     source: str = Field(default="", description="Origin.")
@@ -55,6 +58,7 @@ class MemoryCreateRequest(BaseModel):
     content: str = Field(default="", description="Markdown body.")
     type: str = Field(default="project", description="user | feedback | project | reference.")
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
     source_session_id: str = Field(default="", description="Session that created this memory.")
     anchors: list[dict] = Field(default_factory=list, description="File/symbol anchors.")
 
@@ -67,5 +71,6 @@ class MemoryUpdateRequest(BaseModel):
     type: str | None = None
     status: str | None = None
     confidence: float | None = None
+    importance: float | None = Field(default=None, ge=0.0, le=1.0)
     source_session_id: str | None = None
     anchors: list[dict] | None = None

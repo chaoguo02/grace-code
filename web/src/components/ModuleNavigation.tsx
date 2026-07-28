@@ -87,7 +87,8 @@ export function SecondaryNavigation({
             type="button"
             role="tab"
             key={view.key}
-            className={navigation.view === view.key ? "active" : ""}
+            className={`view-tab${navigation.view === view.key ? " active" : ""}`}
+            data-view={view.key}
             aria-selected={navigation.view === view.key}
             tabIndex={navigation.view === view.key ? 0 : -1}
             data-level={view.level}

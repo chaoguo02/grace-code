@@ -229,9 +229,35 @@ export function EvaluationLab({
             description={error}
           />
         ) : overview && overview.runs.length === 0 ? (
-          <EmptyEvaluation scenarios={overview.scenario_catalog} />
+          <>
+            <section className="eval-scenario-grid">
+              {overview.domain_gates.map((gate) => (
+                <article key={gate.domain}>
+                  <div><span>{gate.status}</span><strong>{gate.domain.replace(/_/g, " ")}</strong></div>
+                  <p>{gate.passed}/{gate.total} acceptance checks · {Math.round(gate.completion * 100)}%</p>
+                  <dl>
+                    {gate.checks.filter((check) => !check.passed).map((check) => (
+                      <div key={check.id}><dt>Failed</dt><dd>{check.evidence}</dd></div>
+                    ))}
+                  </dl>
+                </article>
+              ))}
+            </section>
+            <EmptyEvaluation scenarios={overview.scenario_catalog} />
+          </>
         ) : overview && selectedRun ? (
           <>
+            <section className="eval-scenario-grid">
+              {overview.domain_gates.map((gate) => (
+                <article key={gate.domain}>
+                  <div><span>{gate.status}</span><strong>{gate.domain.replace(/_/g, " ")}</strong></div>
+                  <p>{gate.passed}/{gate.total} acceptance checks · {Math.round(gate.completion * 100)}%</p>
+                  {gate.checks.filter((check) => !check.passed).map((check) => (
+                    <small key={check.id}>Failed: {check.evidence}</small>
+                  ))}
+                </article>
+              ))}
+            </section>
             <section className="eval-metrics">
               <div>
                 <span>Evaluation runs</span>

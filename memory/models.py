@@ -103,6 +103,7 @@ class MemoryMetadata:
     status: MemoryStatus = MemoryStatus.ACTIVE
     scope: MemoryScope = MemoryScope.PROJECT
     confidence: float = 0.7  # 0.0–1.0
+    importance: float = 0.5  # 0.0–1.0 durable priority signal
     ttl_seconds: int | None = None  # None = permanent
     expires_at: str = ""  # computed ISO timestamp when TTL expires
     access_count: int = 0
@@ -122,6 +123,8 @@ class MemoryMetadata:
                 object.__setattr__(self, "scope", MemoryScope(self.scope))
             except ValueError:
                 object.__setattr__(self, "scope", MemoryScope.PROJECT)
+        self.confidence = min(1.0, max(0.0, float(self.confidence)))
+        self.importance = min(1.0, max(0.0, float(self.importance)))
 
 
 @dataclass
@@ -150,6 +153,7 @@ class Memory:
             "status": self.metadata.status,
             "scope": self.metadata.scope,
             "confidence": self.metadata.confidence,
+            "importance": self.metadata.importance,
             "ttl_seconds": self.metadata.ttl_seconds,
             "expires_at": self.metadata.expires_at,
             "created_at": self.created_at,

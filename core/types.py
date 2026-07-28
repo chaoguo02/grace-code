@@ -191,6 +191,43 @@ class ToolConcurrency(str, Enum):
     PARALLEL_SAFE = "parallel_safe"
 
 
+class RetryMode(str, Enum):
+    NEVER = "never"
+    AUTOMATIC = "automatic"
+    APPROVAL = "approval"
+
+
+class IdempotencyStrategy(str, Enum):
+    NONE = "none"
+    INVOCATION_KEY = "invocation_key"
+    USER_ACKNOWLEDGED = "user_acknowledged"
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Declarative retry contract for one logical tool invocation."""
+
+    mode: RetryMode = RetryMode.NEVER
+    max_attempts: int = 1
+    base_delay_ms: int = 250
+    max_delay_ms: int = 4000
+    retryable_error_types: frozenset[str] = frozenset({
+        "timeout", "unavailable", "environment_unavailable",
+    })
+    idempotency_strategy: IdempotencyStrategy = IdempotencyStrategy.NONE
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mode", RetryMode(self.mode))
+        object.__setattr__(
+            self, "idempotency_strategy",
+            IdempotencyStrategy(self.idempotency_strategy),
+        )
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        if self.base_delay_ms < 0 or self.max_delay_ms < self.base_delay_ms:
+            raise ValueError("retry delays must be non-negative and ordered")
+
+
 @dataclass(frozen=True)
 class ToolMetadata:
     effects: frozenset[ToolEffect] = frozenset({ToolEffect.UNKNOWN})
@@ -203,4 +240,7 @@ class ToolMetadata:
     requires_user_interaction: bool = False
     """CC-aligned: when True, this tool ALWAYS prompts for user confirmation,
     even in bypassPermissions mode or when an allow rule matches.
-    Equivalent to MCP _meta['anthropic/requiresUserInteraction']."""
+    Equivalent to MCP _meta['anthropic/requiresUserInteraction'].
+    """
+    retry_policy: RetryPolicy | None = None
+    """Explicit override.  None derives a safe policy from call effects."""

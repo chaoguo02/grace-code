@@ -223,10 +223,11 @@ test.beforeEach(async ({ page }) => {
 
 test("shows memory trace events and current session recall controls", async ({ page }) => {
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Memory Runtime Session").click();
 
-  await expect(page.getByText("Memory Recall", { exact: true })).toBeVisible();
-  await expect(page.getByText("Memory Saved", { exact: true })).toBeVisible();
+  await expect(page.locator("#event-sidebar")).toContainText("memory_recall");
+  await expect(page.locator("#event-sidebar")).toContainText("memory_written");
 
   await page.locator("button[data-view='memory']").click();
   await expect(page.getByText("Current session recall")).toBeVisible();
@@ -258,6 +259,7 @@ test("shows memory trace events and current session recall controls", async ({ p
 test.describe("memory override lifecycle", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
+    await page.getByRole("button", { name: "Workbench", exact: true }).click();
     await page.getByText("Memory Runtime Session").click();
     await page.locator("button[data-view='memory']").click();
     await expect(page.getByText("Current session recall")).toBeVisible();

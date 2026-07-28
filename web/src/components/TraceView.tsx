@@ -198,7 +198,12 @@ export function TraceView({
         </div>
 
         {/* Timeline */}
-        <div style={{ flex: 1, overflow: "auto", padding: "16px 20px" }}>
+        <div
+          key={filter}
+          className="trace-timeline"
+          data-filter={filter}
+          style={{ flex: 1, overflow: "auto", padding: "16px 20px" }}
+        >
           {!activeId && (
             <div className="plan-empty">
               <div className="plan-empty-icon">E</div>

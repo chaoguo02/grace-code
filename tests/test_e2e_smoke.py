@@ -12,6 +12,8 @@ import pytest
 import requests
 import websocket  # pip install websocket-client
 
+pytestmark = pytest.mark.e2e
+
 
 BASE = "http://localhost:8765"
 WS_BASE = "ws://localhost:8765"

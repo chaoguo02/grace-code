@@ -284,9 +284,46 @@ class AgentService:
                     pruned = self._memory_store.prune_expired()
                     if pruned:
                         logger.info("Startup memory prune: %d entries cleaned", pruned)
+                    self._stats_service.prune_raw_telemetry()
                 except Exception:
-                    pass
+                    logger.warning("Startup maintenance failed", exc_info=True)
             threading.Thread(target=_prune_background, daemon=True, name="memory-startup-prune").start()
+            try:
+                loop = asyncio.get_running_loop()
+                self._memory_stop_event = asyncio.Event()
+
+                async def _memory_maintenance_loop() -> None:
+                    while not self._memory_stop_event.is_set():
+                        try:
+                            await asyncio.wait_for(
+                                self._memory_stop_event.wait(),
+                                timeout=6 * 60 * 60,
+                            )
+                        except asyncio.TimeoutError:
+                            try:
+                                changed = await asyncio.to_thread(
+                                    self._memory_store.prune_expired
+                                )
+                                telemetry = await asyncio.to_thread(
+                                    self._stats_service.prune_raw_telemetry
+                                )
+                                logger.info(
+                                    "Scheduled maintenance completed: %d memory changes, telemetry=%s",
+                                    changed,
+                                    telemetry,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Scheduled memory maintenance failed",
+                                    exc_info=True,
+                                )
+
+                self._memory_maintenance_task = loop.create_task(
+                    _memory_maintenance_loop(),
+                    name="memory-maintenance",
+                )
+            except RuntimeError:
+                logger.debug("Memory maintenance scheduler awaits server event loop")
 
         # ── 5. Agent registry ──
         from agent.session.agent_registry import AgentRegistryV2
@@ -344,6 +381,7 @@ class AgentService:
                             _store_ref, log_dir=_log_dir_ref, backend=_backend_ref,
                             async_run=True, workspace_root=_repo_ref,
                         )
+                        _store_ref.prune_expired()
                     except Exception as exc:
                         logger.debug("Consolidation hook skipped: %s", exc)
 
@@ -439,6 +477,13 @@ class AgentService:
         self._reliability_service = ReliabilityService(self)
         from server.services.project_overview_service import ProjectOverviewService
         self._project_overview_service = ProjectOverviewService(self)
+
+        # ── Memory maintenance daemon: periodic decay + TTL expiry ──
+        self._memory_maintenance_stop = threading.Event()
+        self._memory_maintenance_thread = threading.Thread(
+            target=self._memory_maintenance_loop, daemon=True,
+        )
+        self._memory_maintenance_thread.start()
 
         logger.info(
             "AgentService initialized — repo=%s, model=%s",
@@ -980,28 +1025,34 @@ class AgentService:
                 # ── Recovery: re-inject critical context after compaction ──
                 _recovery = AgentService._build_recovery_context(self.repo_path)
                 if _recovery:
-                    from llm.base import LLMMessage as _LLMMsg
-                    self._storage.append_message(session_id, _LLMMsg(
-                        role="user",
-                        content=f"[AUTOCOMPACT RECOVERY]\n{_recovery}",
-                    ))
+                    compacted.append({
+                        "role": "user",
+                        "content": f"[AUTOCOMPACT RECOVERY]\n{_recovery}",
+                        "kind": "recovery_context",
+                    })
 
-                # Touch session updated_at so the frontend context bar
-                # reflects the compaction time in "Updated HH:MM:SS".
-                try:
-                    store = self._storage.store
-                    with store._connect() as conn:
-                        conn.execute(
-                            "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?",
-                            (session_id,),
-                        )
-                except Exception:
-                    pass
+                before_chars = sum(
+                    len(str(item.get("content", ""))) for item in msgs
+                )
+                after_chars = sum(
+                    len(str(item.get("content", ""))) for item in compacted
+                )
+                result = self._storage.replace_messages_with_compaction(
+                    session_id,
+                    compacted,
+                    method="snip_micro_auto",
+                    tokens_before=(before_chars + 3) // 4,
+                    tokens_after=(after_chars + 3) // 4,
+                    truncation_status=(
+                        "reduced" if after_chars < before_chars else "unchanged"
+                    ),
+                )
 
                 if self._event_bus is not None:
                     self._event_bus.publish_raw(session_id, {
                         "type": "status",
                         "status": "compacted",
+                        "compaction": result,
                         "message": f"Compressed {len(msgs)} → {len(compacted)} messages",
                     })
             except Exception as exc:
@@ -1018,6 +1069,25 @@ class AgentService:
         thread.start()
 
     # ── Plan file management ─────────────────────────────────────────────
+
+    # ── Memory maintenance daemon ────────────────────────────────────────
+
+    def _memory_maintenance_loop(self) -> None:
+        """Background daemon: periodically prune expired + decay stale memories."""
+        _INTERVAL = 6 * 3600  # every 6 hours
+        while not self._memory_maintenance_stop.wait(_INTERVAL):
+            self._do_memory_maintenance()
+
+    def _do_memory_maintenance(self) -> None:
+        """Run one cycle of memory decay + TTL expiry."""
+        if self._memory_store is None:
+            return
+        try:
+            pruned = self._memory_store.prune_expired()
+            if pruned:
+                logger.info("Memory maintenance: %d entries cleaned", pruned)
+        except Exception:
+            logger.debug("Memory maintenance cycle skipped", exc_info=True)
 
     def remove_plan_file(self, session_id: str) -> bool:
         """Remove the plan file for a session (CC-aligned cleanup).
@@ -1189,7 +1259,18 @@ class AgentService:
         # Release all session runtime resources via centralized dispose
         if self._runtime is not None:
             self._runtime.dispose()
-        # Cancel memory maintenance
+        # Stop memory maintenance daemon thread
+        if hasattr(self, '_memory_maintenance_stop'):
+            self._memory_maintenance_stop.set()
+        # Final memory prune on shutdown
+        if self._memory_store is not None:
+            try:
+                pruned = self._memory_store.prune_expired()
+                if pruned:
+                    logger.info("Shutdown memory prune: %d entries cleaned", pruned)
+            except Exception:
+                pass
+        # Cancel memory maintenance (legacy async task)
         if self._memory_stop_event is not None:
             self._memory_stop_event.set()
         if self._memory_maintenance_task is not None:

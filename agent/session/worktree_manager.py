@@ -237,7 +237,14 @@ class WorktreeManager:
     def get_diff(self, wt: Worktree) -> str:
         """获取 worktree 相对于基础分支的 diff。"""
         try:
-            return self._run_git(["diff", f"{wt.base_commit}...{wt.branch}"])
+            committed = self._run_git(
+                ["diff", f"{wt.base_commit}...{wt.branch}"],
+            )
+            working = self._run_git(
+                ["diff", "--binary", wt.base_commit, "--"],
+                cwd=wt.path,
+            )
+            return working or committed
         except subprocess.CalledProcessError:
             return ""
 

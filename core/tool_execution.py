@@ -8,6 +8,8 @@ evaluation, final-parameter validation, execution, and post-tool hooks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from core.errors import ToolErrorType
@@ -52,9 +54,11 @@ class ToolExecutionPipeline:
         params: dict[str, Any],
         *,
         thought: str = "",
+        invocation_id: str = "",
     ) -> "ToolResult":
-        """Validate and execute a single concrete tool call."""
+        """Validate and execute one logical call, including safe retries."""
         from core.base import ToolResult
+        from core.types import RetryMode
 
         validation_error = self._validate_params(tool, params)
         if validation_error is not None:
@@ -74,20 +78,107 @@ class ToolExecutionPipeline:
                     detail=getattr(budget_status, "inject_message", "") or "Budget exhausted",
                 )
 
+        logical_id = invocation_id or f"tool_{uuid.uuid4().hex}"
+        policy = tool.retry_policy(params)
+        attempts: list[dict[str, Any]] = []
+        delay_ms = policy.base_delay_ms
+        result: ToolResult | None = None
+
+        for attempt in range(1, policy.max_attempts + 1):
+            permission_result = self._authorize(
+                tool,
+                params,
+                thought,
+                force_retry_approval=(
+                    attempt > 1 and policy.mode is RetryMode.APPROVAL
+                ),
+                attempt=attempt,
+                invocation_id=logical_id,
+            )
+            if isinstance(permission_result, ToolResult):
+                result = permission_result
+                attempts.append(self._attempt_fact(attempt, result))
+                break
+
+            actual_params = dict(params)
+            if (
+                permission_result is not None
+                and permission_result.updated_params
+            ):
+                actual_params.update(permission_result.updated_params)
+
+            validation_error = self._validate_params(tool, actual_params)
+            if validation_error is not None:
+                result = validation_error
+                attempts.append(self._attempt_fact(attempt, result))
+                break
+
+            call = AuthorizedToolCall(
+                name=tool.name,
+                params=actual_params,
+                thought=thought,
+            )
+            try:
+                result = tool.execute(call.params)
+            except Exception as exc:
+                result = ToolResult.from_error(
+                    error_type=ToolErrorType.INTERNAL,
+                    detail=(
+                        f"Tool '{tool.name}' raised an unexpected error: {exc}"
+                    ),
+                )
+
+            self._fire_post_tool_hook(call, result)
+            attempts.append(self._attempt_fact(attempt, result))
+            if result.success or not self._should_retry(result, policy, attempt):
+                break
+            if delay_ms:
+                time.sleep(delay_ms / 1000)
+            delay_ms = min(policy.max_delay_ms, max(delay_ms * 2, 1))
+
+        assert result is not None
+        result.invocation_id = logical_id
+        result.attempt_count = len(attempts)
+        result.eventual_success = result.success
+        result.metadata = {
+            **(result.metadata or {}),
+            "invocation_id": logical_id,
+            "attempt_count": len(attempts),
+            "eventual_success": result.success,
+            "retry_mode": policy.mode.value,
+            "attempts": attempts,
+        }
+        return result
+
+    def _authorize(
+        self,
+        tool: "BaseTool",
+        params: dict[str, Any],
+        thought: str,
+        *,
+        force_retry_approval: bool,
+        attempt: int,
+        invocation_id: str,
+    ) -> Any:
+        from core.base import ToolResult
+
         permission_result = None
         if self._permission_pipeline is not None:
             permission_result = self._permission_pipeline.check(
                 tool,
                 params,
                 thought=thought,
+                force_interactive_override=force_retry_approval,
+                decision_reason_override=(
+                    f"Retry attempt {attempt} for {invocation_id}; this tool "
+                    "may repeat external side effects."
+                    if force_retry_approval else ""
+                ),
             )
             from hitl.pipeline import PermissionDecision
-
             if permission_result.decision is PermissionDecision.DENY:
                 feedback = getattr(permission_result, "feedback", "")
-                detail = (
-                    f"Tool '{tool.name}' denied: {permission_result.reason}"
-                )
+                detail = f"Tool '{tool.name}' denied: {permission_result.reason}"
                 if feedback:
                     detail += f" Feedback: {feedback}"
                 return ToolResult.from_error(
@@ -96,9 +187,7 @@ class ToolExecutionPipeline:
                 )
         elif self._hitl_manager is not None:
             hitl_result = self._hitl_manager.check(
-                tool,
-                params,
-                thought=thought,
+                tool, params, thought=thought,
             )
             if hitl_result.is_denied:
                 detail = f"Tool '{tool.name}' denied by user."
@@ -108,35 +197,38 @@ class ToolExecutionPipeline:
                     error_type=ToolErrorType.PERMISSION_DENIED,
                     detail=detail,
                 )
-
-        actual_params = dict(params)
-        if (
-            permission_result is not None
-            and permission_result.updated_params
-        ):
-            actual_params.update(permission_result.updated_params)
-
-        # Hooks and approval UIs may rewrite input.  The final call must satisfy
-        # the same schema contract as the model-generated input.
-        validation_error = self._validate_params(tool, actual_params)
-        if validation_error is not None:
-            return validation_error
-
-        call = AuthorizedToolCall(
-            name=tool.name,
-            params=actual_params,
-            thought=thought,
-        )
-        try:
-            result = tool.execute(call.params)
-        except Exception as exc:
-            result = ToolResult.from_error(
-                error_type=ToolErrorType.INTERNAL,
-                detail=f"Tool '{tool.name}' raised an unexpected error: {exc}",
+        elif force_retry_approval:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.PERMISSION_DENIED,
+                detail="Interactive retry approval is unavailable.",
             )
+        return permission_result
 
-        self._fire_post_tool_hook(call, result)
-        return result
+    @staticmethod
+    def _should_retry(result: "ToolResult", policy: Any, attempt: int) -> bool:
+        from core.errors import ToolRetryDirective
+        from core.types import RetryMode
+
+        if attempt >= policy.max_attempts or policy.mode is RetryMode.NEVER:
+            return False
+        error = result.tool_error
+        return bool(
+            error is not None
+            and error.retry is ToolRetryDirective.RETRY
+            and error.error_type.value in policy.retryable_error_types
+        )
+
+    @staticmethod
+    def _attempt_fact(attempt: int, result: "ToolResult") -> dict[str, Any]:
+        return {
+            "attempt": attempt,
+            "success": result.success,
+            "error_type": (
+                result.tool_error.error_type.value
+                if result.tool_error is not None else ""
+            ),
+            "duration_ms": result.duration_ms,
+        }
 
     @staticmethod
     def _validate_params(

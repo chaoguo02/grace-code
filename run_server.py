@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from server.services.agent_service import AgentService
 from server.services.event_bus import EventBus
-from server.main import create_app
+from server.main import create_app, validate_bind_host
 import uvicorn
 
 if __name__ == "__main__":
@@ -14,6 +14,10 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=18768)
     parser.add_argument("--repo", default=".")
     args = parser.parse_args()
+    try:
+        validate_bind_host(args.host)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     repo = str(os.path.abspath(args.repo))
     print(f"Starting Grace Code Web MVP on {args.host}:{args.port}")

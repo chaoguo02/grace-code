@@ -1,3 +1,4 @@
+import { describe, expect, it } from "vitest";
 import { orderTopologyNodes } from "./MultiAgentControlPlane";
 import { normalizeMultiAgentSnapshot } from "../api/multiAgent";
 import type { MultiAgentNode } from "../types/multiAgent";
@@ -22,43 +23,36 @@ const base: MultiAgentNode = {
   result_status: null,
 };
 
-const ordered = orderTopologyNodes([
-  { ...base, id: "grandchild", depth: 2 },
-  { ...base, id: "child", depth: 1 },
-  base,
-]);
+describe("multi-agent projections", () => {
+  it("orders nodes parent first", () => {
+    const ordered = orderTopologyNodes([
+      { ...base, id: "grandchild", depth: 2 },
+      { ...base, id: "child", depth: 1 },
+      base,
+    ]);
+    expect(ordered.map((node) => node.id)).toEqual(["root", "child", "grandchild"]);
+  });
 
-if (ordered.map((node) => node.id).join(",") !== "root,child,grandchild") {
-  throw new Error("Topology nodes must be presented parent depth first");
-}
-
-const normalized = normalizeMultiAgentSnapshot({
-  routing_decision: {
-    topology: "fan_out",
-    reason_code: "independent_work_items",
-    explanation: "Two independent scopes",
-  },
-  tasks: [{
-    task_id: "task-1",
-    description: "Inspect web",
-    assigned_agent: "explore",
-    status: "failed",
-    depends_on: ["task-0"],
-    retry_count: 1,
-    error: "provider timeout",
-  }],
-  team_capability: {
-    enabled: true,
-    arbitrary_agent_message_bus: true,
-  },
-} as unknown as MultiAgentSnapshot);
-
-if (normalized.routing?.topology !== "fan_out") {
-  throw new Error("Legacy routing_decision must be normalized");
-}
-if (normalized.delegation_tasks?.[0].dependencies[0] !== "task-0") {
-  throw new Error("Task dependency aliases must be normalized");
-}
-if (!normalized.team?.direct_messaging) {
-  throw new Error("Team message-bus capability must be disclosed");
-}
+  it("normalizes legacy routing, dependencies, and messaging", () => {
+    const normalized = normalizeMultiAgentSnapshot({
+      routing_decision: {
+        topology: "fan_out",
+        reason_code: "independent_work_items",
+        explanation: "Two independent scopes",
+      },
+      tasks: [{
+        task_id: "task-1",
+        description: "Inspect web",
+        assigned_agent: "explore",
+        status: "failed",
+        depends_on: ["task-0"],
+        retry_count: 1,
+        error: "provider timeout",
+      }],
+      team_capability: { enabled: true, arbitrary_agent_message_bus: true },
+    } as unknown as MultiAgentSnapshot);
+    expect(normalized.routing?.topology).toBe("fan_out");
+    expect(normalized.delegation_tasks?.[0].dependencies[0]).toBe("task-0");
+    expect(normalized.team?.direct_messaging).toBe(true);
+  });
+});

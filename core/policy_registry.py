@@ -300,14 +300,26 @@ class PolicyAwareToolRegistry(ToolRegistry):
             if self._is_tool_visible(name) and self._is_tool_enabled(name)
         ]
 
-    def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
+    def execute_tool(
+        self,
+        name: str,
+        params: dict[str, Any],
+        thought: str = "",
+        *,
+        invocation_id: str = "",
+    ) -> ToolResult:
         start = time.perf_counter()
         violation = self._check_tool_call(name, params)
         if violation:
             result = ToolResult(success=False, output="", error=violation, outcome=ToolOutcome.BLOCKED)
             self._record_timing(name, start, result)
             return result
-        result = self._base.execute_tool(name, params, thought=thought)
+        result = self._base.execute_tool(
+            name,
+            params,
+            thought=thought,
+            invocation_id=invocation_id,
+        )
         # Consume CC-aligned SkillContextModifier from tool result metadata
         if result.metadata and "skill_modifier" in result.metadata:
             self._apply_skill_modifier(result.metadata["skill_modifier"])

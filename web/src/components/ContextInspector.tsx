@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getSessionContext } from "../api/stats";
+import { compactSession } from "../api/sessions";
 import { useSessionStore } from "../stores/sessionStore";
 import type {
   ContextSnapshot,
@@ -18,7 +19,7 @@ interface ContextSegment {
 export interface ContextComposition {
   segments: ContextSegment[];
   utilization: number;
-  pressure: "low" | "moderate" | "high" | "over";
+  pressure: "low" | "moderate" | "high" | "critical" | "over";
   unclassifiedTokens: number;
 }
 
@@ -70,10 +71,12 @@ export function deriveContextComposition(
     utilization,
     pressure: utilization > 1
       ? "over"
-      : utilization >= 0.85
-        ? "high"
-        : utilization >= 0.6
-          ? "moderate"
+      : utilization >= 0.95
+        ? "critical"
+        : utilization >= 0.85
+          ? "high"
+          : utilization >= 0.70
+            ? "moderate"
           : "low",
     unclassifiedTokens,
   };
@@ -121,6 +124,8 @@ export function ContextInspector({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [showAll, setShowAll] = useState(false);
+  const [compacting, setCompacting] = useState(false);
+  const [compactNotice, setCompactNotice] = useState("");
 
   useEffect(() => setShowAll(false), [requestedRunId]);
 
@@ -189,6 +194,19 @@ export function ContextInspector({
   const compactCount = visibleSnapshots.filter(
     (snapshot) => snapshot.stats.compact_triggered,
   ).length;
+  const pressureMessage = composition && (
+    composition.utilization >= 0.95
+      ? "需要立即压缩"
+      : composition.utilization >= 0.85
+        ? "建议压缩"
+        : composition.utilization >= 0.70
+          ? "可考虑压缩"
+          : ""
+  );
+  const estimatedRelease = selected && composition
+    ? Math.max(0, selected.stats.estimated_total_tokens
+      - Math.round(selected.stats.request_budget_tokens * 0.55))
+    : 0;
   const usedTools = new Set(inspection.actual_usage.tool_names);
 
   return (
@@ -331,6 +349,33 @@ export function ContextInspector({
                   <span>{Math.round(composition.utilization * 100)}% used</span>
                   <span>{formatTokens(selected.stats.request_budget_tokens)}</span>
                 </div>
+                {pressureMessage && activeId && (
+                  <div className="context-decision-state">
+                    <span className={composition.utilization >= 0.95 ? "warning" : "good"}>C</span>
+                    <p>
+                      {pressureMessage}。预计可释放约 {formatTokens(estimatedRelease)} tokens。
+                      {compactNotice && ` ${compactNotice}`}
+                    </p>
+                    <button
+                      type="button"
+                      disabled={compacting}
+                      onClick={async () => {
+                        setCompacting(true);
+                        setCompactNotice("");
+                        try {
+                          await compactSession(activeId);
+                          setCompactNotice("压缩任务已接受，完成后会记录实际释放量。");
+                        } catch (reason) {
+                          setCompactNotice(reason instanceof Error ? reason.message : "压缩请求失败");
+                        } finally {
+                          setCompacting(false);
+                        }
+                      }}
+                    >
+                      {compacting ? "正在提交…" : "立即压缩"}
+                    </button>
+                  </div>
+                )}
 
                 <div className="context-token-breakdown">
                   {composition.segments.map((segment) => (

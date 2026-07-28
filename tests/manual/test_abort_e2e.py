@@ -19,6 +19,10 @@ import threading
 import time
 from typing import Any
 
+import pytest
+
+pytestmark = pytest.mark.e2e
+
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", ".."))

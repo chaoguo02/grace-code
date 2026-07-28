@@ -103,6 +103,7 @@ class FileMemoryBackend:
             status=MemoryStatus(meta.get("status", "active")) if isinstance(meta, dict) else MemoryStatus.ACTIVE,
             scope=MemoryScope(meta.get("scope", "project")) if isinstance(meta, dict) else MemoryScope.PROJECT,
             confidence=float(meta.get("confidence", 0.7)) if isinstance(meta, dict) else 0.7,
+            importance=float(meta.get("importance", 0.5)) if isinstance(meta, dict) else 0.5,
             ttl_seconds=meta.get("ttl_seconds") if isinstance(meta, dict) else None,
             expires_at=meta.get("expires_at", "") if isinstance(meta, dict) else "",
             access_count=int(meta.get("access_count", 0)) if isinstance(meta, dict) else 0,

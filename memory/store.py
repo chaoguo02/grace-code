@@ -88,6 +88,27 @@ class MemoryStore:
     def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "", source_run_id: str = "") -> bool:
         return self._backend.write_memory(memory, source=source, source_session_id=source_session_id, source_run_id=source_run_id)
 
+    @property
+    def last_write_result(self) -> dict[str, Any]:
+        return dict(getattr(self._backend, "last_write_result", {}) or {})
+
+    def list_revisions(self, name: str) -> list[dict[str, Any]]:
+        method = getattr(self._backend, "list_revisions", None)
+        return method(name) if callable(method) else []
+
+    def list_edges(self, name: str) -> list[dict[str, Any]]:
+        method = getattr(self._backend, "list_edges", None)
+        return method(name) if callable(method) else []
+
+    def upsert_edge(
+        self, source_name: str, target_name: str, relation_type: str,
+        confidence: float, evidence: str,
+    ) -> dict[str, Any]:
+        method = getattr(self._backend, "upsert_edge", None)
+        if not callable(method):
+            raise RuntimeError("Memory relations require the SQLite backend")
+        return method(source_name, target_name, relation_type, confidence, evidence)
+
     def consolidate(
         self,
         candidate: Any,

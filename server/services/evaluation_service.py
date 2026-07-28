@@ -57,6 +57,7 @@ class EvaluationService:
                 for baseline in baselines
             ],
             "summary": self._build_summary(latest, previous, runs),
+            "domain_gates": self._build_domain_gates(latest),
             "disclosure": {
                 "source": "langfuse_validation_artifacts",
                 "read_only": True,
@@ -64,6 +65,75 @@ class EvaluationService:
                 "auto_run_enabled": False,
             },
         }
+
+    def _build_domain_gates(
+        self, latest: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Build eight-domain completion strictly from inspectable evidence."""
+        suites = {
+            "offline_evaluation": [
+                "pyproject.toml", "tests/test_evaluation_service.py",
+                "web/package.json", "web/playwright.config.ts",
+            ],
+            "replay": [
+                "server/services/replay_service.py", "server/routers/replay.py",
+                "web/src/components/ReplayLab.tsx", "tests/test_replay_service.py",
+            ],
+            "tool_retry": [
+                "core/tool_execution.py", "core/types.py",
+                "tests/test_tool_execution_pipeline.py",
+            ],
+            "memory": [
+                "memory/sqlite_backend.py", "memory/recall.py",
+                "tests/test_memory_recall.py",
+            ],
+            "security": [
+                "hitl/pipeline.py", "server/main.py",
+                "tests/test_server_bind_security.py",
+            ],
+            "state_machine": [
+                "agent/session/task_state_machine.py",
+                "tests/test_react_turn_seams.py",
+            ],
+            "long_context": [
+                "context/compaction.py", "agent/session/session_store.py",
+                "tests/test_compaction_trigger.py",
+            ],
+            "observability": [
+                "server/services/stats_recorder.py",
+                "web/src/components/ReliabilityDashboard.tsx",
+                "tests/test_evaluation_service.py",
+            ],
+        }
+        result = []
+        for domain, paths in suites.items():
+            checks = [
+                {
+                    "id": path,
+                    "passed": (self._repo_path / path).is_file(),
+                    "evidence": path,
+                }
+                for path in paths
+            ]
+            checks.append({
+                "id": "latest_deterministic_gate",
+                "passed": bool(latest and latest.get("all_passed")),
+                "evidence": latest.get("path", "") if latest else "No CI artifact",
+            })
+            passed = sum(1 for check in checks if check["passed"])
+            result.append({
+                "domain": domain,
+                "passed": passed,
+                "total": len(checks),
+                "completion": passed / len(checks) if checks else 0.0,
+                "status": "passed" if passed == len(checks) else "incomplete",
+                "checks": checks,
+                "last_success_commit": (
+                    str((latest or {}).get("configuration", {}).get("commit", ""))
+                ),
+                "last_run_at": (latest or {}).get("created_at", ""),
+            })
+        return result
 
     def _load_runs(
         self,

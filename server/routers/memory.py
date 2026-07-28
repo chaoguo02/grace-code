@@ -30,6 +30,15 @@ class MemoryOverrideRequest(BaseModel):
     action: str = Field(description="pin | disable | unpin | enable")
 
 
+class MemoryEdgeRequest(BaseModel):
+    target: str = Field(min_length=1)
+    relation_type: str = Field(
+        description="related_to | depends_on | contradicts | supersedes | mentions"
+    )
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    evidence: str = Field(min_length=1)
+
+
 # ── Router ─────────────────────────────────────────────────────────────────
 
 
@@ -94,6 +103,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
                 "name": mem.name, "description": mem.description,
                 "type": meta.type, "status": meta.status,
                 "scope": meta.scope, "confidence": meta.confidence,
+                "importance": meta.importance,
                 "access_count": meta.access_count,
                 "updated_at": mem.updated_at,
             }
@@ -229,6 +239,11 @@ def create_memory_router(get_service: Any) -> APIRouter:
             "content": mem.content, "type": mem.metadata.type,
             "status": mem.metadata.status, "scope": mem.metadata.scope,
             "confidence": mem.metadata.confidence,
+            "importance": mem.metadata.importance,
+            "current_revision": (
+                store.list_revisions(name)[0]["revision"]
+                if store.list_revisions(name) else 1
+            ),
             "access_count": mem.metadata.access_count,
             "source": getattr(mem, "source", ""),
             "source_session_id": getattr(mem, "source_session_id", ""),
@@ -261,6 +276,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
                 status=MemoryStatus.ACTIVE,
                 scope=MemoryScope.PROJECT,
                 confidence=body.confidence,
+                importance=body.importance,
             ),
             anchors=anchors,
         )
@@ -268,7 +284,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
         if not ok:
             raise HTTPException(status_code=409, detail=f"Memory '{body.name}' already exists")
         _invalidate(service)
-        return {"name": body.name, "status": "created"}
+        return {"name": body.name, "status": "created", **store.last_write_result}
 
     # ── PATCH /api/memory/{name} ───────────────────────────────────────
 
@@ -293,6 +309,8 @@ def create_memory_router(get_service: Any) -> APIRouter:
             mem.content = body.content; changed = True
         if body.confidence is not None:
             mem.metadata.confidence = body.confidence; changed = True
+        if body.importance is not None:
+            mem.metadata.importance = body.importance; changed = True
         if body.type is not None:
             from memory.models import MemoryType
             mem.metadata.type = MemoryType(body.type) if body.type in ("user", "feedback", "project", "reference") else mem.metadata.type
@@ -310,7 +328,48 @@ def create_memory_router(get_service: Any) -> APIRouter:
         if changed:
             store.write_memory(mem, source="web_api")
             _invalidate(service)
-        return {"name": name, "status": "updated", "changed": changed}
+        return {
+            "name": name, "status": "updated", "changed": changed,
+            **(store.last_write_result if changed else {"action": "NOOP"}),
+        }
+
+    @router.get("/{name}/revisions")
+    async def list_memory_revisions(
+        name: str,
+        service=Depends(get_service),
+    ) -> dict:
+        store = _store(service)
+        if store is None:
+            raise HTTPException(status_code=503, detail="Memory store not available")
+        if store.read_memory(name) is None:
+            raise HTTPException(status_code=404, detail=f"Memory not found: {name}")
+        return {"name": name, "items": store.list_revisions(name)}
+
+    @router.get("/{name}/edges")
+    async def list_memory_edges(
+        name: str,
+        service=Depends(get_service),
+    ) -> dict:
+        store = _store(service)
+        if store is None:
+            raise HTTPException(status_code=503, detail="Memory store not available")
+        return {"name": name, "items": store.list_edges(name)}
+
+    @router.post("/{name}/edges", status_code=201)
+    async def create_memory_edge(
+        name: str,
+        body: MemoryEdgeRequest,
+        service=Depends(get_service),
+    ) -> dict:
+        store = _store(service)
+        if store is None:
+            raise HTTPException(status_code=503, detail="Memory store not available")
+        try:
+            return store.upsert_edge(
+                name, body.target, body.relation_type, body.confidence, body.evidence
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # ── DELETE /api/memory/{name} ──────────────────────────────────────
 
@@ -328,5 +387,51 @@ def create_memory_router(get_service: Any) -> APIRouter:
         store.delete_memory(name)
         _invalidate(service)
         return {"name": name, "deleted": True}
+
+    # ── GET /api/memory/{name}/edges ────────────────────────────────────
+
+    @router.get("/{name}/edges")
+    async def get_memory_edges(
+        name: str,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """Get entity links (edges) for a memory.
+
+        Returns both outgoing (source) and incoming (target) relationships.
+        Each edge has: source_name, target_name, relation_type, confidence, evidence.
+        """
+        store = _store(service)
+        if store is None:
+            return []
+        mem = store.read_memory(name)
+        if mem is None:
+            raise HTTPException(status_code=404, detail=f"Memory not found: {name}")
+        backend = getattr(store, '_backend', None)
+        if backend is None or not hasattr(backend, 'list_edges'):
+            return []
+        return backend.list_edges(name)
+
+    # ── GET /api/memory/{name}/revisions ────────────────────────────────
+
+    @router.get("/{name}/revisions")
+    async def get_memory_revisions(
+        name: str,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """Get revision history for a memory.
+
+        Returns all revisions ordered by revision DESC (newest first).
+        Each revision has: revision, content_hash, payload_json, source, created_at.
+        """
+        store = _store(service)
+        if store is None:
+            return []
+        mem = store.read_memory(name)
+        if mem is None:
+            raise HTTPException(status_code=404, detail=f"Memory not found: {name}")
+        backend = getattr(store, '_backend', None)
+        if backend is None or not hasattr(backend, 'list_revisions'):
+            return []
+        return backend.list_revisions(name)
 
     return router

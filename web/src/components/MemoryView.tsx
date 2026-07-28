@@ -6,6 +6,8 @@ import {
   createMemory,
   updateMemory,
   getSessionMemoryRecalls,
+  getMemoryEdges,
+  getMemoryRevisions,
   previewSessionMemoryRecall,
   getSessionGeneratedMemories,
   setSessionMemoryOverride,
@@ -115,6 +117,8 @@ export function MemoryView() {
   const [confirmCancelEdit, setConfirmCancelEdit] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [memoryEdges, setMemoryEdges] = useState<Array<{ source_name: string; target_name: string; relation_type: string; confidence: number; evidence: string }>>([]);
+  const [memoryRevisions, setMemoryRevisions] = useState<Array<{ revision: number; content_hash: string; payload: Record<string, unknown>; created_at: string }>>([]);
   const [toast, setToast] = useState<string | null>(null);
   const [recalls, setRecalls] = useState<MemoryRecallItem[]>([]);
   const [generated, setGenerated] = useState<MemoryItem[]>([]);
@@ -145,8 +149,10 @@ export function MemoryView() {
 
   // Fetch full detail when a memory is selected
   useEffect(() => {
-    if (!selectedName) { setSelectedDetail(null); return; }
+    if (!selectedName) { setSelectedDetail(null); setMemoryEdges([]); setMemoryRevisions([]); return; }
     getMemoryDetail(selectedName).then(setSelectedDetail).catch(() => {});
+    getMemoryEdges(selectedName).then(setMemoryEdges).catch(() => {});
+    getMemoryRevisions(selectedName).then(setMemoryRevisions).catch(() => {});
   }, [selectedName]);
 
   useEffect(() => { loadData(); }, [loadData]);
@@ -481,6 +487,38 @@ export function MemoryView() {
                           {!!a.path && <span>: {String(a.path)}</span>}
                           {!!a.name && <span>: {String(a.name)}</span>}
                           {!!a.content_hash && <span style={{ color: "var(--text-muted)", marginLeft: 8 }}>hash:{String(a.content_hash).slice(0, 12)}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Entity Links */}
+                {memoryEdges.length > 0 && (
+                  <div className="memory-preview-card" style={{ marginTop: 8 }}>
+                    <div className="memory-preview-label">Linked Memories ({memoryEdges.length})</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+                      {memoryEdges.map((edge, i) => (
+                        <div key={i} style={{ fontSize: 12, color: "var(--text-dim)", display: "flex", gap: 8, alignItems: "center" }}>
+                          <span style={{ color: "var(--accent)", fontWeight: 500 }}>{edge.relation_type}</span>
+                          <span>{edge.source_name === selected.name ? edge.target_name : edge.source_name}</span>
+                          <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{(edge.confidence * 100).toFixed(0)}%</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Revision History */}
+                {memoryRevisions.length > 1 && (
+                  <div className="memory-preview-card" style={{ marginTop: 8 }}>
+                    <div className="memory-preview-label">Revision History ({memoryRevisions.length})</div>
+                    <div style={{ maxHeight: 120, overflow: "auto", marginTop: 4 }}>
+                      {memoryRevisions.slice(0, 5).map((rev, i) => (
+                        <div key={i} style={{ fontSize: 11, color: "var(--text-dim)", padding: "2px 0", borderBottom: i < Math.min(memoryRevisions.length, 5) - 1 ? "1px solid var(--border)" : "none" }}>
+                          <span style={{ fontWeight: 600, color: "var(--text)" }}>v{rev.revision}</span>
+                          <span style={{ marginLeft: 8 }}>{new Date(rev.created_at).toLocaleString()}</span>
+                          <span style={{ marginLeft: 8, fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text-muted)" }}>{rev.content_hash.slice(0, 8)}</span>
                         </div>
                       ))}
                     </div>

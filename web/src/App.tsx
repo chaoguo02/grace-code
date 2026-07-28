@@ -213,7 +213,16 @@ export default function App() {
             </div>
           ) : (
             <ErrorBoundary>
-              <SessionSidebar onToggleCollapse={() => setLeftCollapsed(true)} />
+              <SessionSidebar
+                onToggleCollapse={() => setLeftCollapsed(true)}
+                onOpenSession={(sessionId) => {
+                  writeNavigation(
+                    navigationForView("chat"),
+                    "push",
+                    sessionId,
+                  );
+                }}
+              />
               <SessionTree />
             </ErrorBoundary>
           )}

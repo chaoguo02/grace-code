@@ -1,11 +1,10 @@
+import { describe, expect, it } from "vitest";
 import { agentNameForUiMode, uiModeForAgentName } from "./modes";
 
-if (agentNameForUiMode("explore") !== "research") {
-  throw new Error("Explore must enter through the research primary");
-}
-if (uiModeForAgentName("research") !== "explore") {
-  throw new Error("Persisted research sessions must reopen on the Explore tab");
-}
-if (uiModeForAgentName("explore") !== "explore") {
-  throw new Error("Legacy explore sessions must remain readable");
-}
+describe("mode mappings", () => {
+  it("keeps research and legacy explore sessions aligned", () => {
+    expect(agentNameForUiMode("explore")).toBe("research");
+    expect(uiModeForAgentName("research")).toBe("explore");
+    expect(uiModeForAgentName("explore")).toBe("explore");
+  });
+});

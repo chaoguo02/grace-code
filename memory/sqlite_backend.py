@@ -8,6 +8,8 @@ Tables: memory_entries, memory_anchors (created by SqliteStorageBackend._init_me
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +32,7 @@ class SqliteMemoryBackend:
         self._indexer = indexer
         self._last_index_error: str | None = None
         self._index_error_count: int = 0
+        self._last_write_result: dict[str, Any] = {}
         self._init_tables()
 
     @staticmethod
@@ -49,6 +52,7 @@ class SqliteMemoryBackend:
                         status=MemoryStatus(r["status"]),
                         scope=MemoryScope(r["scope"]),
                         confidence=float(r["confidence"]),
+                        importance=float(r["importance"]),
                         access_count=int(r["access_count"]),
                     ),
                 )
@@ -70,6 +74,8 @@ class SqliteMemoryBackend:
                         content TEXT NOT NULL DEFAULT '', type TEXT NOT NULL DEFAULT 'project',
                         status TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'project',
                         confidence REAL NOT NULL DEFAULT 0.7, access_count INTEGER NOT NULL DEFAULT 0,
+                        importance REAL NOT NULL DEFAULT 0.5,
+                        current_revision INTEGER NOT NULL DEFAULT 0,
                         source TEXT NOT NULL DEFAULT '', source_session_id TEXT NOT NULL DEFAULT '',
                         source_run_id TEXT NOT NULL DEFAULT '',
                         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -81,6 +87,33 @@ class SqliteMemoryBackend:
                     );
                     CREATE INDEX IF NOT EXISTS idx_mem_type ON memory_entries(type);
                     CREATE INDEX IF NOT EXISTS idx_mem_scope ON memory_entries(scope);
+                    CREATE TABLE IF NOT EXISTS memory_revisions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        memory_name TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        source TEXT NOT NULL DEFAULT '',
+                        source_session_id TEXT NOT NULL DEFAULT '',
+                        source_run_id TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        UNIQUE(memory_name, revision),
+                        UNIQUE(memory_name, content_hash)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_memory_revisions_name
+                        ON memory_revisions(memory_name, revision DESC);
+                    CREATE TABLE IF NOT EXISTS memory_edges (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_name TEXT NOT NULL,
+                        target_name TEXT NOT NULL,
+                        relation_type TEXT NOT NULL,
+                        confidence REAL NOT NULL DEFAULT 0.5,
+                        evidence TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(source_name, target_name, relation_type, evidence)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_memory_edges_source
+                        ON memory_edges(source_name);
                 """)
                 # Migration P1-34a: add expires_at to existing databases
                 try:
@@ -89,6 +122,15 @@ class SqliteMemoryBackend:
                     )
                 except sqlite3.OperationalError:
                     pass  # column already exists
+                for declaration in (
+                    "importance REAL NOT NULL DEFAULT 0.5",
+                    "current_revision INTEGER NOT NULL DEFAULT 0",
+                ):
+                    try:
+                        conn.execute(f"ALTER TABLE memory_entries ADD COLUMN {declaration}")
+                    except sqlite3.OperationalError:
+                        pass
+                self._backfill_revisions(conn)
                 # Migration: add source_run_id for turn-level traceability
                 try:
                     conn.execute(
@@ -110,6 +152,72 @@ class SqliteMemoryBackend:
     def _val(val):
         """Extract string value from enum or plain string."""
         return val.value if hasattr(val, 'value') else str(val) if val else ""
+
+    @property
+    def last_write_result(self) -> dict[str, Any]:
+        return dict(self._last_write_result)
+
+    @staticmethod
+    def _revision_payload(memory: Memory) -> dict[str, Any]:
+        meta = memory.metadata
+        return {
+            "name": memory.name,
+            "description": memory.description,
+            "content": memory.content,
+            "metadata": {
+                "type": SqliteMemoryBackend._val(meta.type),
+                "status": SqliteMemoryBackend._val(meta.status),
+                "scope": SqliteMemoryBackend._val(meta.scope),
+                "confidence": meta.confidence,
+                "importance": meta.importance,
+                "ttl_seconds": meta.ttl_seconds,
+                "expires_at": meta.expires_at,
+                "access_count": meta.access_count,
+                "validated_at": meta.validated_at,
+            },
+            "anchors": [
+                {
+                    "kind": a.kind, "path": a.path, "name": a.name,
+                    "value": a.value, "content_hash": a.content_hash,
+                }
+                for a in memory.anchors
+            ],
+        }
+
+    @staticmethod
+    def _payload_hash(payload: dict[str, Any]) -> str:
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _backfill_revisions(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            "SELECT * FROM memory_entries WHERE current_revision=0"
+        ).fetchall()
+        for row in rows:
+            payload = {
+                "name": row["name"], "description": row["description"],
+                "content": row["content"],
+                "metadata": {
+                    "type": row["type"], "status": row["status"], "scope": row["scope"],
+                    "confidence": row["confidence"], "importance": row["importance"],
+                    "access_count": row["access_count"],
+                },
+                "anchors": [],
+            }
+            digest = self._payload_hash(payload)
+            conn.execute(
+                """INSERT OR IGNORE INTO memory_revisions
+                   (memory_name, revision, content_hash, payload_json, source,
+                    source_session_id, source_run_id, created_at)
+                   VALUES (?, 1, ?, ?, ?, ?, ?, ?)""",
+                (row["name"], digest, json.dumps(payload, ensure_ascii=False),
+                 row["source"], row["source_session_id"], row["source_run_id"],
+                 row["created_at"]),
+            )
+            conn.execute(
+                "UPDATE memory_entries SET current_revision=1 WHERE name=?",
+                (row["name"],),
+            )
 
     # ── CRUD ────────────────────────────────────────────────────────────
 
@@ -133,7 +241,8 @@ class SqliteMemoryBackend:
                         type=MemoryType(row["type"]) if row["type"] in ("user","feedback","project","reference") else MemoryType.PROJECT,
                         status=MemoryStatus(row["status"]) if row["status"] in ("active","deprecated") else MemoryStatus.ACTIVE,
                         scope=MemoryScope(row["scope"]) if row["scope"] in ("session","project","global") else MemoryScope.PROJECT,
-                        confidence=row["confidence"], access_count=row["access_count"],
+                        confidence=row["confidence"], importance=row["importance"],
+                        access_count=row["access_count"],
                     ),
                     created_at=row["created_at"], updated_at=row["updated_at"], anchors=anchors,
                 )
@@ -146,18 +255,55 @@ class SqliteMemoryBackend:
         _t = self._val(memory.metadata.type)
         _s = self._val(memory.metadata.status)
         _sc = self._val(memory.metadata.scope)
+        payload = self._revision_payload(memory)
+        content_hash = self._payload_hash(payload)
         try:
             with self._conn() as conn:
-                conn.execute("BEGIN")
+                conn.execute("BEGIN IMMEDIATE")
+                previous = conn.execute(
+                    """SELECT id, revision FROM memory_revisions
+                       WHERE memory_name=? AND content_hash=?""",
+                    (memory.name, content_hash),
+                ).fetchone()
+                if previous is not None:
+                    conn.execute("COMMIT")
+                    self._last_write_result = {
+                        "action": "NOOP", "revision_id": previous["id"],
+                        "revision": previous["revision"], "content_hash": content_hash,
+                    }
+                    return True
+                current = conn.execute(
+                    "SELECT current_revision FROM memory_entries WHERE name=?",
+                    (memory.name,),
+                ).fetchone()
+                revision = int(current["current_revision"] if current else 0) + 1
+                cur = conn.execute(
+                    """INSERT INTO memory_revisions
+                       (memory_name, revision, content_hash, payload_json, source,
+                        source_session_id, source_run_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (memory.name, revision, content_hash,
+                     json.dumps(payload, ensure_ascii=False), source,
+                     source_session_id, source_run_id, now),
+                )
                 conn.execute(
-                    """INSERT OR REPLACE INTO memory_entries
+                    """INSERT INTO memory_entries
                        (name, description, content, type, status, scope, confidence,
-                        access_count, source, source_session_id, source_run_id, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                               COALESCE((SELECT created_at FROM memory_entries WHERE name=?), ?), ?)""",
+                        importance, access_count, source, source_session_id, source_run_id,
+                        created_at, updated_at, current_revision)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(name) DO UPDATE SET
+                         description=excluded.description, content=excluded.content,
+                         type=excluded.type, status=excluded.status, scope=excluded.scope,
+                         confidence=excluded.confidence, importance=excluded.importance,
+                         access_count=excluded.access_count, source=excluded.source,
+                         source_session_id=excluded.source_session_id,
+                         source_run_id=excluded.source_run_id, updated_at=excluded.updated_at,
+                         current_revision=excluded.current_revision""",
                     (memory.name, memory.description, memory.content,
-                     _t, _s, _sc, memory.metadata.confidence, memory.metadata.access_count,
-                     source, source_session_id, source_run_id, memory.name, now, now),
+                     _t, _s, _sc, memory.metadata.confidence, memory.metadata.importance,
+                     memory.metadata.access_count, source, source_session_id,
+                     source_run_id, now, now, revision),
                 )
                 conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (memory.name,))
                 for a in memory.anchors:
@@ -166,6 +312,11 @@ class SqliteMemoryBackend:
                         (memory.name, a.kind, a.path, a.name, a.value, a.content_hash),
                     )
                 conn.execute("COMMIT")
+                self._last_write_result = {
+                    "action": "NEW" if current is None else "REVISION",
+                    "revision_id": cur.lastrowid, "revision": revision,
+                    "content_hash": content_hash,
+                }
         except Exception as exc:
             logger.error("SQLite write_memory %s failed: %s", memory.name, exc)
             return False
@@ -181,6 +332,64 @@ class SqliteMemoryBackend:
                     memory.name, self._index_error_count, exc,
                 )
         return True
+
+    def list_revisions(self, name: str) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT id, memory_name, revision, content_hash, payload_json,
+                          source, source_session_id, source_run_id, created_at
+                   FROM memory_revisions WHERE memory_name=?
+                   ORDER BY revision DESC""",
+                (name,),
+            ).fetchall()
+        return [
+            dict(row) | {"payload": json.loads(row["payload_json"])}
+            for row in rows
+        ]
+
+    def list_edges(self, name: str) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT * FROM memory_edges
+                   WHERE source_name=? OR target_name=? ORDER BY id""",
+                (name, name),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_edge(
+        self, source_name: str, target_name: str, relation_type: str,
+        confidence: float, evidence: str,
+    ) -> dict[str, Any]:
+        allowed = {"related_to", "depends_on", "contradicts", "supersedes", "mentions"}
+        if relation_type not in allowed:
+            raise ValueError(f"Unsupported memory relation: {relation_type}")
+        if not evidence.strip():
+            raise ValueError("Memory relation evidence is required")
+        if source_name == target_name:
+            raise ValueError("A memory cannot relate to itself")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            missing = [
+                item for item in (source_name, target_name)
+                if conn.execute("SELECT 1 FROM memory_entries WHERE name=?", (item,)).fetchone() is None
+            ]
+            if missing:
+                raise ValueError(f"Unknown memory: {', '.join(missing)}")
+            conn.execute(
+                """INSERT INTO memory_edges
+                   (source_name, target_name, relation_type, confidence, evidence, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source_name, target_name, relation_type, evidence)
+                   DO UPDATE SET confidence=excluded.confidence""",
+                (source_name, target_name, relation_type,
+                 max(0.0, min(1.0, float(confidence))), evidence.strip(), now),
+            )
+        return {
+            "source": source_name, "target": target_name,
+            "relation_type": relation_type,
+            "confidence": max(0.0, min(1.0, float(confidence))),
+            "evidence": evidence.strip(),
+        }
 
     def delete_memory(self, name: str) -> bool:
         try:

@@ -10,6 +10,7 @@ data (tool names, success/failure, duration) and session metadata
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
+import hashlib
 import logging
 import time
 from typing import Any
@@ -17,6 +18,35 @@ from typing import Any
 from server.services.stats_service import StatsService
 
 logger = logging.getLogger(__name__)
+
+_SENSITIVE_PARAM_TERMS = {
+    "token", "secret", "password", "key", "authorization", "cookie",
+    "prompt", "content", "body", "command", "cmd", "script",
+}
+
+
+def _redacted_param_summary(params: dict[str, Any]) -> dict[str, Any]:
+    """Return diagnostic shape and fingerprints without retaining payloads."""
+    result: dict[str, Any] = {}
+    for key, value in params.items():
+        text = str(value)
+        sensitive = any(term in key.lower() for term in _SENSITIVE_PARAM_TERMS)
+        if sensitive or len(text) > 120:
+            result[key] = {
+                "redacted": True,
+                "type": type(value).__name__,
+                "length": len(text),
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
+            }
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            result[key] = value
+        else:
+            result[key] = {
+                "redacted": True,
+                "type": type(value).__name__,
+                "length": len(text),
+            }
+    return result
 
 
 class StatsRecorder:
@@ -48,12 +78,7 @@ class StatsRecorder:
         tool_params: dict | None = None,
     ) -> None:
         """Called after each tool execution in the agent loop."""
-        _params = dict(tool_params or {})
-        # Truncate large param values to avoid storage bloat
-        _truncated: dict[str, Any] = {}
-        for _k, _v in _params.items():
-            _vs = str(_v)
-            _truncated[_k] = _vs[:200] if len(_vs) > 200 else _v
+        _truncated = _redacted_param_summary(dict(tool_params or {}))
         self._stats.record_step(
             session_id,
             step_number=step,
@@ -93,6 +118,9 @@ class StatsRecorder:
             stats=stats,
             capabilities=dict(capabilities or {}),
         )
+
+    def record_llm_turn(self, **payload: Any) -> int:
+        return self._stats.record_llm_turn(payload)
 
     def record_session_end(
         self, session_id: str, *,

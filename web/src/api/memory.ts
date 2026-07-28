@@ -61,6 +61,16 @@ export async function setSessionMemoryOverride(
   });
 }
 
+/** Fetch entity links for a memory. */
+export async function getMemoryEdges(name: string): Promise<Array<{ source_name: string; target_name: string; relation_type: string; confidence: number; evidence: string }>> {
+  return apiGet(`/api/memory/${encodeURIComponent(name)}/edges`);
+}
+
+/** Fetch revision history for a memory. */
+export async function getMemoryRevisions(name: string): Promise<Array<{ revision: number; content_hash: string; payload: Record<string, unknown>; created_at: string }>> {
+  return apiGet(`/api/memory/${encodeURIComponent(name)}/revisions`);
+}
+
 function emptyOverview(): MemoryOverview {
   return {
     enabled: true, preview: false, total: 0, active: 0, deprecated: 0,

@@ -154,9 +154,19 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
         return msgs
 
     if ev_type == "task_failed":
-        return [WsStatus(status="failed",
-            error=payload.get("error", str(payload.get("reason", "unknown"))),
-            timestamp=ts).to_dict()]
+        error = payload.get("error", str(payload.get("reason", "unknown")))
+        normalized = str(error).lower()
+        cancelled = (
+            payload.get("cancelled") is True
+            or payload.get("status") == "cancelled"
+            or "cancelled" in normalized
+            or "canceled" in normalized
+        )
+        return [WsStatus(
+            status="cancelled" if cancelled else "failed",
+            error=error,
+            timestamp=ts,
+        ).to_dict()]
 
     if ev_type == "action":
         action = payload.get("action", {}) or {}

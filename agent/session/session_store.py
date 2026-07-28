@@ -87,6 +87,38 @@ class SessionStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS session_message_archive (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    compaction_id TEXT NOT NULL,
+                    original_message_id INTEGER NOT NULL,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tool_call_id TEXT NULL,
+                    tool_name TEXT NULL,
+                    tool_calls_json TEXT NULL,
+                    turn_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    archived_at TEXT NOT NULL,
+                    UNIQUE(compaction_id, original_message_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS compaction_runs (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    source_message_ids_json TEXT NOT NULL,
+                    summary_hash TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    tokens_before INTEGER NOT NULL DEFAULT 0,
+                    tokens_after INTEGER NOT NULL DEFAULT 0,
+                    truncation_status TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT NULL,
+                    UNIQUE(session_id, source_hash)
+                );
+
                 CREATE TABLE IF NOT EXISTS agent_notifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     parent_session_id TEXT NOT NULL,
@@ -142,6 +174,10 @@ class SessionStore:
                     ON sessions(root_id);
                 CREATE INDEX IF NOT EXISTS idx_session_messages_session_id_id
                     ON session_messages(session_id, id);
+                CREATE INDEX IF NOT EXISTS idx_message_archive_session
+                    ON session_message_archive(session_id, original_message_id);
+                CREATE INDEX IF NOT EXISTS idx_compaction_runs_session
+                    ON compaction_runs(session_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_agent_notifications_parent_state_id
                     ON agent_notifications(parent_session_id, delivery_state, id);
                 CREATE INDEX IF NOT EXISTS idx_delegation_runs_parent
@@ -489,6 +525,119 @@ class SessionStore:
                 "UPDATE sessions SET updated_at = ? WHERE id = ?",
                 (_utc_now(), session_id),
             )
+
+    def replace_messages_with_compaction(
+        self,
+        session_id: str,
+        messages: list[dict],
+        *,
+        method: str = "snip_micro_auto",
+        tokens_before: int = 0,
+        tokens_after: int = 0,
+        truncation_status: str = "",
+    ) -> dict:
+        """Atomically archive active messages and replace them with compacted ones."""
+        if self.get_session(session_id) is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        import hashlib
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT * FROM session_messages WHERE session_id=? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            source_ids = [int(row["id"]) for row in rows]
+            source_hash = hashlib.sha256(
+                json.dumps(source_ids, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            compacted_json = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+            summary_hash = hashlib.sha256(compacted_json.encode("utf-8")).hexdigest()
+            existing = conn.execute(
+                """SELECT * FROM compaction_runs
+                   WHERE session_id=? AND status='completed'
+                     AND (source_hash=? OR summary_hash=?)
+                   ORDER BY created_at DESC LIMIT 1""",
+                (session_id, source_hash, summary_hash),
+            ).fetchone()
+            if existing is not None:
+                conn.execute("COMMIT")
+                return dict(existing) | {"action": "NOOP"}
+
+            compaction_id = uuid.uuid4().hex
+            now = _utc_now()
+            conn.execute(
+                """INSERT INTO compaction_runs
+                   (id, session_id, source_hash, source_message_ids_json, summary_hash,
+                    method, tokens_before, tokens_after, truncation_status, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)""",
+                (compaction_id, session_id, source_hash, json.dumps(source_ids),
+                 summary_hash, method, int(tokens_before), int(tokens_after),
+                 truncation_status, now),
+            )
+            for row in rows:
+                conn.execute(
+                    """INSERT INTO session_message_archive
+                       (compaction_id, original_message_id, session_id, role, content,
+                        tool_call_id, tool_name, tool_calls_json, turn_id, created_at, archived_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (compaction_id, row["id"], session_id, row["role"], row["content"],
+                     row["tool_call_id"], row["tool_name"], row["tool_calls_json"],
+                     row["turn_id"], row["created_at"], now),
+                )
+            conn.execute("DELETE FROM session_messages WHERE session_id=?", (session_id,))
+            for message in messages:
+                tool_calls = message.get("tool_calls") or None
+                tool_calls_json = (
+                    json.dumps(tool_calls, ensure_ascii=True) if tool_calls else None
+                )
+                tool_name = ",".join(
+                    str(item.get("name", "")) for item in tool_calls or []
+                ) or None
+                conn.execute(
+                    """INSERT INTO session_messages
+                       (session_id, role, content, tool_call_id, tool_name,
+                        tool_calls_json, turn_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, str(message.get("role", "user")),
+                     str(message.get("content", "")), message.get("tool_call_id"),
+                     tool_name, tool_calls_json, str(message.get("turn_id", "")), now),
+                )
+            conn.execute(
+                """UPDATE compaction_runs
+                   SET status='completed', completed_at=? WHERE id=?""",
+                (now, compaction_id),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?",
+                (now, session_id),
+            )
+            conn.execute("COMMIT")
+        return {
+            "id": compaction_id, "session_id": session_id, "action": "COMPACTED",
+            "source_count": len(rows), "active_count": len(messages),
+            "source_hash": source_hash, "summary_hash": summary_hash,
+            "tokens_before": int(tokens_before), "tokens_after": int(tokens_after),
+        }
+
+    def list_compaction_runs(self, session_id: str) -> list[dict]:
+        with self._connect() as conn:
+            return [
+                dict(row) for row in conn.execute(
+                    "SELECT * FROM compaction_runs WHERE session_id=? ORDER BY created_at DESC",
+                    (session_id,),
+                ).fetchall()
+            ]
+
+    def list_archived_messages(self, session_id: str) -> list[dict]:
+        with self._connect() as conn:
+            return [
+                dict(row) for row in conn.execute(
+                    """SELECT * FROM session_message_archive
+                       WHERE session_id=? ORDER BY original_message_id""",
+                    (session_id,),
+                ).fetchall()
+            ]
 
     # Runtime-injected prompt-engineering messages start with these
     # prefixes — they should never appear in the frontend.

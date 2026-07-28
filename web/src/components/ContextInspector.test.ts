@@ -42,10 +42,16 @@ describe("deriveContextComposition", () => {
   });
 
   it("classifies budget pressure from measured utilization", () => {
-    expect(deriveContextComposition(makeStats()).pressure).toBe("moderate");
+    expect(deriveContextComposition(makeStats()).pressure).toBe("low");
+    expect(deriveContextComposition(makeStats({
+      estimated_total_tokens: 7_500,
+    })).pressure).toBe("moderate");
     expect(deriveContextComposition(makeStats({
       estimated_total_tokens: 9_000,
     })).pressure).toBe("high");
+    expect(deriveContextComposition(makeStats({
+      estimated_total_tokens: 9_700,
+    })).pressure).toBe("critical");
     expect(deriveContextComposition(makeStats({
       estimated_total_tokens: 11_000,
     })).pressure).toBe("over");

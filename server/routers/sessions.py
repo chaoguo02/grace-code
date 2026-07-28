@@ -57,7 +57,11 @@ def _fire_and_forget_cleanup(coro) -> None:
         loop = asyncio.get_running_loop()
         asyncio.ensure_future(coro, loop=loop)
     except RuntimeError:
-        pass  # No event loop — skip cleanup, no resource leak risk
+        # Avoid leaking a coroutine object when synchronous callers have no
+        # event loop available to schedule it.
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
 
 
 def build_plan_state(rec: Any) -> dict[str, Any]:

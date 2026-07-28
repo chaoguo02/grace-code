@@ -42,6 +42,9 @@ from core.types import (
     ToolDependency,
     ToolEffect,
     ToolMetadata,
+    RetryMode,
+    RetryPolicy,
+    IdempotencyStrategy,
     ToolOutcome,
     ToolRole,
 )
@@ -75,6 +78,9 @@ class ToolResult:
     modified_files: list[str] = field(default_factory=list)  # 此工具调用修改的文件路径列表
     data: Any | None = None                # Optional typed/raw result payload; output remains compatibility rendering.
     attachments: tuple["HookAttachment", ...] = ()
+    invocation_id: str = ""
+    attempt_count: int = 1
+    eventual_success: bool = False
 
     def normalized_outcome(self) -> ToolOutcome:
         """Return the stable outcome vocabulary for this result."""
@@ -369,6 +375,28 @@ class BaseTool(ABC):
         """Declare whether this specific call may run beside sibling calls."""
         return ToolConcurrency.SERIAL
 
+    def retry_policy(self, params: dict[str, Any]) -> RetryPolicy:
+        """Resolve the retry contract for this concrete call.
+
+        Read-only calls retry transient failures automatically. Calls with
+        side effects require a fresh interactive approval before every retry.
+        Individual tools can override this through metadata.
+        """
+        configured = getattr(self.metadata, "retry_policy", None)
+        if configured is not None:
+            return configured
+        if self.isReadOnly(params):
+            return RetryPolicy(
+                mode=RetryMode.AUTOMATIC,
+                max_attempts=3,
+                idempotency_strategy=IdempotencyStrategy.INVOCATION_KEY,
+            )
+        return RetryPolicy(
+            mode=RetryMode.APPROVAL,
+            max_attempts=2,
+            idempotency_strategy=IdempotencyStrategy.USER_ACKNOWLEDGED,
+        )
+
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
         """Return True when this call has no side effects (CC-aligned).
 
@@ -637,7 +665,14 @@ class ToolRegistry:
             return ToolConcurrency.SERIAL
         return self._tools[canonical].concurrency_mode(params)
 
-    def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
+    def execute_tool(
+        self,
+        name: str,
+        params: dict[str, Any],
+        thought: str = "",
+        *,
+        invocation_id: str = "",
+    ) -> ToolResult:
         """
         按名称查找工具并执行。
         如果有 HitlManager，先经过 HITL 审批。
@@ -668,7 +703,12 @@ class ToolRegistry:
             session_id=getattr(self, "_session_id", ""),
             budget=getattr(self, "_budget", None),
         )
-        result = pipeline.execute(tool, params, thought=thought)
+        result = pipeline.execute(
+            tool,
+            params,
+            thought=thought,
+            invocation_id=invocation_id,
+        )
 
         self._record_timing(name, start, result)
         return result

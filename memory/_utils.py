@@ -39,6 +39,8 @@ def build_frontmatter(memory: Memory) -> str:
         meta["scope"] = memory.metadata.scope.value
     if memory.metadata.confidence != 0.7:
         meta["confidence"] = memory.metadata.confidence
+    if memory.metadata.importance != 0.5:
+        meta["importance"] = memory.metadata.importance
     if memory.metadata.ttl_seconds is not None:
         meta["ttl_seconds"] = memory.metadata.ttl_seconds
     if memory.metadata.expires_at:

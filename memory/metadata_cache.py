@@ -41,6 +41,7 @@ class CachedMetadata:
     type: MemoryType
     scope: MemoryScope
     confidence: float
+    importance: float
     ttl_seconds: int | None
     expires_at: str
     status: MemoryStatus
@@ -69,6 +70,7 @@ class CachedMetadata:
                 status=self.status,
                 scope=self.scope,
                 confidence=self.confidence,
+                importance=self.importance,
                 ttl_seconds=self.ttl_seconds,
                 expires_at=self.expires_at,
                 access_count=self.access_count,
@@ -201,6 +203,7 @@ class MetadataCache:
             type=parse_memory_type(fm),
             scope=scope,
             confidence=float(meta.get("confidence") or fm.get("confidence") or 0.7),
+            importance=float(meta.get("importance") or fm.get("importance") or 0.5),
             ttl_seconds=_parse_optional_int(meta.get("ttl_seconds") or fm.get("ttl_seconds")),
             expires_at=str(meta.get("expires_at") or fm.get("expires_at") or ""),
             status=status,
@@ -276,6 +279,7 @@ class MetadataCache:
             type=memory.metadata.type,
             scope=memory.metadata.scope,
             confidence=memory.metadata.confidence,
+            importance=memory.metadata.importance,
             ttl_seconds=memory.metadata.ttl_seconds,
             expires_at=memory.metadata.expires_at,
             status=memory.metadata.status,

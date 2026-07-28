@@ -1,3 +1,4 @@
+import { describe, expect, it } from "vitest";
 import { filterSafetyTools } from "./SafetyCenter";
 import type { SafetyTool } from "../types/safety";
 
@@ -26,9 +27,9 @@ const tools: SafetyTool[] = [
   },
 ];
 
-if (filterSafetyTools(tools, "high", "").map((tool) => tool.name).join() !== "Edit") {
-  throw new Error("Safety tool filtering must respect risk");
-}
-if (filterSafetyTools(tools, "all", "read_workspace").map((tool) => tool.name).join() !== "Read") {
-  throw new Error("Safety tool filtering must search declarative effects");
-}
+describe("filterSafetyTools", () => {
+  it("filters by risk and declarative effects", () => {
+    expect(filterSafetyTools(tools, "high", "").map((tool) => tool.name)).toEqual(["Edit"]);
+    expect(filterSafetyTools(tools, "all", "read_workspace").map((tool) => tool.name)).toEqual(["Read"]);
+  });
+});

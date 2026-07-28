@@ -332,7 +332,11 @@ class StreamingToolExecutor:
         """
         tc = tracked.tool_call
         try:
-            result = self._registry.execute_tool(tc.name, tc.params or {})
+            result = self._registry.execute_tool(
+                tc.name,
+                tc.params or {},
+                invocation_id=tc.id or "",
+            )
             with self._lock:
                 tracked.result = result
                 tracked.status = TrackedStatus.COMPLETED

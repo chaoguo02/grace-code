@@ -90,6 +90,16 @@ export interface EvaluationOverview {
   scenario_catalog: EvaluationScenario[];
   runs: EvaluationRun[];
   baselines: EvaluationBaseline[];
+  domain_gates: Array<{
+    domain: string;
+    passed: number;
+    total: number;
+    completion: number;
+    status: "passed" | "incomplete" | string;
+    checks: Array<{ id: string; passed: boolean; evidence: string }>;
+    last_success_commit: string;
+    last_run_at: string;
+  }>;
   summary: {
     run_count: number;
     latest_pass_rate: number;

@@ -88,6 +88,23 @@ function timelinePayload(sessionId: string, messages: Array<Record<string, unkno
     items,
     last_seq: eventItems.reduce((max, item) => Math.max(max, item.seq), 0),
     has_more: false,
+    turns: [{
+      turn_id: "fixture-turn",
+      run_id: "fixture-run",
+      turn_index: 0,
+      user_message: messages.find((item) => item.role === "user") || null,
+      assistant_message: messages.find((item) => item.role === "assistant") || null,
+      trace_events: events,
+      meta: {
+        steps: events.length, tokens: 1200, status: "completed",
+        started_at: "2026-07-22T10:00:00.000Z",
+        completed_at: "2026-07-22T10:01:00.000Z",
+        termination_reason: "goal_achieved",
+        verification: { status: "verified", reason: "tests_passed", checks: [] },
+        workspace_delta: {},
+      },
+    }],
+    active_run: null,
     plan_state: { lifecycle: "none", plan_text: "", revision: 0, max_revisions: 5 },
   };
 }
@@ -197,32 +214,34 @@ test.beforeEach(async ({ page }) => {
 
 test("keeps core surfaces reachable and secondary surfaces quieter", async ({ page }) => {
   await page.goto("/");
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
 
   await expect(page.locator(".sidebar")).toBeVisible();
   await expect(page.locator(".view-tab[data-view='chat']")).toHaveText(/Chat/);
   await expect(page.locator(".view-tab[data-view='plan']")).toHaveCount(0);
-  await expect(page.locator(".view-tab[data-view='reviews']")).toHaveText(/Review/);
+  await expect(page.locator(".view-tab[data-view='reviews']")).toHaveText(/Changes/);
   await expect(page.locator(".view-tab[data-view='memory']")).toHaveText(/Memory/);
-  await expect(page.locator(".view-tab[data-view='events']")).toHaveText(/Trace/);
 
   await page.getByText("Phase 17-18 Workspace").click();
 
   await expect(page.locator(".session-tree-panel")).toBeVisible();
   await expect(page.getByText("Please help refine the app layout.")).toBeVisible();
-  await expect(page.locator(".tool-call-card")).toBeVisible();
+  await expect(page.locator(".inline-tool")).toBeVisible();
   await expect(page.locator(".event-sidebar")).toBeVisible();
 
-  await expect(page.locator(".trace-block-plan_ready")).toBeVisible();
-  await expect(page.locator(".plan-actions button:has-text('Approve & Build')")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Plan approval" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Approve & Build/ })).toBeVisible();
 
   await page.locator("button[data-view='memory']").click();
   await expect(page.locator(".memory-hero")).toBeVisible();
   await expect(page.locator(".memory-page")).toBeVisible();
 
+  await page.getByRole("button", { name: "Inspect", exact: true }).click();
   await page.locator("button[data-view='events']").click();
   await expect(page.locator("[data-view-name='events']")).toBeVisible();
   await expect(page.locator("[data-view-name='events'] .trace-summary").first()).toContainText("I should reduce visual noise.");
 
+  await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.locator("button[data-view='plans']").click();
   await expect(page.locator(".plan-library")).toBeVisible();
 

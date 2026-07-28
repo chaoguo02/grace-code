@@ -925,6 +925,7 @@ class ReActAgent:
                     "max_steps": ctx.task.max_steps,
                     "execution_token_budget": ctx.task.budget_tokens,
                     "request_context_budget": self._cfg.request_budget_tokens,
+                    "base_commit": ctx.git_state._baseline_revision,
                     "streaming_tool_execution": bool(
                         getattr(
                             self._cfg,
@@ -1710,6 +1711,34 @@ class ReActAgent:
         total_tokens += _billable
         execution_budget.consume(_billable)
         execution_budget.record_step()
+        _record_llm = getattr(self._cfg.stats_collector, "record_llm_turn", None)
+        if callable(_record_llm):
+            _response = provider_turn.response
+            _cache = provider_turn.cache_stats
+            try:
+                _record_llm(
+                    session_id=self._cfg.stats_session_id,
+                    run_id=str(getattr(task, "run_id", "") or ""),
+                    turn_id=str(getattr(task, "turn_id", "") or ""),
+                    step_number=step,
+                    input_tokens=(
+                        _response.input_tokens if _response is not None
+                        else max(0, _billable - provider_turn.output_tokens_estimate)
+                    ),
+                    output_tokens=(
+                        _response.output_tokens if _response is not None
+                        else provider_turn.output_tokens_estimate
+                    ),
+                    billable_tokens=_billable,
+                    cache_read_tokens=(_cache.cache_read_tokens if _cache else 0),
+                    cache_create_tokens=(_cache.cache_creation_tokens if _cache else 0),
+                    non_cached_input_tokens=(
+                        _cache.non_cached_input_tokens if _cache else 0
+                    ),
+                    token_source="provider" if _response is not None else "estimate",
+                )
+            except Exception:
+                logger.debug("Failed to persist LLM turn metrics", exc_info=True)
         if self._cfg.token_callback is not None:
             self._cfg.token_callback(total_tokens)
 

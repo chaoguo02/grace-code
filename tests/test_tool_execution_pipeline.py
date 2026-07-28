@@ -7,6 +7,8 @@ from threading import Barrier
 from types import MethodType
 
 from core.base import BaseTool, ToolMetadata, ToolRegistry, ToolResult
+from core.errors import ToolErrorType, ToolRetryDirective
+from core.types import RetryMode, RetryPolicy, ToolEffect
 from hitl.permission_rule import PermissionRule
 from hitl.pipeline import (
     PermissionDecision,
@@ -223,3 +225,70 @@ def test_notification_internal_hook_failure_is_observable_and_non_blocking() -> 
     assert result.control is HookControl.CONTINUE
     assert result.warnings
     assert "telemetry unavailable" in result.warnings[0]
+
+
+def test_read_only_retry_uses_one_stable_invocation_id_until_success() -> None:
+    class _TransientRead(_GuardedTool):
+        metadata = ToolMetadata(
+            effects=frozenset({ToolEffect.READ_WORKSPACE}),
+            retry_policy=RetryPolicy(
+                mode=RetryMode.AUTOMATIC,
+                max_attempts=3,
+                base_delay_ms=0,
+                max_delay_ms=0,
+            ),
+        )
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, params: dict) -> ToolResult:
+            self.calls += 1
+            if self.calls == 1:
+                return ToolResult.from_error(
+                    ToolErrorType.TIMEOUT,
+                    "temporary timeout",
+                    retry=ToolRetryDirective.RETRY,
+                )
+            return ToolResult(success=True, output="recovered")
+
+    tool = _TransientRead()
+    result = ToolRegistry().register(tool).execute_tool(
+        "Guarded", {"value": "safe"}, invocation_id="stable-call"
+    )
+
+    assert result.success
+    assert result.invocation_id == "stable-call"
+    assert result.attempt_count == 2
+    assert result.eventual_success is True
+    assert [item["attempt"] for item in result.metadata["attempts"]] == [1, 2]
+
+
+def test_side_effect_retry_is_blocked_without_interactive_approval() -> None:
+    class _TransientWrite(_WriteTool):
+        metadata = ToolMetadata(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            retry_policy=RetryPolicy(
+                mode=RetryMode.APPROVAL,
+                max_attempts=2,
+                base_delay_ms=0,
+                max_delay_ms=0,
+            ),
+        )
+
+        def execute(self, params: dict) -> ToolResult:
+            return ToolResult.from_error(
+                ToolErrorType.UNAVAILABLE,
+                "temporary service failure",
+                retry=ToolRetryDirective.RETRY,
+            )
+
+    result = ToolRegistry().register(_TransientWrite()).execute_tool(
+        "Write", {"value": "safe"}, invocation_id="write-call"
+    )
+
+    assert not result.success
+    assert result.tool_error.error_type is ToolErrorType.PERMISSION_DENIED
+    assert result.invocation_id == "write-call"
+    assert result.attempt_count == 2
+    assert "retry approval is unavailable" in result.error.lower()

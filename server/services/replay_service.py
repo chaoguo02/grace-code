@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+from pathlib import Path
+import threading
 from typing import Any
+import uuid
 
 from agent.task import TerminationReason
 from observability.failure_policy import FAILURE_TAXONOMY
@@ -20,6 +26,343 @@ class ReplayService:
 
     def __init__(self, agent_service: Any) -> None:
         self._service = agent_service
+        self._executions: dict[str, dict[str, Any]] = {}
+        self._worktrees: dict[str, tuple[Any, Any]] = {}
+        self._execution_lock = threading.RLock()
+        self._ensure_execution_schema()
+
+    def _connection_factory(self) -> Any:
+        storage = getattr(self._service, "_storage", None)
+        store = getattr(storage, "store", None)
+        return getattr(store, "_connect", None)
+
+    def _ensure_execution_schema(self) -> None:
+        connect = self._connection_factory()
+        if not callable(connect):
+            return
+        with connect() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS replay_executions (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    workspace_path TEXT NOT NULL DEFAULT '',
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+
+    def start_execution(self, session_id: str, run_id: str) -> dict[str, Any]:
+        replay = self.get_session_replay(session_id)
+        run = next(
+            (item for item in replay["runs"] if item["run_id"] == run_id),
+            None,
+        )
+        if run is None:
+            raise ValueError(f"Unknown replay run: {run_id}")
+        if run["contract_source"] != "persisted_replay_run":
+            raise ValueError("Only complete persisted replay contracts can execute")
+
+        execution_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        record = {
+            "id": execution_id,
+            "session_id": session_id,
+            "run_id": run_id,
+            "status": "queued",
+            "classification": "",
+            "workspace_path": "",
+            "pinned": False,
+            "steps": [],
+            "diff": "",
+            "error": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._save_record(record)
+        threading.Thread(
+            target=self._execute_contract,
+            args=(execution_id, run),
+            daemon=True,
+            name=f"replay-{execution_id[:8]}",
+        ).start()
+        self._publish_execution(record, "replay_queued")
+        return dict(record)
+
+    def get_execution(self, execution_id: str) -> dict[str, Any]:
+        with self._execution_lock:
+            record = self._executions.get(execution_id)
+            if record is not None:
+                return dict(record)
+        loaded = self._load_execution(execution_id)
+        if loaded is None:
+            raise ValueError(f"Unknown replay execution: {execution_id}")
+        with self._execution_lock:
+            self._executions[execution_id] = loaded
+        return dict(loaded)
+
+    def pin_execution(self, execution_id: str) -> dict[str, Any]:
+        record = self.get_execution(execution_id)
+        record["pinned"] = True
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_record(record)
+        return record
+
+    def delete_workspace(self, execution_id: str) -> dict[str, Any]:
+        record = self.get_execution(execution_id)
+        managed = self._worktrees.pop(execution_id, None)
+        if managed is not None:
+            manager, worktree = managed
+            manager.discard(worktree)
+        elif record.get("workspace_path") and Path(record["workspace_path"]).exists():
+            metadata = record.get("worktree") or {}
+            required = {"name", "path", "branch", "base_branch", "base_commit"}
+            if not required.issubset(metadata):
+                raise ValueError(
+                    "Legacy replay workspace lacks safe deletion metadata"
+                )
+            from agent.session.worktree_manager import Worktree, WorktreeManager
+            manager = WorktreeManager(self._service.repo_path)
+            worktree = Worktree(**{
+                key: str(metadata[key]) for key in required
+            })
+            manager.discard(worktree)
+        record["workspace_path"] = ""
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_record(record)
+        return record
+
+    def _execute_contract(self, execution_id: str, run: dict[str, Any]) -> None:
+        record = self.get_execution(execution_id)
+        record["status"] = "running"
+        self._save_record(record)
+        self._publish_execution(record, "replay_started")
+        try:
+            base_commit = str(
+                run["record"].get("runtime_snapshot", {}).get("base_commit")
+                or ""
+            )
+            if not base_commit:
+                raise ValueError("Replay contract does not contain a base_commit")
+            registry = getattr(self._service, "_registry", None)
+            if registry is None:
+                raise ValueError("Tool registry is unavailable for replay")
+
+            from agent.session.worktree_manager import WorktreeManager
+            from core.base import ExecutionContext
+
+            manager = WorktreeManager(self._service.repo_path)
+            worktree = manager.create(
+                f"replay-{execution_id[:12]}",
+                base_branch=base_commit,
+            )
+            self._worktrees[execution_id] = (manager, worktree)
+            record["workspace_path"] = worktree.path
+            record["worktree"] = {
+                "name": worktree.name,
+                "path": worktree.path,
+                "branch": worktree.branch,
+                "base_branch": worktree.base_branch,
+                "base_commit": worktree.base_commit,
+            }
+            scoped = registry.scoped(ExecutionContext(
+                workspace_root=worktree.path,
+                repo_path=worktree.path,
+            ))
+            replay_steps: list[dict[str, Any]] = []
+            all_attempts: list[dict[str, Any]] = []
+            unexpected = False
+            expected = False
+            blocked = False
+
+            for step in run["record"].get("steps", []):
+                originals = {
+                    str(item.get("tool_call_id") or ""): item
+                    for item in step.get("tool_executions", [])
+                }
+                attempts = []
+                for call in step.get("model_action", {}).get("tool_calls", []):
+                    call_id = str(call.get("id") or "")
+                    result = scoped.execute_tool(
+                        str(call.get("name") or ""),
+                        dict(call.get("params") or {}),
+                        invocation_id=f"replay:{execution_id}:{call_id}",
+                    )
+                    original = originals.get(call_id, {})
+                    classification = self._classify_tool_result(
+                        original, result,
+                    )
+                    unexpected = (
+                        unexpected
+                        or classification == "unexpected_divergence"
+                    )
+                    expected = expected or classification == "expected_divergence"
+                    blocked = blocked or classification == "blocked"
+                    attempt = {
+                        "tool_call_id": call_id,
+                        "tool_name": str(call.get("name") or ""),
+                        "success": result.success,
+                        "outcome": result.normalized_outcome().value,
+                        "output_fingerprint": self._fingerprint(result.output),
+                        "error": result.format_error_for_observation() or "",
+                        "attempt_count": result.attempt_count,
+                        "classification": classification,
+                        "step": step.get("step"),
+                        "eventual_success": result.eventual_success,
+                    }
+                    attempts.append(attempt)
+                    all_attempts.append(attempt)
+                    self._publish_execution(
+                        {
+                            **record,
+                            "step": step.get("step"),
+                            "attempt": attempt,
+                        },
+                        "replay_attempt",
+                    )
+                replay_steps.append({
+                    "step": step.get("step"),
+                    "attempts": attempts,
+                    "runtime_decision": step.get("runtime_decision", {}),
+                })
+
+            record["steps"] = replay_steps
+            record["attempts"] = all_attempts
+            record["diff"] = manager.get_diff(worktree)
+            record["classification"] = (
+                "blocked" if blocked
+                else "unexpected_divergence" if unexpected
+                else "expected_divergence" if expected
+                else "matched"
+            )
+            record["status"] = "completed"
+        except Exception as exc:
+            record["status"] = "failed"
+            record["classification"] = "blocked"
+            record["error"] = str(exc)
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_record(record)
+        self._publish_execution(record, "replay_completed")
+        self._enforce_retention()
+
+    @staticmethod
+    def _classify_tool_result(original: dict[str, Any], result: Any) -> str:
+        if result.normalized_outcome().value == "blocked":
+            return "blocked"
+        if not original:
+            return "expected_divergence"
+        same_success = bool(original.get("success")) == bool(result.success)
+        same_outcome = (
+            not original.get("outcome")
+            or str(original.get("outcome"))
+            == result.normalized_outcome().value
+        )
+        return (
+            "matched"
+            if same_success and same_outcome
+            else "unexpected_divergence"
+        )
+
+    @staticmethod
+    def _fingerprint(value: str) -> str:
+        return hashlib.sha256((value or "").encode("utf-8")).hexdigest()[:16]
+
+    def _publish_execution(
+        self, record: dict[str, Any], event_type: str,
+    ) -> None:
+        bus = getattr(self._service, "_event_bus", None)
+        if bus is None:
+            return
+        bus.publish_raw(record["session_id"], {
+            "type": event_type,
+            "replay_execution": record,
+        })
+
+    def _save_record(self, record: dict[str, Any]) -> None:
+        with self._execution_lock:
+            self._executions[record["id"]] = dict(record)
+            self._persist_execution(record)
+
+    def _persist_execution(self, record: dict[str, Any]) -> None:
+        connect = self._connection_factory()
+        if not callable(connect):
+            return
+        with connect() as conn:
+            conn.execute(
+                """INSERT INTO replay_executions
+                   (id, session_id, run_id, status, workspace_path, pinned,
+                    result_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     status=excluded.status,
+                     workspace_path=excluded.workspace_path,
+                     pinned=excluded.pinned,
+                     result_json=excluded.result_json,
+                     updated_at=excluded.updated_at""",
+                (
+                    record["id"], record["session_id"], record["run_id"],
+                    record["status"], record.get("workspace_path", ""),
+                    int(bool(record.get("pinned"))),
+                    json.dumps(record, ensure_ascii=True),
+                    record["created_at"], record["updated_at"],
+                ),
+            )
+
+    def _load_execution(self, execution_id: str) -> dict[str, Any] | None:
+        connect = self._connection_factory()
+        if not callable(connect):
+            return None
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT result_json FROM replay_executions WHERE id=?",
+                (execution_id,),
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def _enforce_retention(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        candidates = [
+            item for item in self._executions.values()
+            if not item.get("pinned")
+            and item.get("status") not in {"queued", "running"}
+            and datetime.fromisoformat(item["updated_at"]) < cutoff
+        ]
+        for item in sorted(candidates, key=lambda row: row["updated_at"]):
+            try:
+                self.delete_workspace(item["id"])
+            except ValueError:
+                continue
+        # Project-wide replay workspaces are capped at 2 GiB. Pinned and live
+        # executions are never selected for automatic quota cleanup.
+        quota = 2 * 1024 * 1024 * 1024
+        eligible = [
+            item for item in self._executions.values()
+            if not item.get("pinned")
+            and item.get("status") not in {"queued", "running"}
+            and item.get("workspace_path")
+        ]
+        sizes: dict[str, int] = {}
+        for item in eligible:
+            path = Path(item["workspace_path"])
+            try:
+                sizes[item["id"]] = sum(
+                    entry.stat().st_size for entry in path.rglob("*")
+                    if entry.is_file()
+                )
+            except OSError:
+                sizes[item["id"]] = 0
+        total = sum(sizes.values())
+        for item in sorted(eligible, key=lambda row: row["updated_at"]):
+            if total <= quota:
+                break
+            try:
+                self.delete_workspace(item["id"])
+                total -= sizes.get(item["id"], 0)
+            except ValueError:
+                continue
 
     def get_session_replay(self, session_id: str) -> dict[str, Any]:
         session = self._service.session_service.get_session(session_id)
