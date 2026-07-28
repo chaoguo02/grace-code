@@ -1048,6 +1048,14 @@ class AgentService:
                     ),
                 )
 
+                # After compaction, run storage optimization to reclaim space
+                try:
+                    opt = self._storage.optimize_storage()
+                    logger.debug("Storage optimized: %d → %d pages",
+                                opt.get("pages_before", 0), opt.get("pages_after", 0))
+                except Exception:
+                    pass
+
                 if self._event_bus is not None:
                     self._event_bus.publish_raw(session_id, {
                         "type": "status",

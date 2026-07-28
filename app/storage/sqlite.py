@@ -740,6 +740,23 @@ class SqliteStorageBackend(StorageBackend):
     def list_messages(self, session_id: str) -> list[LLMMessage]:
         return self._store.list_messages(session_id)
 
+    def optimize_storage(self) -> dict:
+        """Run SQLite PRAGMA optimize to reclaim space and update statistics.
+
+        Call after bulk deletes (compaction, session cleanup) to prevent
+        index bloat and file fragmentation.
+        Returns dict with before/after page counts.
+        """
+        try:
+            with self._store._connect() as conn:
+                before = conn.execute("PRAGMA page_count").fetchone()[0]
+                conn.execute("PRAGMA optimize")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                after = conn.execute("PRAGMA page_count").fetchone()[0]
+                return {"pages_before": before, "pages_after": after}
+        except Exception:
+            return {"pages_before": 0, "pages_after": 0}
+
     def replace_messages_with_compaction(
         self, session_id: str, messages: list[dict], **metadata,
     ) -> dict:
