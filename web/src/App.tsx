@@ -14,6 +14,7 @@ import { ReplayLab } from "./components/ReplayLab";
 import { SafetyCenter } from "./components/SafetyCenter";
 import { MultiAgentControlPlane } from "./components/MultiAgentControlPlane";
 import { ReliabilityDashboard } from "./components/ReliabilityDashboard";
+import { StatsDashboard } from "./components/StatsDashboard";
 import { ProjectOverview } from "./components/ProjectOverview";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
