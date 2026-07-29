@@ -913,4 +913,58 @@ def _stream_text_only(self, api_messages, tools, on_text):
 
 
 # 把 stream() 方法绑定到 OpenAIBackend
+def _openai_stream_iter(
+    self: "OpenAIBackend",
+    messages: list,
+    tools: list,
+):
+    """Adapt the working SSE implementation to the StreamEvent contract.
+
+    The previous ``stream_iter`` definition was accidentally nested after an
+    unconditional return in ``_openai_stream`` and therefore never bound to
+    ``OpenAIBackend``.
+    """
+    pending: list[StreamEvent] = []
+
+    def _on_text(text: str) -> None:
+        pending.append(StreamEvent(
+            kind=StreamEventKind.TEXT_DELTA,
+            text=text,
+        ))
+
+    def _on_thought(text: str) -> None:
+        pending.append(StreamEvent(
+            kind=StreamEventKind.TEXT_DELTA,
+            text=text,
+            thought=text,
+        ))
+
+    response = _openai_stream(
+        self,
+        messages,
+        tools,
+        on_text=_on_text,
+        on_thought=_on_thought,
+    )
+    yield from pending
+    if (
+        response.action.action_type is ActionType.TOOL_CALL
+        and response.action.tool_calls
+    ):
+        for tool_call in response.action.tool_calls:
+            yield StreamEvent(
+                kind=StreamEventKind.TOOL_USE,
+                tool_call=tool_call,
+            )
+    yield StreamEvent(
+        kind=StreamEventKind.FINISH,
+        text=response.raw_content,
+        finish_message=response.action.message or "",
+        thought=response.action.thought or "",
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+    )
+
+
 OpenAIBackend.stream = _openai_stream
+OpenAIBackend.stream_iter = _openai_stream_iter

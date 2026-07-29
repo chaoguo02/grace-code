@@ -323,9 +323,30 @@ class ChatPipeline:
                 WsAssistantTextEnd, WsAssistantTextAborted,
             )
 
+            _thought_buffer = ""
+            _text_buffers: dict[str, str] = {}
+
+            def _chunk_ready(text: str) -> bool:
+                stripped = text.rstrip()
+                return (
+                    len(text) >= 160
+                    or "\n\n" in text
+                    or stripped.endswith(
+                        ("。", "！", "？", ".", "!", "?", "；", ";", ":")
+                    )
+                )
+
             def _stream_cb(text: str) -> None:
+                nonlocal _thought_buffer
                 try:
-                    eb.publish_typed(sid, WsThoughtDelta(text=text), run_context=run_ctx)
+                    _thought_buffer += text
+                    if _chunk_ready(_thought_buffer):
+                        eb.publish_typed(
+                            sid,
+                            WsThoughtDelta(text=_thought_buffer),
+                            run_context=run_ctx,
+                        )
+                        _thought_buffer = ""
                 except Exception:
                     pass
 
@@ -333,20 +354,37 @@ class ChatPipeline:
             self._runtime.set_stream_callback(request.session_id, _stream_cb)
 
             # ── Text stream lifecycle callback → assistant_text_start/end/aborted ──
+            def _flush_text(block_id: str) -> None:
+                buffered = _text_buffers.pop(block_id, "")
+                if buffered:
+                    eb.publish_typed(
+                        sid,
+                        WsAssistantTextDelta(
+                            block_id=block_id,
+                            text=buffered,
+                        ),
+                        run_context=run_ctx,
+                    )
+
             def _text_lifecycle_cb(evt_type: str, block_id: str, reason: str = "") -> None:
                 try:
                     if evt_type == "start":
+                        _text_buffers[block_id] = ""
                         eb.publish_typed(sid, WsAssistantTextStart(block_id=block_id), run_context=run_ctx)
                     elif evt_type == "end":
+                        _flush_text(block_id)
                         eb.publish_typed(sid, WsAssistantTextEnd(block_id=block_id), run_context=run_ctx)
                     elif evt_type == "aborted":
+                        _flush_text(block_id)
                         eb.publish_typed(sid, WsAssistantTextAborted(block_id=block_id, reason=reason), run_context=run_ctx)
                 except Exception:
                     pass
 
             def _text_delta_cb(block_id: str, text: str) -> None:
                 try:
-                    eb.publish_typed(sid, WsAssistantTextDelta(block_id=block_id, text=text), run_context=run_ctx)
+                    _text_buffers[block_id] = _text_buffers.get(block_id, "") + text
+                    if _chunk_ready(_text_buffers[block_id]):
+                        _flush_text(block_id)
                 except Exception:
                     pass
 

@@ -169,6 +169,12 @@ class AgentService:
         migrate_legacy_session_db(self.repo_path, db_path)
         self._store = SessionStore(db_path)
         self._storage: SqliteStorageBackend = SqliteStorageBackend(db_path)
+        recovered = self._storage.recover_orphaned_runs()
+        if recovered:
+            logger.warning(
+                "Recovered %d orphaned run(s) left by a previous process",
+                len(recovered),
+            )
 
         # ── SessionService ─────────────────────────────────────────────
         from server.services.session_service import SessionService
@@ -525,6 +531,7 @@ class AgentService:
             history_max_messages=self._config.context.history_window * 2,
             llm_max_retries=3,
             llm_retry_delay=1.0,
+            request_timeout=float(self._config.llm.timeout_seconds),
             stream=True,
             confirm_dangerous=False,
             token_budget_continuation=True,
@@ -1229,6 +1236,12 @@ class AgentService:
                     status="cancelled",
                     error=detail or "User cancelled",
                     expect_status="running",
+                )
+                from agent.session.models import SessionStatus
+                self._storage.update_status(
+                    session_id,
+                    SessionStatus.CANCELLED,
+                    error=detail or "User cancelled",
                 )
             except Exception:
                 logger.debug("Run cancel CAS failed", exc_info=True)

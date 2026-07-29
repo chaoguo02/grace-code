@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import re
+import subprocess
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -489,11 +490,59 @@ def _workspace_file_hash(repo_path: str, relative_path: str) -> str:
 
 def _dirty_git_files(repo: Any) -> set[str]:
     """Return staged, unstaged, deleted, and untracked paths."""
-    files: set[str] = set(repo.untracked_files)
-    for diff in tuple(repo.index.diff(None)) + tuple(repo.index.diff("HEAD")):
-        path = diff.b_path or diff.a_path
-        if path:
-            files.add(str(path))
+    worktree = getattr(repo, "working_tree_dir", None)
+    # Tests and lightweight adapters may provide a repository-shaped object
+    # without a concrete worktree. Preserve the original GitPython fallback.
+    if not isinstance(worktree, (str, Path)):
+        files: set[str] = set(repo.untracked_files)
+        for diff in tuple(repo.index.diff(None)) + tuple(repo.index.diff("HEAD")):
+            path = diff.b_path or diff.a_path
+            if path:
+                files.add(str(path))
+        return files
+
+    # GitPython's untracked_files/index.diff calls have no hard deadline and
+    # can block a chat turn indefinitely on a large runtime-artifact tree.
+    # Ask git directly, exclude generated trees at the pathspec level (before
+    # traversal), and enforce a bounded wait.
+    exclusions = (
+        ".scratch/**",
+        ".grace/**",
+        ".agents/**",
+        ".codex/**",
+        "node_modules/**",
+        "test-results/**",
+        "playwright-report/**",
+        "dist/**",
+        "build/**",
+    )
+    command = [
+        "git",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        ".",
+        *(f":(exclude){path}" for path in exclusions),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=str(worktree),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise OSError(result.stderr.strip() or "git status failed")
+
+    files: set[str] = set()
+    for record in result.stdout.split("\0"):
+        if len(record) >= 4 and record[2] == " ":
+            files.add(record[3:])
     return files
 
 
@@ -535,6 +584,10 @@ def _capture_git_state(repo_path: str) -> _GitState:
         state.is_git_repo = False
         state._last_git_error = "git module not installed"
         logger.debug("Git not installed — skipping git state capture")
+    except subprocess.TimeoutExpired as exc:
+        state.is_git_repo = False
+        state._last_git_error = f"git status timed out after {exc.timeout}s"
+        logger.warning("%s; continuing without Git completion checks", state._last_git_error)
     except _git_exc as exc:
         state.is_git_repo = False
         state._last_git_error = str(exc)
@@ -588,6 +641,16 @@ def _refresh_git_state(state: _GitState, repo_path: str) -> None:
         state._last_git_error = "git module unavailable during refresh"
         _log_level = logging.WARNING if not state._refresh_error_logged else logging.DEBUG
         logger.log(_log_level, "Git import failed during refresh — marking repo as unavailable")
+        state._refresh_error_logged = True
+    except subprocess.TimeoutExpired as exc:
+        state.is_git_repo = False
+        state._last_git_error = f"git status timed out after {exc.timeout}s"
+        _log_level = logging.WARNING if not state._refresh_error_logged else logging.DEBUG
+        logger.log(
+            _log_level,
+            "%s; disabling Git completion checks for this run",
+            state._last_git_error,
+        )
         state._refresh_error_logged = True
     except (InvalidGitRepositoryError, GitError) as exc:
         state.is_git_repo = False
@@ -1379,6 +1442,7 @@ class ReActAgent:
             stop_hook_retry_guard,
         )
 
+        logger.info("Preparing run workspace state for task %s", task.task_id)
         git_state = _capture_git_state(task.repo_path)
         reflection_counts: dict[str, int] = {}
         finish_context = _FinishRunContext(
@@ -1394,6 +1458,7 @@ class ReActAgent:
         )
         LocalRuntime().setup_workspace(task.repo_path)
         state_machine.transition(TaskState.RUNNING, "workspace ready")
+        logger.info("Run workspace ready for task %s", task.task_id)
         return _RunSetup(
             observer=observer,
             history=history,
@@ -1587,6 +1652,7 @@ class ReActAgent:
             sid = str(task.metadata.get("session_id") or task.task_id)
             self._memory_context.set_turn_id(f"{sid}-step-{step}")
 
+        logger.info("Building provider context for task %s step %d", task.task_id, step)
         messages = self._build_messages(
             history,
             token_budget,
@@ -1595,6 +1661,7 @@ class ReActAgent:
             max_context_window=self._backend.max_context_window,
             step=step,
         )
+        logger.info("Provider context ready for task %s step %d", task.task_id, step)
         provider_request = prepare_provider_request(
             messages=messages,
             history_messages=history.messages,
@@ -3448,6 +3515,7 @@ class ReActAgent:
         self._apply_active_skill_runtime_overrides()
         import uuid as _uuid_mod
         from llm.base import StreamEventKind
+        from llm.invoker import iter_with_timeout
 
         accumulated_text = ""
         accumulated_thought = ""
@@ -3456,24 +3524,34 @@ class ReActAgent:
 
         _text_lifecycle = self._cfg.text_stream_lifecycle_callback
         _text_delta_cb = self._cfg.text_stream_delta_callback
+        stream_events = iter_with_timeout(
+            lambda: self._backend.stream_iter(messages, tools),
+            timeout=float(getattr(self._cfg, "request_timeout", 300.0)),
+            cancellation_token=getattr(
+                self._cfg, "cancellation_token", None,
+            ),
+        )
+        logger.info(
+            "Starting LLM stream (model=%s timeout=%.1fs)",
+            self._backend.model_name,
+            float(getattr(self._cfg, "request_timeout", 300.0)),
+        )
 
         try:
-            for event in self._backend.stream_iter(messages, tools):
+            for event in stream_events:
                 if event.kind == StreamEventKind.ERROR:
                     raise RuntimeError(f"LLM stream error: {event.text}")
 
                 elif event.kind == StreamEventKind.TEXT_DELTA:
-                    accumulated_text += event.text
                     if event.thought:
                         accumulated_thought += event.thought
-                    # Forward to user-visible rendering
-                    if self._cfg.stream_callback:
-                        self._cfg.stream_callback(event.text)
-                    # ── Differentiate thought vs assistant text ──
-                    if event.thought:
-                        # Reasoning/thinking content → existing thought_delta path
-                        pass
+                        # Only reasoning_content belongs in the thought stream.
+                        # Publishing every TEXT_DELTA here duplicated ordinary
+                        # answer tokens as one "Thinking" block per token.
+                        if self._cfg.stream_callback:
+                            self._cfg.stream_callback(event.thought)
                     else:
+                        accumulated_text += event.text
                         # Assistant text → new text_delta path
                         if not current_text_block_id:
                             current_text_block_id = str(_uuid_mod.uuid4())

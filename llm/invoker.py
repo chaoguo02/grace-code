@@ -11,6 +11,7 @@ Extracted from ReActAgent._call_with_retry().
 from __future__ import annotations
 
 import logging
+import queue
 import random as _random
 import threading
 import time as _time
@@ -21,6 +22,52 @@ if TYPE_CHECKING:
     from llm.base import LLMBackend, LLMMessage, LLMToolSchema, LLMResponse, CacheStats
 
 logger = logging.getLogger(__name__)
+
+
+def iter_with_timeout(
+    iterator_factory,
+    *,
+    timeout: float,
+    cancellation_token: Any = None,
+):
+    """Yield a blocking provider iterator under a hard, cancellable deadline."""
+    events: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+    def _produce() -> None:
+        try:
+            for item in iterator_factory():
+                events.put(("item", item))
+        except Exception as exc:
+            events.put(("error", exc))
+        finally:
+            events.put(("done", None))
+
+    worker = threading.Thread(target=_produce, daemon=True)
+    worker.start()
+    deadline = _time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if cancellation_token is not None and getattr(
+            cancellation_token, "is_cancelled", False
+        ):
+            raise InterruptedError(
+                getattr(cancellation_token, "detail", "")
+                or "LLM request cancelled"
+            )
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"LLM backend stream timed out after {float(timeout):.0f}s"
+            )
+        try:
+            kind, value = events.get(timeout=min(0.1, remaining))
+        except queue.Empty:
+            continue
+        if kind == "item":
+            yield value
+        elif kind == "error":
+            raise value
+        else:
+            return
 
 
 @dataclass
@@ -93,7 +140,20 @@ class LLMInvoker:
 
         t = threading.Thread(target=_target, daemon=True)
         t.start()
-        t.join(timeout=timeout)
+        deadline = _time.monotonic() + max(0.0, float(timeout))
+        while t.is_alive():
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+            t.join(timeout=min(0.1, remaining))
+            cancellation = getattr(self.config, "cancellation_token", None)
+            if cancellation is not None and getattr(
+                cancellation, "is_cancelled", False
+            ):
+                raise InterruptedError(
+                    getattr(cancellation, "detail", "")
+                    or "LLM request cancelled"
+                )
         if t.is_alive():
             # Hung — abandon the thread (daemon=True means it won't
             # block process exit). The OS will clean up its resources.
@@ -148,7 +208,14 @@ class LLMInvoker:
                         cb = self.config.stream_callback
                         thought_cb = self.config.thought_callback
                         if hasattr(self.backend, "stream"):
-                            response = self.backend.stream(messages, tools, on_text=cb, on_thought=thought_cb)
+                            response = self._call_with_timeout(
+                                lambda: self.backend.stream(
+                                    messages,
+                                    tools,
+                                    on_text=cb,
+                                    on_thought=thought_cb,
+                                )
+                            )
                         else:
                             response = self._call_with_timeout(
                                 self.backend.complete, messages, tools,
@@ -196,7 +263,8 @@ class LLMInvoker:
                 _metrics.last_error_type = type(exc).__name__
                 # P2-41: check HTTP status code directly, not substring match
                 _is_non_retryable = (
-                    _metrics.last_error_type == "AuthenticationError"
+                    isinstance(exc, InterruptedError)
+                    or _metrics.last_error_type == "AuthenticationError"
                     or getattr(exc, "status_code", None) in (400, 401, 403)
                     or getattr(exc, "http_status", None) in (400, 401, 403)
                 )

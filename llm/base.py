@@ -217,7 +217,11 @@ class LLMBackend(ABC):
 
         action = response.action
         if action.thought:
-            yield StreamEvent(kind=StreamEventKind.TEXT_DELTA, text=action.thought)
+            yield StreamEvent(
+                kind=StreamEventKind.TEXT_DELTA,
+                text=action.thought,
+                thought=action.thought,
+            )
 
         if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
             for tc in action.tool_calls:

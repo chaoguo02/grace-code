@@ -705,6 +705,23 @@ class SessionStore:
         if not full:
             return full
 
+        # Older Web runs could persist the same prompt in both the atomic
+        # Run/Turn submission and SessionRuntime. Hide that legacy duplication
+        # from model context without rewriting the auditable message history.
+        # A genuine repeated turn has an assistant/tool message between user
+        # messages, so only adjacent byte-identical user rows are collapsed.
+        deduped: list[LLMMessage] = []
+        for msg in full:
+            if (
+                deduped
+                and msg.role == "user"
+                and deduped[-1].role == "user"
+                and str(msg.content or "") == str(deduped[-1].content or "")
+            ):
+                continue
+            deduped.append(msg)
+        full = deduped
+
         # ── Cap 1+2: per-message truncation ──
         capped: list[LLMMessage] = []
         for msg in full:

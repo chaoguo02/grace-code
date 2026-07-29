@@ -1682,11 +1682,29 @@ class SessionRuntime:
 
             persisted_all = self._store.list_messages(session_id)
             had_persisted_messages = bool(persisted_all)
-            if messages:
-                for message in messages:
-                    self._store.append_message(session_id, message)
-            else:
-                self._store.append_message(session_id, LLMMessage(role="user", content=task_description))
+            _submitted_turn_id = (
+                str(getattr(_run_ctx, "turn_id", "") or "")
+                if _run_ctx is not None
+                else ""
+            )
+            _prompt_already_persisted = bool(
+                _submitted_turn_id
+                and any(
+                    message.role == "user"
+                    and str(getattr(message, "turn_id", "") or "")
+                    == _submitted_turn_id
+                    for message in persisted_all
+                )
+            )
+            if not _prompt_already_persisted:
+                if messages:
+                    for message in messages:
+                        self._store.append_message(session_id, message)
+                else:
+                    self._store.append_message(
+                        session_id,
+                        LLMMessage(role="user", content=task_description),
+                    )
 
             history = ConversationHistory(max_messages=agent_cfg.history_max_messages)
             injected_messages = self._build_runtime_messages(spec, task_description)
@@ -1704,6 +1722,26 @@ class SessionRuntime:
             # intermediate-thought cap, and 8K-token budget.
             # list_messages() (used by GET /messages) returns FULL content.
             persisted_for_context = self._store.list_messages_for_context(session_id)
+            if _prompt_already_persisted:
+                # The Run/Turn submission transaction stores the display
+                # prompt exactly once. If hooks, @mentions, or Skills changed
+                # the execution prompt, replace only the in-memory copy for
+                # this model call; keep the durable user-visible text intact.
+                for index in range(len(persisted_for_context) - 1, -1, -1):
+                    message = persisted_for_context[index]
+                    if (
+                        message.role == "user"
+                        and str(getattr(message, "turn_id", "") or "")
+                        == _submitted_turn_id
+                    ):
+                        if str(message.content or "") != task_description:
+                            replacement = LLMMessage(
+                                role="user",
+                                content=task_description,
+                            )
+                            replacement.turn_id = _submitted_turn_id
+                            persisted_for_context[index] = replacement
+                        break
             history.add_many(injected_messages + persisted_for_context)
             agent._pending_history = history
 

@@ -77,6 +77,55 @@ def test_chat_request_is_immutable():
         request.prompt = "changed"
 
 
+def test_web_stream_callbacks_publish_sentence_chunks_not_tokens():
+    published = []
+
+    class _Runtime:
+        hook_dispatcher = None
+
+        def set_web_confirm_callback(self, session_id, callback):
+            self.confirm = callback
+
+        def set_stream_callback(self, session_id, callback):
+            self.thought = callback
+
+        def set_text_stream_callbacks(self, session_id, lifecycle, delta):
+            self.lifecycle = lifecycle
+            self.delta = delta
+
+    class _EventBus:
+        def publish_typed(self, session_id, event, run_context=None):
+            published.append(event)
+
+    runtime = _Runtime()
+    pipeline = ChatPipeline(_pipeline_ports(
+        runtime=runtime,
+        event_bus=_EventBus(),
+    ))
+    pipeline.build_callbacks(ChatRequest(session_id="s", prompt="hello"))
+
+    runtime.thought("reasoning")
+    assert published == []
+    runtime.thought(" complete.")
+    assert [event.type for event in published] == ["thought_delta"]
+    assert published[-1].text == "reasoning complete."
+
+    runtime.lifecycle("start", "block-1")
+    runtime.delta("block-1", "first")
+    runtime.delta("block-1", " sentence.")
+    runtime.delta("block-1", " trailing")
+    runtime.lifecycle("end", "block-1")
+
+    text_events = [
+        event for event in published
+        if event.type == "assistant_text_delta"
+    ]
+    assert [event.text for event in text_events] == [
+        "first sentence.",
+        " trailing",
+    ]
+
+
 def test_mention_resolution_returns_value_without_mutating_request(tmp_path):
     (tmp_path / "note.txt").write_text("hello from file", encoding="utf-8")
     request = ChatRequest(

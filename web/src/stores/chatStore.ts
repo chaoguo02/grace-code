@@ -184,7 +184,7 @@ function loadViewModePreference(): "verbose" | "normal" | "summary" {
  * Events that do NOT produce blocks (run_started, status, subagent_*, etc.)
  * are no-ops — they're handled by downstream UI state updates in handleWsEvent.
  */
-function applyWsToBlocks(
+export function applyWsToBlocks(
   blocks: ContentBlock[],
   ev: WsMessage,
   messageId: string,
@@ -316,6 +316,29 @@ function applyWsToBlocks(
   // plan_ready, memory_*, etc.) are NOT mapped to ContentBlocks.
   // They drive UI state changes (isRunning, toolApprovals, planApproval)
   // via their dedicated handleWsEvent branches — not through blocks.
+}
+
+/** Project persisted trace events into UI blocks while repairing the legacy
+ * contract that mirrored visible answer tokens into thought_delta events. */
+export function applyTraceEventsToBlocks(
+  blocks: ContentBlock[],
+  events: WsMessage[],
+  messageId: string,
+): void {
+  events.forEach((event, index) => {
+    if (event.type === "thought_delta") {
+      let next = index + 1;
+      if (events[next]?.type === "assistant_text_start") next += 1;
+      const candidate = events[next];
+      if (
+        candidate?.type === "assistant_text_delta"
+        && (candidate.text || "") === (event.text || "")
+      ) {
+        return;
+      }
+    }
+    applyWsToBlocks(blocks, event, messageId);
+  });
 }
 
 function runOutcomeFromTerminal(re: WsRunTerminalEvent): RunOutcome {
@@ -1285,9 +1308,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           // Build assistant blocks from trace events via the unified builder
           const asstBlocks: ContentBlock[] = [];
           const asstId = `${turn.turn_id}_asst`;
-          for (const ev of turn.trace_events) {
-            applyWsToBlocks(asstBlocks, ev, asstId);
-          }
+          applyTraceEventsToBlocks(asstBlocks, turn.trace_events, asstId);
           // The durable final assistant message is canonical.  Reconcile it
           // even when streaming left an empty block or a pre-tool preamble.
           reconcileFinalTextBlock(

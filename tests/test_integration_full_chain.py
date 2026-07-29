@@ -140,6 +140,64 @@ def test_full_chain_mock_backend_give_up_with_error_handling():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_transactional_run_prompt_is_not_persisted_twice(tmp_path):
+    """The HTTP Run/Turn transaction owns durable user-prompt insertion."""
+    from agent.core import AgentConfig
+    from agent.session.agent_registry import AgentRegistryV2
+    from agent.session.models import RunContext, SessionMode
+    from agent.session.runtime import SessionRuntime
+    from app.storage.sqlite import SqliteStorageBackend
+    from server.services.run_submission import submit_run_turn
+
+    storage = SqliteStorageBackend(str(tmp_path / "sessions.db"))
+    session = storage.create_session(
+        agent_name="build",
+        mode=SessionMode.PRIMARY,
+        repo_path=str(tmp_path),
+        title="No duplicate prompt",
+    )
+    submitted = submit_run_turn(
+        storage,
+        session_id=session.id,
+        prompt="docs目录下有多少个文件",
+        idempotency_key="one-prompt",
+    )
+    backend = MockBackend([
+        Action(ActionType.FINISH, thought="", message="75"),
+    ])
+    runtime = SessionRuntime(
+        store=storage._store,
+        backend=backend,
+        base_registry=ToolRegistry(),
+        agent_registry=AgentRegistryV2(project_dir=str(tmp_path)),
+        root_agent_config=AgentConfig(max_steps=2, stream=False),
+        log_dir=str(tmp_path),
+    )
+
+    result = runtime.run_session(
+        session.id,
+        agent_name="build",
+        task_description="docs目录下有多少个文件",
+        run_context=RunContext(
+            session_id=session.id,
+            run_id=submitted.run_id,
+            turn_id=submitted.turn_id,
+            turn_index=submitted.turn_index,
+            idempotency_key="one-prompt",
+        ),
+    )
+
+    assert result.status.value == "success"
+    messages = storage.list_messages(session.id)
+    assert [
+        (message.role, message.content)
+        for message in messages
+    ] == [
+        ("user", "docs目录下有多少个文件"),
+        ("assistant", "75"),
+    ]
+
+
 def test_full_chain_memory_context_injects_to_llm():
     """End-to-end: memory context reaches LLM via the full pipeline."""
     from agent.session.models import SessionMode

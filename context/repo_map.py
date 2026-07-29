@@ -26,6 +26,7 @@ tree-sitter 每种语言需要单独安装语言包：
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,7 +71,8 @@ _CLASS_NODES: frozenset[str] = frozenset({
 # 跳过的目录
 _SKIP_DIRS: frozenset[str] = frozenset({
     ".git", "__pycache__", ".venv", "venv", "node_modules",
-    ".mypy_cache", ".pytest_cache", "dist", "build",
+    ".mypy_cache", ".pytest_cache", ".scratch", ".grace", ".agents",
+    ".codex", "test-results", "playwright-report", "dist", "build",
 })
 
 # 正则 fallback：匹配常见语言的定义语句
@@ -187,32 +189,45 @@ class RepoMap:
     def _scan(self) -> list[FileInfo]:
         results: list[FileInfo] = []
         try:
-            paths = sorted(self._root.rglob("*"))
+            walker = os.walk(self._root)
         except OSError:
             return results
-        for path in paths:
-            if any(part in _SKIP_DIRS for part in path.parts):
-                continue
-            try:
-                if not path.is_file():
-                    continue
-                size = path.stat().st_size
-            except OSError:
-                continue
-            if size > 500_000:
-                continue
 
-            fi = FileInfo(path=path.relative_to(self._root), size=size)
-            ext = path.suffix.lower()
+        try:
+            for dirpath, dirnames, filenames in walker:
+                # Prune ignored directories before os.walk descends into them.
+                # Filtering paths after Path.rglob() is too late: rglob has
+                # already traversed large runtime trees such as node_modules
+                # and .scratch by then.
+                dirnames[:] = sorted(
+                    name for name in dirnames if name not in _SKIP_DIRS
+                )
+                base = Path(dirpath)
+                for filename in sorted(filenames):
+                    path = base / filename
+                    try:
+                        relative = path.relative_to(self._root)
+                        size = path.stat().st_size
+                    except (OSError, ValueError):
+                        continue
+                    if size > 500_000:
+                        continue
 
-            if ext in _LANG_REGISTRY or ext in {".py", ".js", ".ts", ".go", ".rs"}:
-                try:
-                    content = path.read_text(encoding="utf-8", errors="replace")
-                    fi.symbols = _extract_symbols(content, fi.path, ext)
-                except OSError:
-                    pass
+                    fi = FileInfo(path=relative, size=size)
+                    ext = path.suffix.lower()
 
-            results.append(fi)
+                    if ext in _LANG_REGISTRY or ext in {".py", ".js", ".ts", ".go", ".rs"}:
+                        try:
+                            content = path.read_text(encoding="utf-8", errors="replace")
+                            fi.symbols = _extract_symbols(content, fi.path, ext)
+                        except OSError:
+                            pass
+
+                    results.append(fi)
+        except OSError:
+            # A directory may disappear or become unreadable during a scan.
+            # Keep the partial map instead of failing the whole chat turn.
+            return results
         return results
 
     def _format_file(self, fi: FileInfo) -> str:

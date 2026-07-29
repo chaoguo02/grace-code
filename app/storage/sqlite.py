@@ -12,6 +12,7 @@ import os
 import json
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.session.models import (
@@ -352,6 +353,95 @@ class SqliteStorageBackend(StorageBackend):
         self, session_id: str, status: SessionStatus, error: str = "",
     ) -> None:
         self._store.update_status(session_id, status, error=error)
+
+    def recover_orphaned_runs(self) -> list[dict[str, str]]:
+        """Atomically fail active runs left by a previous server process."""
+        now = datetime.now(timezone.utc).isoformat()
+        detail = "Interrupted by server restart"
+        with self._store._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    """SELECT id, session_id FROM runs
+                       WHERE status IN ('queued', 'running')"""
+                ).fetchall()
+                if rows:
+                    conn.executemany(
+                        """UPDATE runs
+                           SET status='failed', error=?,
+                               termination_reason='internal_error',
+                               completed_at=?, updated_at=?
+                           WHERE id=? AND status IN ('queued', 'running')""",
+                        [
+                            (detail, now, now, str(row["id"]))
+                            for row in rows
+                        ],
+                    )
+                dangling = conn.execute(
+                    """SELECT s.id AS session_id,
+                              (SELECT r.id FROM runs r
+                               WHERE r.session_id=s.id
+                               ORDER BY r.turn_index DESC, r.created_at DESC
+                               LIMIT 1) AS run_id,
+                              (SELECT r.status FROM runs r
+                               WHERE r.session_id=s.id
+                               ORDER BY r.turn_index DESC, r.created_at DESC
+                               LIMIT 1) AS run_status,
+                              (SELECT r.error FROM runs r
+                               WHERE r.session_id=s.id
+                               ORDER BY r.turn_index DESC, r.created_at DESC
+                               LIMIT 1) AS run_error
+                       FROM sessions s
+                       WHERE s.status='running'
+                         AND NOT EXISTS (
+                           SELECT 1 FROM runs active
+                           WHERE active.session_id=s.id
+                             AND active.status IN ('queued', 'running')
+                         )"""
+                ).fetchall()
+                for item in dangling:
+                    run_status = str(item["run_status"] or "")
+                    session_status = (
+                        "cancelled" if run_status == "cancelled"
+                        else "completed" if run_status == "completed"
+                        else "failed"
+                    )
+                    error = (
+                        str(item["run_error"] or "")
+                        if session_status in {"cancelled", "failed"}
+                        else ""
+                    ) or detail
+                    conn.execute(
+                        """UPDATE sessions
+                           SET status=?, error=?, updated_at=?,
+                               completed_at=COALESCE(completed_at, ?)
+                           WHERE id=? AND status='running'""",
+                        (
+                            session_status,
+                            error if session_status != "completed" else "",
+                            now,
+                            now,
+                            str(item["session_id"]),
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        recovered = [
+            {"run_id": str(row["id"]), "session_id": str(row["session_id"])}
+            for row in rows
+        ]
+        active_session_ids = {item["session_id"] for item in recovered}
+        recovered.extend(
+            {
+                "run_id": str(item["run_id"] or ""),
+                "session_id": str(item["session_id"]),
+            }
+            for item in dangling
+            if str(item["session_id"]) not in active_session_ids
+        )
+        return recovered
 
     def set_summary(
         self, session_id: str, summary: str, *, status: SessionStatus,
