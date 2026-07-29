@@ -404,11 +404,12 @@ def main() -> None:
         _loop.run_until_complete(_server.serve())
     except KeyboardInterrupt:
         pass
+    except SystemExit:
+        pass  # Server startup failed (port conflict, etc.)
     finally:
-        # Graceful shutdown: close all connections, release port immediately
-        _loop.run_until_complete(_server.shutdown())
-        # Allow port reuse immediately (skip TIME_WAIT on some platforms)
-        _server.config.uds = None
+        # Graceful shutdown: only if the server successfully started
+        if hasattr(_server, "started") and _server.started:
+            _loop.run_until_complete(_server.shutdown())
         _loop.close()
         _asyncio.set_event_loop(None)
 
