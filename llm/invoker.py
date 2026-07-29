@@ -119,22 +119,20 @@ class LLMInvoker:
     """Per-request timeout for LLM backend calls (seconds).
     Prevents hung providers from blocking agent threads indefinitely."""
 
-    def _call_with_timeout(self, fn, *args):
-        """Wrap a blocking backend call in a thread-pool timeout.
-
-        Uses a bare thread so that timeout truly abandons the hung call
-        — ThreadPoolExecutor.shutdown() blocks on worker threads on some
-        platforms even with wait=False.
-        """
-        timeout = getattr(
-            self.config, "request_timeout", self._DEFAULT_REQUEST_TIMEOUT,
+    def _call_with_timeout(self, fn, *args, **kwargs):
+        """Run one backend call with a hard wall-clock timeout."""
+        timeout = max(
+            0.001,
+            float(getattr(
+                self.config, "request_timeout", self._DEFAULT_REQUEST_TIMEOUT,
+            )),
         )
         result: list[Any] = []
         error: list[Exception] = []
 
         def _target() -> None:
             try:
-                result.append(fn(*args))
+                result.append(fn(*args, **kwargs))
             except Exception as exc:
                 error.append(exc)
 
@@ -208,14 +206,32 @@ class LLMInvoker:
                         cb = self.config.stream_callback
                         thought_cb = self.config.thought_callback
                         if hasattr(self.backend, "stream"):
-                            response = self._call_with_timeout(
-                                lambda: self.backend.stream(
+                            callbacks_active = threading.Event()
+                            callbacks_active.set()
+
+                            def guarded_text(*args, **kwargs):
+                                if callbacks_active.is_set() and cb is not None:
+                                    return cb(*args, **kwargs)
+                                return None
+
+                            def guarded_thought(*args, **kwargs):
+                                if (
+                                    callbacks_active.is_set()
+                                    and thought_cb is not None
+                                ):
+                                    return thought_cb(*args, **kwargs)
+                                return None
+
+                            try:
+                                response = self._call_with_timeout(
+                                    self.backend.stream,
                                     messages,
                                     tools,
-                                    on_text=cb,
-                                    on_thought=thought_cb,
+                                    on_text=guarded_text,
+                                    on_thought=guarded_thought,
                                 )
-                            )
+                            finally:
+                                callbacks_active.clear()
                         else:
                             response = self._call_with_timeout(
                                 self.backend.complete, messages, tools,

@@ -333,6 +333,67 @@ class WsAssistantTextAborted:
         return _to_dict(self)
 
 
+# ── Multi-agent delegation events ────────────────────────────────────
+
+
+DelegationEventType = Literal[
+    "delegation_planned",
+    "delegation_task_queued",
+    "delegation_task_started",
+    "delegation_task_reported",
+    "delegation_task_failed",
+    "delegation_task_blocked",
+    "delegation_task_retrying",
+    "delegation_synthesis_started",
+    "delegation_phase_changed",
+    "delegation_integration_started",
+    "delegation_integration_completed",
+    "delegation_verification_started",
+    "delegation_verification_completed",
+    "delegation_completed",
+    "delegation_budget_exhausted",
+]
+
+
+@dataclass
+class WsDelegationEvent:
+    """Typed, flattened delegation lifecycle event used by live WS and replay."""
+
+    type: DelegationEventType = "delegation_phase_changed"
+    delegation_run_id: str = ""
+    task_id: str = ""
+    generation: int = 0
+    topology: str = ""
+    task_count: int = 0
+    phase: str = ""
+    previous_phase: str = ""
+    status: str = ""
+    agent_type: str = ""
+    child_session_id: str = ""
+    report_count: int = 0
+    tokens_used: int = 0
+    duration_ms: int = 0
+    reason: str = ""
+    error: str = ""
+    action: str = ""
+    integration_status: str = ""
+    verification: dict = field(default_factory=dict)
+    budget: dict = field(default_factory=dict)
+    changed_files: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    timestamp: str = ""
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
 # ── Run lifecycle events ───────────────────────────────────────────────
 
 

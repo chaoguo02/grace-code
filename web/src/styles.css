@@ -10590,3 +10590,186 @@ footer.composer { margin-top: 0; padding-top: 0; }
     grid-template-columns: 1fr;
   }
 }
+
+/* ── Multi-agent delegation run ─────────────────────────────────────── */
+.multi-agent-run-card {
+  margin: 0 20px 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elev);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+.multi-agent-run-card.empty { opacity: 0.78; }
+.multi-agent-run-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.multi-agent-run-eyebrow {
+  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.multi-agent-run-title {
+  margin-top: 2px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+}
+.multi-agent-run-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+.multi-agent-run-state strong,
+.multi-agent-task-status {
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 700;
+}
+.multi-agent-run-state[data-status="failed"] strong,
+.multi-agent-run-state[data-status="budget_exhausted"] strong,
+.multi-agent-task[data-status="failed"] .multi-agent-task-status,
+.multi-agent-task[data-status="cancelled"] .multi-agent-task-status {
+  border-color: var(--red, #f44336);
+}
+.multi-agent-run-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 10px;
+}
+.multi-agent-run-counts strong { color: var(--text); }
+.multi-agent-task-list {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+}
+.multi-agent-task {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: var(--bg-panel);
+  font-size: 11px;
+}
+.multi-agent-task-main {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  gap: 7px;
+}
+.multi-agent-task-agent { color: var(--text); font-weight: 650; }
+.multi-agent-task-id {
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.multi-agent-task-detail {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 4px;
+}
+.multi-agent-task-detail:hover { text-decoration: underline; }
+@media (max-width: 640px) {
+  .multi-agent-run-card { margin: 0 10px 10px; padding: 10px; }
+  .multi-agent-run-header { align-items: stretch; flex-direction: column; gap: 6px; }
+  .multi-agent-run-state { justify-content: space-between; }
+  .multi-agent-task { grid-template-columns: minmax(0, 1fr) auto; }
+  .multi-agent-task-detail { grid-column: 1 / -1; justify-self: start; }
+}
+
+/* ── Chat-native Multi-Agent run card ─────────────────────────────── */
+.multi-agent-run-card {
+  margin: 0 20px 14px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: linear-gradient(180deg, rgba(91, 92, 240, 0.06), transparent 120px), var(--bg-panel);
+  box-shadow: var(--shadow-md);
+}
+
+.multi-agent-run-card.empty { opacity: 0.78; }
+.multi-agent-run-header,
+.multi-agent-task-row,
+.multi-agent-run-actions,
+.multi-agent-gates,
+.multi-agent-integration-decision {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.multi-agent-run-header { justify-content: space-between; }
+.multi-agent-run-eyebrow { color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+.multi-agent-run-title { margin-top: 3px; color: var(--text); font-size: 16px; font-weight: 800; }
+.multi-agent-run-id { margin-top: 3px; color: var(--text-muted); font: 10px var(--font-mono); }
+.multi-agent-run-state { display: grid; justify-items: end; gap: 2px; }
+.multi-agent-run-state span { color: var(--text-muted); font-size: 11px; }
+.multi-agent-run-state strong { padding: 4px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; }
+.multi-agent-run-state[data-status="failed"] strong,
+.multi-agent-run-state[data-status="partial"] strong,
+.multi-agent-run-state[data-status="cancelled"] strong { background: rgba(239, 68, 68, 0.1); color: var(--error); }
+.multi-agent-run-counts { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0; padding: 9px 10px; border: 1px solid var(--border); border-radius: 12px; color: var(--text-muted); font-size: 11px; }
+.multi-agent-run-counts strong { color: var(--text); }
+.multi-agent-task-list { display: grid; gap: 8px; }
+.multi-agent-task { border: 1px solid var(--border); border-left: 3px solid var(--border-strong); border-radius: 14px; background: var(--bg-strong); overflow: hidden; }
+.multi-agent-task[data-status="running"] { border-left-color: var(--accent); }
+.multi-agent-task[data-status="completed"], .multi-agent-task[data-status="no_findings"] { border-left-color: var(--success); }
+.multi-agent-task[data-status="failed"], .multi-agent-task[data-status="partial"], .multi-agent-task[data-status="blocked"] { border-left-color: var(--error); }
+.multi-agent-task-row { padding: 9px 10px; }
+.multi-agent-task-toggle { min-width: 0; flex: 1; display: grid; grid-template-columns: 110px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.multi-agent-task-agent { color: var(--accent); font-size: 10px; font-weight: 800; text-transform: uppercase; }
+.multi-agent-task-title { overflow: hidden; color: var(--text); font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.multi-agent-task-status { color: var(--text-muted); font-size: 10px; }
+.multi-agent-task-detail { border: 1px solid var(--border); border-radius: 999px; background: var(--bg-panel); color: var(--text-dim); cursor: pointer; font-size: 10px; font-weight: 700; padding: 5px 8px; }
+.multi-agent-task-detail:disabled { cursor: default; opacity: 0.55; }
+.multi-agent-task-detail.danger, .multi-agent-run-actions .danger { color: var(--error); }
+.multi-agent-task-dependencies { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 0 10px 9px; color: var(--text-muted); font-size: 10px; }
+.multi-agent-task-dependencies code { padding: 2px 5px; border-radius: 6px; background: var(--bg-soft); color: var(--text-dim); }
+.multi-agent-task-dependencies span { margin-left: auto; }
+.multi-agent-task-report { padding: 10px; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 11px; line-height: 1.5; }
+.multi-agent-task-report p { margin: 0 0 8px; }
+.multi-agent-task-report ul { margin: 5px 0 8px; padding-left: 20px; }
+.multi-agent-task-meta { display: flex; flex-wrap: wrap; gap: 12px; color: var(--text-muted); }
+.multi-agent-integration-decision { justify-content: space-between; padding: 9px 10px; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 11px; }
+.multi-agent-integration-decision label { display: flex; align-items: center; gap: 8px; }
+.multi-agent-integration-decision select { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-panel); color: var(--text); padding: 4px 7px; }
+.multi-agent-integration-decision code { max-width: 45%; overflow: hidden; color: var(--text-muted); text-overflow: ellipsis; white-space: nowrap; }
+.multi-agent-gates { margin-top: 12px; align-items: stretch; }
+.multi-agent-gates > div { flex: 1; display: grid; gap: 3px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 12px; }
+.multi-agent-gates strong { color: var(--text); font-size: 11px; }
+.multi-agent-gates span { color: var(--text-muted); font-size: 10px; }
+.multi-agent-run-actions { flex-wrap: wrap; margin-top: 12px; }
+.multi-agent-run-actions .btn-secondary { min-height: 32px; padding: 0 11px; font-size: 11px; }
+.multi-agent-busy { color: var(--text-muted); font-size: 11px; }
+.multi-agent-action-error { margin: 8px 0; padding: 8px 10px; border-radius: 10px; background: rgba(239, 68, 68, 0.09); color: var(--error); font-size: 11px; }
+
+@media (max-width: 760px) {
+  .multi-agent-run-card { margin-inline: 10px; }
+  .multi-agent-task-toggle { grid-template-columns: 1fr auto; }
+  .multi-agent-task-agent { grid-column: 1 / -1; }
+  .multi-agent-task-row, .multi-agent-gates, .multi-agent-integration-decision { align-items: stretch; flex-direction: column; }
+  .multi-agent-task-detail { align-self: flex-start; }
+}

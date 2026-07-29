@@ -174,6 +174,7 @@ class RunContext:
     phase_policy: "PhasePolicy | None" = None
     delegation_effects: "frozenset[ToolEffect] | None" = None
     spawn_context: AgentSpawnContext | None = None
+    run_id: str = ""
 
     def __post_init__(self) -> None:
         if self.delegation_width < 1:

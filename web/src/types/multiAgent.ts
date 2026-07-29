@@ -93,6 +93,8 @@ export interface AgentBudgetProjection {
   max_concurrent_subagents?: number | null;
   max_subagent_spawn_depth?: number | null;
   max_fanout_per_turn?: number | null;
+  max_multi_agent_tasks?: number | null;
+  max_wave_fanout?: number | null;
 }
 
 export interface DelegationRunProjection {
@@ -100,6 +102,10 @@ export interface DelegationRunProjection {
   topology: string;
   reason?: string;
   status: string;
+  phase?: string;
+  verification?: Record<string, unknown> | null;
+  created_at?: string;
+  completed_at?: string | null;
   required_count?: number;
   completed_count?: number;
   failed_count?: number;
@@ -116,6 +122,9 @@ export interface DelegationTaskProjection {
   child_session_id?: string | null;
   status: string;
   required: boolean;
+  integration_status?: string;
+  integration_error?: string;
+  report?: Record<string, unknown> | null;
   dependencies: string[];
   generation?: number;
   retry_count?: number;
@@ -201,5 +210,13 @@ export interface MultiAgentSnapshot {
   delegation_runs?: DelegationRunProjection[];
   delegation_tasks?: DelegationTaskProjection[];
   limits?: AgentBudgetProjection | null;
+  feature?: {
+    enabled: boolean;
+    environment_variable: string;
+    max_tasks: number;
+    max_wave_fanout: number;
+    max_concurrent: number;
+  };
+  observability?: Record<string, unknown>;
   team?: AgentTeamProjection | null;
 }

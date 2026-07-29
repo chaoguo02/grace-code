@@ -151,8 +151,16 @@ def _validate_json_value(value: Any, schema: dict, *, path: str) -> str:
         "null": lambda item: item is None,
     }
     if expected in type_checks and not type_checks[expected](value):
-        article = "an" if expected and expected[0] in "aeiou" else "a"
-        return f"{path} must be {article} {expected}, got {type(value).__name__}"
+        expected_label = {
+            "string": "a string",
+            "integer": "an integer",
+            "number": "a number",
+            "boolean": "a boolean",
+            "object": "an object",
+            "array": "an array",
+            "null": "null",
+        }.get(expected, str(expected))
+        return f"{path} must be {expected_label}, got {type(value).__name__}"
 
     if "enum" in schema and value not in schema["enum"]:
         return f"{path} must be one of {schema['enum']}"

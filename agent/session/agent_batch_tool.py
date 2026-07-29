@@ -17,6 +17,7 @@ from agent.session.models import (
     AgentSpawnRequest,
     ExecutionPlacement,
     WorkspaceMode,
+    WorktreeDisposition,
 )
 from agent.session.result_contract import (
     ChangedFile,
@@ -93,9 +94,10 @@ class AgentBatchTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Run 2-4 well-scoped subagent tasks as a real persisted workflow. "
-            "Independent safe tasks fan out; dependencies execute in later waves; "
-            "all reports fan back into one result. Use Agent for one worker."
+            "Run a bounded DAG of 2 or more well-scoped subagent tasks as a real "
+            "persisted workflow. Independent safe tasks execute in bounded waves; "
+            "dependencies execute later; all reports fan back into one result. "
+            "Use Agent for one worker."
         )
 
     @property
@@ -131,6 +133,7 @@ class AgentBatchTool(BaseTool):
             },
             "required": ["id", "goal", "prompt"],
         }
+        config = self._feature_config()
         return {
             "type": "object",
             "properties": {
@@ -144,7 +147,7 @@ class AgentBatchTool(BaseTool):
                 "tasks": {
                     "type": "array",
                     "minItems": 2,
-                    "maxItems": 4,
+                    "maxItems": config.max_tasks,
                     "items": task,
                 },
             },
@@ -155,6 +158,15 @@ class AgentBatchTool(BaseTool):
         return ToolConcurrency.SERIAL
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
+        if not self._feature_config().enabled:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "Multi-Agent mode is disabled by "
+                    "GRACE_MULTI_AGENT_MODE_ENABLED"
+                ),
+            )
         if self._run_context is None:
             return ToolResult(
                 success=False,
@@ -273,8 +285,30 @@ class AgentBatchTool(BaseTool):
         reports: dict[str, WorkerReport] = {}
         pending = {task.id: task for task in tasks}
         failed_required = False
+        incomplete = {
+            WorkerReportStatus.PARTIAL,
+            WorkerReportStatus.FAILED,
+            WorkerReportStatus.CANCELLED,
+        }
         try:
             while pending:
+                if run_context.cancellation.is_cancelled:
+                    detail = run_context.cancellation.detail or "Delegation cancelled"
+                    for task in tuple(pending.values()):
+                        report = WorkerReport(
+                            task_id=task.id,
+                            session_id=f"cancelled:{task.id}",
+                            generation=0,
+                            agent_type=task.agent_type,
+                            status=WorkerReportStatus.CANCELLED,
+                            summary=detail,
+                            unresolved=(detail,),
+                        )
+                        reports[task.id] = report
+                        pending.pop(task.id)
+                        self._persist_report(run_id, task, report, detail)
+                        failed_required = failed_required or task.required
+                    break
                 ready = [
                     task
                     for task in pending.values()
@@ -284,11 +318,7 @@ class AgentBatchTool(BaseTool):
                     raise ValueError("Delegation task graph contains a cycle")
                 blocked = [
                     task for task in ready
-                    if any(
-                        reports[dep].status
-                        in {WorkerReportStatus.FAILED, WorkerReportStatus.CANCELLED}
-                        for dep in task.dependencies
-                    )
+                    if any(reports[dep].status in incomplete for dep in task.dependencies)
                 ]
                 for task in blocked:
                     report = WorkerReport(
@@ -297,12 +327,12 @@ class AgentBatchTool(BaseTool):
                         generation=0,
                         agent_type=task.agent_type,
                         status=WorkerReportStatus.FAILED,
-                        summary="Dependency failed",
-                        unresolved=("A required dependency did not complete",),
+                        summary="Dependency incomplete",
+                        unresolved=("A dependency did not complete successfully",),
                     )
                     reports[task.id] = report
                     pending.pop(task.id)
-                    self._persist_report(run_id, task, report, "Dependency failed")
+                    self._persist_report(run_id, task, report, "Dependency incomplete")
                     failed_required = failed_required or task.required
                 ready = [task for task in ready if task not in blocked]
                 if not ready:
@@ -311,46 +341,58 @@ class AgentBatchTool(BaseTool):
                 safe = [task for task in ready if self._is_parallel_safe(task)]
                 serial = [task for task in ready if task not in safe]
                 if safe:
-                    workers = min(len(safe), self._max_concurrent())
-                    with ThreadPoolExecutor(
-                        max_workers=workers,
-                        thread_name_prefix="agent-batch",
-                    ) as executor:
-                        future_map = {
-                            executor.submit(
-                                self._execute_one, run_id, task, reports
-                            ): task
-                            for task in safe
-                        }
-                        for future in as_completed(future_map):
-                            task = future_map[future]
-                            report = future.result()
-                            reports[task.id] = report
-                            pending.pop(task.id)
-                            failed_required = (
-                                failed_required
-                                or task.required
-                                and report.status
-                                in {
-                                    WorkerReportStatus.FAILED,
-                                    WorkerReportStatus.CANCELLED,
-                                }
-                            )
+                    config = self._feature_config()
+                    wave_limit = min(
+                        config.max_wave_fanout,
+                        config.max_concurrent,
+                    )
+                    for offset in range(0, len(safe), wave_limit):
+                        wave = safe[offset:offset + wave_limit]
+                        if run_context.cancellation.is_cancelled:
+                            break
+                        with ThreadPoolExecutor(
+                            max_workers=min(len(wave), config.max_concurrent),
+                            thread_name_prefix="agent-batch",
+                        ) as executor:
+                            future_map = {
+                                executor.submit(
+                                    self._execute_one, run_id, task, reports
+                                ): task
+                                for task in wave
+                            }
+                            for future in as_completed(future_map):
+                                task = future_map[future]
+                                report = future.result()
+                                reports[task.id] = report
+                                pending.pop(task.id)
+                                failed_required = (
+                                    failed_required
+                                    or task.required and report.status in incomplete
+                                )
                 for task in serial:
+                    if run_context.cancellation.is_cancelled:
+                        break
                     report = self._execute_one(run_id, task, reports)
                     reports[task.id] = report
                     pending.pop(task.id)
                     failed_required = (
                         failed_required
-                        or task.required
-                        and report.status
-                        in {
-                            WorkerReportStatus.FAILED,
-                            WorkerReportStatus.CANCELLED,
-                        }
+                        or task.required and report.status in incomplete
                     )
         except Exception as exc:
-            store.complete_delegation_run(run_id, status="failed")
+            current = store.get_delegation_run(run_id) or {}
+            terminal_event = store.finalize_delegation_run(
+                run_id,
+                status="failed",
+                phase="failed",
+                expected_version=int(current.get("version", 0)),
+                report_count=len(reports),
+            )
+            if terminal_event is not None:
+                self._emit(
+                    "delegation_completed", run_id,
+                    {"_persisted_event": terminal_event},
+                )
             return ToolResult(
                 success=False,
                 output="",
@@ -363,27 +405,64 @@ class AgentBatchTool(BaseTool):
                 },
             )
 
-        final_status = "partial" if failed_required else "completed"
-        self._emit(
-            "delegation_synthesis_started",
-            run_id,
-            {"report_count": len(reports)},
-        )
-        store.complete_delegation_run(run_id, status=final_status)
-        self._emit(
-            "delegation_completed",
-            run_id,
-            {"status": final_status, "report_count": len(reports)},
-        )
+        persisted_before_synthesis = store.get_delegation_run(run_id) or {}
+        if (
+            str(persisted_before_synthesis.get("status")) == "cancelled"
+            or run_context.cancellation.is_cancelled
+        ):
+            terminal_event = None
+            if str(persisted_before_synthesis.get("status")) != "cancelled":
+                terminal_event = store.finalize_delegation_run(
+                    run_id,
+                    status="cancelled",
+                    phase="cancelled",
+                    expected_version=int(persisted_before_synthesis.get("version", 0)),
+                    report_count=len(reports),
+                )
+            persisted_run = store.get_delegation_run(run_id) or {}
+            if terminal_event is not None:
+                persisted_run["_terminal_event"] = terminal_event
+        else:
+            self._emit(
+                "delegation_synthesis_started",
+                run_id,
+                {"report_count": len(reports)},
+            )
+            store.transition_delegation_run(
+                run_id,
+                status="running",
+                phase="synthesizing",
+                expected_statuses=("running",),
+                synthesis={
+                    "report_count": len(reports),
+                    "required_incomplete": failed_required,
+                },
+            )
+            persisted_run = store.reconcile_delegation_run(run_id)
+        terminal_event = persisted_run.pop("_terminal_event", None)
+        final_status = str(persisted_run.get("status", "failed"))
+        final_phase = str(persisted_run.get("phase", final_status))
+        if isinstance(terminal_event, dict):
+            self._emit(
+                "delegation_completed",
+                run_id,
+                {"_persisted_event": terminal_event},
+            )
         ordered = [reports[task.id] for task in tasks]
         output = self._format_result(run_id, topology, ordered)
+        success = final_status == "completed" and not failed_required
+        if final_phase == "awaiting_integration":
+            error = "Subagent worktrees require explicit integration review"
+        elif failed_required:
+            error = "One or more required subagent tasks were incomplete"
+        elif not success:
+            error = f"Delegation did not converge: {final_phase}"
+        else:
+            error = ""
         return ToolResult(
-            success=not failed_required,
+            success=success,
             output=output,
-            error=(
-                "One or more required subagent tasks failed"
-                if failed_required else ""
-            ),
+            error=error,
             subagent_tokens_used=sum(item.tokens_used for item in ordered),
             structured_findings=tuple(
                 finding.to_dict()
@@ -393,6 +472,7 @@ class AgentBatchTool(BaseTool):
             metadata={
                 "delegation_run_id": run_id,
                 "topology": topology,
+                "phase": final_phase,
                 "worker_reports": [item.to_dict() for item in ordered],
             },
         )
@@ -422,12 +502,15 @@ class AgentBatchTool(BaseTool):
         def child_created(child: Any) -> None:
             child_identity["id"] = child.id
             child_identity["generation"] = int(child.generation)
-            self._runtime._store.update_delegation_task(
+            started = self._runtime._store.update_delegation_task(
                 store_task_id,
                 status="running",
                 child_session_id=child.id,
                 generation=int(child.generation),
+                expected_statuses=("queued",),
             )
+            if not started:
+                return
             self._emit(
                 "delegation_task_started",
                 run_id,
@@ -498,7 +581,18 @@ class AgentBatchTool(BaseTool):
                 generation=int(child_identity.get("generation", 0)),
                 duration_ms=int((time.monotonic() - started) * 1000),
             )
-            self._persist_report(run_id, task, report, result.error)
+            integration_status = (
+                "pending"
+                if result.worktree_disposition is WorktreeDisposition.PRESERVED
+                else "not_required"
+            )
+            self._persist_report(
+                run_id,
+                task,
+                report,
+                result.error,
+                integration_status=integration_status,
+            )
             return report
         except Exception as exc:
             report = WorkerReport(
@@ -520,19 +614,27 @@ class AgentBatchTool(BaseTool):
         task: _BatchTask,
         report: WorkerReport,
         error: str,
+        *,
+        integration_status: str | None = None,
     ) -> None:
-        self._runtime._store.update_delegation_task(
+        persisted = self._runtime._store.update_delegation_task(
             f"{run_id}:{task.id}",
             status=report.status.value,
             child_session_id=(
                 report.session_id
-                if not report.session_id.startswith(("failed:", "blocked:"))
+                if not report.session_id.startswith(
+                    ("failed:", "blocked:", "cancelled:")
+                )
                 else None
             ),
             generation=report.generation,
             report=report.to_dict(),
             error=error,
+            integration_status=integration_status,
+            expected_statuses=("queued", "running"),
         )
+        if not persisted:
+            return
         self._emit(
             (
                 "delegation_task_failed"
@@ -599,8 +701,12 @@ class AgentBatchTool(BaseTool):
         )
 
     def _parse_tasks(self, raw: Any) -> tuple[_BatchTask, ...]:
-        if not isinstance(raw, list) or not 2 <= len(raw) <= 4:
-            raise ValueError("AgentBatch requires between 2 and 4 tasks")
+        max_tasks = self._feature_config().max_tasks
+        if not isinstance(raw, list) or not 2 <= len(raw) <= max_tasks:
+            raise ValueError(
+                "AgentBatch requires at least 2 tasks and at most "
+                f"GRACE_MAX_MULTI_AGENT_TASKS ({max_tasks})"
+            )
         tasks = []
         for item in raw:
             if not isinstance(item, dict):
@@ -696,13 +802,11 @@ class AgentBatchTool(BaseTool):
     def _validate(self, tasks: tuple[_BatchTask, ...], topology: str) -> None:
         if topology not in {"fan_out_fan_in", "chain"}:
             raise ValueError("AgentBatch topology must be fan_out_fan_in or chain")
-        max_fanout = self._positive_env(
-            "GRACE_MAX_FANOUT_PER_TURN", 3, 16,
-        )
-        if topology == "fan_out_fan_in" and len(tasks) > max_fanout:
+        config = self._feature_config()
+        if len(tasks) > config.max_tasks:
             raise ValueError(
-                f"AgentBatch fan-out exceeds the configured per-turn limit "
-                f"({max_fanout})"
+                "AgentBatch task count exceeds GRACE_MAX_MULTI_AGENT_TASKS "
+                f"({config.max_tasks})"
             )
         ids = {task.id for task in tasks}
         if len(ids) != len(tasks):
@@ -730,6 +834,10 @@ class AgentBatchTool(BaseTool):
         for task in tasks:
             definition = self._runtime.agent_registry.get(task.agent_type)
             workspace = task.isolation or definition.workspace_mode
+            if definition.intent is TaskIntent.EDIT and not task.write_files:
+                raise ValueError(
+                    f"Write task {task.id!r} must declare non-empty write_files"
+                )
             if task.write_files and workspace is WorkspaceMode.CURRENT:
                 write_set = set(task.write_files)
                 for other_id, other_set in active_write_sets:
@@ -823,9 +931,9 @@ class AgentBatchTool(BaseTool):
         return TopologyPlanner().plan(
             shape,
             TopologyPolicy(
-                max_fanout=self._positive_env(
-                    "GRACE_MAX_FANOUT_PER_TURN", 3, 16,
-                ),
+                # Topology validation uses the independent total DAG bound.
+                # Execution below still slices each ready set into bounded waves.
+                max_fanout=self._feature_config().max_tasks,
                 max_concurrent_subagents=self._max_concurrent(),
                 max_spawn_per_session=self._positive_env(
                     "GRACE_MAX_SUBAGENTS_PER_SESSION", 64, 10_000,
@@ -871,10 +979,14 @@ class AgentBatchTool(BaseTool):
         )
 
     @staticmethod
+    def _feature_config():
+        from agent.session.multi_agent_config import MultiAgentFeatureConfig
+
+        return MultiAgentFeatureConfig.from_environment()
+
+    @staticmethod
     def _max_concurrent() -> int:
-        return AgentBatchTool._positive_env(
-            "GRACE_MAX_CONCURRENT_SUBAGENTS", 4, 16,
-        )
+        return AgentBatchTool._feature_config().max_concurrent
 
     @staticmethod
     def _positive_env(name: str, default: int, maximum: int) -> int:

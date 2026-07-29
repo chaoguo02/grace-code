@@ -294,14 +294,22 @@ class EventLog:
             payload=payload,
         ))
 
-    def log_task_failed(self, steps: int, reason: str) -> None:
-        """任务失败或被熔断。"""
+    def log_task_failed(
+        self,
+        steps: int,
+        reason: str,
+        *,
+        status: str = "failed",
+    ) -> None:
+        """Record a typed unsuccessful terminal event."""
         self._append(Event(
             event_type=EventType.TASK_FAILED,
             task_id=self._current_task_id,
             payload={
-                "steps":  steps,
+                "steps": steps,
                 "reason": reason,
+                "status": status,
+                "cancelled": status in {"cancelled", "canceled"},
             },
         ))
 

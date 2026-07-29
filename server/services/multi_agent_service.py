@@ -30,6 +30,189 @@ class MultiAgentService:
     def __init__(self, agent_service: Any) -> None:
         self._service = agent_service
         self._store = agent_service._store
+        from agent.session.integration_coordinator import (
+            DelegationIntegrationCoordinator,
+        )
+        self._integration = (
+            DelegationIntegrationCoordinator(
+                agent_service._runtime,
+                self._store,
+                event_callback=self._emit_delegation_event,
+            )
+            if getattr(agent_service, "_runtime", None) is not None
+            else None
+        )
+
+    def _emit_delegation_event(
+        self, event_type: str, run_id: str, payload: dict[str, object],
+    ) -> None:
+        event_bus = getattr(self._service, "_event_bus", None)
+        run = self._store.get_delegation_run(run_id)
+        if event_bus is None or run is None:
+            return
+        from agent.task import Event, EventType
+
+        event_bus.publish(Event(
+            event_type=EventType(event_type),
+            task_id=run_id,
+            session_id=str(run["parent_session_id"]),
+            payload={
+                "delegation_run_id": run_id,
+                "phase": str(run.get("phase", "")),
+                **payload,
+            },
+        ))
+
+    def get_run(self, session_id: str, run_id: str) -> dict[str, Any]:
+        run = self._store.get_delegation_run(run_id)
+        if run is None or str(run["parent_session_id"]) != session_id:
+            raise ValueError("Delegation run not found in session")
+        return {
+            "run": run,
+            "tasks": self._store.list_delegation_tasks(run_id),
+        }
+
+    def integrate_run(
+        self, session_id: str, run_id: str, decisions: list[dict[str, Any]],
+    ) -> dict[str, object]:
+        from agent.session.integration_coordinator import IntegrationDecision
+
+        if self._integration is None:
+            raise RuntimeError("Multi-agent runtime is unavailable")
+        return self._integration.integrate(
+            parent_session_id=session_id,
+            run_id=run_id,
+            decisions=[
+                IntegrationDecision(
+                    task_id=str(item.get("task_id", "")),
+                    action=str(item.get("action", "")),
+                    expected_revision=str(item.get("expected_revision", "")),
+                )
+                for item in decisions
+            ],
+        )
+
+    def verify_run(self, session_id: str, run_id: str) -> dict[str, object]:
+        if self._integration is None:
+            raise RuntimeError("Multi-agent runtime is unavailable")
+        return self._integration.verify(
+            parent_session_id=session_id, run_id=run_id,
+        )
+
+    def retry_task(self, session_id: str, task_id: str) -> dict[str, object]:
+        task = self._store.get_delegation_task(task_id)
+        if task is None:
+            raise ValueError("Unknown delegation task")
+        run_id = str(task["delegation_run_id"])
+        self.get_run(session_id, run_id)
+        replacements = self._store.prepare_delegation_retry(task_id)
+        for replacement in replacements:
+            self._emit_delegation_event("delegation_task_retrying", run_id, {
+                "task_id": str(replacement["id"]),
+                "generation": int(replacement.get("retry_count", 0)),
+                "status": "queued",
+                "reason": f"Supersedes {replacement.get('supersedes_task_id')}",
+                "dependencies": list(replacement.get("dependencies", [])),
+            })
+        self._emit_delegation_event("delegation_phase_changed", run_id, {
+            "phase": "executing", "status": "running",
+            "reason": "retry",
+        })
+        scheduler = self._scheduler()
+        run = scheduler.execute(parent_session_id=session_id, run_id=run_id)
+        return {
+            "run": run,
+            "replacement_tasks": replacements,
+            "tasks": self._store.list_delegation_tasks(run_id),
+        }
+
+    def resume_run(self, session_id: str, run_id: str) -> dict[str, object]:
+        self.get_run(session_id, run_id)
+        replacements = self._store.prepare_delegation_resume(run_id)
+        for replacement in replacements:
+            self._emit_delegation_event("delegation_task_retrying", run_id, {
+                "task_id": str(replacement["id"]),
+                "generation": int(replacement.get("retry_count", 0)),
+                "status": "queued",
+                "reason": f"Resumes {replacement.get('supersedes_task_id')}",
+                "dependencies": list(replacement.get("dependencies", [])),
+            })
+        self._emit_delegation_event("delegation_phase_changed", run_id, {
+            "phase": "executing", "status": "running",
+            "reason": "resume",
+        })
+        run = self._scheduler().execute(
+            parent_session_id=session_id, run_id=run_id,
+        )
+        return {
+            "run": run,
+            "replacement_tasks": replacements,
+            "tasks": self._store.list_delegation_tasks(run_id),
+        }
+
+    def cancel_run(
+        self, session_id: str, run_id: str, detail: str,
+    ) -> dict[str, object]:
+        current = self.get_run(session_id, run_id)["run"]
+        if str(current["status"]) != "running":
+            raise ValueError(f"Delegation already converged as {current['status']}")
+        cancelled: list[str] = []
+        for task in self._store.list_delegation_tasks(run_id):
+            if str(task["status"]) != "superseded" and str(task["status"]) not in {
+                "completed", "partial", "failed", "cancelled", "interrupted",
+                "no_findings", "budget_exhausted", "rejected",
+            }:
+                child_id = str(task.get("child_session_id") or "")
+                if child_id:
+                    try:
+                        self._service._runtime.cancel_agent(
+                            parent_session_id=session_id,
+                            child_session_id=child_id,
+                            detail=detail,
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                if self._store.update_delegation_task(
+                    str(task["id"]),
+                    status="cancelled",
+                    error=detail,
+                    expected_statuses=("queued", "running"),
+                ):
+                    cancelled.append(str(task["id"]))
+        terminal_event = self._store.finalize_delegation_run(
+            run_id,
+            status="cancelled",
+            phase="cancelled",
+            expected_version=int(current["version"]),
+            report_count=len([
+                task for task in self._store.list_delegation_tasks(run_id)
+                if str(task["status"]) != "superseded"
+            ]),
+        )
+        if terminal_event is None:
+            actual = self._store.get_delegation_run(run_id) or current
+            raise ValueError(f"Delegation already converged as {actual['status']}")
+        self._emit_delegation_event(
+            "delegation_completed", run_id,
+            {"_persisted_event": terminal_event},
+        )
+        return {
+            "delegation_run_id": run_id,
+            "status": "cancelled",
+            "cancelled_task_ids": cancelled,
+        }
+
+    def _scheduler(self):
+        runtime = getattr(self._service, "_runtime", None)
+        if runtime is None:
+            raise RuntimeError("Multi-agent runtime is unavailable")
+        from agent.session.delegation_scheduler import DelegationRunScheduler
+
+        return DelegationRunScheduler(
+            runtime,
+            self._store,
+            event_callback=self._emit_delegation_event,
+        )
 
     def get_snapshot(self, session_id: str) -> dict[str, Any]:
         selected = self._store.get_session(session_id)
@@ -84,12 +267,13 @@ class MultiAgentService:
                 ),
                 "failed_count": sum(
                     str(task["status"]) in {
-                        "failed", "cancelled", "budget_exhausted",
+                        "partial", "failed", "cancelled", "interrupted",
+                        "budget_exhausted", "rejected",
                     }
                     for task in required
                 ),
-                "retry_count": (
-                    1 if str(run.get("reason_code")) == "explicit_retry" else 0
+                "retry_count": sum(
+                    int(task.get("retry_count", 0)) for task in run_tasks
                 ),
             })
         latest_routing = (
@@ -113,6 +297,45 @@ class MultiAgentService:
             item["consistency_state"] == "needs_resolution"
             for item in worktrees
         )
+        from agent.session.multi_agent_config import MultiAgentFeatureConfig
+
+        feature = MultiAgentFeatureConfig.from_environment()
+        run_status_counts = Counter(
+            str(run.get("status", "unknown")) for run in delegation_runs
+        )
+        phase_counts = Counter(
+            str(run.get("phase", "unknown")) for run in delegation_runs
+        )
+        task_status_counts = Counter(
+            str(task.get("status", "unknown")) for task in delegation_tasks
+        )
+        integration_counts = Counter(
+            str(task.get("integration_status", "unknown"))
+            for task in delegation_tasks
+        )
+        verification_counts = Counter(
+            str((run.get("verification") or {}).get("status", "not_run"))
+            if isinstance(run.get("verification"), dict) else "not_run"
+            for run in delegation_runs
+        )
+        observability = {
+            "run_count": len(delegation_runs),
+            "task_count": len(delegation_tasks),
+            "run_status_counts": dict(run_status_counts),
+            "phase_counts": dict(phase_counts),
+            "task_status_counts": dict(task_status_counts),
+            "integration_status_counts": dict(integration_counts),
+            "verification_status_counts": dict(verification_counts),
+            "retry_count": sum(
+                int(task.get("retry_count", 0)) for task in delegation_tasks
+            ),
+            "tokens_used": sum(
+                int(task.get("tokens_used", 0)) for task in delegation_tasks
+            ),
+            "worker_duration_ms": sum(
+                int(task.get("elapsed_ms", 0)) for task in delegation_tasks
+            ),
+        }
 
         return {
             "selected_session_id": selected.id,
@@ -121,6 +344,14 @@ class MultiAgentService:
             "delegation_runs": delegation_runs,
             "delegation_tasks": delegation_tasks,
             "limits": self._limits(),
+            "feature": {
+                "enabled": feature.enabled,
+                "environment_variable": "GRACE_MULTI_AGENT_MODE_ENABLED",
+                "max_tasks": feature.max_tasks,
+                "max_wave_fanout": feature.max_wave_fanout,
+                "max_concurrent": feature.max_concurrent,
+            },
+            "observability": observability,
             "team": self._team_projection(root_id),
             "nodes": nodes,
             "edges": [
@@ -264,7 +495,12 @@ class MultiAgentService:
         return max(1, min(value, maximum))
 
     def _limits(self) -> dict[str, int]:
+        from agent.session.multi_agent_config import MultiAgentFeatureConfig
+
+        multi_agent = MultiAgentFeatureConfig.from_environment()
         return {
+            "max_multi_agent_tasks": multi_agent.max_tasks,
+            "max_wave_fanout": multi_agent.max_wave_fanout,
             "max_spawn_per_session": self._int_env(
                 "GRACE_MAX_SUBAGENTS_PER_SESSION", 64,
             ),

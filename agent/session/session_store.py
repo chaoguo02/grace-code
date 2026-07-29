@@ -131,6 +131,19 @@ class SessionStore:
                     UNIQUE(child_session_id, generation)
                 );
 
+                CREATE TABLE IF NOT EXISTS session_trace_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'event_bus',
+                    child_session_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(session_id, seq)
+                );
+
                 CREATE TABLE IF NOT EXISTS delegation_runs (
                     id TEXT PRIMARY KEY,
                     parent_session_id TEXT NOT NULL,
@@ -139,10 +152,15 @@ class SessionStore:
                     reason_code TEXT NOT NULL DEFAULT '',
                     explanation TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
+                    phase TEXT NOT NULL DEFAULT 'executing',
                     budget_json TEXT NOT NULL DEFAULT '{}',
+                    synthesis_json TEXT NULL,
+                    verification_json TEXT NULL,
                     downgraded_from TEXT NULL,
                     is_team INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
+                    interrupted_at TEXT NULL,
                     completed_at TEXT NULL
                 );
 
@@ -163,6 +181,11 @@ class SessionStore:
                     status TEXT NOT NULL,
                     report_json TEXT NULL,
                     error TEXT NOT NULL DEFAULT '',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    max_retries INTEGER NOT NULL DEFAULT 1,
+                    supersedes_task_id TEXT NULL,
+                    integration_status TEXT NOT NULL DEFAULT 'not_required',
+                    integration_error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     started_at TEXT NULL,
                     completed_at TEXT NULL
@@ -314,15 +337,44 @@ class SessionStore:
                         );
                     """
                 )
+            delegation_run_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(delegation_runs)")
+            }
+            for name, declaration in {
+                "phase": "TEXT NOT NULL DEFAULT 'executing'",
+                "synthesis_json": "TEXT NULL",
+                "verification_json": "TEXT NULL",
+                "version": "INTEGER NOT NULL DEFAULT 0",
+                "interrupted_at": "TEXT NULL",
+            }.items():
+                if name not in delegation_run_columns:
+                    conn.execute(
+                        f"ALTER TABLE delegation_runs ADD COLUMN {name} {declaration}"
+                    )
             delegation_task_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(delegation_tasks)")
             }
-            if "prompt" not in delegation_task_columns:
-                conn.execute(
-                    "ALTER TABLE delegation_tasks "
-                    "ADD COLUMN prompt TEXT NOT NULL DEFAULT ''"
-                )
+            for name, declaration in {
+                "prompt": "TEXT NOT NULL DEFAULT ''",
+                "retry_count": "INTEGER NOT NULL DEFAULT 0",
+                "max_retries": "INTEGER NOT NULL DEFAULT 1",
+                "supersedes_task_id": "TEXT NULL",
+                "integration_status": "TEXT NOT NULL DEFAULT 'not_required'",
+                "integration_error": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if name not in delegation_task_columns:
+                    conn.execute(
+                        f"ALTER TABLE delegation_tasks ADD COLUMN {name} {declaration}"
+                    )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_tasks_supersedes
+                ON delegation_tasks(supersedes_task_id)
+                WHERE supersedes_task_id IS NOT NULL
+                """
+            )
 
     def create_session(
         self,
@@ -842,7 +894,12 @@ class SessionStore:
         expected_files: tuple[str, ...] = (),
         write_files: tuple[str, ...] = (),
         required: bool = True,
+        retry_count: int = 0,
+        max_retries: int = 1,
+        supersedes_task_id: str | None = None,
     ) -> dict[str, object]:
+        if retry_count < 0 or max_retries < 0 or retry_count > max_retries:
+            raise ValueError("Invalid delegation retry budget")
         now = _utc_now()
         with self._connect() as conn:
             exists = conn.execute(
@@ -851,16 +908,44 @@ class SessionStore:
             ).fetchone()
             if exists is None:
                 raise ValueError(f"Unknown delegation run: {delegation_run_id}")
+            if supersedes_task_id is not None:
+                cursor = conn.execute(
+                    """
+                    UPDATE delegation_tasks
+                    SET status = 'superseded',
+                        completed_at = COALESCE(completed_at, ?)
+                    WHERE id = ? AND delegation_run_id = ?
+                      AND status IN (
+                          'failed', 'cancelled', 'interrupted',
+                          'partial', 'budget_exhausted'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM delegation_tasks
+                          WHERE supersedes_task_id = ?
+                      )
+                    """,
+                    (
+                        now,
+                        supersedes_task_id,
+                        delegation_run_id,
+                        supersedes_task_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(
+                        "The delegation task is not retryable or was already superseded"
+                    )
             conn.execute(
                 """
                 INSERT INTO delegation_tasks (
                     id, delegation_run_id, child_session_id, generation,
                     agent_type, purpose, goal, prompt, scope_json,
                     dependencies_json, expected_files_json, write_files_json,
-                    required, status,
-                    report_json, error, created_at, started_at, completed_at
+                    required, status, report_json, error, retry_count,
+                    max_retries, supersedes_task_id, integration_status,
+                    integration_error, created_at, started_at, completed_at
                 ) VALUES (?, ?, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued',
-                          NULL, '', ?, NULL, NULL)
+                          NULL, '', ?, ?, ?, 'not_required', '', ?, NULL, NULL)
                 """,
                 (
                     task_id,
@@ -874,10 +959,197 @@ class SessionStore:
                     json.dumps(list(expected_files), ensure_ascii=True),
                     json.dumps(list(write_files), ensure_ascii=True),
                     int(required),
+                    retry_count,
+                    max_retries,
+                    supersedes_task_id,
                     now,
                 ),
             )
+            if supersedes_task_id is not None:
+                conn.execute(
+                    """
+                    UPDATE delegation_runs
+                    SET status = 'running', phase = 'executing',
+                        completed_at = NULL, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (delegation_run_id,),
+                )
         return self.get_delegation_task(task_id) or {}
+
+    def prepare_delegation_retry(
+        self, task_id: str,
+    ) -> list[dict[str, object]]:
+        task = self.get_delegation_task(task_id)
+        if task is None:
+            raise ValueError(f"Unknown delegation task: {task_id}")
+        if str(task["status"]) not in {
+            "failed", "cancelled", "interrupted", "partial", "budget_exhausted",
+        }:
+            raise ValueError("Only a terminal incomplete task can be retried")
+        return self._replace_delegation_subgraph(
+            str(task["delegation_run_id"]), {task_id},
+        )
+
+    def prepare_delegation_resume(
+        self, run_id: str,
+    ) -> list[dict[str, object]]:
+        run = self.get_delegation_run(run_id)
+        if run is None:
+            raise ValueError(f"Unknown delegation run: {run_id}")
+        tasks = self.list_delegation_tasks(run_id)
+        seeds = {
+            str(task["id"])
+            for task in tasks
+            if str(task["status"]) == "interrupted"
+        }
+        if not seeds:
+            raise ValueError("Delegation run has no interrupted tasks to resume")
+        return self._replace_delegation_subgraph(run_id, seeds)
+
+    def _replace_delegation_subgraph(
+        self, run_id: str, seed_ids: set[str],
+    ) -> list[dict[str, object]]:
+        """Atomically supersede seeds and every downstream consumer."""
+        now = _utc_now()
+        replacement_ids: list[str] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT * FROM delegation_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+            if run is None:
+                raise ValueError(f"Unknown delegation run: {run_id}")
+            rows = conn.execute(
+                """
+                SELECT * FROM delegation_tasks
+                WHERE delegation_run_id = ? AND status != 'superseded'
+                ORDER BY created_at, id
+                """,
+                (run_id,),
+            ).fetchall()
+            by_id = {str(row["id"]): row for row in rows}
+            if not seed_ids or not seed_ids <= set(by_id):
+                raise ValueError("Retry seed is not an effective task in this run")
+            affected = set(seed_ids)
+            changed = True
+            while changed:
+                changed = False
+                for task_id, row in by_id.items():
+                    dependencies = {
+                        str(item)
+                        for item in json.loads(row["dependencies_json"] or "[]")
+                    }
+                    if task_id not in affected and dependencies & affected:
+                        affected.add(task_id)
+                        changed = True
+            unresolved_worktrees = [
+                task_id for task_id in affected
+                if str(by_id[task_id]["integration_status"]) in {"pending", "retained"}
+            ]
+            if unresolved_worktrees:
+                raise ValueError(
+                    "Resolve affected worktrees before retrying: "
+                    + ", ".join(sorted(unresolved_worktrees))
+                )
+            mapping: dict[str, str] = {}
+            for task_id in sorted(affected):
+                row = by_id[task_id]
+                retry_count = int(row["retry_count"]) + 1
+                if retry_count > int(row["max_retries"]):
+                    raise ValueError(f"Task retry budget exhausted: {task_id}")
+                mapping[task_id] = (
+                    f"{task_id}:generation-{retry_count}-{uuid.uuid4().hex[:8]}"
+                )
+            remaining = set(affected)
+            ordered: list[str] = []
+            while remaining:
+                ready = sorted(
+                    task_id for task_id in remaining
+                    if not (
+                        {
+                            str(item)
+                            for item in json.loads(
+                                by_id[task_id]["dependencies_json"] or "[]"
+                            )
+                        }
+                        & remaining
+                    )
+                )
+                if not ready:
+                    raise ValueError("Delegation task graph contains a cycle")
+                ordered.extend(ready)
+                remaining.difference_update(ready)
+            for old_id in ordered:
+                row = by_id[old_id]
+                existing = conn.execute(
+                    "SELECT 1 FROM delegation_tasks WHERE supersedes_task_id = ?",
+                    (old_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise ValueError(f"Task was already superseded: {old_id}")
+                cursor = conn.execute(
+                    """
+                    UPDATE delegation_tasks
+                    SET status = 'superseded', completed_at = COALESCE(completed_at, ?)
+                    WHERE id = ? AND status != 'superseded'
+                    """,
+                    (now, old_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(f"Could not claim task for retry: {old_id}")
+                old_dependencies = [
+                    str(item)
+                    for item in json.loads(row["dependencies_json"] or "[]")
+                ]
+                dependencies = [mapping.get(item, item) for item in old_dependencies]
+                new_id = mapping[old_id]
+                conn.execute(
+                    """
+                    INSERT INTO delegation_tasks (
+                        id, delegation_run_id, child_session_id, generation,
+                        agent_type, purpose, goal, prompt, scope_json,
+                        dependencies_json, expected_files_json, write_files_json,
+                        required, status, report_json, error, retry_count,
+                        max_retries, supersedes_task_id, integration_status,
+                        integration_error, created_at, started_at, completed_at
+                    ) VALUES (?, ?, NULL, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued',
+                              NULL, '', ?, ?, ?, 'not_required', '', ?, NULL, NULL)
+                    """,
+                    (
+                        new_id,
+                        run_id,
+                        row["agent_type"],
+                        row["purpose"],
+                        row["goal"],
+                        row["prompt"],
+                        row["scope_json"],
+                        json.dumps(dependencies, ensure_ascii=True),
+                        row["expected_files_json"],
+                        row["write_files_json"],
+                        row["required"],
+                        int(row["retry_count"]) + 1,
+                        row["max_retries"],
+                        old_id,
+                        now,
+                    ),
+                )
+                replacement_ids.append(new_id)
+            conn.execute(
+                """
+                UPDATE delegation_runs
+                SET status = 'running', phase = 'executing', completed_at = NULL,
+                    interrupted_at = NULL, synthesis_json = NULL,
+                    verification_json = NULL, version = version + 1
+                WHERE id = ?
+                """,
+                (run_id,),
+            )
+            conn.execute("COMMIT")
+        return [
+            task for task_id in replacement_ids
+            if (task := self.get_delegation_task(task_id)) is not None
+        ]
 
     def update_delegation_task(
         self,
@@ -888,59 +1160,353 @@ class SessionStore:
         generation: int | None = None,
         report: dict[str, object] | None = None,
         error: str = "",
-    ) -> None:
+        integration_status: str | None = None,
+        integration_error: str = "",
+        expected_statuses: tuple[str, ...] | None = None,
+    ) -> bool:
         now = _utc_now()
         terminal = status in {
-            "completed", "partial", "failed", "cancelled", "no_findings",
-            "budget_exhausted", "rejected", "superseded",
+            "completed", "partial", "failed", "cancelled", "interrupted",
+            "no_findings", "budget_exhausted", "rejected", "superseded",
         }
+        where = "id = ?"
+        params: list[object] = [
+            status,
+            child_session_id,
+            generation,
+            json.dumps(report, ensure_ascii=True) if report is not None else None,
+            error,
+            integration_status,
+            integration_error,
+            status,
+            now,
+            int(terminal),
+            now,
+            task_id,
+        ]
+        if expected_statuses:
+            placeholders = ", ".join("?" for _ in expected_statuses)
+            where += f" AND status IN ({placeholders})"
+            params.extend(expected_statuses)
         with self._connect() as conn:
             cursor = conn.execute(
-                """
+                f"""
                 UPDATE delegation_tasks
                 SET status = ?,
                     child_session_id = COALESCE(?, child_session_id),
                     generation = COALESCE(?, generation),
                     report_json = COALESCE(?, report_json),
                     error = ?,
+                    integration_status = COALESCE(?, integration_status),
+                    integration_error = ?,
                     started_at = CASE
                         WHEN ? = 'running' THEN COALESCE(started_at, ?)
                         ELSE started_at
                     END,
                     completed_at = CASE WHEN ? THEN ? ELSE completed_at END
-                WHERE id = ?
+                WHERE {where}
                 """,
-                (
-                    status,
-                    child_session_id,
-                    generation,
-                    (
-                        json.dumps(report, ensure_ascii=True)
-                        if report is not None else None
-                    ),
-                    error,
-                    status,
-                    now,
-                    int(terminal),
-                    now,
-                    task_id,
-                ),
+                tuple(params),
             )
-            if cursor.rowcount != 1:
-                raise ValueError(f"Unknown delegation task: {task_id}")
+        if cursor.rowcount == 1:
+            return True
+        if self.get_delegation_task(task_id) is None:
+            raise ValueError(f"Unknown delegation task: {task_id}")
+        return False
 
-    def complete_delegation_run(self, run_id: str, *, status: str) -> None:
+    def transition_delegation_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        phase: str,
+        expected_statuses: tuple[str, ...] | None = None,
+        expected_version: int | None = None,
+        synthesis: dict[str, object] | None = None,
+        verification: dict[str, object] | None = None,
+    ) -> bool:
+        terminal = status in {"completed", "partial", "failed", "cancelled"}
+        now = _utc_now()
+        where = "id = ?"
+        params: list[object] = [
+            status,
+            phase,
+            json.dumps(synthesis, ensure_ascii=True) if synthesis is not None else None,
+            json.dumps(verification, ensure_ascii=True) if verification is not None else None,
+            now if terminal else None,
+            run_id,
+        ]
+        if expected_statuses:
+            placeholders = ", ".join("?" for _ in expected_statuses)
+            where += f" AND status IN ({placeholders})"
+            params.extend(expected_statuses)
+        if expected_version is not None:
+            where += " AND version = ?"
+            params.append(expected_version)
         with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE delegation_runs
+                SET status = ?, phase = ?,
+                    synthesis_json = COALESCE(?, synthesis_json),
+                    verification_json = COALESCE(?, verification_json),
+                    completed_at = ?, version = version + 1
+                WHERE {where}
+                """,
+                tuple(params),
+            )
+        return cursor.rowcount == 1
+
+    def finalize_delegation_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        phase: str,
+        expected_version: int,
+        report_count: int = 0,
+        verification: dict[str, object] | None = None,
+    ) -> dict[str, object] | None:
+        """Atomically CAS a delegation terminal state and append its trace.
+
+        A successful call is the only path that creates ``delegation_completed``.
+        Concurrent/stale callers lose the CAS and therefore cannot persist or
+        broadcast a duplicate terminal event. A retried run has a newer version
+        and may later produce one terminal event for that new execution.
+        """
+        if status not in {"completed", "partial", "failed", "cancelled"}:
+            raise ValueError(f"Invalid delegation terminal status: {status}")
+        now = _utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM delegation_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise ValueError(f"Unknown delegation run: {run_id}")
+            if int(row["version"]) != expected_version or str(row["status"]) in {
+                "completed", "partial", "failed", "cancelled",
+            }:
+                conn.execute("ROLLBACK")
+                return None
+            next_version = expected_version + 1
             cursor = conn.execute(
                 """
                 UPDATE delegation_runs
-                SET status = ?, completed_at = ?
-                WHERE id = ?
+                SET status = ?, phase = ?,
+                    verification_json = COALESCE(?, verification_json),
+                    completed_at = ?, version = ?
+                WHERE id = ? AND version = ?
+                  AND status NOT IN ('completed', 'partial', 'failed', 'cancelled')
                 """,
-                (status, _utc_now(), run_id),
+                (
+                    status,
+                    phase,
+                    json.dumps(verification, ensure_ascii=True)
+                    if verification is not None else None,
+                    now,
+                    next_version,
+                    run_id,
+                    expected_version,
+                ),
             )
             if cursor.rowcount != 1:
-                raise ValueError(f"Unknown delegation run: {run_id}")
+                conn.execute("ROLLBACK")
+                return None
+            seq_row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM session_trace_events "
+                "WHERE session_id = ?",
+                (str(row["parent_session_id"]),),
+            ).fetchone()
+            sequence = int(seq_row[0]) if seq_row else 1
+            event = {
+                "type": "delegation_completed",
+                "session_id": str(row["parent_session_id"]),
+                "run_id": str(row["parent_run_id"]),
+                "delegation_run_id": run_id,
+                "event_id": f"delegation-terminal:{run_id}:{next_version}",
+                "sequence": sequence,
+                "seq": sequence,
+                "timestamp": now,
+                "status": status,
+                "phase": phase,
+                "report_count": report_count,
+                "version": next_version,
+            }
+            conn.execute(
+                """
+                INSERT INTO session_trace_events (
+                    session_id, seq, event_type, timestamp, event_json,
+                    source, child_session_id
+                ) VALUES (?, ?, 'delegation_completed', ?, ?,
+                          'delegation_terminal', '')
+                """,
+                (
+                    str(row["parent_session_id"]),
+                    sequence,
+                    now,
+                    json.dumps(event, ensure_ascii=False),
+                ),
+            )
+            conn.execute("COMMIT")
+            return event
+
+    def complete_delegation_run(self, run_id: str, *, status: str) -> None:
+        """Finalize a delegation through the atomic terminal-event path.
+
+        Kept as a compatibility helper for team and legacy callers. New
+        orchestration code should use ``reconcile_delegation_run`` when task
+        facts determine the outcome.
+        """
+        current = self.get_delegation_run(run_id)
+        if current is None:
+            raise ValueError(f"Unknown delegation run: {run_id}")
+        if str(current["status"]) in {"completed", "partial", "failed", "cancelled"}:
+            return
+        phase = "completed" if status == "completed" else status
+        terminal_event = self.finalize_delegation_run(
+            run_id,
+            status=status,
+            phase=phase,
+            expected_version=int(current["version"]),
+            report_count=len(self.list_delegation_tasks(run_id)),
+        )
+        if terminal_event is None:
+            latest = self.get_delegation_run(run_id)
+            if latest is None or str(latest["status"]) not in {
+                "completed", "partial", "failed", "cancelled",
+            }:
+                raise ValueError(f"Delegation run changed before finalization: {run_id}")
+
+    def reconcile_delegation_run(self, run_id: str) -> dict[str, object]:
+        current = self.get_delegation_run(run_id)
+        if current is None:
+            raise ValueError(f"Unknown delegation run: {run_id}")
+        if str(current["status"]) == "cancelled":
+            return current
+        tasks = self.list_delegation_tasks(run_id)
+        if not tasks:
+            terminal_event = self.finalize_delegation_run(
+                run_id,
+                status="failed",
+                phase="failed",
+                expected_version=int(current["version"]),
+            )
+            failed = self.get_delegation_run(run_id) or {}
+            if terminal_event is not None:
+                failed["_terminal_event"] = terminal_event
+            return failed
+        effective = [task for task in tasks if task["status"] != "superseded"]
+        terminal = {
+            "completed", "partial", "failed", "cancelled", "interrupted",
+            "no_findings", "budget_exhausted", "rejected",
+        }
+        required_failures = [
+            task for task in effective
+            if bool(task["required"])
+            and str(task["status"]) not in {"completed", "no_findings"}
+            and str(task["status"]) in terminal
+        ]
+        pending = [task for task in effective if str(task["status"]) not in terminal]
+        awaiting_integration = [
+            task for task in effective
+            if str(task["integration_status"]) in {"pending", "applying"}
+        ]
+        rejected_integration = [
+            task for task in effective
+            if bool(task["required"])
+            and str(task["integration_status"]) in {
+                "discarded", "retained", "conflict", "stale",
+                "contract_violation",
+            }
+        ]
+        integrated_changes = any(
+            str(task["integration_status"]) == "applied"
+            for task in effective
+        )
+        verification = (
+            current.get("verification")
+            if isinstance(current.get("verification"), dict) else {}
+        )
+        verification_status = str(verification.get("status", ""))
+        if pending:
+            status, phase = "running", "executing"
+        elif awaiting_integration:
+            status, phase = "running", "awaiting_integration"
+        elif required_failures or rejected_integration:
+            status, phase = "partial", "partial"
+        elif integrated_changes and verification_status != "passed":
+            if verification_status == "failed":
+                status, phase = "partial", "verification_failed"
+            else:
+                status, phase = "running", "awaiting_verification"
+        else:
+            status, phase = "completed", "completed"
+        if status in {"completed", "partial", "failed", "cancelled"}:
+            terminal_event = self.finalize_delegation_run(
+                run_id,
+                status=status,
+                phase=phase,
+                expected_version=int(current["version"]),
+                report_count=sum(
+                    str(task["status"]) in terminal for task in effective
+                ),
+            )
+            converged = self.get_delegation_run(run_id) or {}
+            if terminal_event is not None:
+                converged["_terminal_event"] = terminal_event
+            return converged
+        changed = self.transition_delegation_run(
+            run_id,
+            status=status,
+            phase=phase,
+            expected_version=int(current["version"]),
+        )
+        if not changed:
+            return self.get_delegation_run(run_id) or {}
+        return self.get_delegation_run(run_id) or {}
+
+    def reconcile_interrupted_delegations(self) -> list[str]:
+        """Converge non-team in-flight work after process restart."""
+        now = _utc_now()
+        interrupted: list[str] = []
+        stable: list[str] = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM delegation_runs
+                WHERE is_team = 0 AND status = 'running'
+                """
+            ).fetchall()
+            for row in rows:
+                run_id = str(row["id"])
+                cursor = conn.execute(
+                    """
+                    UPDATE delegation_tasks
+                    SET status = 'interrupted', error = 'Runtime restarted',
+                        completed_at = COALESCE(completed_at, ?)
+                    WHERE delegation_run_id = ? AND status IN ('queued', 'running')
+                    """,
+                    (now, run_id),
+                )
+                if cursor.rowcount:
+                    interrupted.append(run_id)
+                    conn.execute(
+                        """
+                        UPDATE delegation_runs
+                        SET status = 'partial', phase = 'recovery_required',
+                            interrupted_at = ?, completed_at = ?,
+                            version = version + 1
+                        WHERE id = ? AND status = 'running'
+                        """,
+                        (now, now, run_id),
+                    )
+                else:
+                    stable.append(run_id)
+        for run_id in stable:
+            self.reconcile_delegation_run(run_id)
+        return interrupted
 
     def get_delegation_run(self, run_id: str) -> dict[str, object] | None:
         with self._connect() as conn:
@@ -953,6 +1519,20 @@ class SessionStore:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM delegation_tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+        return self._delegation_task_row(row) if row is not None else None
+
+    def get_delegation_task_for_child(
+        self, child_session_id: str,
+    ) -> dict[str, object] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM delegation_tasks
+                WHERE child_session_id = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (child_session_id,),
             ).fetchone()
         return self._delegation_task_row(row) if row is not None else None
 
@@ -994,10 +1574,21 @@ class SessionStore:
             "reason_code": str(row["reason_code"]),
             "explanation": str(row["explanation"]),
             "status": str(row["status"]),
+            "phase": str(row["phase"]),
             "budget": json.loads(row["budget_json"] or "{}"),
+            "synthesis": (
+                json.loads(row["synthesis_json"])
+                if row["synthesis_json"] is not None else None
+            ),
+            "verification": (
+                json.loads(row["verification_json"])
+                if row["verification_json"] is not None else None
+            ),
             "downgraded_from": row["downgraded_from"],
             "is_team": bool(row["is_team"]),
+            "version": int(row["version"]),
             "created_at": str(row["created_at"]),
+            "interrupted_at": row["interrupted_at"],
             "completed_at": row["completed_at"],
         }
 
@@ -1023,6 +1614,11 @@ class SessionStore:
                 if row["report_json"] is not None else None
             ),
             "error": str(row["error"]),
+            "retry_count": int(row["retry_count"]),
+            "max_retries": int(row["max_retries"]),
+            "supersedes_task_id": row["supersedes_task_id"],
+            "integration_status": str(row["integration_status"]),
+            "integration_error": str(row["integration_error"]),
             "created_at": str(row["created_at"]),
             "started_at": row["started_at"],
             "completed_at": row["completed_at"],

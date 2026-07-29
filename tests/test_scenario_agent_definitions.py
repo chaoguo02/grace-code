@@ -13,8 +13,48 @@ from agent.session.models import (
     AgentVisibility,
     DelegationMode,
     DelegationScope,
+    WorkspaceMode,
 )
 from agent.task import TaskIntent
+
+
+def test_temp_project_orchestrator_session_exposes_agent_batch_schema(
+    tmp_path: Path,
+) -> None:
+    """A fixture repo must expose the session-effective batch tool to the LLM."""
+    from agent.session.agent_registry import AgentRegistryV2
+    from agent.session.models import SessionMode
+    from agent.session.registry_builder import build_registry_for_session
+    from agent.session.session_store import SessionStore
+    from core.base import ToolRegistry
+
+    project = tmp_path / "fixture"
+    project.mkdir()
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(
+        agent_name="orchestrator",
+        mode=SessionMode.PRIMARY,
+        repo_path=str(project),
+        title="isolated multi-agent smoke",
+    )
+    agent_registry = AgentRegistryV2(project_dir=project)
+    spec = agent_registry.get("orchestrator")
+
+    effective_registry = build_registry_for_session(
+        spec,
+        session,
+        base_registry=ToolRegistry(),
+        agent_registry=agent_registry,
+        runtime=__import__("types").SimpleNamespace(
+            agent_registry=agent_registry,
+        ),
+    )
+
+    assert session.agent_name == "orchestrator"
+    assert "AgentBatch" in effective_registry.tool_names
+    assert "AgentBatch" in {
+        schema.name for schema in effective_registry.get_schemas()
+    }
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +64,43 @@ SCENARIO_WORKERS = {
     "test-runner",
     "security-reviewer",
 }
+ORCHESTRATOR_SUBAGENTS = frozenset({
+    "explore",
+    "general",
+    "debugger",
+    "test-runner",
+    "code-reviewer",
+    "security-reviewer",
+})
+ORCHESTRATOR_COORDINATION_TOOLS = frozenset({
+    "Agent",
+    "AgentBatch",
+    "subagent_worktree_inspect",
+    "subagent_worktree_apply",
+    "subagent_worktree_discard",
+    "subagent_worktree_retain",
+})
+
+
+def _assert_orchestrator_contract(definitions: dict) -> None:
+    orchestrator = definitions["orchestrator"]
+    assert orchestrator.agent_kind is AgentKind.PRIMARY
+    assert orchestrator.intent is TaskIntent.EDIT
+    assert orchestrator.permission_mode == "default"
+    assert orchestrator.delegation_policy.mode is DelegationMode.ALLOWLIST
+    assert orchestrator.delegation_policy.allowed_names == ORCHESTRATOR_SUBAGENTS
+    assert {
+        "Read", "Glob", "Grep", "Write", "Edit", "Bash",
+        "git_status", "git_diff", "pytest",
+    } <= orchestrator.tools
+    assert ORCHESTRATOR_COORDINATION_TOOLS <= orchestrator.tools
+    assert {"ProposeAgentTeam", "TeamCoordinate"}.isdisjoint(orchestrator.tools)
+
+    general = definitions["general"]
+    assert general.workspace_mode is WorkspaceMode.WORKTREE
+    assert orchestrator.permits_subagent(definitions["explore"])
+    assert orchestrator.permits_subagent(general)
+    assert orchestrator.permits_subagent(definitions["code-reviewer"])
 
 
 def test_project_catalog_exposes_research_primary_and_leaf_workers(
@@ -33,6 +110,8 @@ def test_project_catalog_exposes_research_primary_and_leaf_workers(
         project_dir=PROJECT_ROOT,
         user_dir=tmp_path / "empty-user-agents",
     )
+
+    _assert_orchestrator_contract(definitions)
 
     research = definitions["research"]
     assert research.agent_kind is AgentKind.PRIMARY
@@ -94,7 +173,24 @@ def test_builtin_catalog_contains_scenario_agents_without_project_files(
         user_dir=tmp_path / "empty-user-agents",
     )
 
-    assert {"research", "explore", *SCENARIO_WORKERS} <= definitions.keys()
+    assert {"orchestrator", "research", "explore", *SCENARIO_WORKERS} <= definitions.keys()
+    _assert_orchestrator_contract(definitions)
+
+    project_definitions = load_agent_definitions(
+        project_dir=PROJECT_ROOT,
+        user_dir=tmp_path / "empty-user-agents",
+    )
+    builtin = definitions["orchestrator"]
+    project = project_definitions["orchestrator"]
+    assert project.description == builtin.description
+    assert project.intent is builtin.intent
+    assert project.agent_kind is builtin.agent_kind
+    assert project.tools == builtin.tools
+    assert project.delegation_policy == builtin.delegation_policy
+    assert project.permission_mode == builtin.permission_mode
+    assert project.max_turns == builtin.max_turns
+    assert project.system_prompt.strip() == builtin.system_prompt.strip()
+
     assert definitions["research"].agent_kind is AgentKind.PRIMARY
     assert definitions["explore"].agent_kind is AgentKind.NAMED_SUBAGENT
 

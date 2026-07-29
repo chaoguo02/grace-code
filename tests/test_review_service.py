@@ -516,7 +516,9 @@ def test_running_review_cancels_recorded_child_session(tmp_path, monkeypatch):
     cancelling = service.cancel_review(started["id"])
     terminal = _wait_for_terminal(service, started["id"])
 
-    assert cancelling["status"] == "cancelling"
+    # Cancellation may complete concurrently before cancel_review() reloads the
+    # job; both the acknowledged intermediate state and terminal state are valid.
+    assert cancelling["status"] in {"cancelling", "cancelled"}
     assert terminal["status"] == "cancelled"
     assert runtime.cancel_calls
 

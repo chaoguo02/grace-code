@@ -121,7 +121,7 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
     from agent.task import EventType
     from server.events import (
         WsStatus, WsThought, WsToolCall, WsObservation, WsReflection,
-        WsSubagentStart, WsSubagentStop, WsPlanReady,
+        WsSubagentStart, WsSubagentStop, WsPlanReady, WsDelegationEvent,
     )
 
     ev_type = getattr(event, "event_type", "")
@@ -154,16 +154,17 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
         return msgs
 
     if ev_type == "task_failed":
-        error = payload.get("error", str(payload.get("reason", "unknown")))
-        normalized = str(error).lower()
-        cancelled = (
-            payload.get("cancelled") is True
-            or payload.get("status") == "cancelled"
+        error = str(payload.get("error") or payload.get("reason") or "unknown")
+        normalized = error.lower()
+        explicit_status = str(payload.get("status", "")).strip().lower()
+        is_cancelled = (
+            explicit_status in {"cancelled", "canceled"}
+            or payload.get("cancelled") is True
             or "cancelled" in normalized
             or "canceled" in normalized
         )
         return [WsStatus(
-            status="cancelled" if cancelled else "failed",
+            status="cancelled" if is_cancelled else "failed",
             error=error,
             timestamp=ts,
         ).to_dict()]
@@ -217,6 +218,14 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
         return [WsSubagentStop(
             child_session_id=payload.get("child_session_id", ""),
             status=payload.get("status", "completed"), timestamp=ts).to_dict()]
+
+    if str(ev_type).startswith("delegation_"):
+        allowed = set(WsDelegationEvent.__dataclass_fields__) - {"type"}
+        values = {key: value for key, value in payload.items() if key in allowed}
+        values.setdefault("delegation_run_id", getattr(event, "task_id", ""))
+        values.setdefault("timestamp", ts)
+        values.setdefault("event_id", getattr(event, "event_id", ""))
+        return [WsDelegationEvent(type=ev_type, **values).to_dict()]
 
     # Fallback: send raw event as-is
     return [{"type": ev_type, "payload": payload, "timestamp": ts}]
@@ -321,8 +330,23 @@ class EventBus:
         are injected into every translated message as envelope fields.
         """
         try:
-            msgs = _translate_event(event)
+            persisted = (getattr(event, "payload", {}) or {}).get("_persisted_event")
             target_session_id = getattr(event, "session_id", None)
+            if isinstance(persisted, dict) and target_session_id:
+                # The run state and terminal trace were committed atomically by
+                # SessionStore. EventBus remains the sole live broadcast path,
+                # but must not persist the terminal event a second time.
+                if self.trace_cache is not None:
+                    try:
+                        self.trace_cache.append(target_session_id, persisted)
+                    except Exception:
+                        logger.debug("Trace cache append failed", exc_info=True)
+                with self._publish_lock:
+                    sub = self._sessions.get(target_session_id)
+                if sub is not None and sub.has_subscribers:
+                    sub.publish(persisted)
+                return
+            msgs = _translate_event(event)
             if target_session_id:
                 for msg in msgs:
                     logger.info("EVENT → %s | type=%s step=%s",

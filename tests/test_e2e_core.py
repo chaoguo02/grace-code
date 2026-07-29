@@ -552,41 +552,50 @@ class TestEventTyping:
             timestamp="2026-07-24T00:00:01Z",
             session_id="sess-1",
         )
-        observation_msgs = _translate_event(observation)
-        assert observation_msgs[0] == {
-            "type": "observation",
-            "tool_name": "Read",
-            "output": "content",
-            "status": "success",
-            "step": 2,
-            "id": "call-1",
-            "diff": "",
-            "child_session_id": "",
-            "timestamp": "2026-07-24T00:00:01Z",
-            "session_id": "",
-            "run_id": "",
-            "turn_id": "",
-            "event_id": "",
-            "sequence": 0,
-            "block_id": "",
-            "tool_call_id": "call-1",
-        }
+        observation_msg = _translate_event(observation)[0]
+        assert observation_msg["type"] == "observation"
+        assert observation_msg["tool_name"] == "Read"
+        assert observation_msg["output"] == "content"
+        assert observation_msg["status"] == "success"
+        assert observation_msg["step"] == 2
+        assert observation_msg["id"] == "call-1"
+        assert observation_msg["tool_call_id"] == "call-1"
+        assert observation_msg["timestamp"] == "2026-07-24T00:00:01Z"
 
     def test_translate_cancelled_failure(self):
-        """Cancelled task failures should become status:cancelled, not failed."""
+        """Only structured cancellation facts should become cancelled."""
         from agent.task import Event, EventType
         from server.services.event_bus import _translate_event
 
-        ev = Event(
+        status_event = Event(
             event_type=EventType.TASK_FAILED,
             task_id="task-1",
-            payload={"error": "Task cancelled: user requested stop"},
+            payload={
+                "status": "cancelled",
+                "error": "user requested stop",
+            },
             timestamp="2026-07-24T00:00:02Z",
             session_id="sess-1",
         )
-        msgs = _translate_event(ev)
-        assert msgs[0]["type"] == "status"
-        assert msgs[0]["status"] == "cancelled"
+        assert _translate_event(status_event)[0]["status"] == "cancelled"
+
+        boolean_event = Event(
+            event_type=EventType.TASK_FAILED,
+            task_id="task-1",
+            payload={"cancelled": True, "reason": "timeout cancellation"},
+            timestamp="2026-07-24T00:00:03Z",
+            session_id="sess-1",
+        )
+        assert _translate_event(boolean_event)[0]["status"] == "cancelled"
+
+        untrusted_text_event = Event(
+            event_type=EventType.TASK_FAILED,
+            task_id="task-1",
+            payload={"error": "Task cancelled: model-authored failure text"},
+            timestamp="2026-07-24T00:00:04Z",
+            session_id="sess-1",
+        )
+        assert _translate_event(untrusted_text_event)[0]["status"] == "failed"
 
 
 # ────────────────────────────────────────────────────────────────────────────

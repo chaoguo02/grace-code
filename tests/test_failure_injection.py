@@ -264,3 +264,47 @@ class TestReplayStepRecordCapture:
         replay_decision = build_replay_runtime_decision(FakeDecision())
         assert replay_decision.action == "continue"
         assert replay_decision.terminate_reason == "none"
+
+
+class TestStreamingProviderTimeout:
+    """Streaming calls must honor the same wall-clock boundary as complete()."""
+
+    def test_stream_timeout_suppresses_late_deltas(self):
+        import time
+        from types import SimpleNamespace
+
+        from llm.invoker import LLMInvoker
+
+        chunks: list[str] = []
+
+        class HungStreamingBackend:
+            model_name = "timeout-test"
+
+            def stream(self, messages, tools, *, on_text, on_thought):
+                del messages, tools, on_thought
+                on_text("before-timeout")
+                time.sleep(0.08)
+                on_text("after-timeout")
+                return SimpleNamespace(
+                    total_tokens=0,
+                    cache_stats=None,
+                    finish_reason="stop",
+                    output_tokens=0,
+                )
+
+        config = SimpleNamespace(
+            request_timeout=0.02,
+            llm_retry_delay=0.0,
+            llm_max_retries=1,
+            stream=True,
+            stream_callback=chunks.append,
+            thought_callback=None,
+            max_tokens=128,
+        )
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            LLMInvoker(HungStreamingBackend(), config).invoke([], [])
+
+        # The abandoned daemon may finish, but it must not mutate the live turn.
+        time.sleep(0.1)
+        assert chunks == ["before-timeout"]

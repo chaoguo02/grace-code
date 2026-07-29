@@ -115,6 +115,128 @@ export interface WsSubagentStopEvent extends EventEnvelope {
   step?: number;
 }
 
+// ── Multi-agent delegation ─────────────────────────────────────────────
+
+export interface DelegationBudgetPayload {
+  available_tokens?: number;
+  parent_reserve_tokens?: number;
+  recovery_reserve_tokens?: number;
+  worker_pool_tokens?: number;
+  max_concurrent?: number;
+  [key: string]: unknown;
+}
+
+export interface DelegationEventPayload {
+  delegation_run_id?: string;
+  topology?: string;
+  task_count?: number;
+  budget?: DelegationBudgetPayload;
+  task_id?: string;
+  generation?: number;
+  agent_type?: string;
+  child_session_id?: string;
+  phase?: string;
+  previous_phase?: string;
+  status?: string;
+  integration_status?: string;
+  verification?: Record<string, unknown>;
+  action?: string;
+  dependencies?: string[];
+  changed_files?: string[];
+  report_count?: number;
+  tokens_used?: number;
+  duration_ms?: number;
+  reason?: string;
+  error?: string;
+}
+
+/**
+ * Delegation events may arrive flattened over WebSocket or in the durable
+ * fallback shape `{ type, payload, timestamp }`. Keep both forms optional so
+ * older servers and replayed traces remain readable.
+ */
+interface WsDelegationEventBase extends EventEnvelope, DelegationEventPayload {
+  payload?: DelegationEventPayload;
+  timestamp?: string;
+}
+
+export interface WsDelegationPlannedEvent extends WsDelegationEventBase {
+  type: "delegation_planned";
+}
+
+export interface WsDelegationTaskQueuedEvent extends WsDelegationEventBase {
+  type: "delegation_task_queued";
+}
+
+export interface WsDelegationTaskStartedEvent extends WsDelegationEventBase {
+  type: "delegation_task_started";
+}
+
+export interface WsDelegationTaskReportedEvent extends WsDelegationEventBase {
+  type: "delegation_task_reported";
+}
+
+export interface WsDelegationTaskFailedEvent extends WsDelegationEventBase {
+  type: "delegation_task_failed";
+}
+
+export interface WsDelegationTaskBlockedEvent extends WsDelegationEventBase {
+  type: "delegation_task_blocked";
+}
+
+export interface WsDelegationTaskRetryingEvent extends WsDelegationEventBase {
+  type: "delegation_task_retrying";
+}
+
+export interface WsDelegationPhaseChangedEvent extends WsDelegationEventBase {
+  type: "delegation_phase_changed";
+}
+
+export interface WsDelegationIntegrationStartedEvent extends WsDelegationEventBase {
+  type: "delegation_integration_started";
+}
+
+export interface WsDelegationIntegrationCompletedEvent extends WsDelegationEventBase {
+  type: "delegation_integration_completed";
+}
+
+export interface WsDelegationVerificationStartedEvent extends WsDelegationEventBase {
+  type: "delegation_verification_started";
+}
+
+export interface WsDelegationVerificationCompletedEvent extends WsDelegationEventBase {
+  type: "delegation_verification_completed";
+}
+
+export interface WsDelegationSynthesisStartedEvent extends WsDelegationEventBase {
+  type: "delegation_synthesis_started";
+}
+
+export interface WsDelegationCompletedEvent extends WsDelegationEventBase {
+  type: "delegation_completed";
+}
+
+export interface WsDelegationBudgetExhaustedEvent extends WsDelegationEventBase {
+  type: "delegation_budget_exhausted";
+}
+
+export type WsDelegationEvent =
+  | WsDelegationPlannedEvent
+  | WsDelegationTaskQueuedEvent
+  | WsDelegationTaskStartedEvent
+  | WsDelegationTaskReportedEvent
+  | WsDelegationTaskFailedEvent
+  | WsDelegationTaskBlockedEvent
+  | WsDelegationTaskRetryingEvent
+  | WsDelegationPhaseChangedEvent
+  | WsDelegationIntegrationStartedEvent
+  | WsDelegationIntegrationCompletedEvent
+  | WsDelegationVerificationStartedEvent
+  | WsDelegationVerificationCompletedEvent
+  | WsDelegationSynthesisStartedEvent
+  | WsDelegationCompletedEvent
+  | WsDelegationBudgetExhaustedEvent;
+
 // ── Approval ────────────────────────────────────────────────────────────
 
 export interface WsApprovalRequiredEvent extends EventEnvelope {
@@ -292,6 +414,7 @@ export type WsMessage =
   | WsObservationEvent
   | WsSubagentStartEvent
   | WsSubagentStopEvent
+  | WsDelegationEvent
   | WsApprovalRequiredEvent
   | WsApprovalTimeoutEvent
   | WsApprovalResolvedEvent

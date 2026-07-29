@@ -486,30 +486,33 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                     tasks = self._store.list_delegation_tasks(
                         delegation_run_id
                     )
-                    terminal_states = {
-                        "completed", "partial", "failed", "cancelled",
-                        "no_findings",
-                    }
-                    if tasks and all(
-                        str(item["status"]) in terminal_states
-                        for item in tasks
-                    ):
-                        required_failed = any(
-                            bool(item["required"])
-                            and str(item["status"]) in {"failed", "cancelled"}
-                            for item in tasks
+                    # A multi-task AgentBatch owns run-level synthesis and
+                    # terminal reconciliation. Child completion only persists
+                    # task facts; finalizing here races the batch owner and can
+                    # bypass its exactly-once terminal broadcast. A one-to-one
+                    # Agent delegation has no separate coordinator, so finalize
+                    # and publish its persisted terminal here.
+                    if len(tasks) == 1:
+                        converged = self._store.reconcile_delegation_run(
+                            delegation_run_id
                         )
-                        any_partial = any(
-                            str(item["status"]) == "partial" for item in tasks
-                        )
-                        self._store.complete_delegation_run(
-                            delegation_run_id,
-                            status=(
-                                "partial"
-                                if required_failed or any_partial
-                                else "completed"
-                            ),
-                        )
+                        terminal_event = converged.pop("_terminal_event", None)
+                        callback = getattr(self, "_event_callback", None)
+                        if isinstance(terminal_event, dict) and callback is not None:
+                            from agent.task import Event, EventType
+
+                            callback(Event(
+                                event_type=EventType.DELEGATION_COMPLETED,
+                                task_id=delegation_run_id,
+                                session_id=str(converged["parent_session_id"]),
+                                payload={
+                                    "delegation_run_id": delegation_run_id,
+                                    "parent_session_id": str(
+                                        converged["parent_session_id"]
+                                    ),
+                                    "_persisted_event": terminal_event,
+                                },
+                            ))
                 except Exception:
                     logger.exception(
                         "Failed to persist delegation result for child %s",

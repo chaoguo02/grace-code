@@ -168,6 +168,12 @@ class AgentService:
 
         migrate_legacy_session_db(self.repo_path, db_path)
         self._store = SessionStore(db_path)
+        interrupted_delegations = self._store.reconcile_interrupted_delegations()
+        if interrupted_delegations:
+            logger.warning(
+                "Marked %d interrupted delegation run(s) recovery_required",
+                len(interrupted_delegations),
+            )
         self._storage: SqliteStorageBackend = SqliteStorageBackend(db_path)
         recovered = self._storage.recover_orphaned_runs()
         if recovered:

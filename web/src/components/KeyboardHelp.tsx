@@ -22,7 +22,7 @@ const SHORTCUTS: Shortcut[] = [
   { keys: "Ctrl+O", action: "Cycle view mode (Verbose→Normal→Summary)", scope: "Global" },
   { keys: "Ctrl+Shift+B", action: "Switch to Build mode", scope: "Global" },
   { keys: "Ctrl+Shift+P", action: "Switch to Plan mode", scope: "Global" },
-  { keys: "Ctrl+Shift+E", action: "Switch to Explore mode", scope: "Global" },
+  { keys: "Ctrl+Shift+M", action: "Switch to Multi-Agent mode", scope: "Global" },
   { keys: "?", action: "Show/hide this help", scope: "Global, not editing" },
 ];
 

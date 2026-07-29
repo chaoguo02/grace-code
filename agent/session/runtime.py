@@ -965,6 +965,11 @@ class SessionRuntime:
                     worktree_disposition=disposition,
                 ),
             )
+        self._record_delegation_integration(
+            child.id,
+            "applied" if result.is_success else result.status.value,
+            result.error,
+        )
         return result
 
     def discard_subagent_worktree(
@@ -996,6 +1001,9 @@ class SessionRuntime:
                     worktree_disposition=WorktreeDisposition.DISCARDED,
                 ),
             )
+        self._record_delegation_integration(
+            child.id, result.status.value, result.error,
+        )
         return result
 
     def retain_subagent_worktree(
@@ -1016,28 +1024,52 @@ class SessionRuntime:
         )
         evidence = inspect_worktree(worktree)
         if evidence.change is WorktreeChange.UNKNOWN:
-            return WorktreeOperationResult(
+            operation = WorktreeOperationResult(
                 WorktreeOperationStatus.FAILED,
                 evidence,
                 evidence.error or "Unable to inspect child worktree",
             )
-        if evidence.revision != expected_revision:
-            return WorktreeOperationResult(
+        elif evidence.revision != expected_revision:
+            operation = WorktreeOperationResult(
                 WorktreeOperationStatus.STALE,
                 evidence,
                 "Child worktree revision changed after review",
             )
-        self._store.set_agent_result(
-            child.id,
-            replace(
-                fork_result,
-                worktree=evidence,
-                worktree_disposition=WorktreeDisposition.RETAINED,
-            ),
+        else:
+            self._store.set_agent_result(
+                child.id,
+                replace(
+                    fork_result,
+                    worktree=evidence,
+                    worktree_disposition=WorktreeDisposition.RETAINED,
+                ),
+            )
+            operation = WorktreeOperationResult(
+                WorktreeOperationStatus.RETAINED, evidence,
+            )
+        self._record_delegation_integration(
+            child.id, operation.status.value, operation.error,
         )
-        return WorktreeOperationResult(
-            WorktreeOperationStatus.RETAINED, evidence,
+        return operation
+
+    def _record_delegation_integration(
+        self, child_session_id: str, status: str, error: str = "",
+    ) -> None:
+        task = self._store.get_delegation_task_for_child(child_session_id)
+        if task is None:
+            return
+        normalized = {
+            "no_changes": "applied",
+            "parent_dirty": "conflict",
+            "failed": "conflict",
+        }.get(status, status)
+        self._store.update_delegation_task(
+            str(task["id"]),
+            status=str(task["status"]),
+            integration_status=normalized,
+            integration_error=error,
         )
+        self._store.reconcile_delegation_run(str(task["delegation_run_id"]))
 
     def _require_available_worktree(
         self, parent_session_id: str, child_session_id: str,
@@ -1106,10 +1138,10 @@ class SessionRuntime:
     def _check_session_completion(
         self, session_id: str,
     ) -> "CompletionCheckResult":
-        """Block success while direct-child worktrees await an explicit decision."""
+        """Block success until delegated work and child worktrees converge."""
         from agent.completion_guard import CompletionCheckResult
 
-        pending = []
+        pending_worktrees = []
         for child in self._store.list_child_sessions(session_id):
             result = child.agent_result
             if (
@@ -1117,27 +1149,41 @@ class SessionRuntime:
                 and result.worktree_disposition is WorktreeDisposition.PRESERVED
                 and result.worktree is not None
             ):
-                pending.append((child.id, result.worktree))
-        if not pending:
+                pending_worktrees.append((child.id, result.worktree))
+        incomplete_runs = [
+            run for run in self._store.list_delegation_runs(session_id)
+            if not bool(run.get("is_team"))
+            and str(run.get("status")) == "running"
+        ]
+        if not pending_worktrees and not incomplete_runs:
             return CompletionCheckResult(can_complete=True)
 
-        facts = "\n".join(
-            f"- {child_id}: path={evidence.path}, rev={evidence.revision}"
-            for child_id, evidence in pending
-        )
-        child_list = ", ".join(cid for cid, _ in pending)
+        sections = []
+        if pending_worktrees:
+            facts = "\n".join(
+                f"- {child_id}: path={evidence.path}, rev={evidence.revision}"
+                for child_id, evidence in pending_worktrees
+            )
+            child_list = ", ".join(cid for cid, _ in pending_worktrees)
+            sections.append(
+                "Subagent worktrees still need an explicit apply or discard "
+                f"decision:\n{facts}\nChild sessions: {child_list}"
+            )
+        if incomplete_runs:
+            facts = "\n".join(
+                f"- {run['id']}: status={run['status']}, phase={run['phase']}"
+                for run in incomplete_runs
+            )
+            sections.append(
+                "Delegation runs have not met their required-task gate. Retry or "
+                f"cancel/resolve the incomplete work:\n{facts}"
+            )
         return CompletionCheckResult(
             can_complete=False,
-            blocked_reason="Unresolved preserved subagent worktree",
+            blocked_reason="Unresolved multi-agent delegation",
             inject_message=(
-                "[RUNTIME BLOCK] You have subagent worktree(s) with unmerged changes:\n"
-                f"{facts}\n\n"
-                "These changes are NOT yet in the parent workspace. "
-                "You must resolve EACH worktree before finishing:\n"
-                "- To review a child's work: open its session and inspect the diff\n"
-                "- To accept changes: use the worktree apply operation\n"
-                "- To discard changes: use the worktree discard operation\n"
-                f"Child sessions needing resolution: {child_list}"
+                "[RUNTIME BLOCK] Multi-agent work has not converged:\n"
+                + "\n\n".join(sections)
             ),
         )
 
@@ -1756,6 +1802,7 @@ class SessionRuntime:
                     "entrypoint": "session",
                     "mode": agent_name,
                     "session_id": session_id,
+                    "run_id": str(getattr(_run_ctx, "run_id", "") or ""),
                     "parent_session_id": session.parent_id,
                     "root_session_id": session.root_id,
                     "agent_name": agent_name,

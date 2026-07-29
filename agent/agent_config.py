@@ -31,7 +31,7 @@ class AgentConfig:
     llm_max_retries: int = 3
     llm_retry_delay: float = 2.0
     request_timeout: float = 300.0
-    """Hard deadline for one complete or streaming provider attempt."""
+    """Maximum wall-clock seconds for one backend call, including streams."""
     stream: bool = False
     stream_callback: object = None
     thought_callback: object = None

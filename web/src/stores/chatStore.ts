@@ -8,6 +8,12 @@ import type {
   WsAssistantTextAbortedEvent,
 } from "../types/events";
 import type { ContentBlock, RunOutcome, StreamingTurn } from "../types/blocks";
+import type { DelegationRuns } from "../types/delegation";
+import {
+  isDelegationEvent,
+  rebuildDelegationRuns,
+  reduceDelegationEvent,
+} from "../types/delegation";
 import {
   blockId,
   createStreamingTurn,
@@ -19,6 +25,8 @@ import * as api from "../api/sessions";
 import { ApiError } from "../api/client";
 import { connectWebSocket, disconnectWebSocket, scheduleReconnect } from "../hooks/useWebSocket";
 import { agentNameForUiMode } from "../modes";
+import { getMultiAgentSnapshot } from "../api/multiAgent";
+import type { DelegationRunProjection, DelegationTaskProjection } from "../types/multiAgent";
 
 let sessionMissingHandler: ((sessionId: string) => void) | null = null;
 
@@ -65,6 +73,7 @@ export interface SessionUiState {
   currentModel: string;
   viewingChildSessionId: string | null;
   backgroundAgents: Record<string, BackgroundAgentState>;
+  delegationRuns: DelegationRuns;
   worktreeStates: Record<string, string>;
   /** Per-session draft text — survives tab switches. */
   draft: string;
@@ -149,6 +158,7 @@ export function createEmptySessionUiState(): SessionUiState {
     currentModel: "",
     viewingChildSessionId: null,
     backgroundAgents: {},
+    delegationRuns: {},
     worktreeStates: {},
     draft: "",
     streamingThought: "",
@@ -556,6 +566,88 @@ function maxTraceSeq(events: WsEnvelope[], fallback: number): number {
   return events.reduce((max, ev) => Math.max(max, ev.seq ?? 0), fallback);
 }
 
+function delegationSnapshotEvents(
+  runs: DelegationRunProjection[],
+  tasks: DelegationTaskProjection[],
+): WsMessage[] {
+  const byRun = new Map<string, DelegationTaskProjection[]>();
+  for (const task of tasks) {
+    if (!task.run_id) continue;
+    const group = byRun.get(task.run_id) || [];
+    group.push(task);
+    byRun.set(task.run_id, group);
+  }
+  const events: WsMessage[] = [];
+  for (const run of runs) {
+    const runTasks = byRun.get(run.id) || [];
+    const timestamp = run.completed_at || run.created_at;
+    events.push({
+      type: "delegation_planned",
+      delegation_run_id: run.id,
+      topology: run.topology,
+      task_count: runTasks.length,
+      timestamp,
+      reason: "snapshot_reconciliation",
+    });
+    for (const task of runTasks) {
+      const base = {
+        delegation_run_id: run.id,
+        task_id: task.id,
+        agent_type: task.agent_name,
+        child_session_id: task.child_session_id || undefined,
+        status: task.status,
+        generation: task.generation,
+        dependencies: task.dependencies,
+        integration_status: task.integration_status,
+        tokens_used: task.tokens_used,
+        duration_ms: task.elapsed_ms,
+        reason: "snapshot_reconciliation",
+        timestamp,
+      };
+      if (task.status === "queued") events.push({ type: "delegation_task_queued", ...base });
+      else if (task.status === "running") events.push({ type: "delegation_task_started", ...base });
+      else if (task.status === "blocked") events.push({ type: "delegation_task_blocked", ...base });
+      else if (["completed", "no_findings", "partial"].includes(task.status)) {
+        events.push({ type: "delegation_task_reported", ...base });
+      } else {
+        events.push({ type: "delegation_task_failed", ...base });
+      }
+    }
+    if (run.verification) {
+      events.push({
+        type: "delegation_verification_completed",
+        delegation_run_id: run.id,
+        phase: run.phase,
+        status: String(run.verification.status || "not_run"),
+        verification: run.verification,
+        reason: "snapshot_reconciliation",
+        timestamp,
+      });
+    }
+    if (["completed", "partial", "failed", "cancelled"].includes(run.status)) {
+      events.push({
+        type: "delegation_completed",
+        delegation_run_id: run.id,
+        phase: run.phase,
+        status: run.status,
+        report_count: runTasks.filter((task) => task.status !== "queued" && task.status !== "running").length,
+        reason: "snapshot_reconciliation",
+        timestamp,
+      });
+    } else {
+      events.push({
+        type: "delegation_phase_changed",
+        delegation_run_id: run.id,
+        phase: run.phase || "executing",
+        status: run.status,
+        reason: "snapshot_reconciliation",
+        timestamp,
+      });
+    }
+  }
+  return events;
+}
+
 export const useChatStore = create<ChatState>((set, get) => {
   const resolveSessionId = (sessionId?: string | null): string | null => {
     if (sessionId) return sessionId;
@@ -648,6 +740,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         events: [ev, ...prev.events].slice(0, 100),
         lastTraceSeq: evSeq > prev.lastTraceSeq ? evSeq : prev.lastTraceSeq,
       }));
+
+      if (isDelegationEvent(ev)) {
+        patchSession(sid, (prev) => ({
+          ...prev,
+          delegationRuns: reduceDelegationEvent(prev.delegationRuns, ev),
+        }));
+      }
 
       // ── ContentBlock streaming: mutate activeTurn.assistantResponse ──
       // ALL event types that produce ContentBlocks go through this single branch.
@@ -1280,7 +1379,16 @@ export const useChatStore = create<ChatState>((set, get) => {
     loadTimeline: async (sessionId, signal, afterSeq = 0, reconcileTurnId = "") => {
       try {
         ensureSession(sessionId);
-        const response = await api.getTimeline(sessionId, signal, afterSeq);
+        const [response, multiAgentSnapshot] = await Promise.all([
+          api.getTimeline(sessionId, signal, afterSeq),
+          getMultiAgentSnapshot(sessionId, signal).catch(() => null),
+        ]);
+        const snapshotEvents = multiAgentSnapshot
+          ? delegationSnapshotEvents(
+              multiAgentSnapshot.delegation_runs || [],
+              multiAgentSnapshot.delegation_tasks || [],
+            )
+          : [];
 
         // ── Legacy events for timeline/plan_state compat ──
         const events = (response.items || [])
@@ -1402,6 +1510,13 @@ export const useChatStore = create<ChatState>((set, get) => {
 
           return {
             ...prev,
+            delegationRuns: rebuildDelegationRuns(
+              snapshotEvents,
+              rebuildDelegationRuns(
+                events,
+                afterSeq > 0 ? prev.delegationRuns : {},
+              ),
+            ),
             events: afterSeq > 0
               ? [...events.slice().reverse(), ...prev.events].slice(0, 100)
               : events.slice().reverse().slice(0, 100),
@@ -1436,7 +1551,16 @@ export const useChatStore = create<ChatState>((set, get) => {
     loadTraceEvents: async (sessionId, signal, afterSeq = 0) => {
       try {
         ensureSession(sessionId);
-        const events = await api.getTraceEvents(sessionId, 0, 200, signal, afterSeq);
+        const [events, multiAgentSnapshot] = await Promise.all([
+          api.getTraceEvents(sessionId, 0, 200, signal, afterSeq),
+          getMultiAgentSnapshot(sessionId, signal).catch(() => null),
+        ]);
+        const snapshotEvents = multiAgentSnapshot
+          ? delegationSnapshotEvents(
+              multiAgentSnapshot.delegation_runs || [],
+              multiAgentSnapshot.delegation_tasks || [],
+            )
+          : [];
         patchSession(sessionId, (prev) => {
           // Lifecycle status events are NOT timeline items on replay:
           //   "completed" → isRunning=false signal, no display value
@@ -1457,6 +1581,13 @@ export const useChatStore = create<ChatState>((set, get) => {
               ? [...events.slice().reverse(), ...prev.events].slice(0, 100)
               : events.slice().reverse().slice(0, 100),
             timeline: merged,
+            delegationRuns: rebuildDelegationRuns(
+              snapshotEvents,
+              rebuildDelegationRuns(
+                events,
+                afterSeq > 0 ? prev.delegationRuns : {},
+              ),
+            ),
             planApproval: restorePlanApprovalFromEvents(prev.planApproval, sessionId, events),
             lastTraceSeq: maxTraceSeq(events, prev.lastTraceSeq),
           };

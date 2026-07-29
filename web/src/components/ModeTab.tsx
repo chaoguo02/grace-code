@@ -4,7 +4,7 @@
  * Mode is session-level context, not message-level. Placing it above
  * the composer makes this clear: choose mode first, then type.
  *
- * Keyboard: Ctrl+Shift+B/P/E  (CC Shift+Tab equivalent for Web)
+ * Keyboard: Ctrl+Shift+B/P/M  (CC Shift+Tab equivalent for Web)
  */
 import type { ModeKey } from "./ChatView";
 
@@ -15,9 +15,9 @@ interface ModeTabProps {
 }
 
 const OPTIONS: Array<{ key: ModeKey; label: string; title: string; placeholder: string }> = [
-  { key: "build",   label: "Build",   title: "Implement, edit, and ship changes",         placeholder: "描述要实现的功能…" },
-  { key: "plan",    label: "Plan",    title: "Think first — generate an implementation plan", placeholder: "描述要规划的任务…" },
-  { key: "explore", label: "Explore", title: "Read the repo and report findings",          placeholder: "询问代码库相关问题…" },
+  { key: "build",       label: "Build",       title: "Implement, edit, and ship changes",         placeholder: "描述要实现的功能…" },
+  { key: "plan",        label: "Plan",        title: "Think first — generate an implementation plan", placeholder: "描述要规划的任务…" },
+  { key: "multi-agent", label: "Multi-Agent", title: "Coordinate specialist tasks, integrate changes, and verify the result", placeholder: "描述要由多个 Agent 协作完成的复杂任务…" },
 ];
 
 export function getPlaceholder(mode: ModeKey): string {

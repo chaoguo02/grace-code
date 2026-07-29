@@ -1047,6 +1047,52 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         ),
         permission_mode="default",
     ),
+    "orchestrator": AgentDefinition(
+        name="orchestrator",
+        description=(
+            "Primary multi-agent implementation coordinator. Decomposes work, "
+            "delegates to specialist workers, integrates worktree changes, and "
+            "performs final verification."
+        ),
+        intent=TaskIntent.EDIT,
+        tools=_DEFAULT_GENERAL_TOOLS | frozenset({
+            "AgentBatch",
+            "subagent_worktree_inspect",
+            "subagent_worktree_apply",
+            "subagent_worktree_discard",
+            "subagent_worktree_retain",
+        }),
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({
+                "explore",
+                "general",
+                "debugger",
+                "test-runner",
+                "code-reviewer",
+                "security-reviewer",
+            })
+        ),
+        agent_kind=AgentKind.PRIMARY,
+        visibility=AgentVisibility.PUBLIC,
+        max_turns=100,
+        system_prompt="""You are the primary multi-agent implementation coordinator.
+Break complex work into bounded specialist tasks and keep simple work on the main
+thread. Use Agent for one worker and AgentBatch for 2-4 independent or dependency-
+ordered tasks. Delegate read-only discovery and review to specialist workers; use
+general for isolated implementation work.
+
+For general workers, inspect every preserved worktree result before deciding to apply,
+discard, or retain it. Integrate accepted changes deliberately, resolve only small
+integration issues on the main thread, and never treat child-local verification as
+final. After integration, inspect git status and diff, then run the relevant tests or
+build in the parent workspace. Wait for required workers, validate their evidence,
+and return one concise synthesis of changes, verification, and remaining issues.
+
+Do not create or bind an Agent Team. Agent Team is a separate, explicitly enabled
+workflow. Do not bypass the permission pipeline or lower approval requirements for
+high-risk operations.""",
+        permission_mode="default",
+    ),
     "plan": AgentDefinition(
         name="plan",
         description="Read-only planning agent. Explores codebase and produces structured plans.",

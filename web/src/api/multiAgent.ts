@@ -44,6 +44,8 @@ function budget(value: unknown): AgentBudgetProjection | undefined {
     max_concurrent_subagents: number(item.max_concurrent_subagents),
     max_subagent_spawn_depth: number(item.max_subagent_spawn_depth),
     max_fanout_per_turn: number(item.max_fanout_per_turn),
+    max_multi_agent_tasks: number(item.max_multi_agent_tasks),
+    max_wave_fanout: number(item.max_wave_fanout),
   };
 }
 
@@ -66,6 +68,12 @@ function delegationRun(value: unknown): DelegationRunProjection {
     reason: string(item.reason) || string(item.explanation)
       || string(item.reason_code),
     status: string(item.status, "unknown"),
+    phase: string(item.phase) || undefined,
+    verification: item.verification && typeof item.verification === "object"
+      ? object(item.verification)
+      : null,
+    created_at: string(item.created_at) || undefined,
+    completed_at: string(item.completed_at) || null,
     required_count: number(item.required_count),
     completed_count: number(item.completed_count),
     failed_count: number(item.failed_count),
@@ -88,6 +96,9 @@ function delegationTask(value: unknown): DelegationTaskProjection {
     child_session_id: string(item.child_session_id) || null,
     status: string(item.status, "unknown"),
     required: boolean(item.required, true),
+    integration_status: string(item.integration_status) || undefined,
+    integration_error: string(item.integration_error) || undefined,
+    report: item.report && typeof item.report === "object" ? object(item.report) : null,
     dependencies: Array.isArray(dependencies) ? dependencies.map((entry) => String(entry)) : [],
     generation: number(item.generation),
     retry_count: number(item.retry_count),
@@ -280,5 +291,53 @@ export function cancelDelegationTask(
 export function retryDelegationTask(sessionId: string, taskId: string) {
   return apiPost<Record<string, unknown>>(
     `/api/multi-agent/${encodeURIComponent(sessionId)}/tasks/${encodeURIComponent(taskId)}/retry`,
+  );
+}
+
+export interface DelegationRunDetail {
+  run: Record<string, unknown>;
+  tasks: Array<Record<string, unknown>>;
+  replacement_tasks?: Array<Record<string, unknown>>;
+  integration_outcomes?: Array<Record<string, unknown>>;
+}
+
+export function getDelegationRun(sessionId: string, runId: string, signal?: AbortSignal) {
+  return apiGet<DelegationRunDetail>(
+    `/api/multi-agent/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}`,
+    signal,
+  );
+}
+
+export function cancelDelegationRun(
+  sessionId: string,
+  runId: string,
+  detail = "User cancelled delegation run",
+) {
+  return apiPost<Record<string, unknown>>(
+    `/api/multi-agent/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/cancel`,
+    { detail },
+  );
+}
+
+export function resumeDelegationRun(sessionId: string, runId: string) {
+  return apiPost<DelegationRunDetail>(
+    `/api/multi-agent/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/resume`,
+  );
+}
+
+export function integrateDelegationRun(
+  sessionId: string,
+  runId: string,
+  decisions: Array<{ task_id: string; action: "apply" | "discard" | "retain"; expected_revision: string }>,
+) {
+  return apiPost<DelegationRunDetail>(
+    `/api/multi-agent/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/integrate`,
+    { decisions },
+  );
+}
+
+export function verifyDelegationRun(sessionId: string, runId: string) {
+  return apiPost<Record<string, unknown>>(
+    `/api/multi-agent/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/verify`,
   );
 }

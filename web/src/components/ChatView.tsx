@@ -5,6 +5,7 @@ import { ToolApprovalCard } from "./ToolApprovalCard";
 import { PlanApprovalBar } from "./PlanApprovalBar";
 import { SubagentDetail } from "./SubagentDetail";
 import { SubagentProgress } from "./SubagentProgress";
+import { MultiAgentRunCard } from "./MultiAgentRunCard";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { BlocksMessage } from "./BlocksMessage";
 import { RunOutcomeBar } from "./RunOutcomeBar";
@@ -32,7 +33,11 @@ interface ContextChip {
 const MODE_OPTIONS: Array<{ key: ModeKey; title: string; description: string; intent?: string }> = [
   { key: "build", title: "Build", description: "Implement, edit, and ship changes." },
   { key: "plan", title: "Plan", description: "Think first and generate an implementation plan.", intent: "analysis" },
-  { key: "explore", title: "Explore", description: "Read the repo, inspect files, and report findings.", intent: "analysis" },
+  {
+    key: "multi-agent",
+    title: "Multi-Agent",
+    description: "Break complex work into coordinated specialist tasks, then integrate and verify the result.",
+  },
 ];
 
 const MODEL_FALLBACK: Array<{ key: string; family: string; note: string }> = [
@@ -55,7 +60,8 @@ const PROJECT_FILE_SUGGESTIONS = [
 const BUILTIN_SLASH_COMMANDS = [
   { key: "/build", title: "Switch to build mode", description: "Use the main implementation agent." },
   { key: "/plan", title: "Switch to plan mode", description: "Prepare a plan before execution." },
-  { key: "/explore", title: "Switch to explore mode", description: "Read and inspect without editing." },
+  { key: "/multi-agent", title: "Switch to Multi-Agent mode", description: "Coordinate specialist tasks, then integrate and verify." },
+  { key: "/explore", title: "Switch to Multi-Agent mode", description: "Legacy alias for /multi-agent." },
   { key: "/compact", title: "Compact context", description: "Compress conversation history to free up context window." },
   { key: "/clear", title: "Clear local timeline", description: "Reset the current chat view." },
   { key: "/new", title: "Create a new session", description: "Open a fresh conversation." },
@@ -216,6 +222,7 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
     currentModel,
     viewingChildSessionId,
     backgroundAgents,
+    delegationRuns,
     draft: storedDraft,
     streamingThought,
     activeTurn,
@@ -411,11 +418,11 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
       if (e.key === "?") { e.preventDefault(); setHelpOpen((v) => !v); return; }
       // Ctrl+O = cycle view mode
       if (e.ctrlKey && e.key === "o") { e.preventDefault(); cycleViewMode(activeId); return; }
-      // Mod+Shift+B/P/E = switch mode
+      // Mod+Shift+B/P/M = switch mode
       if (e.ctrlKey && e.shiftKey) {
         if (e.key === "b") { e.preventDefault(); setMode("build"); setSessionMode("build", activeId); return; }
         if (e.key === "p") { e.preventDefault(); setMode("plan"); setSessionMode("plan", activeId); return; }
-        if (e.key === "e") { e.preventDefault(); setMode("explore"); setSessionMode("explore", activeId); return; }
+        if (e.key === "m") { e.preventDefault(); setMode("multi-agent"); setSessionMode("multi-agent", activeId); return; }
       }
     };
     document.addEventListener("keydown", onKeyDown);
@@ -610,9 +617,9 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
       setComposerMenu("closed");
       return;
     }
-    if (command === "/explore") {
-      setMode("explore");
-      setSessionMode("explore", activeId);
+    if (command === "/multi-agent" || command === "/explore") {
+      setMode("multi-agent");
+      setSessionMode("multi-agent", activeId);
       updateDraft("");
       setComposerMenu("closed");
       return;
@@ -628,7 +635,7 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
     }
     if (command === "/help") {
       updateDraft(
-        "Composer shortcuts:\n/build switch to build mode\n/plan switch to plan mode\n/explore switch to explore mode\n/compact compress conversation history\n/clear clear the local timeline\n/new create a fresh session",
+        "Composer shortcuts:\n/build switch to build mode\n/plan switch to plan mode\n/multi-agent switch to Multi-Agent mode\n/explore legacy alias for /multi-agent\n/compact compress conversation history\n/clear clear the local timeline\n/new create a fresh session",
       );
       setComposerMenu("closed");
     }
@@ -705,7 +712,7 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
               <span className="composer-action-icon">M</span>
               <span>
                 <strong>Mode</strong>
-                <small>Switch between build, plan, and explore.</small>
+                <small>Switch between build, plan, and Multi-Agent.</small>
               </span>
             </button>
             <button type="button" className="composer-action-item" onClick={() => openMenu("model")}>
@@ -926,7 +933,7 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
               <h1>Welcome to Grace Code</h1>
               <p>
                 Your AI software engineer that plans, builds, and ships with clarity.
-                Describe what you want to build or explore.
+                Describe what you want to build or coordinate across specialist agents.
               </p>
               <div className="welcome-grid welcome-grid-four">
                 {HERO_CARDS.map((card) => (
@@ -974,6 +981,14 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
                 Step {steps} · {tokens.toLocaleString()} tokens
               </span>
             </div>
+          )}
+
+          {(mode === "multi-agent" || Object.keys(delegationRuns).length > 0) && (
+            <MultiAgentRunCard
+              sessionId={activeId}
+              runs={delegationRuns}
+              onViewChild={(childId) => setViewingChild(childId, activeId)}
+            />
           )}
 
           <div id="messages">

@@ -1398,6 +1398,7 @@ class ReActAgent:
             delegation_step_limit=task.max_steps,
             phase_policy=policy.execution,
             delegation_effects=frozenset(delegation_effects),
+            run_id=str(task.metadata.get("run_id", "") or ""),
         )
         self._registry = self._registry.with_run_context(base_run_context)
 
@@ -2746,6 +2747,7 @@ class ReActAgent:
             log.log_task_failed(
                 steps=evaluation.steps_taken,
                 reason=evaluation.detail or evaluation.summary,
+                status=(evaluation.status or RunStatus.GAVE_UP).value,
             )
         elif evaluation.status is RunStatus.GAVE_UP:
             logger.warning(evaluation.summary)
