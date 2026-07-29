@@ -305,7 +305,7 @@ def main() -> None:
         prog="grace-code-server",
         description="Grace Code Web MVP — FastAPI server for the ReAct agent.",
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1). Use 0.0.0.0 with --allow-remote to expose on LAN.")
     parser.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
     parser.add_argument("--repo", default=".", help="Repository path for the agent to work on")
     parser.add_argument("--config", default=None, help="Path to config YAML file")
@@ -315,11 +315,17 @@ def main() -> None:
     parser.add_argument("--base-url", default=None, help="LLM base URL override")
     parser.add_argument("--max-steps", type=int, default=None, help="Max agent steps")
     parser.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
+    parser.add_argument("--allow-remote", action="store_true", help="Allow non-loopback binds (0.0.0.0). Required to expose the server on LAN.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
+
+    # --allow-remote is required for non-loopback binds (0.0.0.0, LAN IP, etc.)
+    if args.allow_remote and args.host == "127.0.0.1":
+        args.host = "0.0.0.0"
+
     try:
-        validate_bind_host(args.host)
+        validate_bind_host(args.host, allow_remote=args.allow_remote)
     except ValueError as exc:
         parser.error(str(exc))
 
