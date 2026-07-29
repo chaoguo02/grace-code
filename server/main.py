@@ -305,7 +305,7 @@ def main() -> None:
         prog="grace-code-server",
         description="Grace Code Web MVP — FastAPI server for the ReAct agent.",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
     parser.add_argument("--repo", default=".", help="Repository path for the agent to work on")
     parser.add_argument("--config", default=None, help="Path to config YAML file")
@@ -391,7 +391,17 @@ def main() -> None:
         _l.default_exception_handler(ctx)
     _loop.set_exception_handler(_quiet_exc)
     _asyncio.set_event_loop(_loop)
-    _loop.run_until_complete(_server.serve())
+    try:
+        _loop.run_until_complete(_server.serve())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Graceful shutdown: close all connections, release port immediately
+        _loop.run_until_complete(_server.shutdown())
+        # Allow port reuse immediately (skip TIME_WAIT on some platforms)
+        _server.config.uds = None
+        _loop.close()
+        _asyncio.set_event_loop(None)
 
 
 if __name__ == "__main__":
