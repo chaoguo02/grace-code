@@ -56,12 +56,15 @@ from server.services.event_bus import EventBus
 logger = logging.getLogger(__name__)
 
 
-def validate_bind_host(host: str) -> None:
-    """Reject every non-loopback bind.
+def validate_bind_host(host: str, *, allow_remote: bool = False) -> None:
+    """Reject every non-loopback bind unless --allow-remote is set.
 
     Grace Code is a local, single-user application.  Authentication and
     tenant isolation are deliberately outside its supported boundary.
+    --allow-remote is an explicit opt-in for LAN exposure.
     """
+    if allow_remote:
+        return
     normalized = host.strip().strip("[]").lower()
     is_loopback = normalized == "localhost"
     if not is_loopback:
