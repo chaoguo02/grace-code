@@ -9,6 +9,10 @@ __pycache__/
 .python-version
 *.log
 .env
+.scratch/
+.pytest-tmp-*/
+test-results/
+node_modules/.vite/
 
 # Temp dirs from Docker test runs (permission-locked)
 .pytest-batch3-20260713/
