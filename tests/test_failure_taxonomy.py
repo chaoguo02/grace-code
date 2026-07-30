@@ -3,15 +3,33 @@
 import pytest
 
 from agent.task import RunStatus, TerminationReason
+from core.resource_governor import AdmissionOutcome, ResourceKind
 from observability.failure_policy import (
     BoundaryBehavior,
     FailureCategory,
     FailurePolicy,
+    ResourceFailureCategory,
     FAILURE_TAXONOMY,
+    classify_resource_failure,
     classify_termination,
     termination_to_harness_label,
     verify_boundary_preserved,
 )
+
+
+@pytest.mark.parametrize("kind,expected", [
+    (ResourceKind.TOKEN_BUDGET, ResourceFailureCategory.BUDGET_EXHAUSTED),
+    (ResourceKind.PROVIDER_RPM, ResourceFailureCategory.PROVIDER_THROTTLED),
+    (ResourceKind.WORKER_SLOT, ResourceFailureCategory.THREAD_CAPACITY),
+    (ResourceKind.TOOL_SLOT, ResourceFailureCategory.THREAD_CAPACITY),
+    (ResourceKind.DISK_BYTES, ResourceFailureCategory.DISK_CAPACITY),
+    (ResourceKind.EVENT_CAPACITY, ResourceFailureCategory.EVENT_BACKPRESSURE),
+    (ResourceKind.DB_WRITE_CAPACITY, ResourceFailureCategory.DB_BACKPRESSURE),
+])
+def test_resource_admission_failures_have_actionable_categories(kind, expected):
+    assert classify_resource_failure(
+        AdmissionOutcome.CAPACITY_TIMEOUT, kind
+    ) is expected
 
 
 class TestFailureTaxonomyCompleteness:

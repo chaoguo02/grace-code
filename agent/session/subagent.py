@@ -188,6 +188,16 @@ def run_child_agent(
         _worktree, _effective_repo_path = create_worktree(
             repo_path, result_agent_name, agent_id,
             isolation=request.workspace_mode,
+            governor=(
+                getattr(session_runtime, "_governor", None)
+                if session_runtime is not None else None
+            ),
+            root_session_id=(
+                (session_record.root_id or session_record.id)
+                if session_record is not None else agent_id
+            ),
+            session_id=agent_id,
+            cancel_token=cancellation_token,
         )
     except WorktreeIsolationError as exc:
         return AgentRunResult(
@@ -254,7 +264,7 @@ def run_child_agent(
     # Callbacks stay None — parent-specific callbacks don't apply to child.
     cfg.stream_callback = None
     cfg.thought_callback = None
-    cfg.compact_history = False
+    cfg.compact_history = True  # Phase 3: subagents get context compaction
 
     # Model override: subagent can use a different model than parent.
     # CC-aligned cost optimization — use cheaper model for exploration.
@@ -302,6 +312,21 @@ def run_child_agent(
                         "max_tokens": getattr(_cfg_snapshot, 'max_tokens', None),
                         "timeout_seconds": getattr(_cfg_snapshot, 'timeout_seconds', 60),
                     })
+                    # Model overrides remain in the same provider family and
+                    # must share the parent's limiter/backoff state.
+                    provider_governor = getattr(
+                        backend, "_provider_governor", None,
+                    )
+                    if provider_governor is not None:
+                        from llm.provider_capacity import (
+                            attach_provider_governor,
+                        )
+
+                        attach_provider_governor(
+                            _effective_backend,
+                            provider_governor,
+                            provider_name=_parent_provider,
+                        )
         except Exception:
             logger.debug("Model override failed for %s, using parent model", agent_id[:8], exc_info=True)
 

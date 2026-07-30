@@ -221,7 +221,7 @@ def create_app(service: AgentService) -> FastAPI:
     @app.get("/api/skills", tags=["skills"])
     async def list_skills() -> list[dict]:
         """List all discovered skills for the frontend slash-command menu."""
-        skill_registry = getattr(service._registry, "_skill_registry", None)
+        skill_registry = service._registry.skill_registry
         if skill_registry is None:
             return []
         return [

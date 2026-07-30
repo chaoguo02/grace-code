@@ -25,6 +25,17 @@ from config.schema import PromptConfig
 logger = logging.getLogger(__name__)
 
 
+def _qualified_prompt_name(namespace: str, relative_path: str) -> str:
+    normalized = relative_path.replace("\\", "/")
+    if normalized.endswith(".md"):
+        normalized = normalized[:-3]
+    normalized_namespace = namespace.strip("/")
+    return (
+        f"{normalized_namespace}/{normalized}"
+        if normalized_namespace else normalized
+    )
+
+
 class _SafeDict(dict):
     """format_map 用的安全字典，未知 key 保留原样 {key}。"""
 
@@ -105,11 +116,7 @@ class _LangfusePromptProvider:
         return self._client
 
     def _prompt_name_for(self, relative_path: str) -> str:
-        normalized = relative_path.replace("\\", "/")
-        if normalized.endswith(".md"):
-            normalized = normalized[:-3]
-        namespace = self._config.namespace.strip("/")
-        return f"{namespace}/{normalized}" if namespace else normalized
+        return _qualified_prompt_name(self._config.namespace, relative_path)
 
     @staticmethod
     def _coerce_compiled_prompt(compiled: Any) -> str:
@@ -260,16 +267,12 @@ class PromptAssembler:
         )
 
     def _local_prompt_name(self, relative_path: str) -> str:
-        normalized = relative_path.replace("\\", "/")
-        if normalized.endswith(".md"):
-            normalized = normalized[:-3]
-        namespace = self._config.namespace.strip("/")
-        return f"{namespace}/{normalized}" if namespace else normalized
+        return _qualified_prompt_name(self._config.namespace, relative_path)
 
     @staticmethod
     def _build_platform_info() -> str:
         """Declare the platform truth to the LLM — control plane, not secret translation."""
-        import platform as _platform, os as _os
+        import platform as _platform
         system = _platform.system()
         if system == "Windows":
             return (

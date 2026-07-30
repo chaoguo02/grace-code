@@ -28,28 +28,41 @@ memory:
   max_index_lines: 50 # MEMORY.md 每次注入上下文的最大行数
   auto_memory: true # 是否允许 agent 自主写入记忆
 
-plan:
-  enable_replan: false # DAG 失败后是否自动重新规划剩余任务
-  max_replans: 1 # 单次 DAG 执行最多重新规划次数
-  allow_parallel_verification: false # 是否允许 verification 同层并行（默认关闭）
-  allow_parallel_commands: false # 是否允许 command 同层并行（默认关闭）
+# ── 统一资源治理 ──
+# 所有资源先申请后执行，finally 释放。
+# mode: observe(只记录不阻止) | soft_enforce(警告但放行) | enforce(阻止超限)
+resource_governance:
+  mode: enforce
 
-multi_agent:
-  worker_model: "" # 子 Agent 使用的模型（空=与 Coordinator 同款）
-  worker_provider: "" # 子 Agent 的 provider（空=与 Coordinator 同款）
-  max_parallel_executors: 3 # 并行 executor 最大数
-  coordinator_budget_ratio: 0.30 # Coordinator 占总预算比例
-  sub_agent_budget_ratio: 0.70 # 子 Agent 占总预算比例
-  max_retries: 2 # Reviewer 拒绝后最大重试次数
-  coordinator_max_steps: 25
+  worker:
+    global_max: 2        # 全服务并发 subagent worker 上限
+    per_root_max: 2      # 单 root session 并发 worker 上限
 
-hitl:
-  enabled: true
-  min_risk_for_confirm: medium   # none / low / medium / high (legacy, kept for compat)
-  policy_file: .grace/hitl/policies.yaml
-  learn_threshold: 3
-  settings_file: .grace/settings.json
-  default_mode: ask_edits        # ask_edits / ask_all / auto
+  queue:
+    max_size: 64          # 全局排队队列容量
+    timeout_seconds: 120.0  # 单队列项最大等待秒数
+
+  provider:
+    rate_limit_enabled: false  # Phase 3 生效
+    rpm: 0                     # 每分钟最大请求数 (0=不限)
+    tpm: 0                     # 每分钟最大 token 数 (0=不限)
+    max_concurrent: 0          # 单 provider 最大并发请求数 (0=不限)
+
+  event:
+    queue_max_size: 4096       # 每个 session 的 WebSocket 事件队列上限
+
+  tool:
+    global_max: 8              # 全局并发 MCP 工具调用上限
+    per_root_max: 4            # 单个 root session 的 MCP 并发上限
+
+  worktree:
+    global_max: 10            # 全局最大 worktree 数
+    per_root_max: 3           # 单 root session 最大 worktree 数
+    disk_limit_mb: 0          # worktree 磁盘上限 MB (0=不检查)
+
+  shutdown:
+    drain_timeout_seconds: 30.0
+    force_kill_seconds: 5.0
 
 observability:
   enabled: false

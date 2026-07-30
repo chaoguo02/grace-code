@@ -220,7 +220,7 @@ class ArchitectureService:
         return "control"
 
     def _skills(self) -> list[dict[str, Any]]:
-        registry = getattr(self._service._registry, "_skill_registry", None)
+        registry = self._service._registry.skill_registry
         if registry is None:
             return []
         return [

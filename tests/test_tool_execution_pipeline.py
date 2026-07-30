@@ -6,8 +6,18 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import MethodType
 
+from config.schema import (
+    ResourceGovernanceConfig,
+    ResourceGovernanceQueueConfig,
+    ResourceGovernanceToolConfig,
+)
 from core.base import BaseTool, ToolMetadata, ToolRegistry, ToolResult
 from core.errors import ToolErrorType, ToolRetryDirective
+from core.resource_governor import (
+    ResourceGovernor,
+    ResourceKind,
+    ResourceRequest,
+)
 from core.types import RetryMode, RetryPolicy, ToolEffect
 from hitl.permission_rule import PermissionRule
 from hitl.pipeline import (
@@ -56,6 +66,14 @@ class _WriteTool(_GuardedTool):
         return "Write"
 
 
+class _MCPTool(_GuardedTool):
+    is_mcp = True
+
+    @property
+    def name(self) -> str:
+        return "MCPTest"
+
+
 class _UpdatingDispatcher:
     def __init__(self, *, control: HookControl = HookControl.CONTINUE) -> None:
         self._control = control
@@ -67,6 +85,35 @@ class _UpdatingDispatcher:
             control=self._control,
             updated_input={"value": f"{value}-hook"},
         )
+
+
+def test_mcp_tool_uses_shared_governor_and_surfaces_typed_capacity_failure():
+    governor = ResourceGovernor(ResourceGovernanceConfig(
+        mode="enforce",
+        queue=ResourceGovernanceQueueConfig(
+            max_size=4, timeout_seconds=0.01,
+        ),
+        tool=ResourceGovernanceToolConfig(global_max=1, per_root_max=1),
+    ))
+    held = governor.admit(ResourceRequest(
+        "held-tool", "root", "other",
+        resources={ResourceKind.TOOL_SLOT: 1},
+    ))
+    registry = ToolRegistry()
+    registry.register(_MCPTool())
+    registry.attach_resource_governor(
+        governor,
+        root_session_resolver=lambda _: "root",
+    )
+    result = registry.with_session_id("session").execute_tool(
+        "MCPTest", {"value": "ok"},
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.metadata["resource_failure"] == "capacity_timeout"
+    assert result.metadata["resource_failure_category"] == "thread_capacity"
+    held.lease.release()
 
 
 def test_hook_rewrite_is_revalidated_by_absolute_safety_layer() -> None:

@@ -38,6 +38,42 @@ def _completed_run(tmp_path):
     return store, parent
 
 
+def test_delegation_resource_facts_round_trip(tmp_path):
+    store, _ = _completed_run(tmp_path)
+    assert store.update_delegation_task_resource(
+        "delegation-1:inspect",
+        {
+            "requested": {"worker_slot": 1},
+            "granted": {"worker_slot": 1},
+        },
+    )
+    # ExecutionBudget is the token authority and reports its lifecycle
+    # independently; nested resource maps must merge rather than overwrite.
+    assert store.update_delegation_task_resource(
+        "delegation-1:inspect",
+        {
+            "requested": {"token_budget": 10_000},
+            "granted": {"token_budget": 10_000},
+        },
+    )
+    assert store.update_delegation_task_resource(
+        "delegation-1:inspect",
+        {
+            "consumed": {"token_budget": 7_500},
+            "refunded": {"token_budget": 2_500},
+            "wait_time_s": 0.25,
+        },
+    )
+    task = store.get_delegation_task("delegation-1:inspect")
+    assert task["resource"] == {
+        "requested": {"worker_slot": 1, "token_budget": 10_000},
+        "granted": {"worker_slot": 1, "token_budget": 10_000},
+        "consumed": {"token_budget": 7_500},
+        "refunded": {"token_budget": 2_500},
+        "wait_time_s": 0.25,
+    }
+
+
 def test_delegation_terminal_state_and_trace_are_committed_once(tmp_path):
     store, parent = _completed_run(tmp_path)
 

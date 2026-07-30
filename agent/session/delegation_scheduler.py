@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from typing import Any, Callable
 
 from agent.session.models import (
@@ -13,8 +12,21 @@ from agent.session.models import (
     ExplicitDelegationRequest,
     WorktreeDisposition,
 )
+from agent.session.executor_pool import borrowed_executor
 from agent.session.result_contract import ChangedFile, WorkerReport, WorkerReportStatus
 from agent.session.task_contract import TaskContract
+
+
+def _governor_max_concurrent(runtime: Any, fallback: int) -> int:
+    """Return effective max concurrent workers informed by ResourceGovernor."""
+    governor = getattr(runtime, "_governor", None)
+    if governor is not None and governor.mode != "observe":
+        from core.resource_governor import ResourceKind
+        snap = governor.snapshot()
+        ws = snap.snapshots.get(ResourceKind.WORKER_SLOT)
+        if ws is not None and ws.limit > 0:
+            return min(max(1, ws.available), fallback)
+    return fallback
 
 
 class DelegationRunScheduler:
@@ -91,11 +103,14 @@ class DelegationRunScheduler:
             from agent.session.multi_agent_config import MultiAgentFeatureConfig
 
             config = MultiAgentFeatureConfig.from_environment()
-            wave_limit = min(config.max_wave_fanout, config.max_concurrent)
+            # Governor-informed max concurrency (Phase 1)
+            max_workers = _governor_max_concurrent(self._runtime, config.max_concurrent)
+            wave_limit = min(config.max_wave_fanout, max_workers)
             for offset in range(0, len(ready), wave_limit):
                 wave = ready[offset:offset + wave_limit]
-                with ThreadPoolExecutor(
-                    max_workers=min(len(wave), config.max_concurrent),
+                with borrowed_executor(
+                    self._runtime,
+                    max_workers=min(len(wave), max_workers),
                     thread_name_prefix="delegation-resume",
                 ) as executor:
                     futures = {
@@ -282,17 +297,10 @@ class DelegationRunScheduler:
                 value for value in (result.warning, result.failure_diagnosis) if value
             ),
             tokens_used=result.tokens_used,
+            budget_settled=result.budget_settled,
             duration_ms=duration_ms,
             worktree=evidence.to_dict() if evidence is not None else None,
         )
-
-    @staticmethod
-    def _max_concurrent() -> int:
-        try:
-            configured = int(os.environ.get("GRACE_MAX_CONCURRENT_SUBAGENTS", "4"))
-        except ValueError:
-            configured = 4
-        return max(1, min(configured, 16))
 
     def _emit(self, event_type: str, run_id: str, payload: dict[str, object]) -> None:
         if self._event_callback is not None:

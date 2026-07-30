@@ -68,9 +68,9 @@ def slugify_mcp_name(value: str) -> str:
     return slug or "unnamed"
 
 
-@dataclass(frozen=True)
+@dataclass
 class MCPToolProps:
-    """Declarative MCP attachment for a runtime ConcreteTool.
+    """Declarative MCP attachment for a canonical runtime tool.
 
     Replaces the previous pattern of dynamically injecting ``is_mcp``,
     ``always_load``, ``should_defer``, ``server_name`` etc. as bare

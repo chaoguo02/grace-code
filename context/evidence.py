@@ -242,15 +242,18 @@ class EvidenceLedger:
                 f"Phase: {phase}\n\n"
                 f"Evidence:\n{evidence_text}"
             )
-            response = backend.complete(
-                messages=[
+            from llm.provider_capacity import complete_with_provider_capacity
+
+            response = complete_with_provider_capacity(
+                backend,
+                [
                     LLMMessage(
                         role="system",
                         content="You produce concise structured evidence summaries for coding agents.",
                     ),
                     LLMMessage(role="user", content=prompt),
                 ],
-                tools=[],
+                [],
             )
             parsed = self._parse_summary_json(response.raw_content)
             if not parsed:

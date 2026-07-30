@@ -474,7 +474,18 @@ class LocalRuntime(Runtime):
         except subprocess.TimeoutExpired:
             if proc and proc.returncode is None:
                 kill_process_tree(proc)
-                proc.wait(timeout=5)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Phase 2: second kill attempt for uncooperative processes
+                    try:
+                        kill_process_tree(proc)
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "Process %d survived kill — leaked_operation: %s",
+                        proc.pid, cmd[0],
+                    )
             return RunResult(
                 returncode=-1,
                 stdout="",
@@ -485,7 +496,17 @@ class LocalRuntime(Runtime):
         except KeyboardInterrupt:
             if proc and proc.returncode is None:
                 kill_process_tree(proc)
-                proc.wait(timeout=5)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        kill_process_tree(proc)
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "Process %d survived kill — leaked_operation: %s",
+                        proc.pid, cmd[0],
+                    )
             return RunResult(
                 returncode=-1,
                 stdout="",

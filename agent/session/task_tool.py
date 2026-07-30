@@ -715,6 +715,7 @@ class AgentTool(BaseTool):
                     "write_files": list(params.get("write_files", [])),
                 },
                 child_created_callback=_child_created,
+                parent_budget=run_context.budget,
             )
             if isinstance(dispatch_result, BackgroundAgentHandle):
                 return ToolResult(
@@ -774,7 +775,10 @@ class AgentTool(BaseTool):
             success=not is_failure,
             output=output,
             error=fork_result.error if is_failure else "",
-            subagent_tokens_used=fork_result.tokens_used,
+            subagent_tokens_used=(
+                0 if fork_result.budget_settled
+                else fork_result.tokens_used
+            ),
             structured_findings=tuple(
                 finding.to_dict() for finding in fork_result.structured_findings
             ),

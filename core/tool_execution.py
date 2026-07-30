@@ -35,18 +35,20 @@ class ToolExecutionPipeline:
         self,
         *,
         permission_pipeline: Any = None,
-        hitl_manager: Any = None,
         hook_dispatcher: Any = None,
         capability_registry: Any = None,
         session_id: str = "",
-        budget: Any = None,  # ExecutionBudget — only EXHAUSTED gates tool calls
+        budget: Any = None,  # ExecutionBudget only EXHAUSTED gates calls
+        resource_governor: Any = None,
+        root_session_resolver: Any = None,
     ) -> None:
         self._permission_pipeline = permission_pipeline
-        self._hitl_manager = hitl_manager
         self._hook_dispatcher = hook_dispatcher
         self._capability_registry = capability_registry
         self._session_id = session_id
         self._budget = budget
+        self._resource_governor = resource_governor
+        self._root_session_resolver = root_session_resolver
 
     def execute(
         self,
@@ -119,7 +121,12 @@ class ToolExecutionPipeline:
                 thought=thought,
             )
             try:
-                result = tool.execute(call.params)
+                result = self._execute_once(
+                    tool,
+                    call.params,
+                    invocation_id=logical_id,
+                    attempt=attempt,
+                )
             except Exception as exc:
                 result = ToolResult.from_error(
                     error_type=ToolErrorType.INTERNAL,
@@ -149,6 +156,89 @@ class ToolExecutionPipeline:
             "attempts": attempts,
         }
         return result
+
+    def _execute_once(
+        self,
+        tool: "BaseTool",
+        params: dict[str, Any],
+        *,
+        invocation_id: str,
+        attempt: int,
+    ) -> "ToolResult":
+        """Execute one attempt under the shared external-work capacity."""
+        from core.types import ToolEffect
+
+        governed_effects = {
+            ToolEffect.EXECUTE,
+            ToolEffect.TEST,
+            ToolEffect.NETWORK,
+        }
+        needs_slot = bool(
+            getattr(tool, "is_mcp", False)
+            or (tool.metadata.effects & governed_effects)
+        )
+        if not needs_slot or self._resource_governor is None:
+            return tool.execute(params)
+
+        from core.base import ToolResult
+        from core.resource_governor import (
+            AdmissionOutcome,
+            ResourceKind,
+            ResourceRequest,
+        )
+
+        root_session_id = self._session_id
+        if callable(self._root_session_resolver):
+            try:
+                root_session_id = (
+                    self._root_session_resolver(self._session_id)
+                    or root_session_id
+                )
+            except Exception:
+                # Session cleanup may race with a final tool call. Falling
+                # back to session ownership stays bounded and fail-closed.
+                pass
+        queue_cfg = getattr(
+            getattr(self._resource_governor, "_config", None), "queue", None
+        )
+        timeout_s = float(getattr(queue_cfg, "timeout_seconds", 120.0))
+        admission = self._resource_governor.admit_wait(ResourceRequest(
+            request_id=f"{invocation_id}:attempt-{attempt}",
+            root_session_id=root_session_id or "unscoped",
+            session_id=self._session_id,
+            run_id=invocation_id,
+            resources={ResourceKind.TOOL_SLOT: 1},
+            timeout_s=timeout_s,
+        ))
+        if (
+            admission.outcome is not AdmissionOutcome.GRANTED
+            or admission.lease is None
+        ):
+            from observability.failure_policy import classify_resource_failure
+
+            error = ToolResult.from_error(
+                error_type=ToolErrorType.UNAVAILABLE,
+                detail=(
+                    f"Tool capacity {admission.outcome.value}: "
+                    f"{admission.reason or 'tool slot unavailable'}"
+                ),
+            )
+            error.metadata = {
+                **(error.metadata or {}),
+                "resource_failure": admission.outcome.value,
+                "resource_failure_category": classify_resource_failure(
+                    admission.outcome,
+                    ResourceKind.TOOL_SLOT,
+                    admission.reason,
+                ).value,
+                "resource_kind": ResourceKind.TOOL_SLOT.value,
+                "wait_time_s": admission.wait_time_s,
+            }
+            return error
+        try:
+            return tool.execute(params)
+        finally:
+            admission.lease.release()
 
     def _authorize(
         self,
@@ -181,18 +271,6 @@ class ToolExecutionPipeline:
                 detail = f"Tool '{tool.name}' denied: {permission_result.reason}"
                 if feedback:
                     detail += f" Feedback: {feedback}"
-                return ToolResult.from_error(
-                    error_type=ToolErrorType.PERMISSION_DENIED,
-                    detail=detail,
-                )
-        elif self._hitl_manager is not None:
-            hitl_result = self._hitl_manager.check(
-                tool, params, thought=thought,
-            )
-            if hitl_result.is_denied:
-                detail = f"Tool '{tool.name}' denied by user."
-                if hitl_result.feedback_note:
-                    detail += f" Feedback: {hitl_result.feedback_note}"
                 return ToolResult.from_error(
                     error_type=ToolErrorType.PERMISSION_DENIED,
                     detail=detail,

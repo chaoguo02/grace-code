@@ -94,6 +94,10 @@ class ChatSession:
             from core.state_paths import migrate_legacy_session_db
             migrate_legacy_session_db(repo_path, db_path)
             store = SessionStore(db_path)
+            # Phase 4: ResourceGovernor for CLI
+            from core.resource_governor import ResourceGovernor
+            gov = ResourceGovernor(self.config.resource_governance)
+
             self._runtime = SessionRuntime(
                 store=store, backend=backend, base_registry=registry,
                 agent_registry=self._agent_registry,
@@ -103,6 +107,7 @@ class ChatSession:
                 mcp_integration=mcp_integration,
                 memory_context=memory_context,
                 event_callback=self._make_event_callback(),
+                governor=gov,
             )
 
         # Root session — 所有轮次共享
@@ -353,13 +358,26 @@ class ChatSession:
         rendered = self._skill_registry.load_and_render(name, args, runtime=self._runtime)
         if rendered is None:
             return None
-        self._run_skill_fork(name, rendered, meta)
+        if meta.context == "fork":
+            self._run_skill_fork(name, rendered, meta)
+        else:
+            from llm.base import LLMMessage, MessageKind
+
+            skill_buffer = self._registry.skill_buffer
+            if skill_buffer is not None:
+                rendered = skill_buffer.activate(name, rendered)
+            self._registry.activate_skill(meta)
+            self._shared_history.add(LLMMessage(
+                role="user",
+                kind=MessageKind.RUNTIME_NOTICE,
+                content=f"[Skill: {name}]\n{rendered}",
+            ))
         return name
 
     def _run_skill_fork(self, name, rendered, meta) -> None:
         """以子会话方式运行 skill。"""
-        from agent.session import AgentSpawnRequest, ExecutionPlacement, TaskIntent
-        from agent.session.task_contract import TaskContract
+        from llm.base import LLMMessage
+        from agent.session import AgentSpawnRequest, ExecutionPlacement
         from agent.session.run_context import CancellationToken
         from core.policy import PhasePolicy
         fork_request = AgentSpawnRequest.named(

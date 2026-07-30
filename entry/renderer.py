@@ -14,7 +14,6 @@ ChatSession / CLI 通过 create_renderer() 工厂函数获取实例。
 from __future__ import annotations
 
 import abc
-import os
 import re
 import shutil
 import sys
@@ -30,8 +29,7 @@ from typing import Any
 
 from entry._terminal import (
     _IS_TTY,
-    _c, _clear_line, _move_up,
-    bg_red as _bg_red, bg_yellow as _bg_yellow,
+    _clear_line,
     bold as _bold, cyan as _cyan, dim as _dim,
     green as _green, magenta as _magenta, red as _red, yellow as _yellow,
 )
@@ -173,7 +171,6 @@ class InlineRenderer(RendererBase):
             return
         try:
             from rich.theme import Theme
-            from rich.markdown import Markdown
 
             cls._MD_THEME = Theme({
                 "markdown.h1": "bold blue",
@@ -223,7 +220,7 @@ class InlineRenderer(RendererBase):
             return
         bar = self._render_status_bar()
         sys.stdout.write(f"\n{bar}")
-        sys.stdout.write(f"\033[1A")  # move cursor back up
+        sys.stdout.write("\033[1A")  # move cursor back up
         sys.stdout.flush()
         self._status_visible = True
 
@@ -240,7 +237,7 @@ class InlineRenderer(RendererBase):
         sys.stdout.write(_save_cursor())
         # move to next line, overwrite status bar
         sys.stdout.write(f"\n{_clear_line()}{self._render_status_bar()}")
-        sys.stdout.write(f"\033[1A")  # back up
+        sys.stdout.write("\033[1A")  # back up
         sys.stdout.write(_restore_cursor())
         sys.stdout.flush()
 
@@ -328,7 +325,7 @@ class InlineRenderer(RendererBase):
         if not _IS_TTY or line_count <= 0:
             return
         for _ in range(line_count):
-            sys.stdout.write(f"\033[A\033[2K")
+            sys.stdout.write("\033[A\033[2K")
         sys.stdout.flush()
 
     # ── 工具面板 ──────────────────────────────────────────────────
@@ -754,65 +751,6 @@ def create_renderer(
 # HITL 确认 UI
 # ---------------------------------------------------------------------------
 
-def hitl_terminal_confirm(request: "Any") -> tuple[bool, str]:
-    """
-    Legacy 终端 HITL 确认 UI（向后兼容）。
-    接收 HitlRequest，返回 (approved, note)。
-    新代码应使用 permission_prompt()。
-    """
-    import sys
-
-    if not sys.stdin.isatty():
-        return (False, "Non-interactive terminal, auto-denied")
-
-    params = request.params
-    if "cmd" in params:
-        params_display = f'cmd="{params["cmd"]}"'
-    elif "path" in params:
-        params_display = f'path="{params["path"]}"'
-    else:
-        params_str = str(params)
-        if len(params_str) > 80:
-            params_str = params_str[:80] + "..."
-        params_display = params_str
-
-    sys.stdout.write("\n")
-    sys.stdout.write(_yellow("  ┌─ Confirmation Required ") + _yellow("─" * 34) + "\n")
-    sys.stdout.write(_yellow("  │  ") + f"Tool:   {_bold(request.tool_name)}\n")
-    sys.stdout.write(_yellow("  │  ") + f"Risk:   {_risk_color(request.risk_level)}\n")
-    sys.stdout.write(_yellow("  │  ") + f"Params: {params_display}\n")
-    if request.thought and request.thought != "(no thought)":
-        thought_short = request.thought[:80]
-        if len(request.thought) > 80:
-            thought_short += "..."
-        sys.stdout.write(_yellow("  │  ") + _dim(f'Agent:  "{thought_short}"') + "\n")
-    sys.stdout.write(_yellow("  └") + _yellow("─" * 60) + "\n")
-    sys.stdout.flush()
-
-    while True:
-        try:
-            ans = input(_cyan("  [y]approve / [n]deny / [n: reason] > ")).strip()
-        except (EOFError, KeyboardInterrupt):
-            sys.stdout.write("\n")
-            return (False, "")
-
-        if ans.lower() in ("y", "yes", ""):
-            sys.stdout.write(_green("  ✓ Approved\n\n"))
-            sys.stdout.flush()
-            return (True, "")
-        elif ans.lower() in ("n", "no"):
-            sys.stdout.write(_red("  ✗ Denied\n\n"))
-            sys.stdout.flush()
-            return (False, "")
-        elif ans.lower().startswith("n:") or ans.lower().startswith("n "):
-            note = ans[2:].strip()
-            sys.stdout.write(_red(f"  ✗ Denied") + _dim(f" ({note})\n\n"))
-            sys.stdout.flush()
-            return (False, note)
-        else:
-            sys.stdout.write(_dim("  (enter y, n, or n: <reason>)\n"))
-
-
 def permission_prompt(request: "Any") -> "Any":
     """
     3-way terminal permission prompt (aligned with Claude Code).
@@ -876,7 +814,7 @@ def permission_prompt(request: "Any") -> "Any":
 
         elif ans in ("A",) or ans.lower() in ("always", "aa"):
             rule = infer_permission_pattern(request.tool_name, request.params)
-            sys.stdout.write(_green(f"  ✓ Always allow: ") + _dim(rule.raw) + "\n\n")
+            sys.stdout.write(_green("  ✓ Always allow: ") + _dim(rule.raw) + "\n\n")
             sys.stdout.flush()
             return PromptDecision(action=PromptAction.ALWAYS_ALLOW, inferred_rule=rule)
 
@@ -887,7 +825,7 @@ def permission_prompt(request: "Any") -> "Any":
 
         elif ans.lower().startswith("d:") or ans.lower().startswith("n:"):
             note = ans[2:].strip()
-            sys.stdout.write(_red(f"  ✗ Denied") + _dim(f" ({note})\n\n"))
+            sys.stdout.write(_red("  ✗ Denied") + _dim(f" ({note})\n\n"))
             sys.stdout.flush()
             return PromptDecision(action=PromptAction.DENY, note=note)
 

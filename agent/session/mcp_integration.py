@@ -2,93 +2,22 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import json
+from enum import Enum
 from fnmatch import fnmatch
 from typing import Any, Iterable
 
 from agent.mcp import MCPServerConfig, SyncMCPToolManager, assemble_tool_pool
-from agent.mcp.tool_types import ToolResult as RuntimeToolResult, ToolUseContext
-from core.base import BaseTool, RiskLevel, ToolRegistry, ToolResult
+from core.base import BaseTool, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
 
-class MCPRuntimeToolProxy(BaseTool):
-    """Adapt a runtime ConcreteTool returned by runtime.mcp for legacy tools."""
-
-    def __init__(self, runtime_tool: Any) -> None:
-        self._runtime_tool = runtime_tool
-        self.server_name = getattr(getattr(runtime_tool, "mcp_props", None), "server_name", "")
-        mcp_props = getattr(runtime_tool, "mcp_props", None)
-        if mcp_props is not None:
-            self.is_mcp = True
-            self.always_load = mcp_props.always_load
-            self.should_defer = mcp_props.is_deferred
-        else:
-            self.is_mcp = bool(getattr(runtime_tool, "is_mcp", True))
-            self.always_load = bool(getattr(runtime_tool, "always_load", False))
-            self.should_defer = bool(getattr(runtime_tool, "should_defer", False))
-        self.metadata = dict(getattr(runtime_tool, "metadata", {}) or {})
-
-    @property
-    def name(self) -> str:
-        return self._runtime_tool.name
-
-    @property
-    def description(self) -> str:
-        if hasattr(self._runtime_tool, "to_api_definition"):
-            definition = self._runtime_tool.to_api_definition()
-            return str(definition.get("description") or f"MCP tool {self.name}")
-        return f"MCP tool {self.name}"
-
-    @property
-    def parameters_schema(self) -> dict[str, Any]:
-        return dict(getattr(self._runtime_tool, "input_schema", {"type": "object", "properties": {}}))
-
-    @property
-    def risk_level(self) -> str:
-        return RiskLevel.MEDIUM
-
-    def execute(self, params: dict[str, Any]) -> ToolResult:
-        try:
-            result = asyncio.run(self._runtime_tool.call(params, ToolUseContext()))
-        except RuntimeError as exc:
-            if "asyncio.run() cannot be called from a running event loop" not in str(exc):
-                return ToolResult(success=False, output="", error=f"MCP tool '{self.name}' failed: {exc}")
-            return ToolResult(success=False, output="", error=f"MCP tool '{self.name}' cannot run inside an active event loop")
-        except Exception as exc:
-            return ToolResult(success=False, output="", error=f"MCP tool '{self.name}' failed: {exc}")
-
-        return _runtime_result_to_legacy(self.name, result)
-
-
-# CC-aligned output limits for MCP tools
-MCP_OUTPUT_WARN_CHARS = 10_000
-MCP_OUTPUT_MAX_CHARS = 25_000
-
-
-def _runtime_result_to_legacy(tool_name: str, result: RuntimeToolResult) -> ToolResult:
-    output = str(result.output or "")
-    metadata = result.metadata or {}
-    if metadata.get("mcp_is_error") or metadata.get("mcp_error"):
-        return ToolResult(
-            success=False,
-            output=output,
-            error=str(metadata.get("mcp_error") or output or f"MCP tool '{tool_name}' returned an error"),
-        )
-    # CC-aligned: warn on large MCP outputs
-    out_len = len(output)
-    if out_len > MCP_OUTPUT_MAX_CHARS:
-        output = output[:MCP_OUTPUT_MAX_CHARS] + (
-            f"\n\n[MCP output truncated: {out_len} chars -> {MCP_OUTPUT_MAX_CHARS} chars]"
-        )
-    elif out_len > MCP_OUTPUT_WARN_CHARS:
-        output = output + (
-            f"\n\n[Note: MCP tool '{tool_name}' returned {out_len} chars of output. "
-            f"Consider narrowing your request.]"
-        )
-    return ToolResult(success=True, output=output)
+class ToolLoadingMode(str, Enum):
+    TST = "tst"
+    TST_AUTO = "tst-auto"
+    STANDARD = "standard"
 
 
 class MCPToolIntegration:
@@ -101,15 +30,29 @@ class MCPToolIntegration:
         server_configs: list[MCPServerConfig] | None = None,
         allow_tools: list[str] | None = None,
         deny_tools: list[str] | None = None,
+        loading_mode: ToolLoadingMode | str | None = None,
+        context_window: int = 128_000,
     ) -> None:
         raw_config = raw_config or {}
         parsed_servers, parsed_allow, parsed_deny = _parse_raw_config(raw_config)
         self._server_configs = list(server_configs) if server_configs is not None else parsed_servers
         self._allow_tools = list(allow_tools) if allow_tools is not None else parsed_allow
         self._deny_tools = list(deny_tools) if deny_tools is not None else parsed_deny
+        raw_mode = loading_mode or raw_config.get(
+            "tool_loading_mode",
+            raw_config.get("mcp_tool_loading_mode", ToolLoadingMode.TST.value),
+        )
+        if isinstance(raw_mode, ToolLoadingMode):
+            self._loading_mode = raw_mode
+        else:
+            try:
+                self._loading_mode = ToolLoadingMode(str(raw_mode))
+            except ValueError:
+                self._loading_mode = ToolLoadingMode.TST
+        self._context_window = max(1, int(context_window))
         self._manager: SyncMCPToolManager | None = None
-        self._runtime_tools: list[Any] = []
-        self._tools: list[MCPRuntimeToolProxy] = []
+        self._tools: list[BaseTool] = []
+        self._registry: ToolRegistry | None = None
         self._initialized = False
 
     @property
@@ -134,12 +77,48 @@ class MCPToolIntegration:
         return self._manager
 
     @property
-    def tools(self) -> list[MCPRuntimeToolProxy]:
+    def tools(self) -> list[BaseTool]:
         return list(self._tools)
 
     @property
     def tool_names(self) -> frozenset[str]:
         return frozenset(tool.name for tool in self._tools)
+
+    def deferred_tool_descriptors(self) -> list[dict[str, str]]:
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "server": str(
+                    getattr(
+                        getattr(tool, "mcp_props", None),
+                        "server_name",
+                        "",
+                    ),
+                ),
+            }
+            for tool in self._tools
+            if bool(getattr(tool, "should_defer", False))
+        ]
+
+    def activate_tools(self, names: set[str]) -> list[str]:
+        activated: list[str] = []
+        for tool in self._tools:
+            if tool.name not in names:
+                continue
+            tool.always_load = True
+            tool.should_defer = False
+            activated.append(tool.name)
+        return activated
+
+    def connection_errors(self) -> dict[str, str]:
+        if self._manager is None:
+            return {}
+        errors = dict(self._manager.failed_servers)
+        for name, bridge in self._manager.bridges.items():
+            if not bridge.is_connected:
+                errors.setdefault(name, "not connected")
+        return errors
 
     def initialize(self) -> None:
         if self._initialized:
@@ -149,8 +128,11 @@ class MCPToolIntegration:
             return
 
         self._manager = SyncMCPToolManager()
-        self._runtime_tools = self._manager.load_and_discover(self._server_configs)
-        self._tools = [MCPRuntimeToolProxy(tool) for tool in self._runtime_tools]
+        self._manager.set_tools_changed_callback(
+            self._replace_server_tools,
+        )
+        self._tools = self._manager.load_and_discover(self._server_configs)
+        self._apply_loading_mode()
         self._initialized = True
         logger.info("MCP integration initialized with %d tool(s)", len(self._tools))
 
@@ -161,11 +143,11 @@ class MCPToolIntegration:
         return assemble_tool_pool(builtin_tools, mcp_tools, deny_rules=self._deny_tools)
 
     def register_into(self, registry: ToolRegistry) -> None:
-        for tool in self.get_tool_pool([]):
-            if tool.name in registry:
-                logger.warning("Skipping MCP tool %s because a built-in tool with the same name is registered", tool.name)
-                continue
-            registry.register(tool)
+        self._registry = registry
+        pool = self.get_tool_pool(registry.tools)
+        for name in tuple(registry.tool_names):
+            registry.unregister(name)
+        registry.register_many(pool)
 
     def connect_agent_servers(self, spec) -> list[str]:
         """Connect MCP servers declared in an agent's mcpServers frontmatter.
@@ -189,13 +171,11 @@ class MCPToolIntegration:
                     if self._manager is not None:
                         try:
                             runtime_tools = self._manager.load_and_discover([server_config])
-                            for rt in runtime_tools:
-                                proxy = MCPRuntimeToolProxy(rt)
-                                proxy.server_name = name
-                                self._runtime_tools.append(rt)
-                                self._tools.append(proxy)
-                                new_tools.append(rt.name)
-                                logger.info("Connected agent-scoped MCP server '%s' (tool: %s)", name, rt.name)
+                            for tool in runtime_tools:
+                                self._tools.append(tool)
+                                new_tools.append(tool.name)
+                                logger.info("Connected agent-scoped MCP server '%s' (tool: %s)", name, tool.name)
+                            self._apply_loading_mode()
                         except Exception as exc:
                             logger.warning("Failed to connect agent-scoped MCP server '%s': %s", name, exc)
         return new_tools
@@ -212,13 +192,13 @@ class MCPToolIntegration:
             return
         for server_name in server_names:
             self._manager.close_server(server_name)
-        self._runtime_tools = [
-            rt for rt in self._runtime_tools
-            if getattr(getattr(rt, 'mcp_props', None), 'server_name', '') not in server_names
-        ]
         self._tools = [
             tool for tool in self._tools
-            if getattr(tool, 'server_name', '') not in server_names
+            if getattr(
+                getattr(tool, "mcp_props", None),
+                "server_name",
+                "",
+            ) not in server_names
         ]
         logger.info("Disconnected MCP servers: %s", sorted(server_names))
 
@@ -229,8 +209,11 @@ class MCPToolIntegration:
         old_names = {t.name for t in self._tools}
         self._manager.close_all()
         self._manager = SyncMCPToolManager()
-        self._runtime_tools = self._manager.load_and_discover(self._server_configs)
-        self._tools = [MCPRuntimeToolProxy(tool) for tool in self._runtime_tools]
+        self._manager.set_tools_changed_callback(
+            self._replace_server_tools,
+        )
+        self._tools = self._manager.load_and_discover(self._server_configs)
+        self._apply_loading_mode()
         new_names = {t.name for t in self._tools}
         added = new_names - old_names
         removed = old_names - new_names
@@ -239,10 +222,15 @@ class MCPToolIntegration:
         return list(added)
 
     def shutdown(self) -> None:
+        self.close()
+
+    def close(self, timeout: float = 5.0) -> None:
         if self._manager is not None:
-            self._manager.close_all()
+            self._manager.close_all(
+                drain_timeout=timeout,
+                close_timeout=timeout,
+            )
         self._manager = None
-        self._runtime_tools.clear()
         self._tools.clear()
         self._initialized = False
 
@@ -258,6 +246,49 @@ class MCPToolIntegration:
         if self._allow_tools and not any(fnmatch(tool_name, pattern) for pattern in self._allow_tools):
             return False
         return not any(fnmatch(tool_name, pattern) for pattern in self._deny_tools)
+
+    def _apply_loading_mode(self) -> None:
+        deferred = self._loading_mode is ToolLoadingMode.TST
+        if self._loading_mode is ToolLoadingMode.TST_AUTO:
+            schema_chars = sum(
+                len(json.dumps(tool.parameters_schema, sort_keys=True))
+                + len(tool.description)
+                for tool in self._tools
+            )
+            estimated_tokens = max(1, schema_chars // 4)
+            deferred = estimated_tokens > int(self._context_window * 0.10)
+        for tool in self._tools:
+            props = getattr(tool, "mcp_props", None)
+            if props is None:
+                continue
+            props.always_load = not deferred
+            props.is_deferred = deferred
+
+    def _replace_server_tools(
+        self,
+        server_name: str,
+        tools: list[BaseTool],
+    ) -> None:
+        stale = [
+            tool
+            for tool in self._tools
+            if getattr(
+                getattr(tool, "mcp_props", None),
+                "server_name",
+                "",
+            ) == server_name
+        ]
+        self._tools = [
+            tool for tool in self._tools if tool not in stale
+        ]
+        self._tools.extend(tools)
+        self._apply_loading_mode()
+        if self._registry is not None:
+            for tool in stale:
+                self._registry.unregister(tool.name)
+            for tool in tools:
+                if tool.name not in self._registry:
+                    self._registry.register(tool)
 
 
 def _parse_raw_config(raw_config: dict[str, Any]) -> tuple[list[MCPServerConfig], list[str], list[str]]:

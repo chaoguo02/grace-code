@@ -110,6 +110,9 @@ function delegationTask(value: unknown): DelegationTaskProjection {
     tokens_used: number(item.tokens_used),
     time_budget_ms: number(item.time_budget_ms),
     elapsed_ms: number(item.elapsed_ms),
+    resource: item.resource && typeof item.resource === "object"
+      ? object(item.resource) as DelegationTaskProjection["resource"]
+      : undefined,
   };
 }
 
@@ -170,6 +173,8 @@ export function normalizeMultiAgentSnapshot(value: MultiAgentSnapshot): MultiAge
   const raw = value as MultiAgentSnapshot & JsonObject;
   const rawRuns = raw.delegation_runs ?? raw.runs;
   const rawTasks = raw.delegation_tasks ?? raw.tasks;
+  // Phase 4: preserve resource governance state
+  const resource = raw.resource as Record<string, unknown> | undefined;
   return {
     ...value,
     routing: routing(raw.routing ?? raw.routing_decision),
@@ -177,6 +182,7 @@ export function normalizeMultiAgentSnapshot(value: MultiAgentSnapshot): MultiAge
     delegation_tasks: Array.isArray(rawTasks) ? rawTasks.map(delegationTask) : [],
     limits: budget(raw.limits ?? raw.budget),
     team: team(raw.team ?? raw.team_capability),
+    resource,
   };
 }
 

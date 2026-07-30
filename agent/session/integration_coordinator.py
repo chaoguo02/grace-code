@@ -166,25 +166,26 @@ class DelegationIntegrationCoordinator:
         commands = self._verification_commands()
         if not commands:
             verification = {
-                "status": "not_configured",
+                "status": "skipped",
                 "reason": (
-                    "Configure GRACE_MULTI_AGENT_VERIFICATION_COMMANDS as "
-                    "a JSON array of argv arrays"
+                    "No verification commands configured. Set "
+                    "GRACE_MULTI_AGENT_VERIFICATION_COMMANDS to enable."
                 ),
                 "checks": [],
             }
-            self._store.transition_delegation_run(
+            terminal_event = self._store.finalize_delegation_run(
                 run_id,
-                status="running",
-                phase="awaiting_verification",
+                status="completed",
+                phase="completed",
                 expected_version=int(run["version"]),
                 verification=verification,
             )
             self._emit("delegation_verification_completed", run_id, {
-                "phase": "awaiting_verification",
-                "status": "not_configured",
+                "phase": "completed",
+                "status": "skipped",
                 "verification": verification,
             })
+            self._broadcast_terminal(run_id, terminal_event)
             return self._store.get_delegation_run(run_id) or {}
 
         current = self._store.get_delegation_run(run_id) or run

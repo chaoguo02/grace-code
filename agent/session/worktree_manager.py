@@ -234,6 +234,71 @@ class WorktreeManager:
         for wt in list(self._worktrees.values()):
             self.discard(wt)
 
+    # ── Phase 3: Orphan cleanup ────────────────────────────────────────
+
+    def cleanup_orphans(self, active_session_ids: set[str] | None = None) -> int:
+        """Remove orphan worktree directories not managed by git.
+
+        An orphan is a directory under *worktree_root* that is neither
+        listed by ``git worktree list`` nor associated with an active
+        child session. Only confirmed-clean (no uncommitted changes on
+        worktree branch) orphans are deleted.
+
+        Returns the number of directories removed.
+        """
+        active = active_session_ids or set()
+        wt_root = self._worktree_root
+        if not wt_root.exists():
+            return 0
+
+        # Get git-managed worktree paths
+        try:
+            result = self._run_git(["worktree", "list", "--porcelain"])
+        except Exception:
+            logger.warning("Failed to list git worktrees for orphan cleanup")
+            return 0
+
+        git_paths: set[str] = set()
+        for line in result.splitlines():
+            if line.startswith("worktree "):
+                git_paths.add(str(Path(line[9:].strip()).resolve()))
+
+        removed = 0
+        for entry in wt_root.iterdir():
+            if not entry.is_dir():
+                continue
+            entry_path = str(entry.resolve())
+            # Skip git-managed worktrees
+            if entry_path in git_paths:
+                continue
+            # Skip if associated with an active session (heuristic)
+            try:
+                wt_name = entry.name
+                if any(sid in wt_name for sid in active):
+                    continue
+            except Exception:
+                pass
+            # Without Git metadata there is no reliable way to prove a
+            # non-empty directory is disposable.  Only remove empty shells.
+            try:
+                entry.rmdir()
+                logger.info("Cleaned orphan worktree: %s", entry_path)
+                removed += 1
+            except OSError as exc:
+                logger.info(
+                    "Preserving non-empty or unavailable orphan candidate %s: %s",
+                    entry_path,
+                    exc,
+                )
+
+        # Prune git worktree metadata
+        try:
+            self._run_git(["worktree", "prune"])
+        except Exception:
+            logger.debug("git worktree prune failed", exc_info=True)
+
+        return removed
+
     def get_diff(self, wt: Worktree) -> str:
         """获取 worktree 相对于基础分支的 diff。"""
         try:

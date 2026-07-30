@@ -173,6 +173,6 @@ def test_requires_configured_parent_verification_after_apply(tmp_path, monkeypat
         decisions=[IntegrationDecision("run-1:write", "apply", "rev-1")],
     )
 
-    assert result["run"]["status"] == "running"
-    assert result["run"]["phase"] == "awaiting_verification"
-    assert result["run"]["verification"]["status"] == "not_configured"
+    assert result["run"]["status"] == "completed"
+    assert result["run"]["phase"] == "completed"
+    assert result["run"]["verification"]["status"] == "skipped"

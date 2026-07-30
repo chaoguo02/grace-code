@@ -32,6 +32,8 @@ def _open_runtime(repo: str, *, required: bool):
             )
         return None
     store = SessionStore(str(paths.sessions_db))
+    from core.resource_governor import ResourceGovernor
+    from config.schema import ResourceGovernanceConfig
     return SessionRuntime(
         store=store,
         backend=MockBackend([]),
@@ -39,6 +41,7 @@ def _open_runtime(repo: str, *, required: bool):
         agent_registry=AgentRegistryV2(project_dir=repo_path),
         root_agent_config=AgentConfig(stream=False),
         log_dir=str(paths.logs),
+        governor=ResourceGovernor(ResourceGovernanceConfig()),
     )
 
 

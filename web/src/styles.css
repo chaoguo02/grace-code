@@ -10733,6 +10733,15 @@ footer.composer { margin-top: 0; padding-top: 0; }
 .multi-agent-run-state[data-status="cancelled"] strong { background: rgba(239, 68, 68, 0.1); color: var(--error); }
 .multi-agent-run-counts { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0; padding: 9px 10px; border: 1px solid var(--border); border-radius: 12px; color: var(--text-muted); font-size: 11px; }
 .multi-agent-run-counts strong { color: var(--text); }
+.multi-agent-resource { display: flex; flex-wrap: wrap; gap: 12px; margin: 8px 0; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text-muted); font-size: 11px; }
+.multi-agent-resource strong { color: var(--text); }
+.resource-pressure { font-weight: 700; text-transform: uppercase; font-size: 10px; padding: 1px 5px; border-radius: 4px; }
+.resource-pressure-normal { background: var(--success-muted, #e6f4ea); color: var(--success, #1a7f3f); }
+.resource-pressure-warning { background: #fff3cd; color: #856404; }
+.resource-pressure-critical { background: #fce4e4; color: #c62828; }
+.resource-pressure-draining { background: var(--bg-strong); color: var(--text-muted); }
+.queue-pos { font-size: 10px; color: var(--accent); margin-left: 4px; }
+.queue-wait { font-size: 10px; color: var(--text-muted); margin-left: 2px; }
 .multi-agent-task-list { display: grid; gap: 8px; }
 .multi-agent-task { border: 1px solid var(--border); border-left: 3px solid var(--border-strong); border-radius: 14px; background: var(--bg-strong); overflow: hidden; }
 .multi-agent-task[data-status="running"] { border-left-color: var(--accent); }

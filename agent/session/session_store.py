@@ -363,6 +363,7 @@ class SessionStore:
                 "supersedes_task_id": "TEXT NULL",
                 "integration_status": "TEXT NOT NULL DEFAULT 'not_required'",
                 "integration_error": "TEXT NOT NULL DEFAULT ''",
+                "resource_json": "TEXT NULL",
             }.items():
                 if name not in delegation_task_columns:
                     conn.execute(
@@ -1214,6 +1215,38 @@ class SessionStore:
             raise ValueError(f"Unknown delegation task: {task_id}")
         return False
 
+    def update_delegation_task_resource(
+        self,
+        task_id: str,
+        resource: dict[str, object],
+    ) -> bool:
+        """Merge durable resource lifecycle facts for one delegation task."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT resource_json FROM delegation_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current = (
+                json.loads(row["resource_json"])
+                if row["resource_json"] else {}
+            )
+            for key, value in resource.items():
+                if isinstance(value, dict) and isinstance(current.get(key), dict):
+                    current[key] = {**current[key], **value}
+                else:
+                    current[key] = value
+            cursor = conn.execute(
+                """
+                UPDATE delegation_tasks
+                SET resource_json = ?
+                WHERE id = ?
+                """,
+                (json.dumps(current, ensure_ascii=True), task_id),
+            )
+        return cursor.rowcount == 1
+
     def transition_delegation_run(
         self,
         run_id: str,
@@ -1619,6 +1652,10 @@ class SessionStore:
             "supersedes_task_id": row["supersedes_task_id"],
             "integration_status": str(row["integration_status"]),
             "integration_error": str(row["integration_error"]),
+            "resource": (
+                json.loads(row["resource_json"])
+                if row["resource_json"] is not None else {}
+            ),
             "created_at": str(row["created_at"]),
             "started_at": row["started_at"],
             "completed_at": row["completed_at"],

@@ -737,10 +737,10 @@ class ReActAgent:
         self._artifact_store = ArtifactStore(
             threshold_tokens=self._cfg.artifact_threshold_tokens,
         )
-        artifact_store_ref = getattr(registry, "_artifact_store_ref", None)
+        artifact_store_ref = registry.artifact_store_ref
         if artifact_store_ref is not None:
             artifact_store_ref.store = self._artifact_store
-        evidence_ledger_ref = getattr(registry, "_evidence_ledger_ref", None)
+        evidence_ledger_ref = registry.evidence_ledger_ref
         if evidence_ledger_ref is not None:
             evidence_ledger_ref.ledger = None
         self._context_manager = ContextManager(ContextManagerConfig(
@@ -860,10 +860,24 @@ class ReActAgent:
                 phase_name="task_execution",
                 base_allowed_tools=frozenset(previous_registry.tool_names),
             )
+        pending_skill = previous_registry.consume_skill_modifier()
+        apply_skill = getattr(self._registry, "_apply_skill_modifier", None)
+        if pending_skill is not None and callable(apply_skill):
+            apply_skill(pending_skill)
         try:
             return self._run_body(task, log, policy=policy)
         finally:
+            deactivate_skill = getattr(
+                self._registry,
+                "deactivate_skill_modifier",
+                None,
+            )
+            if callable(deactivate_skill):
+                deactivate_skill()
             self._registry = previous_registry
+            if self._compactor is not None:
+                self._compactor.set_usage_callback(None)
+            self._active_execution_budget = None
             # Close the Langfuse observation span on any exit path.
             # The normal-path close in _build_run_result only fires on
             # structured completion, not on unhandled exceptions.
@@ -927,12 +941,17 @@ class ReActAgent:
             source="git" if ctx.git_state.is_git_repo else "tool_journal",
             is_run_scoped=ctx.git_state.is_git_repo,
         )
+        active_budget = getattr(self, "_active_execution_budget", None)
+        authoritative_tokens = (
+            active_budget.token_used
+            if active_budget is not None else 0
+        )
         result = RunResult(
             task_id=ctx.task.task_id,
             status=status,
             summary=summary,
             steps_taken=steps_taken,
-            total_tokens=total_tokens_used,
+            total_tokens=max(total_tokens_used, authoritative_tokens),
             patch=patch,
             error=error,
             cache_stats=cache_stats,
@@ -1298,11 +1317,7 @@ class ReActAgent:
         self._feedback_injected_files = set()
         self._explicit_memory_write_this_run = False
         self._evidence_ledger = EvidenceLedger()
-        evidence_ref = getattr(
-            self._full_registry,
-            "_evidence_ledger_ref",
-            None,
-        )
+        evidence_ref = self._full_registry.evidence_ledger_ref
         if evidence_ref is not None:
             evidence_ref.ledger = self._evidence_ledger
         self._accumulated_structured_findings = []
@@ -1384,6 +1399,18 @@ class ReActAgent:
             ),
         )
         execution_budget.start()
+        self._active_execution_budget = execution_budget
+        self._compaction_tokens_pending = 0
+
+        def _record_compaction_usage(tokens: int) -> None:
+            billed = max(0, int(tokens))
+            if billed <= 0:
+                return
+            execution_budget.consume(billed)
+            execution_budget.record_overhead_tokens(billed)
+            self._compaction_tokens_pending += billed
+
+        self.compactor.set_usage_callback(_record_compaction_usage)
         # Wire budget into the tool execution pipeline for per-tool gating
         self._full_registry._budget = execution_budget
         cancellation = self._cfg.cancellation_token or CancellationToken()
@@ -1662,6 +1689,12 @@ class ReActAgent:
             max_context_window=self._backend.max_context_window,
             step=step,
         )
+        compaction_tokens = max(
+            0, int(getattr(self, "_compaction_tokens_pending", 0)),
+        )
+        if compaction_tokens:
+            total_tokens += compaction_tokens
+            self._compaction_tokens_pending = 0
         logger.info("Provider context ready for task %s step %d", task.task_id, step)
         provider_request = prepare_provider_request(
             messages=messages,
@@ -3049,22 +3082,12 @@ class ReActAgent:
             if name and name not in tool_names:
                 tool_names.append(name)
 
-        active_skills: list[str] = []
-        registry = self._registry
-        while hasattr(registry, "_base"):
-            skill_buffer = getattr(registry, "_skill_buffer", None)
-            if skill_buffer is not None:
-                active = getattr(skill_buffer, "active_skills", None)
-                if callable(active):
-                    active_skills = list(active())
-                    break
-            registry = registry._base
-        if not active_skills:
-            skill_tool = getattr(registry, "_tools", {}).get("Skill")
-            skill_buffer = getattr(skill_tool, "_buffer", None)
-            active = getattr(skill_buffer, "active_skills", None)
-            if callable(active):
-                active_skills = list(active())
+        skill_buffer = self._registry.skill_buffer
+        active_skills = (
+            list(skill_buffer.active_skills())
+            if skill_buffer is not None
+            else []
+        )
 
         mcp_tools = [name for name in tool_names if name.startswith("mcp__")]
         mcp_servers = sorted({
@@ -3718,7 +3741,7 @@ def _build_compaction_recovery(registry: Any, project_dir: str | None = None) ->
     from context.compaction import CompactionRecovery
 
     _file_cache = None
-    _skill_buf = getattr(registry, "_skill_buffer", None)
+    _skill_buf = registry.skill_buffer
 
     # Walk registry wrappers to find the inner ToolRegistry
     _inner = registry

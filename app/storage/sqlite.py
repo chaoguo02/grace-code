@@ -1150,6 +1150,39 @@ class SqliteStorageBackend(StorageBackend):
             logger.exception("Failed to insert_trace_event %s type=%s", session_id, event.get("type"))
             return event
 
+    def insert_trace_events_batch(
+        self, batch: list[tuple[str, dict, str]],
+    ) -> None:
+        """Phase 3: batch insert trace events in a single transaction."""
+        if not batch:
+            return
+        try:
+            with self._store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                for session_id, event, source in batch:
+                    seq = conn.execute(
+                        "SELECT COALESCE(MAX(seq), 0) + 1 "
+                        "FROM session_trace_events WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0]
+                    conn.execute(
+                        "INSERT INTO session_trace_events "
+                        "(session_id, seq, event_type, timestamp, event_json, source, child_session_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            session_id,
+                            seq,
+                            str(event.get("type", "unknown")),
+                            str(event.get("timestamp", "")),
+                            json.dumps(event, ensure_ascii=True),
+                            source,
+                            str(event.get("child_session_id", "")),
+                        ),
+                    )
+                conn.execute("COMMIT")
+        except Exception:
+            logger.exception("Batch trace event insert failed — %d events", len(batch))
+
     def list_trace_events(
         self,
         session_id: str,

@@ -602,8 +602,7 @@ def run(
         except (AgentDefinitionError, ExplicitDelegationError) as exc:
             raise click.ClickException(str(exc)) from exc
         finally:
-            if mcp_integration is not None:
-                mcp_integration.shutdown()
+            registry.close()
         flush_observability()
         if not mode_result.is_success():
             raise click.exceptions.Exit(1)
@@ -872,53 +871,22 @@ def chat(
                     ))
                     click.echo(dim(f"  🎯 目标已设定：{args}\n  每轮结束后会自动评估。"))
             elif cmd.startswith("/mcp"):
-                parts = user_input.strip().split(maxsplit=2)
-                subcmd = parts[1] if len(parts) > 1 else ""
-                if hasattr(registry, '_mcp_manager') and registry._mcp_manager:
-                    mgr = registry._mcp_manager
-                    if not subcmd:
-                        click.echo(dim(f"  MCP servers: {len(mgr._configs)} configured, {len(mgr.proxies)} tools loaded"))
-                        for cfg in mgr._configs:
-                            tool_count = sum(1 for p in mgr.proxies if getattr(p, '_server_name', None) == cfg.name)
-                            click.echo(dim(f"    {cfg.name}: {tool_count} tools"))
-                        resources_count = sum(len(v) for v in getattr(mgr, '_resources', {}).values())
-                        templates_count = sum(len(v) for v in getattr(mgr, '_resource_templates', {}).values())
-                        if resources_count or templates_count:
-                            click.echo(dim(f"  Resources: {resources_count} static, {templates_count} templates"))
-                    elif subcmd == "resources":
-                        resources = getattr(mgr, '_resources', {})
-                        templates = getattr(mgr, '_resource_templates', {})
-                        has_any = any(resources.values()) or any(templates.values())
-                        if not has_any:
-                            click.echo(dim("  No resources available."))
-                        else:
-                            for server, res_list in resources.items():
-                                if res_list:
-                                    click.echo(dim(f"  [{server}] Resources:"))
-                                    for r in res_list:
-                                        uri = getattr(r, 'uri', str(r))
-                                        name = getattr(r, 'name', '')
-                                        click.echo(dim(f"    {uri}  {name}"))
-                            for server, tpl_list in templates.items():
-                                if tpl_list:
-                                    click.echo(dim(f"  [{server}] Templates:"))
-                                    for t in tpl_list:
-                                        uri_tpl = getattr(t, 'uriTemplate', str(t))
-                                        name = getattr(t, 'name', '')
-                                        click.echo(dim(f"    {uri_tpl}  {name}"))
-                    elif subcmd == "prompts":
-                        prompts = getattr(mgr, '_prompts', {})
-                        if not prompts:
-                            click.echo(dim("  No prompts available."))
-                        else:
-                            for server, prompt_list in prompts.items():
-                                click.echo(dim(f"  [{server}]"))
-                                for p in prompt_list:
-                                    pname = getattr(p, 'name', str(p))
-                                    pdesc = getattr(p, 'description', '')
-                                    click.echo(dim(f"    {pname}: {pdesc}"))
-                    else:
-                        click.echo(dim("  Usage: /mcp | /mcp resources | /mcp prompts"))
+                if mcp_integration is not None:
+                    manager = mcp_integration.manager
+                    servers = (
+                        manager.server_tools if manager is not None else {}
+                    )
+                    failures = mcp_integration.connection_errors()
+                    click.echo(dim(
+                        f"  MCP servers: {len(servers)} connected, "
+                        f"{len(mcp_integration.tool_names)} tools",
+                    ))
+                    for server, names in sorted(servers.items()):
+                        click.echo(dim(
+                            f"    {server}: {len(names)} tools",
+                        ))
+                    for server, error in sorted(failures.items()):
+                        click.echo(dim(f"    {server}: failed — {error}"))
                 else:
                     click.echo(dim("  No MCP servers configured."))
             elif cmd == "/help":
@@ -969,6 +937,7 @@ def chat(
                 import traceback
                 traceback.print_exc()
 
+    registry.close()
     session.print_stats()
     click.echo(dim("  Bye!\n"))
 

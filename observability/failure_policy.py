@@ -49,6 +49,52 @@ class FailureCategory(str, Enum):
     """Unexpected harness-internal failure."""
 
 
+class ResourceFailureCategory(str, Enum):
+    """Stable, actionable classification for resource admission failures."""
+
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CAPACITY_TIMEOUT = "capacity_timeout"
+    PROVIDER_THROTTLED = "provider_throttled"
+    HOST_MEMORY_PRESSURE = "host_memory_pressure"
+    THREAD_CAPACITY = "thread_capacity"
+    DISK_CAPACITY = "disk_capacity"
+    EVENT_BACKPRESSURE = "event_backpressure"
+    DB_BACKPRESSURE = "db_backpressure"
+
+
+def classify_resource_failure(
+    outcome: Any,
+    kind: Any,
+    reason: str = "",
+) -> ResourceFailureCategory:
+    """Classify a governor rejection without collapsing it into exhaustion."""
+    from core.resource_governor import AdmissionOutcome, ResourceKind
+
+    outcome = AdmissionOutcome(outcome)
+    kind = ResourceKind(kind)
+    if "memory" in reason.lower():
+        return ResourceFailureCategory.HOST_MEMORY_PRESSURE
+    if kind is ResourceKind.TOKEN_BUDGET:
+        return ResourceFailureCategory.BUDGET_EXHAUSTED
+    if kind in {ResourceKind.PROVIDER_RPM, ResourceKind.PROVIDER_TPM}:
+        return ResourceFailureCategory.PROVIDER_THROTTLED
+    if kind in {
+        ResourceKind.WORKER_SLOT,
+        ResourceKind.LLM_SLOT,
+        ResourceKind.TOOL_SLOT,
+    }:
+        return ResourceFailureCategory.THREAD_CAPACITY
+    if kind in {ResourceKind.WORKTREE_SLOT, ResourceKind.DISK_BYTES}:
+        return ResourceFailureCategory.DISK_CAPACITY
+    if kind is ResourceKind.EVENT_CAPACITY:
+        return ResourceFailureCategory.EVENT_BACKPRESSURE
+    if kind is ResourceKind.DB_WRITE_CAPACITY:
+        return ResourceFailureCategory.DB_BACKPRESSURE
+    if outcome is AdmissionOutcome.CAPACITY_TIMEOUT:
+        return ResourceFailureCategory.CAPACITY_TIMEOUT
+    return ResourceFailureCategory.CAPACITY_TIMEOUT
+
+
 class BoundaryBehavior(str, Enum):
     """How the harness should behave at the boundary."""
 

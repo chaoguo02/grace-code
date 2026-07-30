@@ -148,6 +148,12 @@ export interface DelegationEventPayload {
   duration_ms?: number;
   reason?: string;
   error?: string;
+  resources?: Record<string, number>;
+  actual?: Record<string, number>;
+  queue_position?: number;
+  wait_time_s?: number;
+  outcome?: string;
+  governance?: Record<string, unknown>;
 }
 
 /**
@@ -220,6 +226,18 @@ export interface WsDelegationBudgetExhaustedEvent extends WsDelegationEventBase 
   type: "delegation_budget_exhausted";
 }
 
+export interface WsDelegationResourceEvent extends WsDelegationEventBase {
+  type:
+    | "delegation_resource_queued"
+    | "delegation_resource_granted"
+    | "delegation_resource_reconciled"
+    | "delegation_resource_released"
+    | "delegation_resource_cancelled"
+    | "delegation_resource_capacity_timeout"
+    | "delegation_resource_shutdown"
+    | "delegation_resource_rejected";
+}
+
 export type WsDelegationEvent =
   | WsDelegationPlannedEvent
   | WsDelegationTaskQueuedEvent
@@ -235,7 +253,20 @@ export type WsDelegationEvent =
   | WsDelegationVerificationCompletedEvent
   | WsDelegationSynthesisStartedEvent
   | WsDelegationCompletedEvent
-  | WsDelegationBudgetExhaustedEvent;
+  | WsDelegationBudgetExhaustedEvent
+  | WsDelegationResourceEvent;
+
+export interface WsResourcePressureChangedEvent extends EventEnvelope {
+  type: "resource_pressure_changed";
+  request_id: string;
+  root_session_id: string;
+  run_id?: string;
+  task_id?: string;
+  resource_kind: string;
+  old_pressure: string;
+  pressure: string;
+  timestamp_s?: number;
+}
 
 // ── Approval ────────────────────────────────────────────────────────────
 
@@ -415,6 +446,7 @@ export type WsMessage =
   | WsSubagentStartEvent
   | WsSubagentStopEvent
   | WsDelegationEvent
+  | WsResourcePressureChangedEvent
   | WsApprovalRequiredEvent
   | WsApprovalTimeoutEvent
   | WsApprovalResolvedEvent

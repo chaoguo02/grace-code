@@ -213,6 +213,7 @@ class WorkerReport:
     unresolved: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     tokens_used: int = 0
+    budget_settled: bool = False
     duration_ms: int = 0
     worktree: dict[str, Any] | None = None
 
@@ -243,6 +244,7 @@ class WorkerReport:
             "unresolved": list(self.unresolved),
             "warnings": list(self.warnings),
             "tokens_used": self.tokens_used,
+            "budget_settled": self.budget_settled,
             "duration_ms": self.duration_ms,
             "worktree": self.worktree,
         }
@@ -274,6 +276,7 @@ class WorkerReport:
             unresolved=tuple(str(item) for item in data.get("unresolved", [])),
             warnings=tuple(str(item) for item in data.get("warnings", [])),
             tokens_used=int(data.get("tokens_used", 0)),
+            budget_settled=bool(data.get("budget_settled", False)),
             duration_ms=int(data.get("duration_ms", 0)),
             worktree=(
                 dict(data["worktree"])

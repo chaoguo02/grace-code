@@ -15,11 +15,8 @@ import queue
 import random as _random
 import threading
 import time as _time
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from llm.base import LLMBackend, LLMMessage, LLMToolSchema, LLMResponse, CacheStats
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +26,13 @@ def iter_with_timeout(
     *,
     timeout: float,
     cancellation_token: Any = None,
+    backend: Any = None,
 ):
-    """Yield a blocking provider iterator under a hard, cancellable deadline."""
+    """Yield a blocking provider iterator under a hard, cancellable deadline.
+
+    Phase 2: if *backend* is provided, its close() is called on timeout/cancel
+    to unblock the producer thread's blocking SDK call.
+    """
     events: queue.Queue[tuple[str, Any]] = queue.Queue()
 
     def _produce() -> None:
@@ -45,29 +47,38 @@ def iter_with_timeout(
     worker = threading.Thread(target=_produce, daemon=True)
     worker.start()
     deadline = _time.monotonic() + max(0.0, float(timeout))
-    while True:
-        if cancellation_token is not None and getattr(
-            cancellation_token, "is_cancelled", False
-        ):
-            raise InterruptedError(
-                getattr(cancellation_token, "detail", "")
-                or "LLM request cancelled"
-            )
-        remaining = deadline - _time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"LLM backend stream timed out after {float(timeout):.0f}s"
-            )
-        try:
-            kind, value = events.get(timeout=min(0.1, remaining))
-        except queue.Empty:
-            continue
-        if kind == "item":
-            yield value
-        elif kind == "error":
-            raise value
-        else:
-            return
+    try:
+        while True:
+            if cancellation_token is not None and getattr(
+                cancellation_token, "is_cancelled", False
+            ):
+                raise InterruptedError(
+                    getattr(cancellation_token, "detail", "")
+                    or "LLM request cancelled"
+                )
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"LLM backend stream timed out after {float(timeout):.0f}s"
+                )
+            try:
+                kind, value = events.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
+            if kind == "item":
+                yield value
+            elif kind == "error":
+                raise value
+            else:
+                return
+    except (TimeoutError, InterruptedError):
+        # Phase 2: attempt graceful close before abandoning the daemon thread
+        if backend is not None and hasattr(backend, "close"):
+            try:
+                backend.close()
+            except Exception:
+                pass
+        raise
 
 
 @dataclass
@@ -121,12 +132,26 @@ class LLMInvoker:
 
     def _call_with_timeout(self, fn, *args, **kwargs):
         """Run one backend call with a hard wall-clock timeout."""
+        from llm.provider_capacity import acquire_provider_capacity
+
         timeout = max(
             0.001,
             float(getattr(
                 self.config, "request_timeout", self._DEFAULT_REQUEST_TIMEOUT,
             )),
         )
+        provider_lease = acquire_provider_capacity(
+            self.backend,
+            args[0] if args else [],
+            max_output_tokens=max(
+                0, int(getattr(self.config, "max_tokens", 0)),
+            ),
+            timeout_s=timeout,
+            cancellation_token=getattr(
+                self.config, "cancellation_token", None,
+            ),
+        )
+
         result: list[Any] = []
         error: list[Exception] = []
 
@@ -136,31 +161,45 @@ class LLMInvoker:
             except Exception as exc:
                 error.append(exc)
 
-        t = threading.Thread(target=_target, daemon=True)
-        t.start()
-        deadline = _time.monotonic() + max(0.0, float(timeout))
-        while t.is_alive():
-            remaining = deadline - _time.monotonic()
-            if remaining <= 0:
-                break
-            t.join(timeout=min(0.1, remaining))
-            cancellation = getattr(self.config, "cancellation_token", None)
-            if cancellation is not None and getattr(
-                cancellation, "is_cancelled", False
-            ):
-                raise InterruptedError(
-                    getattr(cancellation, "detail", "")
-                    or "LLM request cancelled"
+        try:
+            t = threading.Thread(target=_target, daemon=True)
+            t.start()
+            deadline = _time.monotonic() + max(0.0, float(timeout))
+            while t.is_alive():
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
+                t.join(timeout=min(0.1, remaining))
+                cancellation = getattr(self.config, "cancellation_token", None)
+                if cancellation is not None and getattr(
+                    cancellation, "is_cancelled", False
+                ):
+                    raise InterruptedError(
+                        getattr(cancellation, "detail", "")
+                        or "LLM request cancelled"
+                    )
+            if t.is_alive():
+                backend = getattr(self, "backend", None)
+                if backend is not None and hasattr(backend, "close"):
+                    try:
+                        backend.close()
+                    except Exception:
+                        pass
+                # Give cooperative SDK clients a bounded opportunity to exit.
+                t.join(timeout=min(1.0, timeout))
+                logger.warning(
+                    "LLM backend call timed out after %.0fs; worker_alive=%s",
+                    timeout,
+                    t.is_alive(),
                 )
-        if t.is_alive():
-            # Hung — abandon the thread (daemon=True means it won't
-            # block process exit). The OS will clean up its resources.
-            raise TimeoutError(
-                f"LLM backend call timed out after {timeout:.0f}s"
-            )
-        if error:
-            raise error[0]
-        return result[0]
+                raise TimeoutError(
+                    f"LLM backend call timed out after {timeout:.0f}s"
+                )
+            if error:
+                raise error[0]
+            return result[0]
+        finally:
+            provider_lease.release(result[0] if result else None)
 
     def invoke(
         self,
@@ -277,6 +316,22 @@ class LLMInvoker:
             except Exception as exc:
                 last_exc = exc
                 _metrics.last_error_type = type(exc).__name__
+                status_code = (
+                    getattr(exc, "status_code", None)
+                    or getattr(exc, "http_status", None)
+                )
+                if status_code == 429:
+                    provider_governor = getattr(
+                        self.backend, "_provider_governor", None,
+                    )
+                    if provider_governor is not None:
+                        provider_governor.record_response(
+                            provider,
+                            status=429,
+                            retry_after=float(
+                                getattr(exc, "retry_after", 0.0) or 0.0
+                            ),
+                        )
                 # P2-41: check HTTP status code directly, not substring match
                 _is_non_retryable = (
                     isinstance(exc, InterruptedError)

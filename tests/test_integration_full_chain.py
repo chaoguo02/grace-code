@@ -144,7 +144,7 @@ def test_transactional_run_prompt_is_not_persisted_twice(tmp_path):
     """The HTTP Run/Turn transaction owns durable user-prompt insertion."""
     from agent.core import AgentConfig
     from agent.session.agent_registry import AgentRegistryV2
-    from agent.session.models import RunContext, SessionMode
+    from agent.session.models import PipelineRunContext as RunContext, SessionMode
     from agent.session.runtime import SessionRuntime
     from app.storage.sqlite import SqliteStorageBackend
     from server.services.run_submission import submit_run_turn

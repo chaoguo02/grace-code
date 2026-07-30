@@ -184,5 +184,8 @@ class RunContext:
 
     @property
     def delegation_token_limit(self) -> int:
-        """Maximum child spend derived from the parent's remaining budget."""
-        return self.budget.token_remaining // self.delegation_width
+        """Child allocation while retaining 35% for parent synthesis."""
+        return (
+            int(self.budget.token_remaining * 0.65)
+            // self.delegation_width
+        )

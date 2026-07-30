@@ -136,6 +136,16 @@ export interface DelegationTaskProjection {
   tokens_used?: number;
   time_budget_ms?: number | null;
   elapsed_ms?: number;
+  resource?: {
+    requested?: Record<string, number>;
+    granted?: Record<string, number>;
+    consumed?: Record<string, number>;
+    refunded?: Record<string, number>;
+    queue_position?: number;
+    wait_time_s?: number;
+    outcome?: string;
+    reason?: string;
+  };
 }
 
 export interface AgentTeamProjection {
@@ -218,5 +228,7 @@ export interface MultiAgentSnapshot {
     max_concurrent: number;
   };
   observability?: Record<string, unknown>;
+  /** Phase 4: live resource governance state from ResourceGovernor. */
+  resource?: Record<string, unknown>;
   team?: AgentTeamProjection | null;
 }

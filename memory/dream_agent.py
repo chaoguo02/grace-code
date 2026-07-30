@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from llm.base import LLMMessage
+from llm.provider_capacity import complete_with_provider_capacity
 from memory.consolidation_prompt import CONSOLIDATION_PROMPT
 from memory.store import _atomic_write_text, _truncate_index
 
@@ -91,8 +92,14 @@ class DreamAgent:
             if self._abort.is_set():
                 aggregate.aborted = True
                 break
-            response = self.backend.complete(messages, tools=self._tool_schemas())
-            raw = self._response_text(response)
+            response = complete_with_provider_capacity(
+                self.backend,
+                messages,
+                self._tool_schemas(),
+            )
+            from llm.response_utils import response_text
+
+            raw = response_text(response)
             turn_result, tool_output = self._execute_response(raw)
             aggregate.files_created.extend(turn_result.files_created)
             aggregate.files_updated.extend(turn_result.files_updated)
@@ -291,22 +298,6 @@ class DreamAgent:
             f" [This memory is {age_days} days old. Memories are point-in-time "
             "observations, not live state — verify before acting on this information.]"
         )
-
-    @staticmethod
-    def _response_text(response: object) -> str:
-        text = getattr(response, "text", None)
-        if isinstance(text, str):
-            return text
-        action = getattr(response, "action", None)
-        if action is not None:
-            message = getattr(action, "message", None)
-            if isinstance(message, str) and message:
-                return message
-            thought = getattr(action, "thought", None)
-            if isinstance(thought, str):
-                return thought
-        raw_content = getattr(response, "raw_content", None)
-        return raw_content if isinstance(raw_content, str) else ""
 
     @staticmethod
     def _parse_payload(raw: str) -> Any:

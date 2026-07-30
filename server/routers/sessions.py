@@ -649,7 +649,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         # Start async execution in background thread
         try:
-            from agent.session.models import RunContext
+            from agent.session.models import PipelineRunContext as RunContext
             _ctx = RunContext(
                 session_id=session_id,
                 run_id=_run_id,

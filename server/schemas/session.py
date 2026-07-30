@@ -157,7 +157,7 @@ class ChatRequest(BaseModel):
         default=None,
         description="Override the agent definition for this execution. "
         "If null, uses the session's default agent. "
-        "Example values: 'build', 'plan', 'explore'.",
+        "Example values: 'build', 'plan', 'orchestrator'.",
     )
     intent: str | None = Field(
         default=None,

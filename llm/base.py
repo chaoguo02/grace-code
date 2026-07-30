@@ -14,9 +14,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 from core.base import Action, ActionType, LLMToolSchema, ToolCall
+
+StreamCallback = Callable[[str], None]
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +193,15 @@ class LLMBackend(ABC):
             on_text(response.raw_content)
         return response
 
+    def close(self) -> None:
+        """Release underlying connections and abort in-flight requests.
+
+        Default no-op.  Backends with persistent connections (OpenAI, etc.)
+        override this to close their SDK client and unblock producer threads.
+        Called during shutdown and session cleanup.
+        """
+        pass
+
     def stream_iter(
         self,
         messages: "list[LLMMessage]",
@@ -216,12 +227,22 @@ class LLMBackend(ABC):
             return
 
         action = response.action
+        # For non-reasoning models action.thought carries the full response
+        # text (identical to action.message).  Emit it as plain text so the
+        # agent loop routes it to the assistant text stream instead of the
+        # "Thinking" block.  When thought and message differ the model has
+        # genuine reasoning content — keep it as thought.
         if action.thought:
-            yield StreamEvent(
-                kind=StreamEventKind.TEXT_DELTA,
-                text=action.thought,
-                thought=action.thought,
-            )
+            if action.message and action.thought == action.message:
+                yield StreamEvent(
+                    kind=StreamEventKind.TEXT_DELTA,
+                    text=action.thought,
+                )
+            else:
+                yield StreamEvent(
+                    kind=StreamEventKind.TEXT_DELTA,
+                    thought=action.thought,
+                )
 
         if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
             for tc in action.tool_calls:
@@ -231,7 +252,11 @@ class LLMBackend(ABC):
             kind=StreamEventKind.FINISH,
             finish_message=action.message or "",
             text=response.raw_content or "",
-            thought=action.thought or "",
+            thought=(
+                action.thought or ""
+                if (action.message and action.thought != action.message)
+                else ""
+            ),
         )
 
 
@@ -340,60 +365,3 @@ class MockBackend(LLMBackend):
         self.call_count = 0
         self.received_messages.clear()
         self.received_tools.clear()
-
-
-# ---------------------------------------------------------------------------
-# 流式输出支持
-# ---------------------------------------------------------------------------
-
-from typing import Generator, Callable
-
-
-@dataclass
-class StreamChunk:
-    """
-    流式输出的单个 chunk。
-    text_delta: 这个 chunk 新增的文本片段（thought 部分）
-    is_done:    是否是最后一个 chunk
-    final_response: is_done=True 时包含完整的 LLMResponse
-    """
-    text_delta: str = ""
-    is_done: bool = False
-    final_response: "LLMResponse | None" = None
-
-
-# Callable 类型：接收 text_delta，实时打印
-StreamCallback = Callable[[str], None]
-
-
-class StreamingMixin:
-    """
-    为 LLMBackend 子类提供流式调用能力的 Mixin。
-    子类实现 stream()，complete() 可以复用它。
-    """
-
-    def stream(
-        self,
-        messages: "list[LLMMessage]",
-        tools: "list[LLMToolSchema]",
-        on_text: StreamCallback | None = None,
-    ) -> "LLMResponse":
-        """
-        流式调用 LLM。
-
-        Args:
-            messages:  完整对话历史
-            tools:     工具 schema 列表
-            on_text:   每收到一个 text chunk 时的回调，用于实时打印 thought
-
-        Returns:
-            完整的 LLMResponse（流结束后才返回，与 complete() 格式一致）
-
-        默认实现：直接调用 complete()（非流式 fallback）。
-        支持流式的 backend 覆盖此方法。
-        """
-        response = self.complete(messages, tools)  # type: ignore[attr-defined]
-        # 非流式 fallback：把 raw_content 当作一次性输出
-        if on_text and response.raw_content:
-            on_text(response.raw_content)
-        return response

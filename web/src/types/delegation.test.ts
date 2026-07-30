@@ -1,5 +1,44 @@
 import type { WsMessage } from "./events";
 import { rebuildDelegationRuns, reduceDelegationEvent } from "./delegation";
+import { test } from "vitest";
+
+test("delegation replay contract module loaded successfully", () => {
+  // The detailed contract assertions below execute during module evaluation.
+});
+
+test("resource lifecycle events reach task state", () => {
+  const queued = reduceDelegationEvent({}, event(
+    "delegation_resource_queued",
+    1,
+    {
+      task_id: "task-resource",
+      resources: { worker_slot: 1, token_budget: 10000 },
+      queue_position: 2,
+      outcome: "queued",
+    },
+  ));
+  const released = reduceDelegationEvent(queued, event(
+    "delegation_resource_reconciled",
+    2,
+    {
+      task_id: "task-resource",
+      resources: { worker_slot: 1, token_budget: 10000 },
+      actual: { token_budget: 7500 },
+      wait_time_s: 0.25,
+      outcome: "granted",
+    },
+  ));
+  const task = released["run-1"].tasks["task-resource"];
+  if (task.resourceRequested?.token_budget !== 10000) {
+    throw new Error("Requested token budget was not connected");
+  }
+  if (task.resourceConsumed?.token_budget !== 7500) {
+    throw new Error("Consumed token budget was not connected");
+  }
+  if (task.resourceRefunded?.token_budget !== 2500) {
+    throw new Error("Token refund was not reconciled");
+  }
+});
 
 function event(type: string, sequence: number, payload: Record<string, unknown>): WsMessage {
   return {

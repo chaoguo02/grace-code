@@ -45,7 +45,7 @@ class _AgentRegistry:
 class _ToolRegistry:
     tool_names = ()
     _tools = {}
-    _skill_registry = None
+    skill_registry = None
 
     def get_schemas(self):
         return []

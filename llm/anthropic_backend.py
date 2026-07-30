@@ -12,7 +12,6 @@ Anthropic Claude 原生 backend。
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -274,12 +273,12 @@ def _parse_anthropic_response(response: Any) -> Action:
 
 
 # ---------------------------------------------------------------------------
-# 流式支持（覆盖 StreamingMixin.stream()）
+# 流式支持
 # ---------------------------------------------------------------------------
 
-from llm.base import StreamingMixin, StreamCallback
+from llm.base import StreamCallback
 
-# 让 AnthropicBackend 同时继承 StreamingMixin
+# Anthropic 流式适配器
 # Python 不允许事后修改继承，用 monkey-patch 把 stream() 方法加进去
 
 def _anthropic_stream(

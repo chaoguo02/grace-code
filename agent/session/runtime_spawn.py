@@ -7,7 +7,7 @@ SessionRuntime 的子代理生成逻辑。
 from __future__ import annotations
 
 import logging
-import os
+import uuid
 from typing import TYPE_CHECKING
 
 from agent.session.models import (
@@ -26,19 +26,13 @@ from agent.session.run_context import AgentSpawnContext, CancellationToken, Tool
 from agent.session.task_contract import TaskContract
 from hooks.events import HookContext, HookEvent
 from llm.base import LLMMessage
+from config.env import SubagentSafetyLimits
 
 if TYPE_CHECKING:
     from agent.session.runtime import SessionRuntime
+    from core.policy import PhasePolicy
 
 logger = logging.getLogger(__name__)
-
-
-def _positive_env(name: str, default: int, maximum: int) -> int:
-    try:
-        value = int(os.environ.get(name, str(default)))
-    except ValueError:
-        value = default
-    return max(1, min(value, maximum))
 
 
 def _descendants(store, root_id: str):
@@ -67,6 +61,7 @@ def spawn_agent(
     execution_repo_path: str | None = None,
     child_metadata: dict[str, object] | None = None,
     child_created_callback=None,
+    parent_budget=None,
 ):
     from core.policy import PhasePolicy
     if budget_tokens <= 0:
@@ -84,8 +79,9 @@ def spawn_agent(
     parent = self._store.get_session(parent_session_id)
     if parent is None:
         raise ValueError(f"Unknown session: {parent_session_id}")
-    max_depth = _positive_env(
-        "GRACE_MAX_SUBAGENT_SPAWN_DEPTH", 1,
+    safety_limits = SubagentSafetyLimits.from_environment()
+    max_depth = min(
+        safety_limits.max_spawn_depth,
         parent.agent_depth.MAX_SUBAGENT_DEPTH,
     )
     if parent.agent_depth.value >= max_depth:
@@ -136,38 +132,111 @@ def spawn_agent(
             and spawn_context.model_name != self._backend.model_name
         ):
             raise ValueError("Fork model must match the parent model")
-    # Reserve capacity only after all request validation succeeds.  Keeping the
-    # reservation adjacent to durable session creation prevents failed input
-    # validation from leaking a slot while still closing concurrent spawn races.
+    # Preserve the lifetime spawn guard independently from the renewable
+    # concurrency governor.  The two limits have different semantics.
     with self._spawn_lock:
         records = _descendants(self._store, parent.root_id or parent.id)
-        max_spawn = _positive_env(
-            "GRACE_MAX_SUBAGENTS_PER_SESSION", 64, 10_000,
-        )
+        max_spawn = safety_limits.max_spawn_per_session
         spawned = sum(record.parent_id is not None for record in records)
         if spawned + self._spawn_reservations >= max_spawn:
             raise ValueError(
                 f"Subagent spawn limit reached ({max_spawn}); complete directly"
             )
-        max_concurrent = _positive_env(
-            "GRACE_MAX_CONCURRENT_SUBAGENTS", 4, 64,
-        )
-        terminal = {
-            SessionStatus.COMPLETED,
-            SessionStatus.PARTIAL,
-            SessionStatus.FAILED,
-            SessionStatus.CANCELLED,
-        }
-        active = sum(
-            record.parent_id is not None and record.status not in terminal
-            for record in records
-        )
-        if active + self._spawn_reservations >= max_concurrent:
-            raise ValueError(
-                f"Concurrent subagent limit reached ({max_concurrent}); do not "
-                "retry until a running child completes"
-            )
         self._spawn_reservations += 1
+
+    # ResourceGovernor owns renewable execution capacity only.  The child's
+    # token ceiling is already derived once above by TaskContract from the
+    # parent ExecutionBudget.  Reserving an estimated TOKEN_BUDGET here created
+    # a second, weaker budget authority whose estimate could disagree with the
+    # executable contract.
+    governor = getattr(self, "_governor", None)
+    gov_lease = None
+    budget_reservation = None
+    budget_event_request = None
+    try:
+        if parent_budget is not None:
+            budget_reservation = parent_budget.reserve_tokens(
+                child_contract.budget_tokens,
+            )
+        if governor is not None:
+            from core.resource_governor import (
+                AdmissionOutcome,
+                ResourceAdmissionError,
+                ResourceKind,
+                ResourceRequest,
+            )
+            root_id = parent.root_id or parent.id
+            governance_cfg = getattr(governor, "_config", None)
+            queue_cfg = getattr(governance_cfg, "queue", None)
+            queue_timeout = float(
+                getattr(queue_cfg, "timeout_seconds", 120.0)
+            )
+            metadata = child_metadata or {}
+            gov_request = ResourceRequest(
+                request_id=f"spawn-{uuid.uuid4().hex}",
+                root_session_id=root_id,
+                session_id=parent.id,
+                run_id=str(metadata.get("delegation_run_id", "")),
+                task_id=str(metadata.get("delegation_task_id", "")),
+                resources={ResourceKind.WORKER_SLOT: 1},
+                timeout_s=queue_timeout,
+                cancel_token=cancellation_token,
+            )
+            gov_result = governor.admit_wait(gov_request)
+            if gov_result.outcome != AdmissionOutcome.GRANTED:
+                raise ResourceAdmissionError(
+                    gov_result.outcome,
+                    ResourceKind.WORKER_SLOT,
+                    gov_result.reason,
+                )
+            gov_lease = gov_result.lease
+            if budget_reservation is not None:
+                budget_event_request = ResourceRequest(
+                    request_id=f"{gov_request.request_id}:budget",
+                    root_session_id=gov_request.root_session_id,
+                    session_id=gov_request.session_id,
+                    run_id=gov_request.run_id,
+                    task_id=gov_request.task_id,
+                    resources={},
+                )
+                governor.publish_accounting_event(
+                    "granted",
+                    budget_event_request,
+                    {
+                        ResourceKind.TOKEN_BUDGET:
+                            budget_reservation.reserved_tokens,
+                    },
+                )
+        else:
+            # Legacy concurrency check when no governor is installed.
+            from agent.session.multi_agent_config import MultiAgentFeatureConfig
+
+            max_concurrent = (
+                MultiAgentFeatureConfig.from_environment().max_concurrent
+            )
+            terminal = {
+                SessionStatus.COMPLETED,
+                SessionStatus.PARTIAL,
+                SessionStatus.FAILED,
+                SessionStatus.CANCELLED,
+            }
+            active = sum(
+                record.parent_id is not None and record.status not in terminal
+                for record in records
+            )
+            if active + self._spawn_reservations > max_concurrent:
+                raise ValueError(
+                    f"Concurrent subagent limit reached ({max_concurrent}); do not "
+                    "retry until a running child completes"
+                )
+    except Exception:
+        if gov_lease is not None:
+            gov_lease.release()
+        if budget_reservation is not None:
+            budget_reservation.release()
+        with self._spawn_lock:
+            self._spawn_reservations = max(0, self._spawn_reservations - 1)
+        raise
     try:
         child = self._store.create_session(
             agent_name=definition.name, mode=SessionMode.SUBAGENT,
@@ -215,6 +284,26 @@ def spawn_agent(
             "source_repo_path": parent_repo,
             },
         )
+    except Exception:
+        # Release governor lease on session creation failure (lease is
+        # idempotent — _execute_child_session's finally is a safety net).
+        if budget_event_request is not None:
+            from core.resource_governor import ResourceKind
+
+            governor.publish_accounting_event(
+                "reconciled",
+                budget_event_request,
+                {
+                    ResourceKind.TOKEN_BUDGET:
+                        budget_reservation.reserved_tokens,
+                },
+                actual={ResourceKind.TOKEN_BUDGET: 0},
+            )
+        if gov_lease is not None:
+            gov_lease.release()
+        if budget_reservation is not None:
+            budget_reservation.release()
+        raise
     finally:
         with self._spawn_lock:
             self._spawn_reservations = max(0, self._spawn_reservations - 1)
@@ -263,6 +352,9 @@ def spawn_agent(
         contract=child_contract, cancellation_token=child_cancellation,
         parent_policy=parent_policy, repo_path=_repo,
         child_agent_type=child_agent_type, spawn_context=spawn_context,
+        gov_lease=gov_lease,
+        budget_reservation=budget_reservation,
+        budget_event_request=budget_event_request,
     )
     _need_mcp_cleanup = bool(_agent_mcp_tools) and self._mcp_integration is not None
     cleanup = None
@@ -284,7 +376,8 @@ def spawn_agent(
 def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                            definition, parent_definition, contract, cancellation_token,
                            parent_policy, repo_path, child_agent_type, spawn_context,
-                           persisted_messages=None):
+                           persisted_messages=None, gov_lease=None,
+                           budget_reservation=None, budget_event_request=None):
     child_result = None
     child_error = ""
     def _persist(msgs):
@@ -348,6 +441,11 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
             session_record=child, session_runtime=self,
             parent_pipeline_state=_inherited_state,
         )
+        if budget_reservation is not None:
+            from dataclasses import replace
+
+            budget_reservation.settle(child_result.tokens_used)
+            child_result = replace(child_result, budget_settled=True)
         self._store.set_agent_result(child.id, child_result)
         if child_result.summary:
             self._store.append_message(
@@ -467,6 +565,10 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                             child_result.tokens_used
                             if child_result is not None else 0
                         ),
+                        budget_settled=(
+                            child_result.budget_settled
+                            if child_result is not None else False
+                        ),
                         worktree=(
                             evidence.to_dict()
                             if evidence is not None else None
@@ -515,9 +617,72 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                             ))
                 except Exception:
                     logger.exception(
-                        "Failed to persist delegation result for child %s",
+                        "Failed to persist delegation result for child %s — "
+                        "delegation task %s in run %s may be stuck",
                         completed.id,
+                        delegation_task_id,
+                        delegation_run_id,
                     )
+                    # Best-effort: mark the task as failed so the coordinator
+                    # does not wait indefinitely.
+                    try:
+                        self._store.update_delegation_task(
+                            delegation_task_id,
+                            status="failed",
+                            error=(
+                                "Child completed but delegation persistence "
+                                "failed — manual retry required"
+                            ),
+                            expected_statuses=("queued", "running"),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not mark stuck delegation task %s as failed",
+                            delegation_task_id,
+                        )
+                    # Single-task runs have no separate coordinator to detect
+                    # the stuck task — finalize the run as partial so the
+                    # control plane surfaces it.
+                    if len(tasks) == 1:
+                        try:
+                            current = self._store.get_delegation_run(
+                                delegation_run_id,
+                            ) or {}
+                            self._store.finalize_delegation_run(
+                                delegation_run_id,
+                                status="partial",
+                                phase="recovery_required",
+                                expected_version=int(
+                                    current.get("version", 0),
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not finalize stuck delegation run %s",
+                                delegation_run_id,
+                            )
         self._cancellation_tokens.pop(
             (child.id, child.generation), None,
         )
+        # Token usage is settled by the parent ExecutionBudget through the
+        # delegation ToolResult.  This lease only returns renewable capacity.
+        if budget_event_request is not None:
+            from core.resource_governor import ResourceKind
+
+            used_tokens = (
+                child_result.tokens_used
+                if child_result is not None else 0
+            )
+            self._governor.publish_accounting_event(
+                "reconciled",
+                budget_event_request,
+                {
+                    ResourceKind.TOKEN_BUDGET:
+                        budget_reservation.reserved_tokens,
+                },
+                actual={ResourceKind.TOKEN_BUDGET: used_tokens},
+            )
+        if gov_lease is not None and not gov_lease.is_released():
+            gov_lease.release()
+        if budget_reservation is not None:
+            budget_reservation.release()

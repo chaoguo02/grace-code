@@ -5,12 +5,13 @@ from types import SimpleNamespace
 import pytest
 
 from server.services.agent_service import AgentService
+from core.base import ToolRegistry
 from skills.registry import SkillRegistry
 
 
 def _service_with_registry(registry: SkillRegistry):
     return SimpleNamespace(
-        _registry=SimpleNamespace(_skill_registry=registry),
+        _registry=ToolRegistry(skill_registry=registry),
         _root_session_id="session-1",
         repo_path="D:/workspace",
     )

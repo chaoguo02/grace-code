@@ -14,6 +14,7 @@ import type { DelegationRunState, DelegationRuns, TaskState } from "../types/del
 interface MultiAgentRunCardProps {
   sessionId?: string | null;
   runs: DelegationRuns;
+  resourceGovernance?: Record<string, unknown> | null;
   onViewChild: (childSessionId: string) => void;
 }
 
@@ -68,6 +69,7 @@ function taskCounts(tasks: Array<{ status: string }>) {
 
 function effectiveTask(raw: JsonObject, live?: TaskState) {
   const report = object(raw.report);
+  const resource = object(raw.resource);
   const worktree = object(report.worktree);
   const reportFiles = Array.isArray(report.changed_files)
     ? report.changed_files.map((item) => text(object(item).path)).filter(Boolean)
@@ -92,10 +94,34 @@ function effectiveTask(raw: JsonObject, live?: TaskState) {
     revision: text(worktree.revision),
     tokensUsed: number(report.tokens_used, live?.tokensUsed || 0),
     durationMs: number(report.duration_ms, live?.durationMs || 0),
+    resourceRequested: Object.keys(object(resource.requested)).length
+      ? object(resource.requested)
+      : live?.resourceRequested || {},
+    resourceGranted: Object.keys(object(resource.granted)).length
+      ? object(resource.granted)
+      : live?.resourceGranted || {},
+    resourceConsumed: Object.keys(object(resource.consumed)).length
+      ? object(resource.consumed)
+      : live?.resourceConsumed || {},
+    resourceRefunded: Object.keys(object(resource.refunded)).length
+      ? object(resource.refunded)
+      : live?.resourceRefunded || {},
+    resourceQueuePosition: number(
+      resource.queue_position,
+      live?.resourceQueuePosition || 0,
+    ),
+    resourceWaitTimeS: number(
+      resource.wait_time_s,
+      live?.resourceWaitTimeS || 0,
+    ),
+    resourceOutcome: text(
+      resource.outcome,
+      live?.resourceOutcome || "",
+    ),
   };
 }
 
-export function MultiAgentRunCard({ sessionId, runs, onViewChild }: MultiAgentRunCardProps) {
+export function MultiAgentRunCard({ sessionId, runs, resourceGovernance, onViewChild }: MultiAgentRunCardProps) {
   const liveRun = useMemo(() => latestRun(runs), [runs]);
   const [detail, setDetail] = useState<DelegationRunDetail | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -182,11 +208,32 @@ export function MultiAgentRunCard({ sessionId, runs, onViewChild }: MultiAgentRu
         <span><strong>{counts.queued}</strong> queued</span>
       </div>
 
+      {(() => {
+        const r = resourceGovernance as Record<string, unknown> | null | undefined;
+        if (!r) return null;
+        const w = r.worker as Record<string, unknown> | undefined;
+        if (!w) return null;
+        return (
+          <div className="multi-agent-resource" aria-label="Resource governance">
+            <span title={`${w.reserved} reserved, ${w.consumed} consumed`}>
+              Workers: <strong>{Number(w.reserved ?? 0) + Number(w.consumed ?? 0)}/{String(w.limit ?? "?")}</strong>
+            </span>
+            {Number(r.queue_depth ?? 0) > 0 && (
+              <span>Queue: <strong>{String(r.queue_depth)}</strong></span>
+            )}
+            <span className={`resource-pressure resource-pressure-${w.pressure}`}>
+              {String(w.pressure)}
+            </span>
+          </div>
+        );
+      })()}
+
       {actionError && <div className="multi-agent-action-error" role="alert">{actionError}</div>}
 
       <div className="multi-agent-task-list">
         {tasks.map((task) => {
           const retryable = ["failed", "partial", "cancelled", "interrupted", "budget_exhausted", "blocked"].includes(task.status)
+            || task.resourceOutcome === "capacity_timeout"
             && task.retryCount < task.maxRetries;
           const active = ["queued", "running"].includes(task.status);
           const open = Boolean(expanded[task.id]);
@@ -196,7 +243,15 @@ export function MultiAgentRunCard({ sessionId, runs, onViewChild }: MultiAgentRu
                 <button type="button" className="multi-agent-task-toggle" onClick={() => setExpanded((value) => ({ ...value, [task.id]: !open }))} aria-expanded={open}>
                   <span className="multi-agent-task-agent">{readable(task.agentType)}</span>
                   <span className="multi-agent-task-title">{task.goal}</span>
-                  <span className="multi-agent-task-status">{readable(task.status)}</span>
+                  <span className="multi-agent-task-status">
+                    {task.resourceOutcome === "capacity_timeout" ? "Capacity timeout" : readable(task.status)}
+                    {task.status === "queued" && task.resourceQueuePosition > 0 && (
+                      <> <span className="queue-pos">#{task.resourceQueuePosition}</span></>
+                    )}
+                    {task.status === "queued" && task.resourceWaitTimeS > 0 && (
+                      <> <span className="queue-wait">{task.resourceWaitTimeS.toFixed(1)}s</span></>
+                    )}
+                  </span>
                 </button>
                 {task.childSessionId && !task.childSessionId.includes(":") && (
                   <button type="button" className="multi-agent-task-detail" onClick={() => onViewChild(task.childSessionId)}>Child</button>
@@ -219,6 +274,19 @@ export function MultiAgentRunCard({ sessionId, runs, onViewChild }: MultiAgentRu
                   {task.unresolved.length > 0 && <div><strong>Unresolved</strong><ul>{task.unresolved.map((item) => <li key={item}>{item}</li>)}</ul></div>}
                   {task.warnings.length > 0 && <div><strong>Warnings</strong><ul>{task.warnings.map((item) => <li key={item}>{item}</li>)}</ul></div>}
                   <div className="multi-agent-task-meta"><span>Integration: {readable(task.integrationStatus)}</span><span>{task.tokensUsed.toLocaleString()} tokens</span><span>{task.durationMs} ms</span></div>
+                  {(task.resourceOutcome || Object.keys(task.resourceGranted).length > 0) && (
+                    <div className="multi-agent-task-meta">
+                      <span>Resource: {readable(task.resourceOutcome || "granted")}</span>
+                      {task.resourceQueuePosition > 0 && <span>Queue #{task.resourceQueuePosition}</span>}
+                      {task.resourceWaitTimeS > 0 && <span>Wait {task.resourceWaitTimeS.toFixed(2)}s</span>}
+                      {Number(task.resourceGranted.token_budget || 0) > 0 && (
+                        <span>
+                          Token budget {Number(task.resourceConsumed.token_budget || 0).toLocaleString()}
+                          /{Number(task.resourceGranted.token_budget || 0).toLocaleString()}
+                        </span>
+                      )}
+                    </div>
+                  )}
                   {task.integrationError && <div className="multi-agent-action-error">{task.integrationError}</div>}
                 </div>
               )}

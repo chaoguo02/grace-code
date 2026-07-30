@@ -63,10 +63,48 @@ def create_worktree(
     *,
     isolation: WorkspaceMode = WorkspaceMode.CURRENT,
     runtime: Any | None = None,
+    governor: Any | None = None,
+    root_session_id: str = "",
+    session_id: str = "",
+    cancel_token: Any | None = None,
 ) -> tuple[Any | None, str]:
-    """Provision declared isolation and return its effective project root."""
+    """Provision declared isolation and return its effective project root.
+
+    Phase 3: checks worktree quota and disk space before creation.
+    """
     if isolation is not WorkspaceMode.WORKTREE:
         return None, repo_path
+    worktree_lease = None
+    if governor is not None:
+        from core.resource_governor import (
+            AdmissionOutcome,
+            ResourceKind,
+            ResourceRequest,
+        )
+        result = governor.admit_wait(ResourceRequest(
+            request_id=f"worktree-{agent_id}",
+            root_session_id=root_session_id or session_id or agent_id,
+            session_id=session_id or agent_id,
+            resources={ResourceKind.WORKTREE_SLOT: 1},
+            timeout_s=float(getattr(
+                getattr(governor._config, "queue", None),
+                "timeout_seconds",
+                120.0,
+            )),
+            cancel_token=cancel_token,
+        ))
+        if result.outcome is not AdmissionOutcome.GRANTED:
+            raise WorktreeIsolationError(
+                f"Worktree capacity unavailable: {result.outcome.value}"
+                + (f" — {result.reason}" if result.reason else "")
+            )
+        worktree_lease = result.lease
+    disk_limit_mb = int(getattr(
+        getattr(getattr(governor, "_config", None), "worktree", None),
+        "disk_limit_mb",
+        0,
+    ))
+    _check_disk_space(repo_path, minimum_free_mb=disk_limit_mb)
     try:
         from agent.session.worktree_manager import WorktreeManager
         manager = WorktreeManager(
@@ -75,15 +113,88 @@ def create_worktree(
             worktree_root=_worktree_root(repo_path),
         )
         worktree = manager.create(f"agent-{definition_name}-{agent_id}")
+        worktree.resource_lease = worktree_lease
         logger.info(
             "Worktree created for '%s': %s (branch: %s)",
             definition_name, worktree.path, worktree.branch,
         )
         return worktree, worktree.path
     except Exception as exc:
+        if worktree_lease is not None:
+            worktree_lease.release()
         raise WorktreeIsolationError(
             f"Worktree isolation failed for {definition_name!r}: {exc}"
         ) from exc
+
+
+def _check_worktree_quota(repo_path: str, governor: Any | None) -> None:
+    """Phase 3: check worktree quota before creation."""
+    if governor is None:
+        return
+    from core.resource_governor import ResourceKind
+    # Check global worktree limit
+    snap = governor.snapshot()
+    ws = snap.snapshots.get(ResourceKind.WORKTREE_SLOT)
+    if ws is not None and ws.limit > 0 and ws.reserved >= ws.limit:
+        raise WorktreeIsolationError(
+            f"Worktree quota exhausted: {ws.reserved}/{ws.limit} active"
+        )
+
+
+def _estimate_checkout_bytes(repo_path: str) -> int:
+    """Estimate bytes needed for a checkout from Git's tracked file set."""
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=repo_path,
+            capture_output=True,
+            check=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    total = 0
+    root = Path(repo_path)
+    for raw_path in completed.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        try:
+            total += (root / raw_path.decode("utf-8", "surrogateescape")).stat().st_size
+        except (OSError, UnicodeError):
+            continue
+    return total
+
+
+def _check_disk_space(repo_path: str, *, minimum_free_mb: int = 0) -> None:
+    """Phase 3: check available disk space before creating a worktree.
+
+    Requires at least 100 MB free on the filesystem containing the worktree
+    root. On Windows this checks the drive containing *repo_path*.
+    """
+    import shutil
+    try:
+        usage = shutil.disk_usage(_worktree_root(repo_path))
+        configured_floor = max(100, minimum_free_mb) * 1024 * 1024
+        # A worktree shares Git objects but materializes tracked files. Keep
+        # 20% headroom for filesystem allocation and checkout metadata.
+        checkout_bytes = _estimate_checkout_bytes(repo_path)
+        required_bytes = max(
+            configured_floor,
+            int(checkout_bytes * 1.20),
+        )
+        if usage.free < required_bytes:
+            free_mb = usage.free / (1024 * 1024)
+            required_mb = required_bytes / (1024 * 1024)
+            raise WorktreeIsolationError(
+                f"Insufficient disk space: {free_mb:.0f} MB free "
+                f"(need at least {required_mb:.0f} MB; "
+                f"estimated checkout {checkout_bytes / (1024 * 1024):.0f} MB)"
+            )
+    except OSError:
+        # disk_usage can fail on some filesystems — allow through
+        pass
 
 
 def inspect_worktree(worktree: Any, runtime: Any | None = None) -> WorktreeEvidence:
@@ -354,5 +465,10 @@ def discard_worktree(
             worktree_root=_worktree_root(repo_path),
         )
         manager.discard(worktree)
+        if not Path(worktree.path).exists():
+            lease = getattr(worktree, "resource_lease", None)
+            if lease is not None:
+                lease.release()
+                worktree.resource_lease = None
     except Exception as exc:
         logger.debug("Worktree discard failed (non-critical): %s", exc)

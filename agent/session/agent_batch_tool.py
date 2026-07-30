@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,12 +18,14 @@ from agent.session.models import (
     WorkspaceMode,
     WorktreeDisposition,
 )
+from agent.session.executor_pool import borrowed_executor
 from agent.session.result_contract import (
     ChangedFile,
     WorkerReport,
     WorkerReportStatus,
 )
 from agent.task import TaskIntent
+from config.env import SubagentSafetyLimits
 from core.base import (
     BaseTool,
     ToolConcurrency,
@@ -230,7 +231,7 @@ class AgentBatchTool(BaseTool):
                 decision.estimated_budget.recovery_reserve_tokens
             ),
             "worker_pool_tokens": decision.estimated_budget.worker_tokens,
-            "max_concurrent": self._max_concurrent(),
+            "max_concurrent": self._max_concurrent(runtime=self._runtime),
         }
         store.create_delegation_run(
             run_id=run_id,
@@ -342,16 +343,22 @@ class AgentBatchTool(BaseTool):
                 serial = [task for task in ready if task not in safe]
                 if safe:
                     config = self._feature_config()
+                    effective_concurrency = max(
+                        1, self._max_concurrent(runtime=self._runtime),
+                    )
                     wave_limit = min(
                         config.max_wave_fanout,
-                        config.max_concurrent,
+                        effective_concurrency,
                     )
                     for offset in range(0, len(safe), wave_limit):
                         wave = safe[offset:offset + wave_limit]
                         if run_context.cancellation.is_cancelled:
                             break
-                        with ThreadPoolExecutor(
-                            max_workers=min(len(wave), config.max_concurrent),
+                        with borrowed_executor(
+                            self._runtime,
+                            max_workers=min(
+                                len(wave), effective_concurrency,
+                            ),
                             thread_name_prefix="agent-batch",
                         ) as executor:
                             future_map = {
@@ -463,7 +470,11 @@ class AgentBatchTool(BaseTool):
             success=success,
             output=output,
             error=error,
-            subagent_tokens_used=sum(item.tokens_used for item in ordered),
+            subagent_tokens_used=sum(
+                item.tokens_used
+                for item in ordered
+                if not item.budget_settled
+            ),
             structured_findings=tuple(
                 finding.to_dict()
                 for report in ordered
@@ -572,6 +583,7 @@ class AgentBatchTool(BaseTool):
                     "write_files": list(task.write_files),
                 },
                 child_created_callback=child_created,
+                parent_budget=run_context.budget,
             )
             if not isinstance(result, AgentRunResult):
                 raise TypeError("AgentBatch foreground worker returned no result")
@@ -696,6 +708,7 @@ class AgentBatchTool(BaseTool):
             ),
             warnings=warnings,
             tokens_used=result.tokens_used,
+            budget_settled=result.budget_settled,
             duration_ms=duration_ms,
             worktree=evidence.to_dict() if evidence is not None else None,
         )
@@ -928,27 +941,22 @@ class AgentBatchTool(BaseTool):
             risk=RiskLevel.MEDIUM,
             user_requested_topology=AgentTopology(requested_topology),
         )
+        safety_limits = SubagentSafetyLimits.from_environment()
         return TopologyPlanner().plan(
             shape,
             TopologyPolicy(
                 # Topology validation uses the independent total DAG bound.
                 # Execution below still slices each ready set into bounded waves.
                 max_fanout=self._feature_config().max_tasks,
-                max_concurrent_subagents=self._max_concurrent(),
-                max_spawn_per_session=self._positive_env(
-                    "GRACE_MAX_SUBAGENTS_PER_SESSION", 64, 10_000,
-                ),
-                max_subagent_spawn_depth=self._positive_env(
-                    "GRACE_MAX_SUBAGENT_SPAWN_DEPTH", 1, 5,
-                ),
+                max_concurrent_subagents=self._max_concurrent(runtime=self._runtime),
+                max_spawn_per_session=safety_limits.max_spawn_per_session,
+                max_subagent_spawn_depth=safety_limits.max_spawn_depth,
                 current_depth=int(parent.agent_depth.value),
                 spawned_count=spawned,
                 active_count=active,
                 available_tokens=self._run_context.budget.token_remaining,
                 minimum_worker_tokens=2_000,
-                nested_enabled=self._positive_env(
-                    "GRACE_MAX_SUBAGENT_SPAWN_DEPTH", 1, 5,
-                ) > 1,
+                nested_enabled=safety_limits.max_spawn_depth > 1,
                 worktree_writes=all(
                     not task.write_files
                     or (
@@ -985,16 +993,22 @@ class AgentBatchTool(BaseTool):
         return MultiAgentFeatureConfig.from_environment()
 
     @staticmethod
-    def _max_concurrent() -> int:
-        return AgentBatchTool._feature_config().max_concurrent
+    def _max_concurrent(runtime=None) -> int:
+        """Return effective max concurrent workers.
 
-    @staticmethod
-    def _positive_env(name: str, default: int, maximum: int) -> int:
-        try:
-            value = int(os.environ.get(name, str(default)))
-        except ValueError:
-            value = default
-        return max(1, min(value, maximum))
+        When a ResourceGovernor is available and not in observe mode,
+        uses the governor's available worker slots. Otherwise falls
+        back to the env-var-based MultiAgentFeatureConfig.
+        """
+        if runtime is not None:
+            governor = getattr(runtime, "_governor", None)
+            if governor is not None and governor.mode != "observe":
+                from core.resource_governor import ResourceKind
+                snap = governor.snapshot()
+                ws = snap.snapshots.get(ResourceKind.WORKER_SLOT)
+                if ws is not None and ws.limit > 0:
+                    return min(ws.available, ws.limit)
+        return AgentBatchTool._feature_config().max_concurrent
 
     @staticmethod
     def _format_result(

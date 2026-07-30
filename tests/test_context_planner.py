@@ -223,3 +223,50 @@ def test_public_compaction_result_reports_regex_truncation() -> None:
     assert result.truncated
     assert result.source_range == (0, 2)
     assert result.text.endswith("... (truncated to fit budget)")
+
+
+def test_semantic_compaction_uses_shared_provider_capacity_and_reports_usage() -> None:
+    class _Limiter:
+        def __init__(self) -> None:
+            self.acquired = []
+            self.released = []
+
+        def acquire_wait(self, *, tokens, timeout_s, cancellation_token=None):
+            self.acquired.append((tokens, timeout_s, cancellation_token))
+            return True
+
+        def release(self, tokens_used=0, *, reserved_tokens=0):
+            self.released.append((tokens_used, reserved_tokens))
+
+    class _Response:
+        raw_content = "critical summary"
+        total_tokens = 321
+
+    class _Backend:
+        timeout_seconds = 12
+
+        def __init__(self) -> None:
+            self._provider_limiter = _Limiter()
+
+        def complete(self, messages, tools):
+            assert len(messages) == 2
+            assert tools == []
+            return _Response()
+
+    backend = _Backend()
+    usage = []
+    compactor = ConversationCompactor(
+        backend=backend,
+        usage_callback=usage.append,
+    )
+    result = compactor.summarize([
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+    ], max_tokens=2_000)
+
+    assert result.text == "critical summary"
+    assert usage == [321]
+    assert len(backend._provider_limiter.acquired) == 1
+    assert backend._provider_limiter.released == [
+        (321, backend._provider_limiter.acquired[0][0]),
+    ]

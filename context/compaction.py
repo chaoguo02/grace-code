@@ -111,15 +111,21 @@ class ConversationCompactor:
         backend: "LLMBackend | None" = None,
         max_consecutive: int = _MAX_CONSECUTIVE_COMPACTIONS,
         cooldown_steps: int = _COMPACTION_COOLDOWN_STEPS,
+        usage_callback=None,
     ) -> None:
         self._trigger_ratio = trigger_ratio
         self._compact_budget = compact_budget
         self._min_history = min_history
         self._backend = backend
+        self._usage_callback = usage_callback
         self._max_consecutive = max_consecutive
         self._cooldown_steps = cooldown_steps
         self._consecutive_compactions = 0
         self._steps_since_last_compact = cooldown_steps  # 初始允许触发
+
+    def set_usage_callback(self, callback) -> None:
+        """Set the run-scoped billable-token sink for semantic compaction."""
+        self._usage_callback = callback
 
     # ------------------------------------------------------------------
     # 判断是否需要 compaction
@@ -532,13 +538,26 @@ class ConversationCompactor:
         )
 
         try:
-            response = self._backend.complete(
-                messages=[
-                    Msg(role="system", content=_SUMMARIZE_SYSTEM_PROMPT),
-                    Msg(role="user", content=user_prompt),
-                ],
-                tools=[],
+            from llm.provider_capacity import complete_with_provider_capacity
+
+            request_messages = [
+                Msg(role="system", content=_SUMMARIZE_SYSTEM_PROMPT),
+                Msg(role="user", content=user_prompt),
+            ]
+            response = complete_with_provider_capacity(
+                self._backend,
+                request_messages,
+                [],
+                max_output_tokens=max_tokens,
+                timeout_s=float(
+                    getattr(self._backend, "timeout_seconds", 300.0),
+                ),
             )
+            usage_callback = self._usage_callback
+            if callable(usage_callback):
+                usage_callback(
+                    max(0, int(getattr(response, "total_tokens", 0))),
+                )
             summary = response.raw_content.strip()
             if summary and estimate_tokens(summary) <= max_tokens * 1.5:
                 logger.info("LLM-based compaction produced %d token summary", estimate_tokens(summary))
@@ -985,7 +1004,8 @@ class CompactionRecovery:
 
     MAX_FILES = 5
     MAX_CHARS_PER_FILE = 5_000
-    MAX_SKILLS_CHARS = 25_000
+    MAX_CHARS_PER_SKILL = 20_000  # ~5,000 tokens
+    MAX_SKILLS_CHARS = 100_000  # ~25,000 tokens total
 
     def __init__(
         self,

@@ -513,6 +513,11 @@ def run_v2_mode(
     rend = renderer
     last_tool = [""]
     last_tool_params = [{}]
+    # Phase 4: ResourceGovernor for v2 runner (observe by default)
+    from core.resource_governor import ResourceGovernor
+    from config.schema import ResourceGovernanceConfig
+    gov = ResourceGovernor(ResourceGovernanceConfig())
+
     runtime = SessionRuntime(
         store=store,
         backend=backend,
@@ -529,6 +534,7 @@ def run_v2_mode(
                 last_tool=last_tool, last_tool_params=last_tool_params,
             )) if rend is not None else None
         ),
+        governor=gov,
     )
 
     if intent is TaskIntent.EDIT:

@@ -33,6 +33,7 @@ Integration:
 from __future__ import annotations
 
 import logging
+import threading
 import time as _time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -156,6 +157,34 @@ class BudgetExhausted(Exception):
         super().__init__(reason)
 
 
+class BudgetReservation:
+    """One idempotent child allocation owned by its parent budget."""
+
+    def __init__(self, budget: "ExecutionBudget", reserved_tokens: int) -> None:
+        self._budget = budget
+        self.reserved_tokens = reserved_tokens
+        self._settled = False
+        self._lock = threading.Lock()
+
+    def settle(self, actual_tokens: int) -> None:
+        with self._lock:
+            if self._settled:
+                return
+            self._settled = True
+        self._budget._settle_reservation(
+            self.reserved_tokens,
+            max(0, int(actual_tokens)),
+        )
+
+    def release(self) -> None:
+        self.settle(0)
+
+    @property
+    def is_settled(self) -> bool:
+        with self._lock:
+            return self._settled
+
+
 @dataclass
 class ExecutionBudget:
     """Unified execution budget tracking token, step, and time consumption.
@@ -193,6 +222,11 @@ class ExecutionBudget:
     _warning_injected: bool = False
     _critical_injected: bool = False
     _force_finish_injected: bool = False
+    _token_reserved: int = 0
+    _token_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
     usage: BudgetUsage = field(default_factory=BudgetUsage)
 
     def record_retry_step(self) -> None:
@@ -212,6 +246,7 @@ class ExecutionBudget:
         return {
             **self.usage.to_dict(),
             "token_used": self._token_used,
+            "token_reserved": self.token_reserved,
             "token_limit": self.config.token_limit,
             "steps_taken": self._steps_taken,
             "step_limit": self.config.step_limit,
@@ -227,7 +262,13 @@ class ExecutionBudget:
 
     @property
     def token_used(self) -> int:
-        return self._token_used
+        with self._token_lock:
+            return self._token_used
+
+    @property
+    def token_reserved(self) -> int:
+        with self._token_lock:
+            return self._token_reserved
 
     @property
     def steps_taken(self) -> int:
@@ -235,14 +276,19 @@ class ExecutionBudget:
 
     @property
     def elapsed_seconds(self) -> float:
-        if self._started_at == 0:
-            return 0.0
-        end = self._completed_at if self._completed_at > 0 else _time.time()
-        return end - self._started_at
+        from core.time_utils import elapsed_seconds
+
+        return elapsed_seconds(self._started_at, self._completed_at)
 
     @property
     def token_remaining(self) -> int:
-        return max(0, self.config.token_limit - self._token_used)
+        with self._token_lock:
+            return max(
+                0,
+                self.config.token_limit
+                - self._token_used
+                - self._token_reserved,
+            )
 
     @property
     def steps_remaining(self) -> int:
@@ -280,7 +326,40 @@ class ExecutionBudget:
 
     def consume(self, tokens: int) -> None:
         """Consume tokens from the budget. Charges subagent usage here."""
-        self._token_used += max(0, tokens)
+        with self._token_lock:
+            self._token_used += max(0, tokens)
+
+    def reserve_tokens(self, tokens: int) -> BudgetReservation:
+        """Atomically allocate a child ceiling from the remaining parent pool."""
+        requested = max(0, int(tokens))
+        if requested <= 0:
+            raise BudgetExhausted("child token reservation must be positive")
+        with self._token_lock:
+            available = max(
+                0,
+                self.config.token_limit
+                - self._token_used
+                - self._token_reserved,
+            )
+            if requested > available:
+                raise BudgetExhausted(
+                    f"child requested {requested} tokens but only "
+                    f"{available} remain"
+                )
+            self._token_reserved += requested
+        return BudgetReservation(self, requested)
+
+    def _settle_reservation(
+        self,
+        reserved_tokens: int,
+        actual_tokens: int,
+    ) -> None:
+        with self._token_lock:
+            self._token_reserved = max(
+                0, self._token_reserved - max(0, reserved_tokens),
+            )
+            self._token_used += max(0, actual_tokens)
+            self.usage.subagent_tokens += max(0, actual_tokens)
 
     def record_step(self, *, retry: bool = False) -> int:
         """Record a main-loop iteration. Returns the new step count."""
@@ -312,7 +391,10 @@ class ExecutionBudget:
             )
 
         # Determine the limiting factor
-        token_pct = self._token_used / max(1, self.config.token_limit)
+        with self._token_lock:
+            token_committed = self._token_used
+            token_allocated = self._token_used + self._token_reserved
+        token_pct = token_allocated / max(1, self.config.token_limit)
         step_pct = self._steps_taken / max(1, self.config.step_limit)
         time_pct = 0.0
         if self.config.time_limit_seconds > 0:
@@ -353,7 +435,7 @@ class ExecutionBudget:
 
         return BudgetStatus(
             level=level,
-            token_used=self._token_used,
+            token_used=token_committed,
             token_limit=self.config.token_limit,
             steps_taken=self._steps_taken,
             step_limit=self.config.step_limit,

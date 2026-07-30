@@ -229,6 +229,33 @@ def _wait_for_terminal(service: ReviewService, job_id: str):
     raise AssertionError("review did not reach a terminal state")
 
 
+def test_review_reuses_runtime_shared_executor(tmp_path, monkeypatch):
+    runtime = _ReviewRuntime()
+    runtime._shared_executor = ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="shared-review-test",
+    )
+    service, _, session = _service(
+        tmp_path,
+        monkeypatch,
+        runtime=runtime,
+    )
+
+    def fail_if_private_pool_is_created(*args, **kwargs):
+        raise AssertionError("ReviewService created a private executor")
+
+    monkeypatch.setattr(
+        "agent.session.executor_pool.ThreadPoolExecutor",
+        fail_if_private_pool_is_created,
+    )
+    try:
+        started = service.start_review(session.id)
+        job = _wait_for_terminal(service, started["id"])
+        assert job["status"] == "completed"
+        assert len(runtime.calls) == 3
+    finally:
+        runtime._shared_executor.shutdown(wait=True, cancel_futures=True)
+
+
 def test_review_runs_three_read_only_lenses_and_deduplicates_findings(
     tmp_path,
     monkeypatch,

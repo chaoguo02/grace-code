@@ -6,14 +6,8 @@ hitl/ — Human-in-the-Loop 权限框架。
 - PermissionRule: Tool(pattern) 规则解析与匹配
 - PermissionResult/PromptDecision: 管道决策数据模型
 
-Legacy 组件（保留向后兼容）：
-- HitlManager: 旧中央拦截器
-- PolicyEngine: YAML 规则引擎
 """
 
-from hitl.request import HitlDecision, HitlRequest, HitlResult, HitlStats
-from hitl.manager import HitlManager
-from hitl.policy_engine import PolicyEngine
 from hitl.pipeline import (
     PermissionDecision,
     PermissionLayer,
@@ -36,11 +30,4 @@ __all__ = [
     "PermissionRuleTier",
     "PromptAction",
     "PromptDecision",
-    # Legacy (backward compat)
-    "HitlDecision",
-    "HitlRequest",
-    "HitlResult",
-    "HitlStats",
-    "HitlManager",
-    "PolicyEngine",
 ]

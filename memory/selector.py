@@ -170,7 +170,14 @@ def select_memories(
             LLMMessage(role="user", content=user_content),
         ]
 
-        response = selector_backend.complete(messages, tools=[])
+        from llm.provider_capacity import complete_with_provider_capacity
+
+        response = complete_with_provider_capacity(
+            selector_backend,
+            messages,
+            [],
+            max_output_tokens=256,
+        )
         if not response or not response.text:
             return []
 

@@ -346,11 +346,14 @@ class RunState(str, Enum):
 
 
 @dataclass(frozen=True)
-class RunContext:
+class PipelineRunContext:
     """Immutable run identity passed from POST handler → Pipeline → Runtime.
 
     Created once in the POST /chat transaction and carried through the
     entire execution.  Never written to mutable session metadata.
+
+    Renamed from RunContext to disambiguate from agent.session.run_context.RunContext
+    (the runtime tool-execution context).
     """
 
     session_id: str
@@ -726,6 +729,7 @@ class AgentRunResult:
     artifacts: tuple[str, ...] = ()
     turns_used: int = 0
     tokens_used: int = 0
+    budget_settled: bool = False
     report: SubagentReport | None = None
     failure_diagnosis: str = ""  # structured diagnosis when status is "failed"
     warning: str = ""
@@ -767,6 +771,7 @@ class AgentRunResult:
             "artifacts": list(self.artifacts),
             "turns_used": self.turns_used,
             "tokens_used": self.tokens_used,
+            "budget_settled": self.budget_settled,
             "report": self.report.to_dict() if self.report is not None else None,
             "failure_diagnosis": self.failure_diagnosis,
             "warning": self.warning,
@@ -798,6 +803,7 @@ class AgentRunResult:
             artifacts=tuple(str(item) for item in data.get("artifacts", [])),
             turns_used=int(data.get("turns_used", 0)),
             tokens_used=int(data.get("tokens_used", 0)),
+            budget_settled=bool(data.get("budget_settled", False)),
             report=report,
             failure_diagnosis=str(data.get("failure_diagnosis", "")),
             warning=str(data.get("warning", "")),

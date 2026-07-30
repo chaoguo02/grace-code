@@ -16,9 +16,13 @@ via description semantic similarity in the system prompt listing.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -26,6 +30,17 @@ logger = logging.getLogger(__name__)
 
 # 内置 skills 目录（随代码分发）
 BUILTIN_SKILLS_DIR = str(Path(__file__).parent / "builtin")
+
+
+@dataclass(frozen=True)
+class SkillSource:
+    """One ordered skill fact source."""
+
+    name: str
+    directories: tuple[str, ...]
+    priority: int
+    trusted: bool = True
+    legacy_commands: bool = False
 
 
 @dataclass
@@ -82,6 +97,9 @@ class SkillMetadata:
     allowed_tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
     hooks: tuple[dict, ...] = ()
+    source: str = "project"
+    trusted: bool = True
+    file_path: str = ""
 
     # ── Derived helpers ──
 
@@ -122,73 +140,234 @@ class SkillRegistry:
         rendered = registry.load_and_render("code-review", "auth module")
     """
 
-    def __init__(self, skills_dir: str, extra_dirs: list[str] | None = None, include_builtin: bool = True) -> None:
-        self._skills_dirs: list[str] = []
-        if include_builtin:
-            self._skills_dirs.append(BUILTIN_SKILLS_DIR)
-        if skills_dir:
-            self._skills_dirs.append(skills_dir)
-        # CC-aligned: also scan .claude/skills/ as a compatible fact source
-        if skills_dir and ".grace" in skills_dir:
-            cc_dir = skills_dir.replace(".grace", ".claude")
-            if Path(cc_dir).is_dir():
-                self._skills_dirs.append(cc_dir)
-            # Also scan .forge-agent/skills/ alongside .claude/skills/
-            fa_dir = skills_dir.replace(".grace", ".forge-agent")
-            if fa_dir != skills_dir and Path(fa_dir).is_dir():
-                self._skills_dirs.append(fa_dir)
-        if extra_dirs:
-            self._skills_dirs.extend(extra_dirs)
-
+    def __init__(
+        self,
+        skills_dir: str,
+        extra_dirs: list[str] | None = None,
+        include_builtin: bool = True,
+        *,
+        sources: list["SkillSource"] | None = None,
+        live_reload: bool = False,
+    ) -> None:
+        if sources is None:
+            sources = []
+            if skills_dir:
+                sources.append(SkillSource("project", (skills_dir,), 2))
+            if extra_dirs:
+                sources.append(
+                    SkillSource("additional", tuple(extra_dirs), 3),
+                )
+            if include_builtin:
+                sources.append(
+                    SkillSource("bundled", (BUILTIN_SKILLS_DIR,), 5),
+                )
+        self._sources = self._dedupe_sources(sources)
+        self._skills_dirs = [
+            directory
+            for source in self._sources
+            for directory in source.directories
+        ]
         self._metadata: dict[str, SkillMetadata] = {}
         self._nested_metadata: dict[str, SkillMetadata] = {}  # SK-19: dir-prefixed skills
-        self._dir_mtimes: dict[str, float] = {}  # SK-18: mtime tracking
+        self._lock = threading.RLock()
+        self._fingerprint = ""
+        self._change_detector: SkillChangeDetector | None = None
         self._discover()
+        if live_reload:
+            self._change_detector = SkillChangeDetector(self)
+            self._change_detector.start()
+
+    @classmethod
+    def for_project(
+        cls,
+        project_dir: str,
+        *,
+        additional_dirs: list[str] | None = None,
+        mcp_dirs: list[str] | None = None,
+        live_reload: bool = True,
+    ) -> "SkillRegistry":
+        """Create the canonical seven-source skill registry."""
+        root = Path(project_dir).resolve()
+        user_home = Path.home()
+        managed = os.environ.get("GRACE_MANAGED_SKILLS_DIR", "")
+        sources = [
+            SkillSource(
+                "managed",
+                tuple(filter(None, (managed,))),
+                0,
+            ),
+            SkillSource(
+                "user",
+                (
+                    str(user_home / ".grace" / "skills"),
+                    str(user_home / ".claude" / "skills"),
+                ),
+                1,
+            ),
+            SkillSource(
+                "project",
+                (
+                    str(root / ".grace" / "skills"),
+                    str(root / ".claude" / "skills"),
+                    str(root / ".forge-agent" / "skills"),
+                ),
+                2,
+            ),
+            SkillSource(
+                "additional",
+                tuple(additional_dirs or ()),
+                3,
+            ),
+            SkillSource(
+                "legacy",
+                (str(root / ".claude" / "commands"),),
+                4,
+                legacy_commands=True,
+            ),
+            SkillSource("bundled", (BUILTIN_SKILLS_DIR,), 5),
+            SkillSource(
+                "mcp",
+                tuple(mcp_dirs or ()),
+                6,
+                trusted=False,
+            ),
+        ]
+        return cls(
+            "",
+            include_builtin=False,
+            sources=sources,
+            live_reload=live_reload,
+        )
+
+    @staticmethod
+    def _dedupe_sources(
+        sources: list["SkillSource"],
+    ) -> list["SkillSource"]:
+        seen: set[str] = set()
+        result: list[SkillSource] = []
+        for source in sorted(sources, key=lambda item: item.priority):
+            directories: list[str] = []
+            for raw in source.directories:
+                canonical = os.path.realpath(os.path.expanduser(raw))
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
+                directories.append(canonical)
+            result.append(
+                SkillSource(
+                    source.name,
+                    tuple(directories),
+                    source.priority,
+                    trusted=source.trusted,
+                    legacy_commands=source.legacy_commands,
+                ),
+            )
+        return result
 
     def _discover(self) -> None:
-        """扫描所有 skills 目录 + 嵌套目录（SK-19）。
+        """Load all configured sources concurrently, then merge by priority."""
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(7, len(self._sources))),
+            thread_name_prefix="grace-skill-discovery",
+        ) as executor:
+            futures = [
+                (source, executor.submit(self._discover_source, source))
+                for source in self._sources
+            ]
+            discovered = []
+            for source, future in futures:
+                try:
+                    result = future.result()
+                except Exception:
+                    logger.warning(
+                        "Skill source discovery failed: %s",
+                        source.name,
+                        exc_info=True,
+                    )
+                    result = ({}, {})
+                discovered.append((source, result))
 
-        SK-18: tracks directory mtimes for efficient refresh().
-        SK-19: scans nested .claude/skills/ up to 3 levels deep for monorepo support.
-        """
-        self._metadata.clear()
-        self._nested_metadata.clear()
+        metadata: dict[str, SkillMetadata] = {}
+        nested: dict[str, SkillMetadata] = {}
+        for source, (root_items, nested_items) in sorted(
+            discovered,
+            key=lambda item: item[0].priority,
+        ):
+            for name, item in root_items.items():
+                metadata.setdefault(name, item)
+            for name, item in nested_items.items():
+                nested.setdefault(name, item)
+        with self._lock:
+            self._metadata = metadata
+            self._nested_metadata = nested
+            self._fingerprint = self._source_fingerprint()
 
-        for skills_dir in self._skills_dirs:
-            skills_path = Path(skills_dir)
-            if not skills_path.is_dir():
-                logger.debug("Skills directory does not exist: %s", skills_dir)
-                continue
-
-            # SK-18: record mtime for this directory
-            try:
-                self._dir_mtimes[skills_dir] = skills_path.stat().st_mtime
-            except OSError:
-                pass
-
-            # Main skills directory
-            self._scan_skills_dir(skills_path, prefix="")
-
-            # SK-19: nested skills in subdirectories (up to 3 levels)
-            try:
-                for sub in skills_path.parent.rglob(".claude/skills"):
-                    if sub == skills_path:
-                        continue
-                    if sub.is_relative_to(skills_path) or skills_path in sub.parents:
-                        continue
-                    depth = len(sub.relative_to(skills_path.parent).parts)
-                    if depth <= 4:  # e.g. apps/web/.claude/skills = 3 parts
-                        rel_dir = str(sub.parent.relative_to(skills_path.parent)).replace("\\", "/")
-                        prefix = rel_dir + ":"
-                        self._scan_skills_dir(sub, prefix=prefix)
-            except (OSError, ValueError):
-                pass
-
-        total = len(self._metadata) + len(self._nested_metadata)
+        total = len(metadata) + len(nested)
         logger.info("Discovered %d skills total (%d root, %d nested)", total, len(self._metadata), len(self._nested_metadata))
 
-    def _scan_skills_dir(self, skills_path: Path, *, prefix: str = "") -> None:
-        """Scan one skills directory for SKILL.md files."""
+    def _discover_source(
+        self,
+        source: "SkillSource",
+    ) -> tuple[dict[str, SkillMetadata], dict[str, SkillMetadata]]:
+        root_items: dict[str, SkillMetadata] = {}
+        nested_items: dict[str, SkillMetadata] = {}
+        for directory in source.directories:
+            skills_path = Path(directory)
+            if not skills_path.is_dir():
+                continue
+            if source.legacy_commands:
+                for command in sorted(skills_path.glob("*.md")):
+                    metadata = self._parse_frontmatter(
+                        command,
+                        command.stem,
+                        source=source,
+                    )
+                    if metadata:
+                        root_items.setdefault(metadata.name, metadata)
+                continue
+            self._scan_skills_dir(
+                skills_path,
+                source=source,
+                target=root_items,
+            )
+            if source.name != "project":
+                continue
+            try:
+                project_root = skills_path.parent.parent
+                for sub in project_root.rglob(".claude/skills"):
+                    if sub == skills_path:
+                        continue
+                    depth = len(sub.relative_to(project_root).parts)
+                    if depth > 5:
+                        continue
+                    prefix = (
+                        str(sub.parent.relative_to(project_root))
+                        .replace("\\", "/")
+                        + ":"
+                    )
+                    self._scan_skills_dir(
+                        sub,
+                        source=source,
+                        target=nested_items,
+                        prefix=prefix,
+                    )
+            except (OSError, ValueError):
+                logger.debug(
+                    "Nested skill discovery failed under %s",
+                    skills_path,
+                    exc_info=True,
+                )
+        return root_items, nested_items
+
+    def _scan_skills_dir(
+        self,
+        skills_path: Path,
+        *,
+        source: "SkillSource",
+        target: dict[str, SkillMetadata],
+        prefix: str = "",
+    ) -> None:
+        """Scan one skills directory into a source-local result."""
         for entry in sorted(skills_path.iterdir()):
             if not entry.is_dir():
                 continue
@@ -197,18 +376,23 @@ class SkillRegistry:
                 continue
 
             try:
-                metadata = self._parse_frontmatter(skill_file, entry.name)
+                metadata = self._parse_frontmatter(
+                    skill_file,
+                    entry.name,
+                    source=source,
+                )
                 if metadata:
-                    if prefix:
-                        self._nested_metadata[f"{prefix}{metadata.name}"] = metadata
-                        logger.debug("Nested skill: %s%s (from %s)", prefix, metadata.name, skills_path)
-                    else:
-                        self._metadata[metadata.name] = metadata
-                        logger.debug("Discovered skill: %s (from %s)", metadata.name, skills_path)
+                    target.setdefault(f"{prefix}{metadata.name}", metadata)
             except Exception as e:
                 logger.warning("Failed to parse skill %s: %s", entry.name, e)
 
-    def _parse_frontmatter(self, skill_file: Path, dir_name: str) -> SkillMetadata | None:
+    def _parse_frontmatter(
+        self,
+        skill_file: Path,
+        dir_name: str,
+        *,
+        source: "SkillSource",
+    ) -> SkillMetadata | None:
         """Parse SKILL.md YAML frontmatter.
 
         Supported fields (aligned with Claude Code):
@@ -228,12 +412,20 @@ class SkillRegistry:
                 display_name=dir_name,
                 description="",
                 dir_path=str(skill_file.parent),
+                source=source.name,
+                trusted=source.trusted,
+                file_path=str(skill_file),
             )
 
         try:
             fm_dict: dict = yaml.safe_load(frontmatter) or {}
-        except yaml.YAMLError:
-            fm_dict = {}
+        except yaml.YAMLError as exc:
+            logger.warning(
+                "Invalid skill frontmatter in %s: %s",
+                skill_file,
+                exc,
+            )
+            return None
 
         # ── Parse paths: string, comma/space-separated, or YAML list ──
         raw_paths = fm_dict.get("paths", ())
@@ -290,6 +482,9 @@ class SkillRegistry:
             allowed_tools=_parse_tool_set(fm_dict.get("allowed-tools", [])),
             disallowed_tools=_parse_tool_set(fm_dict.get("disallowed-tools", [])),
             hooks=hooks,
+            source=source.name,
+            trusted=source.trusted,
+            file_path=str(skill_file),
         )
 
     @staticmethod
@@ -300,26 +495,36 @@ class SkillRegistry:
 
     def list_skills(self) -> list[SkillMetadata]:
         """返回所有已发现的 skill metadata（含嵌套 skills）。"""
-        return list(self._metadata.values()) + list(self._nested_metadata.values())
+        with self._lock:
+            return (
+                list(self._metadata.values())
+                + list(self._nested_metadata.values())
+            )
 
     def list_skill_entries(self) -> list[tuple[str, SkillMetadata]]:
         """Return canonical invocation names paired with metadata."""
-        return list(self._metadata.items()) + list(self._nested_metadata.items())
+        with self._lock:
+            return (
+                list(self._metadata.items())
+                + list(self._nested_metadata.items())
+            )
 
     def has_skill(self, name: str) -> bool:
         """检查是否存在指定名称的 skill（含嵌套 skills）。"""
-        return name in self._metadata or name in self._nested_metadata
+        with self._lock:
+            return name in self._metadata or name in self._nested_metadata
 
     def get_skill_meta(self, name: str) -> SkillMetadata | None:
         """Get metadata for a skill, checking root then nested."""
-        return self._metadata.get(name) or self._nested_metadata.get(name)
+        with self._lock:
+            return self._metadata.get(name) or self._nested_metadata.get(name)
 
     def get_skill_detail(self, name: str) -> str | None:
         """返回 skill 的完整 body 内容（未做 $ARGUMENTS 替换）。"""
         meta = self.get_skill_meta(name)
         if meta is None:
             return None
-        skill_file = Path(meta.dir_path) / "SKILL.md"
+        skill_file = Path(meta.file_path or Path(meta.dir_path) / "SKILL.md")
         if not skill_file.is_file():
             return None
         content = skill_file.read_text(encoding="utf-8")
@@ -353,7 +558,9 @@ class SkillRegistry:
         if metadata is None:
             return None
 
-        skill_file = Path(metadata.dir_path) / "SKILL.md"
+        skill_file = Path(
+            metadata.file_path or Path(metadata.dir_path) / "SKILL.md",
+        )
 
         if not skill_file.is_file():
             logger.warning("Skill file missing: %s", skill_file)
@@ -366,7 +573,12 @@ class SkillRegistry:
             return None
 
         # Step 1: Expand inline commands (!`cmd` and ```! blocks)
-        body = self._expand_inline_commands(body, cwd=str(skill_file.parent), runtime=runtime)
+        body = self._expand_inline_commands(
+            body,
+            cwd=str(skill_file.parent),
+            runtime=runtime,
+            allow_execution=metadata.trusted,
+        )
 
         # Step 2: Apply string substitutions
         body = self._apply_substitutions(
@@ -429,7 +641,13 @@ class SkillRegistry:
         return "[blocked: skill inline command requires Runtime]"
 
     @staticmethod
-    def _expand_inline_commands(content: str, *, cwd: str = ".", runtime: Any = None) -> str:
+    def _expand_inline_commands(
+        content: str,
+        *,
+        cwd: str = ".",
+        runtime: Any = None,
+        allow_execution: bool = True,
+    ) -> str:
         """Expand !`cmd` and ```! blocks, replacing them with command output.
 
         CC spec: !` at line start or after whitespace triggers execution.
@@ -442,19 +660,28 @@ class SkillRegistry:
         # Fast path: skip if no injection markers present
         if "!`" not in content and "```!" not in content:
             return content
+        if not allow_execution:
+            logger.warning("Blocked inline commands from untrusted MCP skill")
+            blocked = re.sub(
+                r"(?ms)^\s*```!\s*\n.*?^\s*```\s*$",
+                "[blocked: untrusted skill inline command]",
+                content,
+            )
+            return re.sub(
+                r"(?m)^\s*!`[^`]+`\s*$",
+                "[blocked: untrusted skill inline command]",
+                blocked,
+            )
 
-        _FENCED_BLOCK_RE = None  # compiled lazily at module level if needed
         result_parts: list[str] = []
         in_fence = False
         fence_lines: list[str] = []
-        fence_start = 0
 
         for i, line in enumerate(content.splitlines(True)):
             stripped = line.lstrip()
             if not in_fence and stripped.startswith("```!"):
                 in_fence = True
                 fence_lines = []
-                fence_start = i
                 result_parts.append(line)  # keep the opening ```! line
                 continue
             if in_fence:
@@ -623,25 +850,96 @@ class SkillRegistry:
         return "\n".join(lines)
 
     def refresh(self) -> None:
-        """SK-18: mtime-based live change detection.
+        """Clear discovery memoization and atomically reload changed sources."""
+        if self._source_fingerprint() != self._fingerprint:
+            self._discover()
 
-        Only rescans directories whose mtime has changed since last scan.
-        If no changes detected, returns immediately (no-op).
-        """
-        changed = False
-        for skills_dir in self._skills_dirs:
-            try:
-                current_mtime = Path(skills_dir).stat().st_mtime
-            except OSError:
+    def discover_for_paths(
+        self,
+        paths: list[str] | tuple[str, ...],
+    ) -> list[SkillMetadata]:
+        """Return L1 metadata activated by files the model touched."""
+        return [
+            meta
+            for meta in self.list_skills()
+            if any(meta.matches_path(path) for path in paths)
+        ]
+
+    def list_resources(self, name: str) -> tuple[str, ...]:
+        """L3 disclosure: enumerate resources without loading their bodies."""
+        meta = self.get_skill_meta(name)
+        if meta is None:
+            return ()
+        base = Path(meta.dir_path)
+        resources: list[str] = []
+        for directory_name in ("scripts", "templates", "references", "assets"):
+            directory = base / directory_name
+            if not directory.is_dir():
                 continue
-            if self._dir_mtimes.get(skills_dir) != current_mtime:
-                changed = True
-                break
+            for path in sorted(directory.rglob("*")):
+                if path.is_file():
+                    resources.append(
+                        str(path.relative_to(base)).replace("\\", "/"),
+                    )
+        return tuple(resources)
 
-        if not changed:
-            return  # Nothing changed, skip rescan
+    def close(self, timeout: float = 2.0) -> None:
+        detector = self._change_detector
+        self._change_detector = None
+        if detector is not None:
+            detector.close(timeout=timeout)
 
-        self._metadata.clear()
-        self._nested_metadata.clear()
-        self._dir_mtimes.clear()
-        self._discover()
+    def _source_fingerprint(self) -> str:
+        import hashlib
+
+        facts: list[str] = []
+        for source in self._sources:
+            for directory in source.directories:
+                root = Path(directory)
+                if not root.exists():
+                    facts.append(f"{source.name}:{directory}:missing")
+                    continue
+                patterns = ("*.md",) if source.legacy_commands else ("SKILL.md",)
+                for pattern in patterns:
+                    for path in sorted(root.rglob(pattern)):
+                        try:
+                            stat = path.stat()
+                        except OSError:
+                            continue
+                        facts.append(
+                            f"{source.name}:{path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}",
+                        )
+        return hashlib.sha256("\n".join(facts).encode("utf-8")).hexdigest()
+
+
+class SkillChangeDetector:
+    """Polling live-reload watcher with 300 ms debounce."""
+
+    def __init__(
+        self,
+        registry: SkillRegistry,
+        *,
+        interval_seconds: float = 0.3,
+    ) -> None:
+        self._registry = registry
+        self._interval = interval_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="grace-skill-watch",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(0.0, timeout))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                self._registry.refresh()
+            except Exception:
+                logger.warning("Skill live reload failed", exc_info=True)

@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import re
+import threading
 from typing import Any
 
 from agent.task import Action, ActionType, ToolCall
@@ -59,6 +61,10 @@ class OpenAIBackend(LLMBackend):
         max_tokens: int = 4096,
         timeout_seconds: float = 60.0,
     ) -> None:
+        self._api_key = api_key
+        self._base_url = base_url
+        self._client_lock = threading.Lock()
+        self._closed = False
         try:
             from openai import OpenAI
             self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds)
@@ -71,6 +77,9 @@ class OpenAIBackend(LLMBackend):
         self._use_function_calling = not any(
             model.lower().startswith(prefix) for prefix in _NO_FUNCTION_CALLING
         )
+        # Phase 2: active stream tracking for graceful shutdown
+        self._active_streams: list[threading.Thread] = []
+        self._streams_lock = threading.Lock()
 
     @property
     def model_name(self) -> str:
@@ -86,11 +95,48 @@ class OpenAIBackend(LLMBackend):
         # 保守默认 128K，子类可按需覆盖
         return 128_000
 
+    def close(self) -> None:
+        """Abort all active streams and close the SDK client (Phase 2).
+
+        Daemon producer threads will exit when the client's HTTP connection
+        is closed, unblocking the blocking SDK iterator.
+        """
+        # Close the SDK client — this unblocks any active stream iterators.
+        with self._client_lock:
+            if hasattr(self._client, "close"):
+                try:
+                    self._client.close()
+                except Exception:
+                    logger.debug("Error closing OpenAI client", exc_info=True)
+            self._closed = True
+        with self._streams_lock:
+            streams = list(self._active_streams)
+        for stream_thread in streams:
+            stream_thread.join(timeout=1.0)
+        with self._streams_lock:
+            self._active_streams = [
+                thread for thread in self._active_streams if thread.is_alive()
+            ]
+
+    def _ensure_client(self) -> None:
+        """Recreate a client closed to abort a prior timed-out request."""
+        with self._client_lock:
+            if not self._closed:
+                return
+            from openai import OpenAI
+            self._client = OpenAI(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                timeout=self._timeout_seconds,
+            )
+            self._closed = False
+
     def complete(
         self,
         messages: list[LLMMessage],
         tools: list[LLMToolSchema],
     ) -> LLMResponse:
+        self._ensure_client()
         api_messages = _to_openai_messages(messages)
 
         logger.debug(
@@ -532,7 +578,7 @@ def _parse_text_response(text: str) -> Action:
     logger.info("Plain text response (no tool-call markers); treating as FINISH. text=%s", text_stripped[:100])
     return Action(
         action_type=ActionType.FINISH,
-        thought=text_stripped,
+        thought="",
         message=text_stripped,
     )
 
@@ -576,6 +622,7 @@ def _openai_stream(
     on_text:    最终回答（message）的流式回调
     on_thought: 推理过程（reasoning_content）的流式回调，仅推理模型有内容
     """
+    self._ensure_client()
     api_messages = _to_openai_messages(messages)
 
     if self._use_function_calling:
@@ -924,29 +971,74 @@ def _openai_stream_iter(
     unconditional return in ``_openai_stream`` and therefore never bound to
     ``OpenAIBackend``.
     """
-    pending: list[StreamEvent] = []
+    events: queue.Queue[tuple[str, Any]] = queue.Queue()
+    streamed_thought: list[str] = []
+    t: threading.Thread | None = None
 
     def _on_text(text: str) -> None:
-        pending.append(StreamEvent(
+        events.put(("event", StreamEvent(
             kind=StreamEventKind.TEXT_DELTA,
             text=text,
-        ))
+        )))
 
     def _on_thought(text: str) -> None:
-        pending.append(StreamEvent(
+        streamed_thought.append(text)
+        events.put(("event", StreamEvent(
             kind=StreamEventKind.TEXT_DELTA,
-            text=text,
             thought=text,
-        ))
+        )))
 
-    response = _openai_stream(
-        self,
-        messages,
-        tools,
-        on_text=_on_text,
-        on_thought=_on_thought,
-    )
-    yield from pending
+    def _produce() -> None:
+        try:
+            response = _openai_stream(
+                self,
+                messages,
+                tools,
+                on_text=_on_text,
+                on_thought=_on_thought,
+            )
+        except Exception as exc:
+            events.put(("error", exc))
+        else:
+            events.put(("result", response))
+        finally:
+            stream_lock = getattr(self, "_streams_lock", None)
+            active_streams = getattr(self, "_active_streams", None)
+            if stream_lock is not None and active_streams is not None:
+                with stream_lock:
+                    current = threading.current_thread()
+                    if current in active_streams:
+                        active_streams.remove(current)
+
+    # _openai_stream consumes the blocking SDK iterator. Running it in a
+    # producer thread lets this generator yield each callback immediately
+    # instead of buffering the complete response before the first delta.
+    t = threading.Thread(target=_produce, daemon=True)
+    stream_lock = getattr(self, "_streams_lock", None)
+    active_streams = getattr(self, "_active_streams", None)
+    if stream_lock is not None and active_streams is not None:
+        with stream_lock:
+            active_streams.append(t)
+    try:
+        t.start()
+    except Exception:
+        if stream_lock is not None and active_streams is not None:
+            with stream_lock:
+                if t in active_streams:
+                    active_streams.remove(t)
+        raise
+
+    response: LLMResponse | None = None
+    while response is None:
+        event_type, payload = events.get()
+        if event_type == "event":
+            yield payload
+        elif event_type == "error":
+            yield StreamEvent(kind=StreamEventKind.ERROR, text=str(payload))
+            return
+        else:
+            response = payload
+
     if (
         response.action.action_type is ActionType.TOOL_CALL
         and response.action.tool_calls
@@ -960,10 +1052,16 @@ def _openai_stream_iter(
         kind=StreamEventKind.FINISH,
         text=response.raw_content,
         finish_message=response.action.message or "",
-        thought=response.action.thought or "",
+        thought="".join(streamed_thought),
         input_tokens=response.input_tokens,
         output_tokens=response.output_tokens,
     )
+    # Cleanup: remove producer thread from active streams
+    active_streams_cleanup = getattr(self, "_active_streams", None)
+    if active_streams_cleanup is not None:
+        with getattr(self, "_streams_lock", threading.Lock()):
+            if t in active_streams_cleanup:
+                active_streams_cleanup.remove(t)
 
 
 OpenAIBackend.stream = _openai_stream

@@ -24,9 +24,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import re
 import threading
 from typing import Any
 
@@ -34,16 +32,25 @@ from fastapi import WebSocket
 
 logger = logging.getLogger(__name__)
 
-
 class SessionSubscriber:
     """Tracks one session's queue + set of WebSocket subscribers."""
 
-    def __init__(self, session_id: str, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        queue_max_size: int = 0,
+    ) -> None:
         self.session_id = session_id
         self.loop = loop
-        self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
+            maxsize=max(0, queue_max_size)
+        )
         self.websockets: set[WebSocket] = set()
         self._drain_task: asyncio.Task[None] | None = None
+        # Phase 3: delta merge state — keyed by block_id
+        self.dropped_deltas: int = 0
 
     def subscribe(self, ws: WebSocket) -> None:
         self.websockets.add(ws)
@@ -56,12 +63,28 @@ class SessionSubscriber:
         return bool(self.websockets)
 
     def publish(self, event: dict[str, Any]) -> None:
-        """Called from SessionRuntime thread. Thread-safe via call_soon_threadsafe."""
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, event)
+        """Apply bounded, lossless backpressure across the thread boundary."""
+        event_copy = dict(event)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is self.loop:
+            self.loop.create_task(self.queue.put(event_copy))
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self.queue.put(event_copy),
+            self.loop,
+        )
+        # Runtime producers slow down when the websocket cannot keep up. This
+        # bounds memory without dropping assistant answer content.
+        future.result()
 
     def signal_complete(self) -> None:
         """Signal the drain task that no more events will arrive."""
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, None)
+        self.loop.call_soon_threadsafe(
+            lambda: self.loop.create_task(self.queue.put(None))
+        )
 
     async def _drain(self) -> None:
         """Background task: drain queue and broadcast to all subscribers."""
@@ -71,10 +94,12 @@ class SessionSubscriber:
                 if event is None:  # sentinel → shutdown
                     break
                 disconnected: list[WebSocket] = []
-                serial_errors: list[WebSocket] = []
                 for ws in self.websockets:
                     try:
-                        await ws.send_json(event)
+                        await asyncio.wait_for(
+                            ws.send_json(event),
+                            timeout=5.0,
+                        )
                     except (ConnectionResetError, ConnectionAbortedError, OSError):
                         disconnected.append(ws)
                     except (TypeError, ValueError) as exc:
@@ -118,7 +143,6 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
     One Event can produce multiple messages (e.g. ACTION → thought + tool_call).
     Uses server.events dataclasses as the single source of truth for shapes.
     """
-    from agent.task import EventType
     from server.events import (
         WsStatus, WsThought, WsToolCall, WsObservation, WsReflection,
         WsSubagentStart, WsSubagentStop, WsPlanReady, WsDelegationEvent,
@@ -155,13 +179,10 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
 
     if ev_type == "task_failed":
         error = str(payload.get("error") or payload.get("reason") or "unknown")
-        normalized = error.lower()
         explicit_status = str(payload.get("status", "")).strip().lower()
         is_cancelled = (
             explicit_status in {"cancelled", "canceled"}
             or payload.get("cancelled") is True
-            or "cancelled" in normalized
-            or "canceled" in normalized
         )
         return [WsStatus(
             status="cancelled" if is_cancelled else "failed",
@@ -234,11 +255,17 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
 class EventBus:
     """Manages per-session event queues and WebSocket subscribers."""
 
-    def __init__(self, repo_path: str = "") -> None:
+    def __init__(
+        self,
+        repo_path: str = "",
+        *,
+        queue_max_size: int = 0,
+    ) -> None:
         self._sessions: dict[str, SessionSubscriber] = {}
         self._lock = asyncio.Lock()
         self._publish_lock = threading.Lock()  # protects _sessions reads from sync thread
         self._repo_path = repo_path
+        self._queue_max_size = max(0, int(queue_max_size))
         self.recorder: Any = None  # StatsRecorder instance, set by agent_service
         self.trace_store: Any = None  # StorageBackend, set by agent_service
         self.trace_cache: Any = None  # InMemoryTraceCache, set by agent_service
@@ -251,7 +278,11 @@ class EventBus:
             if existing is not None:
                 return existing
             loop = asyncio.get_running_loop()
-            sub = SessionSubscriber(session_id, loop)
+            sub = SessionSubscriber(
+                session_id,
+                loop,
+                queue_max_size=self._queue_max_size,
+            )
             self._sessions[session_id] = sub
             return sub
 

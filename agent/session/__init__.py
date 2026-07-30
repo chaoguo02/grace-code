@@ -24,7 +24,7 @@ from agent.session.worktree_tool import (
 )
 from agent.session.subagent import fork_subagent, run_child_agent
 from agent.session.agent_definition import AgentDefinitionError as _ADE, load_agent_definitions
-from agent.session.mcp_integration import MCPRuntimeToolProxy, MCPToolIntegration
+from agent.session.mcp_integration import MCPToolIntegration
 
 # Re-export AgentDefinitionError from agent_definition
 AgentDefinitionError = _ADE
@@ -43,7 +43,7 @@ __all__ = [
     "AgentControlTool", "AgentSpawnContext", "ToolSchemaSnapshot",
     "ForkResult", "PermissionMode", "WorktreeChange",
     "WorktreeDisposition", "WorktreeEvidence", "WorkspaceMode",
-    "MCPRuntimeToolProxy", "MCPToolIntegration", "SessionRuntime",
+    "MCPToolIntegration", "SessionRuntime",
     "SessionStore", "SubagentWorktreeApplyTool",
     "SubagentWorktreeDiscardTool", "SubagentWorktreeInspectTool",
     "default_session_db_path", "fork_subagent", "run_child_agent",

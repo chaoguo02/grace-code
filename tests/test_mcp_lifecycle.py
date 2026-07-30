@@ -3,9 +3,6 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-import pytest
-
-
 @dataclass
 class FakeToolInfo:
     server_name: str
@@ -30,10 +27,27 @@ class FakeBridge:
         self.config = config
         self.closed = False
         self._connected = False
+        self._fingerprint = "fake-v1"
 
     @property
     def is_connected(self):
         return self._connected
+
+    @property
+    def fingerprint(self):
+        return self._fingerprint
+
+    def mark_disconnected(self):
+        self._connected = False
+
+    def launch_fingerprint_changed(self):
+        return False
+
+    def set_tools_changed_callback(self, callback):
+        self._tools_changed_callback = callback
+
+    async def discover_tools(self):
+        return [FakeToolInfo(server_name=self.config.name, name="tool")]
 
     async def connect(self):
         self._connected = True
@@ -71,16 +85,47 @@ class TestMCPLifecycle:
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
             }
-            is_mcp = True
-            should_defer = True
-            always_load = False
+            from agent.mcp.types import MCPToolProps
+            mcp_props = MCPToolProps(
+                server_name="docs",
+                original_tool_name="lookup",
+                is_deferred=True,
+            )
+
+            @property
+            def should_defer(self):
+                return self.mcp_props.is_deferred
+
+            @should_defer.setter
+            def should_defer(self, value):
+                self.mcp_props.is_deferred = value
+
+            @property
+            def always_load(self):
+                return self.mcp_props.always_load
+
+            @always_load.setter
+            def always_load(self, value):
+                self.mcp_props.always_load = value
 
             def execute(self, params):
                 return ToolResult(success=True, output="ok")
 
         deferred = DeferredTool()
         search = ToolSearchTool()
-        integration = SimpleNamespace(_tools=[deferred], _manager=None)
+        integration = SimpleNamespace(
+            deferred_tool_descriptors=lambda: [{
+                "name": deferred.name,
+                "description": deferred.description,
+                "server": "docs",
+            }],
+            activate_tools=lambda names: [
+                name for name in names
+                if not setattr(deferred, "always_load", True)
+                and not setattr(deferred, "should_defer", False)
+            ],
+            connection_errors=lambda: {},
+        )
         registry = ToolRegistry().register(search).register(deferred)
         search.set_mcp_context(registry, integration)
 
@@ -112,7 +157,8 @@ class TestMCPLifecycle:
                 calls.append(("register", registry))
 
         monkeypatch.setattr(agent.session, "MCPToolIntegration", FakeIntegration)
-        registry = SimpleNamespace(_tools={})
+        from core.base import ToolRegistry
+        registry = ToolRegistry()
         config = SimpleNamespace(mcp_servers={"docs": {"command": "fake"}})
 
         integration = initialize_mcp_integration(config, registry)
@@ -198,4 +244,55 @@ class TestMCPLifecycle:
             return tool.execute({})
 
         import asyncio
-        assert asyncio.run(run_inside_loop()) == "ok"
+        assert asyncio.run(run_inside_loop()).output == "ok"
+
+    def test_restart_sliding_window_is_bounded(self):
+        from agent.mcp.sync_bridge import SyncMCPToolManager
+
+        manager = SyncMCPToolManager(
+            health_interval_seconds=60,
+            restart_limit=2,
+            restart_window_seconds=60,
+        )
+        try:
+            assert manager._restart_allowed("docs") is True
+            manager._record_restart("docs")
+            manager._record_restart("docs")
+            assert manager._restart_allowed("docs") is False
+        finally:
+            manager.close_all()
+
+    def test_stdio_close_uses_terminate_then_force_kill(self, monkeypatch):
+        import asyncio
+        from agent.mcp import client
+        from agent.mcp.client import MCPToolBridge
+        from agent.mcp.types import MCPServerConfig
+
+        monkeypatch.setattr(client, "MCP_CLOSE_GRACE_SECONDS", 0.01)
+        monkeypatch.setattr(client, "MCP_FORCE_KILL_WAIT_SECONDS", 0.01)
+
+        class HungTransport:
+            terminated = False
+            killed = False
+
+            async def __aexit__(self, *_args):
+                raise RuntimeError("transport stuck")
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+            async def wait(self):
+                if not self.killed:
+                    await asyncio.Event().wait()
+
+        bridge = MCPToolBridge(MCPServerConfig(name="stdio"))
+        transport = HungTransport()
+        bridge._transport_cm = transport
+
+        asyncio.run(bridge.close())
+
+        assert transport.terminated is True
+        assert transport.killed is True

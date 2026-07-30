@@ -458,6 +458,18 @@ class StreamingToolExecutor:
                     t.error = reason
             self._wake.set()
 
+    # ── Lifecycle (Phase 2) ─────────────────────────────────────────────
+
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = True) -> None:
+        """Shutdown the internal thread pool and cancel pending work.
+
+        Safe to call multiple times (idempotent).
+        """
+        self.abort_all("Executor shutdown")
+        if self._pool is not None:
+            self._pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+            self._pool = None
+
     # ── Helpers ──────────────────────────────────────────────────────────
 
     def _find_tracked(self, tool_call: "ToolCall") -> TrackedTool | None:

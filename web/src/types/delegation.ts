@@ -49,6 +49,30 @@ export interface TaskState {
   tokensUsed?: number;
   durationMs?: number;
   updatedAt?: string;
+  // Phase 4: resource governance fields
+  resourceRequested?: Record<string, number>;
+  resourceGranted?: Record<string, number>;
+  resourceConsumed?: Record<string, number>;
+  resourceRefunded?: Record<string, number>;
+  resourceQueuePosition?: number;
+  resourceWaitTimeS?: number;
+  resourceOutcome?: string;
+}
+
+export interface ResourceWorkerState {
+  limit: number;
+  reserved: number;
+  consumed: number;
+  available: number;
+  queued: number;
+  pressure: string;
+}
+
+export interface ResourceState {
+  mode: string;
+  worker: ResourceWorkerState;
+  active_leases: number;
+  queue_depth: number;
 }
 
 export interface DelegationRunState {
@@ -85,6 +109,14 @@ const EVENT_TYPES = new Set<WsDelegationEvent["type"]>([
   "delegation_synthesis_started",
   "delegation_completed",
   "delegation_budget_exhausted",
+  "delegation_resource_queued",
+  "delegation_resource_granted",
+  "delegation_resource_reconciled",
+  "delegation_resource_released",
+  "delegation_resource_cancelled",
+  "delegation_resource_capacity_timeout",
+  "delegation_resource_shutdown",
+  "delegation_resource_rejected",
 ]);
 
 const TASK_STATUS_RANK: Record<DelegationTaskStatus, number> = {
@@ -263,6 +295,32 @@ export function reduceDelegationEvent(runs: DelegationRuns, event: WsMessage): D
       integrationStatus: data.integration_status || previousTask.integrationStatus,
       tokensUsed: data.tokens_used ?? previousTask.tokensUsed,
       durationMs: data.duration_ms ?? previousTask.durationMs,
+      resourceRequested: event.type === "delegation_resource_queued"
+        ? data.resources
+        : previousTask.resourceRequested,
+      resourceGranted: event.type === "delegation_resource_granted"
+        ? data.resources
+        : previousTask.resourceGranted,
+      resourceConsumed: (
+        event.type === "delegation_resource_reconciled"
+        || event.type === "delegation_resource_released"
+      )
+        ? data.actual
+        : previousTask.resourceConsumed,
+      resourceRefunded: (
+        event.type === "delegation_resource_reconciled"
+        || event.type === "delegation_resource_released"
+      )
+        ? Object.fromEntries(Object.entries(data.resources || {}).map(
+          ([kind, reserved]) => [
+            kind,
+            Math.max(0, reserved - (data.actual?.[kind] || 0)),
+          ],
+        ))
+        : previousTask.resourceRefunded,
+      resourceQueuePosition: data.queue_position ?? previousTask.resourceQueuePosition,
+      resourceWaitTimeS: data.wait_time_s ?? previousTask.resourceWaitTimeS,
+      resourceOutcome: data.outcome ?? previousTask.resourceOutcome,
       updatedAt: laterTimestamp(previousTask.updatedAt, event.timestamp),
     };
     const isTerminal = TASK_STATUS_RANK[task.status] === 2;

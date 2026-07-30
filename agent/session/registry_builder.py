@@ -14,8 +14,9 @@ by path safety checks inside file tools.
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING
+
+from config.env import SubagentSafetyLimits
 
 if TYPE_CHECKING:
     from agent.session.models import AgentDefinition, SessionRecord
@@ -34,15 +35,9 @@ def attach_delegation_tools(
     circuit_breaker=None,
 ) -> "ToolRegistry":
     """Attach session-bound delegation controls when declared and in depth."""
-    try:
-        configured_depth = int(
-            os.environ.get("GRACE_MAX_SUBAGENT_SPAWN_DEPTH", "1")
-        )
-    except ValueError:
-        configured_depth = 1
-    configured_depth = max(
-        1,
-        min(configured_depth, session.agent_depth.MAX_SUBAGENT_DEPTH),
+    configured_depth = min(
+        SubagentSafetyLimits.from_environment().max_spawn_depth,
+        session.agent_depth.MAX_SUBAGENT_DEPTH,
     )
     delegatable_children = (
         agent_registry.delegatable_by(spec)

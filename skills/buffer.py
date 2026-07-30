@@ -26,7 +26,7 @@ class SkillContextBuffer:
     """
 
     MAX_ACTIVE = 3
-    MAX_CHARS_PER_SKILL = 5000  # ~1250 tokens
+    MAX_CHARS_PER_SKILL = 20_000  # ~5,000 tokens
 
     def __init__(self, max_active: int = MAX_ACTIVE, max_chars: int = MAX_CHARS_PER_SKILL):
         self._max_active = max_active
@@ -74,3 +74,7 @@ class SkillContextBuffer:
     def clear(self) -> None:
         """清空所有激活的 skill。"""
         self._active.clear()
+
+    def deactivate(self, name: str) -> bool:
+        """Deactivate one skill and release its compaction payload."""
+        return self._active.pop(name, None) is not None

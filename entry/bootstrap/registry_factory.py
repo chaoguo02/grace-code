@@ -32,7 +32,8 @@ def initialize_mcp_integration(cfg: Any, registry: Any) -> Any | None:
     integration = MCPToolIntegration({"mcp_servers": server_configs})
     integration.initialize()
     integration.register_into(registry)
-    for tool in getattr(registry, "_tools", {}).values():
+    registry.add_closeable(integration)
+    for tool in registry.tools:
         if isinstance(tool, (ToolSearchTool, WaitForMcpServersTool)):
             tool.set_mcp_context(registry, integration)
     return integration
@@ -50,6 +51,8 @@ def build_registry(
 ) -> Any:
     """Build the complete ToolRegistry with all built-in tools + permission pipeline."""
     from core.base import ToolRegistry
+    from tools.pool import assemble_tool_pool
+    from tools.factory import build_tool
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool, FileReadCache
     from tools.file_edit_tool import FileEditTool
     from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
@@ -93,67 +96,85 @@ def build_registry(
 
     _global_read_cache = FileReadCache()
 
-    registry = (
-        ToolRegistry(permission_pipeline=pipeline)
-        .register(ShellTool(runtime=runtime))
-        .register(FileReadTool(read_cache=_global_read_cache))
-        .register(FileViewTool(read_cache=_global_read_cache))
-        .register(FileWriteTool(read_cache=_global_read_cache, workspace_root=project_root))
-        .register(FileEditTool(read_cache=_global_read_cache, workspace_root=project_root))
-        .register(SearchTextTool())
-        .register(FindFilesTool())
-        .register(FindSymbolTool())
-        .register(PytestTool(runtime=runtime, workspace_root=project_root))
-        .register(GitStatusTool(runtime=runtime))
-        .register(GitDiffTool(runtime=runtime))
-        .register(GitAddTool(runtime=runtime))
-        .register(GitCommitTool(runtime=runtime))
-        .register(WebSearchTool(max_results=web_cfg.search_max_results))
-        .register(WebFetchTool(max_chars=web_cfg.fetch_max_chars, timeout=web_cfg.fetch_timeout))
-        .register(ArtifactListTool(artifact_store_ref))
-        .register(ArtifactReadTool(artifact_store_ref))
-        .register(ArtifactSearchTool(artifact_store_ref))
-        .register(EvidenceListTool(evidence_ledger_ref))
-        .register(EvidenceGetTool(evidence_ledger_ref))
-        .register(SubmitAnalysisTool())
-        # CC-aligned plan mode + worktree session tools
-        .register(EnterPlanModeTool()).register(ExitPlanModeTool())
-        .register(EnterWorktreeTool()).register(ExitWorktreeTool())
-        .register(WorkflowTool()).register(ToolSearchTool()).register(WaitForMcpServersTool())
-    )
-    registry._artifact_store_ref = artifact_store_ref
-    registry._evidence_ledger_ref = evidence_ledger_ref
-
     if skill_registry is None and project_root:
         from skills.registry import SkillRegistry
-        skill_registry = SkillRegistry(str(Path(project_root) / ".grace" / "skills"))
+        skill_registry = SkillRegistry.for_project(project_root)
+
+    from skills.buffer import SkillContextBuffer
+    skill_buffer = SkillContextBuffer() if skill_registry is not None else None
+    registry = ToolRegistry(
+        permission_pipeline=pipeline,
+        artifact_store_ref=artifact_store_ref,
+        evidence_ledger_ref=evidence_ledger_ref,
+        skill_registry=skill_registry,
+        skill_buffer=skill_buffer,
+    )
+
+    local_tools = [build_tool(tool=tool) for tool in [
+        ShellTool(runtime=runtime),
+        FileReadTool(read_cache=_global_read_cache),
+        FileViewTool(read_cache=_global_read_cache),
+        FileWriteTool(
+            read_cache=_global_read_cache,
+            workspace_root=project_root,
+        ),
+        FileEditTool(
+            read_cache=_global_read_cache,
+            workspace_root=project_root,
+        ),
+        SearchTextTool(),
+        FindFilesTool(),
+        FindSymbolTool(),
+        PytestTool(runtime=runtime, workspace_root=project_root),
+        GitStatusTool(runtime=runtime),
+        GitDiffTool(runtime=runtime),
+        GitAddTool(runtime=runtime),
+        GitCommitTool(runtime=runtime),
+        WebSearchTool(max_results=web_cfg.search_max_results),
+        WebFetchTool(
+            max_chars=web_cfg.fetch_max_chars,
+            timeout=web_cfg.fetch_timeout,
+        ),
+        ArtifactListTool(artifact_store_ref),
+        ArtifactReadTool(artifact_store_ref),
+        ArtifactSearchTool(artifact_store_ref),
+        EvidenceListTool(evidence_ledger_ref),
+        EvidenceGetTool(evidence_ledger_ref),
+        SubmitAnalysisTool(),
+        EnterPlanModeTool(),
+        ExitPlanModeTool(),
+        EnterWorktreeTool(),
+        ExitWorktreeTool(),
+        WorkflowTool(),
+        ToolSearchTool(),
+        WaitForMcpServersTool(),
+    ]]
 
     if skill_registry is not None:
-        from skills.buffer import SkillContextBuffer
-        skill_buffer = SkillContextBuffer()
-        registry._skill_registry = skill_registry
-        registry._skill_buffer = skill_buffer
         if skill_registry.list_skills():
             from skills.tool import SkillTool
-            registry.register(SkillTool(
+            local_tools.append(build_tool(tool=SkillTool(
                 skill_registry,
                 buffer=skill_buffer,
                 runtime=runtime,
-            ))
+            )))
 
     if memory_store is not None:
         from tools.memory_tool import (
             MemoryReadTool, MemoryWriteTool, MemoryListTool, MemoryDeleteTool,
         )
-        registry \
-            .register(MemoryReadTool(memory_store)) \
-            .register(MemoryWriteTool(memory_store)) \
-            .register(MemoryListTool(memory_store)) \
-            .register(MemoryDeleteTool(memory_store))
+        local_tools.extend([
+            build_tool(tool=MemoryReadTool(memory_store)),
+            build_tool(tool=MemoryWriteTool(memory_store)),
+            build_tool(tool=MemoryListTool(memory_store)),
+            build_tool(tool=MemoryDeleteTool(memory_store)),
+        ])
 
         if external_store is not None:
             from tools.memory_tool import MemorySearchTool
-            registry.register(MemorySearchTool(external_store))
+            local_tools.append(build_tool(
+                tool=MemorySearchTool(external_store),
+            ))
 
-    # ── MCP tools ──────────────────────────────────────────────────────
+    registry.register_many(assemble_tool_pool(local_tools))
     return registry

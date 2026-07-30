@@ -103,16 +103,25 @@ class PolicyAwareToolRegistry(ToolRegistry):
         base_allowed_tools: set[str] | frozenset[str] | None = None,
         modifier_owner: "PolicyAwareToolRegistry | None" = None,
     ) -> None:
-        super().__init__(hook_dispatcher=base.hook_dispatcher)
+        super().__init__(
+            hook_dispatcher=base.hook_dispatcher,
+            capability_registry=base.capability_registry,
+            artifact_store_ref=base.artifact_store_ref,
+            evidence_ledger_ref=base.evidence_ledger_ref,
+            skill_registry=base.skill_registry,
+            skill_buffer=base.skill_buffer,
+        )
+        self._owns_lifecycle = False
         self._base = base
         self._phase_policy = phase_policy
+        self._skill_base_policy = phase_policy
         self._repo_path = repo_path
         self._phase_name = phase_name
         self._base_allowed_tools = frozenset(base_allowed_tools) if base_allowed_tools is not None else None
         self._modifier_owner = modifier_owner
         self._skill_runtime_overrides: dict[str, str] = {}
-        self._artifact_store_ref = getattr(base, "_artifact_store_ref", None)
-        self._evidence_ledger_ref = getattr(base, "_evidence_ledger_ref", None)
+        self._artifact_store_ref = base.artifact_store_ref
+        self._evidence_ledger_ref = base.evidence_ledger_ref
         for name, tool in base._tools.items():
             if self._is_tool_visible(name):
                 self._tools[name] = tool
@@ -284,13 +293,21 @@ class PolicyAwareToolRegistry(ToolRegistry):
         return True
 
     def get_schemas(self):
-        schemas = [
-            schema
+        from tools.pool import assemble_tool_pool, is_mcp_tool
+        visible = [
+            tool
             for name, tool in self._tools.items()
             if self._is_tool_visible(name) and self._is_tool_enabled(name)
+        ]
+        ordered = assemble_tool_pool(
+            (tool for tool in visible if not is_mcp_tool(tool)),
+            (tool for tool in visible if is_mcp_tool(tool)),
+        )
+        schemas = [
+            schema
+            for tool in ordered
             if not (schema := tool.to_llm_schema()).deferred
         ]
-        schemas.sort(key=lambda s: s.name)
         return schemas
 
     @property
@@ -327,7 +344,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
         return result
 
     def _apply_skill_modifier(self, modifier) -> None:
-        """Persist a skill modifier on this run's registry and bound clones."""
+        """Replace the active modifier; skill policies never accumulate."""
         from skills.tool import SkillContextModifier
         if not isinstance(modifier, SkillContextModifier):
             return
@@ -335,7 +352,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
         owner = self._modifier_owner or self
         targets = (self,) if owner is self else (self, owner)
         for target in targets:
-            new_policy = target._phase_policy
+            new_policy = target._skill_base_policy
             if modifier.allowed_tools:
                 new_policy = new_policy.with_pre_approved_tools(modifier.allowed_tools)
             if modifier.disallowed_tools:
@@ -353,6 +370,15 @@ class PolicyAwareToolRegistry(ToolRegistry):
                     if value
                 },
             }
+
+    def deactivate_skill_modifier(self) -> None:
+        """Restore the pre-skill policy and runtime overrides."""
+        owner = self._modifier_owner or self
+        owner._phase_policy = owner._skill_base_policy
+        owner._skill_runtime_overrides = {}
+        if owner is not self:
+            self._phase_policy = self._skill_base_policy
+            self._skill_runtime_overrides = {}
 
     @property
     def skill_runtime_overrides(self) -> dict[str, str]:

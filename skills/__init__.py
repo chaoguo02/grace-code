@@ -10,7 +10,18 @@ Skill 系统 — filesystem-based 可复用技能模块。
 - 支持 $ARGUMENTS 参数替换
 """
 
-from skills.registry import SkillRegistry, SkillMetadata
+from skills.registry import (
+    SkillChangeDetector,
+    SkillMetadata,
+    SkillRegistry,
+    SkillSource,
+)
 from skills.tool import SkillTool
 
-__all__ = ["SkillRegistry", "SkillMetadata", "SkillTool"]
+__all__ = [
+    "SkillChangeDetector",
+    "SkillMetadata",
+    "SkillRegistry",
+    "SkillSource",
+    "SkillTool",
+]

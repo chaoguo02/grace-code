@@ -154,8 +154,16 @@ class ThreadedSessionMemorySubagent:
                 LLMMessage(role="system", content=EXTRACTION_SYSTEM_PROMPT),
                 LLMMessage(role="user", content=request.prompt),
             ]
-            response = self._backend.complete(messages, tools=[])
-            updated = _response_text(response).strip()
+            from llm.provider_capacity import complete_with_provider_capacity
+
+            response = complete_with_provider_capacity(
+                self._backend,
+                messages,
+                [],
+            )
+            from llm.response_utils import response_text
+
+            updated = response_text(response).strip()
             if _is_valid_notes_output(updated):
                 result = self._write_tool.execute({"path": str(request.notes_path), "content": updated})
                 if result.success:
@@ -282,22 +290,6 @@ class SessionMemoryTracker:
             "Update the notes to reflect the latest work. Return the COMPLETE updated file content."
         )
         return "\n\n".join(parts)
-
-
-def _response_text(response: object) -> str:
-    text = getattr(response, "text", None)
-    if isinstance(text, str):
-        return text
-    action = getattr(response, "action", None)
-    if action is not None:
-        message = getattr(action, "message", None)
-        if isinstance(message, str) and message:
-            return message
-        thought = getattr(action, "thought", None)
-        if isinstance(thought, str):
-            return thought
-    raw_content = getattr(response, "raw_content", None)
-    return raw_content if isinstance(raw_content, str) else ""
 
 
 def _is_valid_notes_output(text: str) -> bool:

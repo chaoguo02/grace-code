@@ -864,11 +864,17 @@ def execute_action(
         for batch in batches:
             for call in batch:
                 executor.enqueue(call)
-    executor.dispatch()
-    return ExecutedAction(
-        tool_calls=tuple(effective_calls),
-        results=tuple(executor.collect()),
-    )
+    try:
+        executor.dispatch()
+        results = tuple(executor.collect())
+        return ExecutedAction(
+            tool_calls=tuple(effective_calls),
+            results=results,
+        )
+    finally:
+        shutdown = getattr(executor, "shutdown", None)
+        if callable(shutdown):
+            shutdown(wait=True, cancel_futures=False)
 
 
 @dataclass(frozen=True)

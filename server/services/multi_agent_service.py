@@ -5,8 +5,12 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 from enum import Enum
-import os
+import logging
 from typing import Any
+
+from config.env import SubagentSafetyLimits
+
+logger = logging.getLogger(__name__)
 
 
 def _value(value: Any) -> Any:
@@ -30,18 +34,31 @@ class MultiAgentService:
     def __init__(self, agent_service: Any) -> None:
         self._service = agent_service
         self._store = agent_service._store
+        self._integration_coordinator: object | None = None
+        self._integration_resolved: bool = False
+
+    @property
+    def _integration(self) -> object | None:
+        """Lazy-resolve the integration coordinator on first access.
+
+        At construction time the runtime may not be ready yet.  Deferring
+        resolution avoids a permanent None assignment.
+        """
+        if self._integration_resolved:
+            return self._integration_coordinator
+        self._integration_resolved = True
+        runtime = getattr(self._service, "_runtime", None)
+        if runtime is None:
+            return None
         from agent.session.integration_coordinator import (
             DelegationIntegrationCoordinator,
         )
-        self._integration = (
-            DelegationIntegrationCoordinator(
-                agent_service._runtime,
-                self._store,
-                event_callback=self._emit_delegation_event,
-            )
-            if getattr(agent_service, "_runtime", None) is not None
-            else None
+        self._integration_coordinator = DelegationIntegrationCoordinator(
+            runtime,
+            self._store,
+            event_callback=self._emit_delegation_event,
         )
+        return self._integration_coordinator
 
     def _emit_delegation_event(
         self, event_type: str, run_id: str, payload: dict[str, object],
@@ -337,6 +354,8 @@ class MultiAgentService:
             ),
         }
 
+        # Phase 3-4: live resource governance state
+        resource = self._resource_state()
         return {
             "selected_session_id": selected.id,
             "root_session_id": root_id,
@@ -344,6 +363,7 @@ class MultiAgentService:
             "delegation_runs": delegation_runs,
             "delegation_tasks": delegation_tasks,
             "limits": self._limits(),
+            "resource": resource,
             "feature": {
                 "enabled": feature.enabled,
                 "environment_variable": "GRACE_MULTI_AGENT_MODE_ENABLED",
@@ -486,34 +506,61 @@ class MultiAgentService:
             "failure_detail": str(task.get("error", "")) or None,
         }
 
-    @staticmethod
-    def _int_env(name: str, default: int, *, maximum: int = 10_000) -> int:
-        try:
-            value = int(os.environ.get(name, str(default)))
-        except ValueError:
-            value = default
-        return max(1, min(value, maximum))
+    def _resource_state(self) -> dict[str, Any]:
+        """Phase 3-4: live resource governance state for frontend display."""
+        runtime = getattr(self._service, "_runtime", None)
+        if runtime is None:
+            return {}
+        governor = getattr(runtime, "_governor", None)
+        if governor is None:
+            return {}
+        from core.resource_governor import ResourceKind
+        snap = governor.snapshot()
+        ws = snap.snapshots.get(ResourceKind.WORKER_SLOT)
+        if ws is None:
+            return {"mode": governor.mode}
+        return {
+            "mode": governor.mode,
+            "worker": {
+                "limit": ws.limit,
+                "reserved": ws.reserved,
+                "consumed": ws.consumed,
+                "available": ws.available,
+                "queued": ws.queued,
+                "pressure": ws.pressure.value if hasattr(ws.pressure, "value") else str(ws.pressure),
+            },
+            "active_leases": snap.active_leases,
+            "queue_depth": governor.queue_depth,
+        }
 
     def _limits(self) -> dict[str, int]:
         from agent.session.multi_agent_config import MultiAgentFeatureConfig
 
         multi_agent = MultiAgentFeatureConfig.from_environment()
-        return {
+        safety_limits = SubagentSafetyLimits.from_environment()
+        result = {
             "max_multi_agent_tasks": multi_agent.max_tasks,
             "max_wave_fanout": multi_agent.max_wave_fanout,
-            "max_spawn_per_session": self._int_env(
-                "GRACE_MAX_SUBAGENTS_PER_SESSION", 64,
-            ),
-            "max_concurrent_subagents": self._int_env(
-                "GRACE_MAX_CONCURRENT_SUBAGENTS", 4, maximum=64,
-            ),
-            "max_subagent_spawn_depth": self._int_env(
-                "GRACE_MAX_SUBAGENT_SPAWN_DEPTH", 1, maximum=5,
-            ),
-            "max_fanout_per_turn": self._int_env(
-                "GRACE_MAX_FANOUT_PER_TURN", 3, maximum=16,
-            ),
+            "max_concurrent_subagents": multi_agent.max_concurrent,
+            "max_spawn_per_session": safety_limits.max_spawn_per_session,
+            "max_subagent_spawn_depth": safety_limits.max_spawn_depth,
+            "max_fanout_per_turn": multi_agent.max_wave_fanout,
         }
+        # Merge governor limits when available (Phase 1)
+        runtime = getattr(self._service, "_runtime", None)
+        if runtime is not None:
+            governor = getattr(runtime, "_governor", None)
+            if governor is not None:
+                from core.resource_governor import ResourceKind
+                snap = governor.snapshot()
+                ws = snap.snapshots.get(ResourceKind.WORKER_SLOT)
+                if ws is not None and ws.limit > 0:
+                    result["governor_worker_limit"] = ws.limit
+                    result["governor_worker_available"] = ws.available
+                    result["governor_worker_reserved"] = ws.reserved
+                    result["governor_mode"] = governor.mode
+                    result["governor_queue_depth"] = governor.queue_depth
+        return result
 
     def _team_projection(self, root_id: str) -> dict[str, Any]:
         from agent.team.feature_flags import TeamFeatureConfig
@@ -645,9 +692,16 @@ class MultiAgentService:
     def _context(self, record: Any) -> dict[str, Any]:
         try:
             messages = self._store.list_messages(record.id)
-        except Exception:
+            context_error = None
+        except Exception as exc:
+            logger.warning(
+                "Failed to list messages for session %s: %s",
+                record.id,
+                exc,
+            )
             messages = []
-        return {
+            context_error = str(exc)
+        result = {
             "session_id": record.id,
             "agent_name": record.agent_name,
             "origin": str(_value(record.context_origin)),
@@ -665,7 +719,9 @@ class MultiAgentService:
             "tool_contract_persisted": bool(
                 (record.metadata or {}).get("parent_tool_schemas")
             ),
+            "context_error": context_error,
         }
+        return result
 
     def _communications(
         self, records: list[Any], notifications: list[dict[str, Any]],

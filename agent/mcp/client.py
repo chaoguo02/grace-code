@@ -6,11 +6,20 @@ Multi-transport: stdio (MCP SDK), HTTP JSON-RPC 2.0, SSE, WebSocket.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
 import os
+import shutil
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
 from agent.mcp.types import MCPServerConfig, MCPToolInfo
+
+_logger = logging.getLogger(__name__)
+MCP_CLOSE_GRACE_SECONDS = 5.0
+MCP_FORCE_KILL_WAIT_SECONDS = 2.0
 
 try:
     from mcp.client.session import ClientSession
@@ -53,6 +62,68 @@ class MCPToolCallError(RuntimeError):
     """Raised when a remote MCP tool call fails before returning a result."""
 
 
+def _server_fingerprint(result: Any, config: MCPServerConfig) -> str:
+    """Fingerprint initialized server identity and launch configuration."""
+    executable_fact = _launch_fact(config)
+    payload = {
+        "protocolVersion": getattr(
+            result,
+            "protocolVersion",
+            None,
+        ) or (
+            result.get("protocolVersion")
+            if isinstance(result, dict)
+            else None
+        ),
+        "serverInfo": getattr(result, "serverInfo", None) or (
+            result.get("serverInfo")
+            if isinstance(result, dict)
+            else None
+        ),
+        "command": config.command,
+        "args": config.args,
+        "url": config.url,
+        "executable": executable_fact,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        default=str,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _launch_fingerprint(config: MCPServerConfig) -> str:
+    encoded = json.dumps(
+        _launch_fact(config),
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _launch_fact(config: MCPServerConfig) -> dict[str, Any]:
+    executable = shutil.which(config.command) if config.command else None
+    executable_fact: dict[str, Any] | None = None
+    if executable:
+        try:
+            stat = Path(executable).stat()
+            executable_fact = {
+                "path": str(Path(executable).resolve()),
+                "mtime_ns": stat.st_mtime_ns,
+                "size": stat.st_size,
+            }
+        except OSError:
+            executable_fact = {"path": executable}
+    return {
+        "command": config.command,
+        "args": config.args,
+        "url": config.url,
+        "executable": executable_fact,
+    }
+
+
 def create_mcp_bridge(config: MCPServerConfig) -> "MCPToolBridge":
     """Factory: return the correct bridge implementation for the transport type.
 
@@ -91,6 +162,8 @@ class MCPToolBridge:
         self._session: Any = None
         self._tools: list[MCPToolInfo] = []
         self._connected = False
+        self._fingerprint = ""
+        self._launch_fingerprint = ""
         # MCP-05: callback invoked when server sends notifications/tools/list_changed
         self._on_tools_changed: Any = None
 
@@ -101,6 +174,19 @@ class MCPToolBridge:
     @property
     def tools(self) -> list[MCPToolInfo]:
         return list(self._tools)
+
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint
+
+    def mark_disconnected(self) -> None:
+        self._connected = False
+
+    def launch_fingerprint_changed(self) -> bool:
+        return bool(
+            self._launch_fingerprint
+            and self._launch_fingerprint != _launch_fingerprint(self.config)
+        )
 
     async def __aenter__(self) -> "MCPToolBridge":
         await self.connect()
@@ -134,7 +220,12 @@ class MCPToolBridge:
 
         self._session_cm = ClientSession(read_stream, write_stream)
         self._session = await self._session_cm.__aenter__()
-        await self._session.initialize()
+        initialize_result = await self._session.initialize()
+        self._fingerprint = _server_fingerprint(
+            initialize_result,
+            self.config,
+        )
+        self._launch_fingerprint = _launch_fingerprint(self.config)
 
         self._tools = await self.discover_tools()
         # MCP-05: register for dynamic tool update notifications
@@ -144,17 +235,36 @@ class MCPToolBridge:
         return self.tools
 
     async def close(self) -> None:
-        """Close the MCP session and transport."""
+        """Close streams, then terminate a surviving stdio subprocess."""
         if self._session_cm is not None:
             try:
-                await self._session_cm.__aexit__(None, None, None)
+                await asyncio.wait_for(
+                    self._session_cm.__aexit__(None, None, None),
+                    timeout=MCP_CLOSE_GRACE_SECONDS,
+                )
+            except Exception:
+                _logger.warning(
+                    "MCP session close timed out for %s",
+                    self.config.name,
+                    exc_info=True,
+                )
             finally:
                 self._session_cm = None
                 self._session = None
 
         if self._transport_cm is not None:
             try:
-                await self._transport_cm.__aexit__(None, None, None)
+                await asyncio.wait_for(
+                    self._transport_cm.__aexit__(None, None, None),
+                    timeout=MCP_CLOSE_GRACE_SECONDS,
+                )
+            except Exception:
+                _logger.warning(
+                    "MCP transport close timed out for %s",
+                    self.config.name,
+                    exc_info=True,
+                )
+                await self._terminate_process()
             finally:
                 self._transport_cm = None
 
@@ -189,16 +299,10 @@ class MCPToolBridge:
                 f"{self.config.timeout_seconds:.1f}s"
             ) from exc
         except Exception as exc:
-            return MCPCallResult(
-                content=[{"text": str(exc)}],
-                is_error=True,
-                metadata={
-                    "mcp_server": self.config.name,
-                    "mcp_tool": tool_name,
-                    "mcp_is_error": True,
-                    "mcp_error": str(exc),
-                },
-            )
+            self._connected = False
+            raise MCPToolCallError(
+                f"MCP transport failure for '{self.config.name}': {exc}",
+            ) from exc
 
         return MCPCallResult(
             content=list(getattr(result, "content", []) or []),
@@ -291,6 +395,65 @@ class MCPToolBridge:
         if self._session is None:
             raise RuntimeError("MCPToolBridge is not connected")
 
+    async def _terminate_process(self) -> None:
+        """Best-effort terminate → wait → kill for SDK-owned subprocesses."""
+        candidates = [
+            self._transport_cm,
+            getattr(self._transport_cm, "_process", None),
+            getattr(self._transport_cm, "process", None),
+        ]
+        generator = getattr(self._transport_cm, "gen", None)
+        frame = getattr(generator, "ag_frame", None) or getattr(
+            generator,
+            "gi_frame",
+            None,
+        )
+        if frame is not None:
+            candidates.extend(frame.f_locals.values())
+        process = next(
+            (
+                item for item in candidates
+                if item is not None
+                and callable(getattr(item, "terminate", None))
+            ),
+            None,
+        )
+        if process is None:
+            _logger.error(
+                "leaked_operation: MCP process handle unavailable for %s",
+                self.config.name,
+            )
+            return
+        process.terminate()
+        wait = getattr(process, "wait", None)
+        if callable(wait):
+            try:
+                result = wait()
+                if hasattr(result, "__await__"):
+                    await asyncio.wait_for(
+                        result,
+                        timeout=MCP_CLOSE_GRACE_SECONDS,
+                    )
+                return
+            except asyncio.TimeoutError:
+                pass
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            kill()
+            if callable(wait):
+                try:
+                    result = wait()
+                    if hasattr(result, "__await__"):
+                        await asyncio.wait_for(
+                            result,
+                            timeout=MCP_FORCE_KILL_WAIT_SECONDS,
+                        )
+                except asyncio.TimeoutError:
+                    _logger.error(
+                        "leaked_operation: MCP process survived force kill: %s",
+                        self.config.name,
+                    )
+
     # ── MCP-05: Dynamic tool updates ─────────────────────────────────
 
     async def _on_list_changed(self, _notification: Any = None) -> None:
@@ -334,13 +497,13 @@ class HttpMCPBridge(MCPToolBridge):
     """
 
     JSONRPC_VERSION = "2.0"
-    _next_id: int = 0
-
     def __init__(self, config: MCPServerConfig) -> None:
         super().__init__(config)
         self._tools: list[MCPToolInfo] = []
         self._client: Any = None  # httpx.AsyncClient
         self._session_id: str | None = None
+        self._next_id = 0
+        self._id_lock = asyncio.Lock()
 
     @property
     def transport_type(self) -> str:
@@ -394,16 +557,10 @@ class HttpMCPBridge(MCPToolBridge):
                 f"{self.config.timeout_seconds:.1f}s"
             ) from exc
         except Exception as exc:
-            return MCPCallResult(
-                content=[{"text": str(exc)}],
-                is_error=True,
-                metadata={
-                    "mcp_server": self.config.name,
-                    "mcp_tool": tool_name,
-                    "mcp_is_error": True,
-                    "mcp_error": str(exc),
-                },
-            )
+            self._connected = False
+            raise MCPToolCallError(
+                f"MCP transport failure for '{self.config.name}': {exc}",
+            ) from exc
 
         return MCPCallResult(
             content=list(result.get("content", []) or []),
@@ -445,14 +602,18 @@ class HttpMCPBridge(MCPToolBridge):
             "clientInfo": {"name": "grace-code", "version": "1.0"},
         })
         self._session_id = result.get("sessionId")
+        self._fingerprint = _server_fingerprint(result, self.config)
+        self._launch_fingerprint = _launch_fingerprint(self.config)
 
     async def _rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if self._client is None:
             raise RuntimeError("HttpMCPBridge is not connected")
-        HttpMCPBridge._next_id += 1
+        async with self._id_lock:
+            self._next_id += 1
+            request_id = self._next_id
         body = {
             "jsonrpc": self.JSONRPC_VERSION,
-            "id": HttpMCPBridge._next_id,
+            "id": request_id,
             "method": method,
             "params": params,
         }
@@ -462,7 +623,6 @@ class HttpMCPBridge(MCPToolBridge):
             response.raise_for_status()
             ct = response.headers.get("content-type", "")
             if not ct.startswith("application/json") and not ct.startswith("text/plain"):
-                from agent.mcp.client import _logger as _mcp_logger
                 import logging as _logging
                 _mcp_log = _logging.getLogger(__name__)
                 _mcp_log.warning(
@@ -530,7 +690,6 @@ class SseMCPBridge(HttpMCPBridge):
         """
         _logger = __import__("logging").getLogger(__name__)
         try:
-            import httpx
             url = self.config.url.rstrip("/") + "/sse"
             async with self._client.stream("GET", url) as response:  # type: ignore[union-attr]
                 async for line in response.aiter_lines():
@@ -654,10 +813,12 @@ class WsMCPBridge(HttpMCPBridge):
         if self._ws is None:
             raise RuntimeError("WsMCPBridge is not connected")
         import json as _json
-        HttpMCPBridge._next_id += 1
+        async with self._id_lock:
+            self._next_id += 1
+            request_id = self._next_id
         body = {
             "jsonrpc": self.JSONRPC_VERSION,
-            "id": HttpMCPBridge._next_id,
+            "id": request_id,
             "method": method,
             "params": params,
         }

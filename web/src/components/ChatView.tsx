@@ -223,6 +223,7 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
     viewingChildSessionId,
     backgroundAgents,
     delegationRuns,
+    resourceGovernance,
     draft: storedDraft,
     streamingThought,
     activeTurn,
@@ -339,20 +340,16 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [timeline, isRunning, error]);
 
-  // After round completion: run_terminal has archived activeTurn → completedTurns.
-  // Do an incremental DB sync (afterSeq > 0 → merge, not replace) to verify
-  // consistency between live streaming blocks and persisted DB data.
+  // run_terminal owns the durable timeline reconciliation. This effect only
+  // refreshes session metadata; issuing another timeline request here races
+  // the terminal handler and can briefly restore a stale active turn.
   const prevRunning = useRef(isRunning);
   useEffect(() => {
     if (prevRunning.current && !isRunning && activeId) {
       useSessionStore.getState().refreshActive();
-      const lastSeq = useChatStore.getState().sessionStateById[activeId]?.lastTraceSeq ?? 0;
-      if (lastSeq > 0) {
-        void loadTimeline(activeId, undefined, lastSeq);
-      }
     }
     prevRunning.current = isRunning;
-  }, [isRunning, activeId, loadTimeline]);
+  }, [isRunning, activeId]);
 
   // Refresh after compaction (manual /compact or auto-compaction).
   // Compaction updates sessions.updated_at before emitting the WS event,
@@ -987,6 +984,7 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
             <MultiAgentRunCard
               sessionId={activeId}
               runs={delegationRuns}
+              resourceGovernance={resourceGovernance}
               onViewChild={(childId) => setViewingChild(childId, activeId)}
             />
           )}

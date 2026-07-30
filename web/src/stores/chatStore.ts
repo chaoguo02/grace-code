@@ -74,6 +74,8 @@ export interface SessionUiState {
   viewingChildSessionId: string | null;
   backgroundAgents: Record<string, BackgroundAgentState>;
   delegationRuns: DelegationRuns;
+  /** Phase 4: live resource governance state (from snapshot). */
+  resourceGovernance: Record<string, unknown> | null;
   worktreeStates: Record<string, string>;
   /** Per-session draft text — survives tab switches. */
   draft: string;
@@ -159,6 +161,7 @@ export function createEmptySessionUiState(): SessionUiState {
     viewingChildSessionId: null,
     backgroundAgents: {},
     delegationRuns: {},
+    resourceGovernance: null,
     worktreeStates: {},
     draft: "",
     streamingThought: "",
@@ -217,18 +220,31 @@ export function applyWsToBlocks(
 
   // ── Thought completed ──
   if (ev.type === "thought") {
-    const last = blocks[blocks.length - 1];
-    if (last?.type === "thought" && last.phase === "streaming") {
-      last.content = ev.content || "";
-      last.phase = "completed";
-      last.summary = summarizeThought(ev.content || "");
+    // The full Action event is persisted only after the provider stream has
+    // ended, so answer text may already follow its thought deltas. Complete
+    // the nearest streaming thought in place instead of appending a second
+    // thought after the answer.
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const block = blocks[i];
+      if (block.type === "thought" && block.phase === "streaming") {
+        block.content = ev.content || "";
+        block.phase = "completed";
+        block.summary = summarizeThought(ev.content || "");
+        return;
+      }
+    }
+
+    const completedThought = {
+      type: "thought" as const,
+      content: ev.content || "",
+      summary: summarizeThought(ev.content || ""),
+      phase: "completed" as const,
+    };
+    const trailingTextIndex = blocks.length - 1;
+    if (blocks[trailingTextIndex]?.type === "text") {
+      blocks.splice(trailingTextIndex, 0, completedThought);
     } else {
-      blocks.push({
-        type: "thought",
-        content: ev.content || "",
-        summary: summarizeThought(ev.content || ""),
-        phase: "completed",
-      });
+      blocks.push(completedThought);
     }
     return;
   }
@@ -416,6 +432,10 @@ const _seenFingerprintsBySession = new Map<string, Set<string>>();
 // arrive for the same run (legacy + new signal paths).
 const _seenTerminalRunsBySession = new Map<string, Set<string>>();
 
+// Timeline loads can overlap (mount, websocket reconnect, and run_terminal all
+// trigger them). Only the newest request for a session may mutate UI state.
+const _timelineRequestVersionBySession = new Map<string, number>();
+
 function _isDuplicateTerminal(sessionId: string, runId: string): boolean {
   if (!runId) return false;
   let seen = _seenTerminalRunsBySession.get(sessionId);
@@ -590,6 +610,7 @@ function delegationSnapshotEvents(
       reason: "snapshot_reconciliation",
     });
     for (const task of runTasks) {
+      const resource = task.resource || {};
       const base = {
         delegation_run_id: run.id,
         task_id: task.id,
@@ -611,6 +632,35 @@ function delegationSnapshotEvents(
         events.push({ type: "delegation_task_reported", ...base });
       } else {
         events.push({ type: "delegation_task_failed", ...base });
+      }
+      if (resource.requested) {
+        events.push({
+          type: "delegation_resource_queued",
+          ...base,
+          resources: resource.requested,
+          queue_position: resource.queue_position,
+          wait_time_s: resource.wait_time_s,
+          outcome: resource.outcome,
+        });
+      }
+      if (resource.granted) {
+        events.push({
+          type: "delegation_resource_granted",
+          ...base,
+          resources: resource.granted,
+          wait_time_s: resource.wait_time_s,
+          outcome: resource.outcome,
+        });
+      }
+      if (resource.consumed) {
+        events.push({
+          type: "delegation_resource_released",
+          ...base,
+          resources: resource.granted || resource.requested || {},
+          actual: resource.consumed,
+          wait_time_s: resource.wait_time_s,
+          outcome: resource.outcome,
+        });
       }
     }
     if (run.verification) {
@@ -690,6 +740,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     }
     _seenFingerprintsBySession.delete(sessionId);
     _seenTerminalRunsBySession.delete(sessionId);
+    _timelineRequestVersionBySession.delete(sessionId);
     set((state) => {
       const next = { ...state.sessionStateById };
       delete next[sessionId];
@@ -742,9 +793,17 @@ export const useChatStore = create<ChatState>((set, get) => {
       }));
 
       if (isDelegationEvent(ev)) {
+        const delegationData = {
+          ...((ev.payload || {}) as Record<string, unknown>),
+          ...(ev as unknown as Record<string, unknown>),
+        };
         patchSession(sid, (prev) => ({
           ...prev,
           delegationRuns: reduceDelegationEvent(prev.delegationRuns, ev),
+          resourceGovernance: ev.type.startsWith("delegation_resource_")
+            ? (delegationData.governance as Record<string, unknown> | undefined)
+              || prev.resourceGovernance
+            : prev.resourceGovernance,
         }));
       }
 
@@ -1158,6 +1217,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (!sid) return;
       _seenFingerprintsBySession.delete(sid);
       _seenTerminalRunsBySession.delete(sid);
+      _timelineRequestVersionBySession.delete(sid);
       patchSession(sid, (prev) => ({
         ...createEmptySessionUiState(),
         currentMode: prev.currentMode,
@@ -1172,7 +1232,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       const validIds = new Set(validSessionIds);
       for (const sessionId of _seenFingerprintsBySession.keys()) {
         if (!validIds.has(sessionId)) _seenFingerprintsBySession.delete(sessionId);
-    _seenTerminalRunsBySession.delete(sessionId);
+        if (!validIds.has(sessionId)) _seenTerminalRunsBySession.delete(sessionId);
+        if (!validIds.has(sessionId)) _timelineRequestVersionBySession.delete(sessionId);
       }
       const { ws, _wsSessionId } = get();
       const activeRemoved = _wsSessionId && !validIds.has(_wsSessionId);
@@ -1377,12 +1438,19 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     loadTimeline: async (sessionId, signal, afterSeq = 0, reconcileTurnId = "") => {
+      const requestVersion = (
+        _timelineRequestVersionBySession.get(sessionId) ?? 0
+      ) + 1;
+      _timelineRequestVersionBySession.set(sessionId, requestVersion);
       try {
         ensureSession(sessionId);
         const [response, multiAgentSnapshot] = await Promise.all([
           api.getTimeline(sessionId, signal, afterSeq),
           getMultiAgentSnapshot(sessionId, signal).catch(() => null),
         ]);
+        if (_timelineRequestVersionBySession.get(sessionId) !== requestVersion) {
+          return;
+        }
         const snapshotEvents = multiAgentSnapshot
           ? delegationSnapshotEvents(
               multiAgentSnapshot.delegation_runs || [],
@@ -1473,8 +1541,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         ));
 
         patchSession(sessionId, (prev) => {
-            let activeTurn = prev.activeTurn;
+            // A terminal local state must not retain an old active turn when
+            // the authoritative response has no active run. Preserve only an
+            // optimistic/live turn while the local run is still in progress.
             const activeRun = response.active_run;
+            let activeTurn = activeRun
+              ? prev.activeTurn
+              : (prev.isRunning ? prev.activeTurn : null);
             if (activeRun) {
               const restored = dbTurns.find(
                 (turn) =>
@@ -1517,6 +1590,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                 afterSeq > 0 ? prev.delegationRuns : {},
               ),
             ),
+            resourceGovernance: (multiAgentSnapshot as unknown as Record<string, unknown> | null)?.resource as Record<string, unknown> ?? prev.resourceGovernance,
             events: afterSeq > 0
               ? [...events.slice().reverse(), ...prev.events].slice(0, 100)
               : events.slice().reverse().slice(0, 100),
@@ -1537,6 +1611,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           };
         });
       } catch (e: unknown) {
+        if (_timelineRequestVersionBySession.get(sessionId) !== requestVersion) {
+          return;
+        }
         if (afterSeq <= 0) {
           await get().loadMessages(sessionId, signal);
           await get().loadTraceEvents(sessionId, signal);
@@ -1588,6 +1665,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                 afterSeq > 0 ? prev.delegationRuns : {},
               ),
             ),
+            resourceGovernance: (multiAgentSnapshot as unknown as Record<string, unknown> | null)?.resource as Record<string, unknown> ?? prev.resourceGovernance,
             planApproval: restorePlanApprovalFromEvents(prev.planApproval, sessionId, events),
             lastTraceSeq: maxTraceSeq(events, prev.lastTraceSeq),
           };

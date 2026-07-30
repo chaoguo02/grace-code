@@ -532,7 +532,7 @@ async def _start_submitted_plan_run(
     if hasattr(service, "_event_bus") and service._event_bus is not None:
         await service._event_bus.create_session(session_id)
 
-    from agent.session.models import RunContext
+    from agent.session.models import PipelineRunContext as RunContext
 
     context = RunContext(
         session_id=session_id,

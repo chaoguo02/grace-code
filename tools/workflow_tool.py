@@ -147,21 +147,17 @@ class ToolSearchTool(BaseTool):
 
         # 1. From MCPToolIntegration (preferred — has connection state)
         if self._mcp_integration is not None:
-            for tool in getattr(self._mcp_integration, "_tools", []):
-                if getattr(tool, "should_defer", False) or getattr(tool, "is_mcp", False):
-                    deferred.append({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "server": getattr(tool, "mcp_props", None) and tool.mcp_props.server_name or "",
-                    })
+            deferred.extend(
+                self._mcp_integration.deferred_tool_descriptors(),
+            )
 
         # 2. Fallback: scan registry for MCP tools
         if not deferred and self._registry_ref is not None:
-            for name, tool in getattr(self._registry_ref, "_tools", {}).items():
+            for tool in self._registry_ref.tools:
                 mcp_props = getattr(tool, "mcp_props", None)
                 if mcp_props is not None:
                     deferred.append({
-                        "name": name,
+                        "name": tool.name,
                         "description": tool.description,
                         "server": mcp_props.server_name,
                     })
@@ -201,13 +197,13 @@ class ToolSearchTool(BaseTool):
 
         lines = [f"Matching deferred tools for '{params['query']}' ({len(activated)} activated):"]
         for m in matches[:20]:
-            marker = " *active" if m in activated else ""
+            marker = " *active" if m["name"] in activated else ""
             lines.append(f"  {m['name']} — {m['description'][:120]}{marker}")
         if len(matches) > 20:
             lines.append(f"  ... and {len(matches) - 20} more")
         return ToolResult(success=True, output="\n".join(lines))
 
-    def _activate_matched_tools(self, matches: list[dict]) -> list[dict]:
+    def _activate_matched_tools(self, matches: list[dict]) -> list[str]:
         """Mark matched MCP tools as always_load so full schemas appear next turn.
 
         CC-aligned: after ToolSearch finds a tool, the API injects its full
@@ -215,28 +211,21 @@ class ToolSearchTool(BaseTool):
         so we instead set always_load=True on the proxy, which makes the tool
         schema appear in the next get_schemas() call.
         """
-        activated = []
         if self._mcp_integration is None:
-            return activated
-        for m in matches:
-            name = m["name"]
-            for tool in getattr(self._mcp_integration, "_tools", []):
-                if tool.name == name:
-                    tool.always_load = True
-                    tool.should_defer = False
-                    activated.append(m)
-                    break
-        return activated
+            return []
+        return self._mcp_integration.activate_tools({
+            item["name"] for item in matches
+        })
 
     def _gather_connection_errors(self) -> str:
         """Collect connection errors from MCP servers (CC spec requirement)."""
         parts: list[str] = []
         if self._mcp_integration is not None:
-            manager = getattr(self._mcp_integration, "_manager", None)
-            if manager is not None:
-                for name, bridge in getattr(manager, "_bridges", {}).items():
-                    if not getattr(bridge, "is_connected", False):
-                        parts.append(f"{name}: not connected")
+            parts.extend(
+                f"{name}: {error}"
+                for name, error
+                in self._mcp_integration.connection_errors().items()
+            )
         return "; ".join(parts) if parts else ""
 
 
@@ -301,11 +290,11 @@ class WaitForMcpServersTool(BaseTool):
         if self._mcp_integration is None:
             return ToolResult(success=True, output="No MCP integration active — all servers ready.")
 
-        manager = getattr(self._mcp_integration, "_manager", None)
+        manager = self._mcp_integration.manager
         if manager is None:
             return ToolResult(success=True, output="No MCP manager — all servers ready.")
 
-        bridges = getattr(manager, "_bridges", {})
+        bridges = manager.bridges
         targets = set(server_names) if server_names else set(bridges.keys())
 
         # Poll until connected or timeout

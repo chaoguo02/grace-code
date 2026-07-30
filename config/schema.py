@@ -39,7 +39,7 @@ class AgentCfg:
     max_steps: int = 40
     budget_tokens: int = 80_000
     log_dir: str = ""
-    default_agent: str = "build"  # "build" | "plan" | "explore"
+    default_agent: str = "build"  # "build" | "plan" | "orchestrator"
 
 
 @dataclass
@@ -78,29 +78,62 @@ class MemoryConfig:
 
 
 @dataclass
-class CodeIndexConfig:
-    enabled: bool = True
-    max_chunk_lines: int = 100
-    min_chunk_lines: int = 2
+class ResourceGovernanceWorkerConfig:
+    global_max: int = 2
+    per_root_max: int = 2
 
 
 @dataclass
-class PlanCfg:
-    enable_replan: bool = False
-    max_replans: int = 1
-    allow_parallel_verification: bool = False
-    allow_parallel_commands: bool = False
+class ResourceGovernanceQueueConfig:
+    max_size: int = 64
+    timeout_seconds: float = 120.0
 
 
 @dataclass
-class MultiAgentCfg:
-    worker_model: str = ""
-    worker_provider: str = ""
-    max_parallel_executors: int = 3
-    coordinator_budget_ratio: float = 0.30
-    sub_agent_budget_ratio: float = 0.70
-    max_retries: int = 2
-    coordinator_max_steps: int = 25
+class ResourceGovernanceProviderConfig:
+    rate_limit_enabled: bool = False
+    rpm: int = 0
+    tpm: int = 0
+    max_concurrent: int = 0
+
+
+@dataclass
+class ResourceGovernanceEventConfig:
+    queue_max_size: int = 4096
+
+
+@dataclass
+class ResourceGovernanceToolConfig:
+    """Concurrency limits for externally-backed tools such as MCP."""
+
+    global_max: int = 8
+    per_root_max: int = 4
+
+
+@dataclass
+class ResourceGovernanceWorktreeConfig:
+    global_max: int = 10
+    per_root_max: int = 3
+    disk_limit_mb: int = 0  # 0 = no check
+
+
+@dataclass
+class ResourceGovernanceShutdownConfig:
+    drain_timeout_seconds: float = 30.0
+    force_kill_seconds: float = 5.0
+
+
+@dataclass
+class ResourceGovernanceConfig:
+    """统一资源治理配置。首期在 observe 模式运行，不阻止任何请求。"""
+    mode: str = "enforce"  # observe | soft_enforce | enforce
+    worker: ResourceGovernanceWorkerConfig = field(default_factory=ResourceGovernanceWorkerConfig)
+    queue: ResourceGovernanceQueueConfig = field(default_factory=ResourceGovernanceQueueConfig)
+    provider: ResourceGovernanceProviderConfig = field(default_factory=ResourceGovernanceProviderConfig)
+    event: ResourceGovernanceEventConfig = field(default_factory=ResourceGovernanceEventConfig)
+    tool: ResourceGovernanceToolConfig = field(default_factory=ResourceGovernanceToolConfig)
+    worktree: ResourceGovernanceWorktreeConfig = field(default_factory=ResourceGovernanceWorktreeConfig)
+    shutdown: ResourceGovernanceShutdownConfig = field(default_factory=ResourceGovernanceShutdownConfig)
 
 
 @dataclass
@@ -108,7 +141,6 @@ class ContextConfig:
     repo_map_budget: int = 8_000
     history_window: int = 20
     project_rules_file: str = ".grace/rules.md"
-    code_index: CodeIndexConfig = field(default_factory=CodeIndexConfig)
     # Phase 2: 预算分离
     request_budget_tokens: int = 70_000      # 单次 LLM request 输入上下文目标
     session_compact_tokens: int = 30_000     # shared_history 超过此值触发自动压缩
@@ -116,16 +148,6 @@ class ContextConfig:
     compact_every_rounds: int = 3            # 每 N 轮强制检查压缩
     artifact_threshold_tokens: int = 2_000   # 工具输出超过此值时 artifact 化
     artifact_storage_dir: str = ""
-
-
-@dataclass
-class HitlConfig:
-    enabled: bool = True
-    min_risk_for_confirm: str = "medium"
-    policy_file: str = ".grace/hitl/policies.yaml"
-    learn_threshold: int = 3
-    settings_file: str = ".grace/settings.json"
-    default_mode: str = "ask_edits"
 
 
 @dataclass
@@ -165,10 +187,8 @@ class AppConfig:
     agent: AgentCfg = field(default_factory=AgentCfg)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
-    plan: PlanCfg = field(default_factory=PlanCfg)
-    multi_agent: MultiAgentCfg = field(default_factory=MultiAgentCfg)
+    resource_governance: ResourceGovernanceConfig = field(default_factory=ResourceGovernanceConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
-    hitl: HitlConfig = field(default_factory=HitlConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     prompts: PromptConfig = field(default_factory=PromptConfig)
     mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -198,6 +218,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     Returns:
         AppConfig 实例
     """
+    config: AppConfig
     if path is None:
         # 自动查找：当前目录 → 项目根目录
         candidates = [
@@ -209,7 +230,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
                 path = p
                 break
         else:
-            return AppConfig()   # 找不到配置文件，用全默认值
+            config = AppConfig()   # 找不到配置文件，用全默认值
+            return config
 
     config_path = Path(path)
     if not config_path.exists():
@@ -217,7 +239,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     raw = config_path.read_text(encoding="utf-8")
     raw = _expand_env(raw)
     data: dict[str, Any] = yaml.safe_load(raw) or {}
-    return _parse(data)
+    config = _parse(data)
+    return config
 
 
 def _parse(data: dict[str, Any]) -> AppConfig:
@@ -226,10 +249,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     agent_raw = data.get("agent", {})
     tools_raw = data.get("tools", {})
     memory_raw = data.get("memory", {})
-    plan_raw = data.get("plan", {})
-    multi_agent_raw = data.get("multi_agent", {})
     context_raw = data.get("context", {})
-    hitl_raw = data.get("hitl", {})
     observability_raw = data.get("observability", {})
     langfuse_raw = observability_raw.get("langfuse", {})
     prompts_raw = data.get("prompts", {})
@@ -277,47 +297,59 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         selector_model=memory_raw.get("selector_model", ""),
     )
 
-    plan = PlanCfg(
-        enable_replan=bool(plan_raw.get("enable_replan", False)),
-        max_replans=int(plan_raw.get("max_replans", 1)),
-        allow_parallel_verification=bool(plan_raw.get("allow_parallel_verification", False)),
-        allow_parallel_commands=bool(plan_raw.get("allow_parallel_commands", False)),
-    )
+    # ── resource_governance ──
+    rg_raw = data.get("resource_governance", {})
+    rg_worker_raw = rg_raw.get("worker", {})
+    rg_queue_raw = rg_raw.get("queue", {})
+    rg_provider_raw = rg_raw.get("provider", {})
+    rg_event_raw = rg_raw.get("event", {})
+    rg_tool_raw = rg_raw.get("tool", {})
+    rg_worktree_raw = rg_raw.get("worktree", {})
+    rg_shutdown_raw = rg_raw.get("shutdown", {})
 
-    multi_agent = MultiAgentCfg(
-        worker_model=multi_agent_raw.get("worker_model", "") or "",
-        worker_provider=multi_agent_raw.get("worker_provider", "") or "",
-        max_parallel_executors=int(multi_agent_raw.get("max_parallel_executors", 3)),
-        coordinator_budget_ratio=float(multi_agent_raw.get("coordinator_budget_ratio", 0.30)),
-        sub_agent_budget_ratio=float(multi_agent_raw.get("sub_agent_budget_ratio", 0.70)),
-        max_retries=int(multi_agent_raw.get("max_retries", 2)),
-        coordinator_max_steps=int(multi_agent_raw.get("coordinator_max_steps", 25)),
-    )
-
-    code_index_raw = context_raw.get("code_index", {})
-    code_index = CodeIndexConfig(
-        enabled=bool(code_index_raw.get("enabled", True)),
-        max_chunk_lines=int(code_index_raw.get("max_chunk_lines", 100)),
-        min_chunk_lines=int(code_index_raw.get("min_chunk_lines", 3)),
+    resource_governance = ResourceGovernanceConfig(
+        mode=rg_raw.get("mode", "enforce") or "enforce",
+        worker=ResourceGovernanceWorkerConfig(
+            global_max=int(rg_worker_raw.get("global_max", 2)),
+            per_root_max=int(rg_worker_raw.get("per_root_max", 2)),
+        ),
+        queue=ResourceGovernanceQueueConfig(
+            max_size=int(rg_queue_raw.get("max_size", 64)),
+            timeout_seconds=float(rg_queue_raw.get("timeout_seconds", 120.0)),
+        ),
+        provider=ResourceGovernanceProviderConfig(
+            rate_limit_enabled=bool(rg_provider_raw.get("rate_limit_enabled", False)),
+            rpm=int(rg_provider_raw.get("rpm", 0)),
+            tpm=int(rg_provider_raw.get("tpm", 0)),
+            max_concurrent=int(rg_provider_raw.get("max_concurrent", 0)),
+        ),
+        event=ResourceGovernanceEventConfig(
+            queue_max_size=int(rg_event_raw.get("queue_max_size", 4096)),
+        ),
+        tool=ResourceGovernanceToolConfig(
+            global_max=int(rg_tool_raw.get("global_max", 8)),
+            per_root_max=int(rg_tool_raw.get("per_root_max", 4)),
+        ),
+        worktree=ResourceGovernanceWorktreeConfig(
+            global_max=int(rg_worktree_raw.get("global_max", 10)),
+            per_root_max=int(rg_worktree_raw.get("per_root_max", 3)),
+            disk_limit_mb=int(rg_worktree_raw.get("disk_limit_mb", 0)),
+        ),
+        shutdown=ResourceGovernanceShutdownConfig(
+            drain_timeout_seconds=float(rg_shutdown_raw.get("drain_timeout_seconds", 30.0)),
+            force_kill_seconds=float(rg_shutdown_raw.get("force_kill_seconds", 5.0)),
+        ),
     )
 
     context = ContextConfig(
         repo_map_budget=int(context_raw.get("repo_map_budget", 8_000)),
         history_window=int(context_raw.get("history_window", 20)),
-        code_index=code_index,
         request_budget_tokens=int(context_raw.get("request_budget_tokens", 70_000)),
         session_compact_tokens=int(context_raw.get("session_compact_tokens", 30_000)),
         auto_compact_after_round=bool(context_raw.get("auto_compact_after_round", True)),
         compact_every_rounds=int(context_raw.get("compact_every_rounds", 3)),
         artifact_threshold_tokens=int(context_raw.get("artifact_threshold_tokens", 2_000)),
         artifact_storage_dir=context_raw.get("artifact_storage_dir", ""),
-    )
-
-    hitl = HitlConfig(
-        enabled=bool(hitl_raw.get("enabled", True)),
-        min_risk_for_confirm=hitl_raw.get("min_risk_for_confirm", "medium"),
-        policy_file=hitl_raw.get("policy_file", ".grace/hitl/policies.yaml"),
-        learn_threshold=int(hitl_raw.get("learn_threshold", 3)),
     )
 
     observability = ObservabilityConfig(
@@ -361,8 +393,9 @@ def _parse(data: dict[str, Any]) -> AppConfig:
 
     return AppConfig(
         llm=llm, agent=agent, tools=tools,
-        memory=memory, plan=plan, multi_agent=multi_agent,
-        context=context, hitl=hitl, observability=observability, prompts=prompts,
+        memory=memory,
+        resource_governance=resource_governance,
+        context=context, observability=observability, prompts=prompts,
         mcp_servers=mcp_servers,
     )
 

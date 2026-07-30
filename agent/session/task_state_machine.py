@@ -320,10 +320,9 @@ class TaskStateMachine:
 
     @property
     def elapsed_seconds(self) -> float:
-        if self._started_at == 0:
-            return 0.0
-        end = self._completed_at if self._completed_at > 0 else _time.time()
-        return end - self._started_at
+        from core.time_utils import elapsed_seconds
+
+        return elapsed_seconds(self._started_at, self._completed_at)
 
     @property
     def step_count(self) -> int:

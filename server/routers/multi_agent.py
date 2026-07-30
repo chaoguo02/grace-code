@@ -8,6 +8,29 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 
+def _http_status_for(exc: Exception, not_found_hint: bool = False) -> int:
+    """Map domain exceptions to HTTP status codes.
+
+    - PermissionError → 403 Forbidden
+    - TypeError → 422 Unprocessable Entity (bad input shape)
+    - ValueError with a "not found" / "unknown" message → 404
+    - ValueError (other) → 422 Unprocessable Entity
+    - RuntimeError → 409 Conflict (runtime state)
+    """
+    if isinstance(exc, PermissionError):
+        return 403
+    if isinstance(exc, TypeError):
+        return 422
+    if isinstance(exc, ValueError):
+        detail = str(exc).lower()
+        if not_found_hint or "not found" in detail or "unknown" in detail:
+            return 404
+        return 422
+    if isinstance(exc, RuntimeError):
+        return 409
+    return 500
+
+
 def create_multi_agent_router(get_service: Any) -> APIRouter:
     router = APIRouter(prefix="/api/multi-agent", tags=["multi-agent"])
 
@@ -72,7 +95,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 run_id,
             )
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/runs/{run_id}/integrate")
     async def integrate_delegation_run(
@@ -89,7 +114,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 list(body.get("decisions", [])),
             )
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/runs/{run_id}/verify")
     async def verify_delegation_run(
@@ -104,7 +131,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 run_id,
             )
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/team/propose")
     async def propose_team(
@@ -119,7 +148,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 tasks=list(body.get("tasks", [])),
             )
         except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -131,7 +162,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
         try:
             return service._runtime.approve_agent_team(session_id=session_id)
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/team/reject")
     async def reject_team(
@@ -141,7 +174,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
         try:
             return service._runtime.reject_agent_team(session_id=session_id)
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/team/message")
     async def team_message(
@@ -157,7 +192,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 body=str(body.get("body", "")),
             )
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/team/shutdown")
     async def shutdown_team(
@@ -171,7 +208,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 cancel=bool(body.get("cancel", False)),
             )
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/team/tasks/{task_id}/claim")
     async def claim_team_task(
@@ -187,7 +226,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 member_id=str(body.get("member_id", "")),
             )
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/team/tasks/{task_id}/complete")
     async def complete_team_task(
@@ -206,7 +247,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 failed=bool(body.get("failed", False)),
             )
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/team/tasks/{task_id}/execute")
     async def execute_team_task(
@@ -231,7 +274,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 "tokens_used": result.tokens_used,
             }
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/team/tasks/{task_id}/resolve")
     async def resolve_team_task(
@@ -248,7 +293,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 summary=str(body.get("summary", "")),
             )
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/delegations/{run_id}/cancel")
     @router.post("/{session_id}/runs/{run_id}/cancel")
@@ -265,9 +312,10 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 str(body.get("detail", "User cancelled delegation run")),
             )
         except ValueError as exc:
-            detail = str(exc)
-            code = 404 if "not found" in detail.lower() else 409
-            raise HTTPException(status_code=code, detail=detail) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc, not_found_hint=True),
+                detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/tasks/{task_id}/cancel")
     async def cancel_delegation_task(
@@ -314,7 +362,9 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 "status": result.session_status.value,
             }
         except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     @router.post("/{session_id}/tasks/{task_id}/retry")
     async def retry_delegation_task(
@@ -329,10 +379,13 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 task_id,
             )
         except ValueError as exc:
-            detail = str(exc)
-            status_code = 404 if "Unknown" in detail or "outside" in detail else 409
-            raise HTTPException(status_code=status_code, detail=detail) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc, not_found_hint=True),
+                detail=str(exc),
+            ) from exc
         except (TypeError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=_http_status_for(exc), detail=str(exc),
+            ) from exc
 
     return router

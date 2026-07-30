@@ -150,7 +150,13 @@ class MemoryExtractor:
             ),
             LLMMessage(role="user", content=self._build_extraction_context(task, log, summary)),
         ]
-        response = self._backend.complete(messages, tools=[])
+        from llm.provider_capacity import complete_with_provider_capacity
+
+        response = complete_with_provider_capacity(
+            self._backend,
+            messages,
+            [],
+        )
         raw = response.action.message or response.action.thought or response.raw_content
         return self._parse_candidates(raw)
 

@@ -5,12 +5,13 @@ from __future__ import annotations
 import copy
 import logging
 import threading
+import time as _time
 import uuid
 from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-from agent.core import AgentConfig, ReActAgent
+from agent.core import AgentConfig
 from agent.event_log import EventLog
 from agent.task import Event, EventType, RunResult, RunStatus, Task, TaskIntent
 from agent.session.agent_registry import AgentRegistryV2
@@ -33,7 +34,6 @@ from agent.session.models import (
     AgentWaitOutcome,
     AgentWaitResult,
     BackgroundAgentHandle,
-    ForkStatus,
     ManagedWorktreeRecord,
     SessionMode,
     SessionStatus,
@@ -44,9 +44,8 @@ from agent.session.models import (
     WorkspaceMode,
 )
 from agent.session.session_store import SessionStore
-from agent.session.subagent import run_child_agent
 from agent.session.run_context import (
-    AgentSpawnContext, CancellationToken, ToolSchemaSnapshot,
+    AgentSpawnContext, CancellationToken,
 )
 from context.history import ConversationHistory
 from hooks.events import HookContext, HookEvent, SessionStartSource
@@ -80,11 +79,16 @@ def _inject_shared_read_cache(
 
 
 if TYPE_CHECKING:
-    from agent.completion_guard import CompletionCheckResult
+    from agent.completion_guard import CompletionCheckResult, CompletionContext
+    from agent.session.task_contract import TaskContract
     from core.policy import PhasePolicy
     from agent.session.models import SessionRecord
     from agent.session.worktree_service import WorktreeOperationResult
     from agent.session.worktree_manager import Worktree
+    from hitl.pipeline import WebConfirmCallback
+    from llm.base import StreamCallback
+    from server.services.approval_broker import ApprovalBroker
+    from tools.file_tool import FileReadCache
 
 
 class SessionRuntime:
@@ -108,6 +112,7 @@ class SessionRuntime:
         hook_dispatcher=None,
         mcp_integration=None,
         event_callback=None,
+        governor=None,
     ) -> None:
         self._store = store
         self._backend = backend
@@ -119,6 +124,36 @@ class SessionRuntime:
         self._hook_dispatcher = hook_dispatcher
         self._mcp_integration = mcp_integration
         self._event_callback = event_callback
+        # ResourceGovernor: set by AgentService. Phase 1+ multi-agent paths
+        # call admit()/release() on this. May be None in test contexts.
+        self._governor = governor
+        provider_governor = getattr(backend, "_provider_governor", None)
+        if provider_governor is None and governor is not None:
+            from core.provider_governor import ProviderGovernor
+
+            provider_governor = ProviderGovernor(
+                getattr(governor, "_config", None),
+            )
+        if provider_governor is not None:
+            from llm.provider_capacity import attach_provider_governor
+
+            attach_provider_governor(backend, provider_governor)
+            selector_backend = getattr(
+                memory_context, "_selector_backend", None,
+            )
+            if selector_backend is not None:
+                attach_provider_governor(
+                    selector_backend,
+                    provider_governor,
+                )
+        # Phase 2: shared bounded executor for multi-agent delegation
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        self._shared_executor = _TPE(
+            max_workers=getattr(getattr(governor, "_config", None), "worker", None)
+            and getattr(getattr(governor, "_config", None).worker, "global_max", 4)
+            or 4,
+            thread_name_prefix="grace-delegation",
+        ) if governor is not None else None
         # Callback for publishing run_terminal / run_started WS events.
         # Set by AgentService.  Signature: (session_id, event_dict) -> None.
         # Unlike _event_callback which receives agent.task.Event objects,
@@ -178,11 +213,82 @@ class SessionRuntime:
     def dispose(self) -> None:
         """Release all mutable state. Called by AgentService.shutdown().
 
+        Phase 2 unified shutdown order:
+          1. Cancel all cancellation tokens
+          2. Drain background threads (with timeout)
+          3. Shutdown shared executor
+          4. Clear remaining state
+
         Idempotent — safe to call multiple times.
         """
+        # 1. Cancel all cancellation tokens
+        from agent.task import TerminationReason
+        for (session_id, gen), token in list(self._cancellation_tokens.items()):
+            try:
+                token.cancel(
+                    TerminationReason.USER_CANCELLED,
+                    detail="Runtime disposing",
+                )
+            except Exception:
+                pass
+
+        # 2. Drain background threads (with bounded timeout)
+        with self._background_runs_lock:
+            threads = list(self._background_runs.values())
+        shutdown_cfg = getattr(
+            getattr(self._governor, "_config", None), "shutdown", None,
+        )
+        drain_timeout = max(
+            0.0, float(getattr(shutdown_cfg, "drain_timeout_seconds", 30.0)),
+        )
+        deadline = _time.monotonic() + drain_timeout
+        for t in threads:
+            remaining = deadline - _time.monotonic()
+            if remaining > 0:
+                t.join(timeout=remaining)
+
+        # 3. Shutdown shared executor
+        if self._shared_executor is not None:
+            executor = self._shared_executor
+            self._shared_executor = None
+            shutdown_done = threading.Event()
+
+            def _shutdown_executor() -> None:
+                try:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                finally:
+                    shutdown_done.set()
+
+            shutdown_thread = threading.Thread(
+                target=_shutdown_executor,
+                name="grace-executor-shutdown",
+                daemon=True,
+            )
+            shutdown_thread.start()
+            force_timeout = max(
+                0.0, float(getattr(shutdown_cfg, "force_kill_seconds", 5.0)),
+            )
+            shutdown_done.wait(timeout=force_timeout)
+            if not shutdown_done.is_set():
+                logger.warning(
+                    "Shared executor did not drain within %.1fs",
+                    force_timeout,
+                )
+
+        # 4. Clear remaining state
         with self._active_sessions_lock:
+            backends = list(self._backend_store.values())
             self._active_sessions.clear()
             self._backend_store.clear()
+        for backend in backends:
+            if backend is self._backend:
+                continue
+            try:
+                backend.close()
+            except Exception:
+                logger.debug(
+                    "Per-session backend close failed", exc_info=True,
+                )
         self._approval_brokers.clear()
         self._web_confirm_callbacks.clear()
         self._stream_callbacks.clear()
@@ -222,6 +328,13 @@ class SessionRuntime:
 
     def set_backend_for_session(self, session_id: str, backend: "LLMBackend") -> None:
         """Store a per-session backend for the given session."""
+        provider_governor = getattr(
+            self._backend, "_provider_governor", None,
+        )
+        if provider_governor is not None:
+            from llm.provider_capacity import attach_provider_governor
+
+            attach_provider_governor(backend, provider_governor)
         with self._active_sessions_lock:
             self._backend_store[session_id] = backend
 
@@ -233,6 +346,11 @@ class SessionRuntime:
     @property
     def agent_registry(self) -> AgentRegistryV2:
         return self._agent_registry
+
+    @property
+    def governor(self):
+        """The service-level ResourceGovernor. May be None in test contexts."""
+        return self._governor
 
     @property
     def circuit_breaker(self):
@@ -1540,7 +1658,6 @@ class SessionRuntime:
 
         # ── Run lifecycle: QUEUED → RUNNING ──
         _run_ctx = run_context
-        _run_transitioned = False
         if _run_ctx is not None:
             try:
                 _run_id = getattr(_run_ctx, "run_id", None)
@@ -1551,7 +1668,6 @@ class SessionRuntime:
                         expect_status="queued",
                     )
                     if _updated:
-                        _run_transitioned = True
                         # Emit run_started WS event (synthetic)
                         if self._publish_run_terminal is not None:
                             import uuid as _uuid_mod
@@ -2100,365 +2216,20 @@ class SessionRuntime:
             logger.exception("Failed to finalize run %s", _run_id)
 
     # ── Child subagent ──
-    # ⚠️ WARNING: The spawn_agent and _execute_child_session methods below
-    # are DEAD CODE. They are overwritten by the monkey-patch import at the
-    # bottom of this module (line ~2055). The ACTIVE implementations live in
-    # agent/session/runtime_spawn.py. DO NOT modify the methods below —
-    # your changes will never execute. Make changes in runtime_spawn.py instead.
+    # These methods delegate to the implementations in runtime_spawn.py.
+    # This avoids a monkey-patch at module bottom and ensures edits to
+    # the real logic go to the right file.
+    # Run 'from agent.session import runtime_spawn' to see the actual code.
 
-    def spawn_agent(
-        self,
-        *,
-        parent_session_id: str,
-        request: AgentSpawnRequest,
-        budget_tokens: int,
-        parent_max_steps: int,
-        cancellation_token: CancellationToken,
-        parent_policy: "PhasePolicy",
-        origin: DelegationOrigin = DelegationOrigin.TOOL,
-        spawn_context: AgentSpawnContext | None = None,
-    ) -> AgentRunResult | BackgroundAgentHandle:
-        """Create and run one typed child through the unified spawn path.
+    def spawn_agent(self, **kwargs: Any) -> Any:
+        """Delegate to the canonical implementation in runtime_spawn.py."""
+        from agent.session.runtime_spawn import spawn_agent as _impl
+        return _impl(self, **kwargs)
 
-        Named children use their definition and a fresh context. Forks use the
-        parent's immutable model-input snapshot and reconstructed tool contract.
-        """
-        if budget_tokens <= 0:
-            raise ValueError("child budget_tokens must be positive")
-        if parent_max_steps <= 0:
-            raise ValueError("child parent_max_steps must be positive")
-        if not isinstance(cancellation_token, CancellationToken):
-            raise TypeError("child cancellation_token must be a CancellationToken")
-        from core.policy import PhasePolicy
-        if not isinstance(parent_policy, PhasePolicy):
-            raise TypeError("child parent_policy must be a PhasePolicy")
-        if not isinstance(request, AgentSpawnRequest):
-            raise TypeError("request must be an AgentSpawnRequest")
-        if not isinstance(origin, DelegationOrigin):
-            origin = DelegationOrigin(origin)
-        parent = self._store.get_session(parent_session_id)
-        if parent is None:
-            raise ValueError(f"Unknown session: {parent_session_id}")
-        if not parent.agent_depth.can_spawn:
-            raise ValueError("Maximum subagent depth reached")
-        parent_definition = self._agent_registry.get(parent.agent_name)
-        if request.agent_kind is AgentKind.NAMED_SUBAGENT:
-            definition = request.definition
-            if definition is None:
-                raise ValueError("Named spawn requires a definition")
-            allowed_names = {
-                child.name
-                for child in self._agent_registry.delegatable_by(parent_definition)
-            }
-            if definition.name not in allowed_names:
-                raise ValueError(
-                    f"Agent {definition.name!r} is not delegatable by "
-                    f"{parent.agent_name!r}"
-                )
-        else:
-            if parent.agent_kind is AgentKind.FORK:
-                raise ValueError("A fork cannot spawn another fork")
-            if spawn_context is None:
-                raise ValueError("Fork spawn requires a live parent snapshot")
-            definition = parent_definition
-        is_fork = request.agent_kind is AgentKind.FORK
-        from agent.session.task_contract import TaskContract
-        child_contract = TaskContract.for_subagent(
-            definition,
-            self._root_agent_config,
-            parent_budget_tokens=budget_tokens,
-            parent_max_steps=parent_max_steps,
-        )
-        _repo = self._require_project_scope(parent.repo_path)
-        if spawn_context is not None:
-            if not isinstance(spawn_context, AgentSpawnContext):
-                raise TypeError("spawn_context must be an AgentSpawnContext")
-            if spawn_context.parent_session_id != parent.id:
-                raise ValueError("spawn context parent does not match the session")
-            if spawn_context.parent_agent_name != parent.agent_name:
-                raise ValueError("spawn context agent does not match the session")
-            if self._require_project_scope(spawn_context.repo_path) != _repo:
-                raise ValueError("spawn context repo does not match the session")
-            if (
-                request.agent_kind is AgentKind.FORK
-                and spawn_context.model_name != self._backend.model_name
-            ):
-                raise ValueError("Fork model must match the parent model")
-        child_agent_type = (
-            AgentKind.FORK.value
-            if request.agent_kind is AgentKind.FORK
-            else definition.name
-        )
-        child = self._store.create_session(
-            agent_name=definition.name,
-            mode=SessionMode.SUBAGENT,
-            agent_kind=request.agent_kind,
-            context_origin=request.context_origin,
-            execution_placement=request.execution_placement,
-            workspace_mode=request.workspace_mode,
-            repo_path=_repo,
-            title=request.description[:80] or definition.name,
-            parent_id=parent.id,
-            root_id=parent.root_id,
-            metadata={
-                "entrypoint": origin.value,
-                "agent_kind": request.agent_kind.value,
-                "context_origin": request.context_origin.value,
-                "workspace_mode": request.workspace_mode.value,
-                "intent": definition.intent.value,
-                "requested_budget_tokens": budget_tokens,
-                "budget_tokens": child_contract.budget_tokens,
-                "max_steps": child_contract.max_steps,
-                "parent_policy": parent_policy.to_dict(),
-                "parent_snapshot_fingerprint": (
-                    spawn_context.conversation.fingerprint
-                    if spawn_context is not None else None
-                ),
-                "parent_snapshot_message_count": (
-                    len(spawn_context.conversation.messages)
-                    if spawn_context is not None else 0
-                ),
-                "model_name": (
-                    spawn_context.model_name
-                    if spawn_context is not None else self._backend.model_name
-                ),
-                "parent_tool_schemas": (
-                    [
-                        {
-                            "name": schema.name,
-                            "description": schema.description,
-                            "parameters_json": schema.parameters_json,
-                            "prompt_contract": list(schema.prompt_contract),
-                        }
-                        for schema in spawn_context.tool_schemas
-                    ]
-                    if request.agent_kind is AgentKind.FORK
-                    and spawn_context is not None
-                    else []
-                ),
-            },
-        )
-        child_cancellation = cancellation_token.child()
-        self._cancellation_tokens[(child.id, child.generation)] = child_cancellation
-        if request.agent_kind is AgentKind.FORK:
-            for message in spawn_context.conversation.materialize():
-                self._store.append_message(child.id, message)
-        self._store.append_message(
-            child.id, LLMMessage(role="user", content=request.prompt)
-        )
-        self._store.update_status(child.id, SessionStatus.RUNNING)
-        self._emit_subagent_event(
-            EventType.SUBAGENT_START,
-            parent_session_id=parent.id,
-            root_session_id=parent.root_id,
-            child_session_id=child.id,
-            agent_name=child_agent_type,
-            status=SessionStatus.RUNNING,
-        )
-        self._fire_hook(HookContext(
-            event=HookEvent.SUBAGENT_START,
-            session_id=parent.id,
-            agent_id=child.id,
-            agent_type=child_agent_type,
-        ))
-
-        # Subagent permission inheritance (CC-aligned: parent mode overrides child)
-        # Store resolved mode in child metadata; _build_registry_for_session()
-        # reads it to create a per-session pipeline without touching the shared one.
-        _child_permission_mode = self._resolve_child_permission_mode(
-            parent_definition, definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None
-        )
-        if _child_permission_mode:
-            child.metadata["permission_mode_override"] = _child_permission_mode
-
-        # Connect agent-scoped MCP servers (CC-aligned: inline mcpServers)
-        _agent_mcp_tools = []
-        if self._mcp_integration is not None and not is_fork:
-            _agent_mcp_tools = self._mcp_integration.connect_agent_servers(definition)
-
-        execute = lambda: self._execute_child_session(
-            parent=parent,
-            child=child,
-            request=request,
-            definition=definition,
-            parent_definition=parent_definition,
-            contract=child_contract,
-            cancellation_token=child_cancellation,
-            parent_policy=parent_policy,
-            repo_path=_repo,
-            child_agent_type=child_agent_type,
-            spawn_context=spawn_context,
-        )
-        _need_mcp_cleanup = _agent_mcp_tools and self._mcp_integration is not None
-        cleanup = None
-        if _need_mcp_cleanup:
-            cleanup = lambda: self._mcp_integration.disconnect_agent_servers(definition)
-
-        if request.execution_placement is ExecutionPlacement.FOREGROUND:
-            try:
-                return execute()
-            finally:
-                if cleanup is not None:
-                    cleanup()
-        return self._start_background_execution(
-            parent=parent,
-            child=child,
-            agent_name=definition.name,
-            execute=execute,
-            cleanup=cleanup,
-        )
-
-    def _execute_child_session(
-        self,
-        *,
-        parent: "SessionRecord",
-        child: "SessionRecord",
-        request: AgentSpawnRequest,
-        definition: AgentDefinition,
-        parent_definition: AgentDefinition,
-        contract: "TaskContract",
-        cancellation_token: CancellationToken,
-        parent_policy: "PhasePolicy",
-        repo_path: str,
-        child_agent_type: str,
-        spawn_context: AgentSpawnContext | None,
-        persisted_messages: list[LLMMessage] | None = None,
-    ) -> AgentRunResult:
-        """Execute one child generation and converge its persisted state."""
-        child_result: AgentRunResult | None = None
-        child_error = ""
-
-        def _persist_child_messages(messages: list[LLMMessage]) -> None:
-            for message in messages:
-                self._store.append_message(child.id, message)
-
-        try:
-            inherited_registry = None
-            if request.agent_kind is AgentKind.FORK:
-                inherited_registry = self._build_registry_for_session(
-                    parent_definition, child,
-                ).with_phase_policy(parent_policy)
-                if request.context_origin is ContextOrigin.PARENT_SNAPSHOT:
-                    if spawn_context is None:
-                        raise ValueError("Fork spawn requires a live parent snapshot")
-                    live_schemas = tuple(
-                        ToolSchemaSnapshot.capture(schema)
-                        for schema in inherited_registry.get_schemas()
-                    )
-                    if live_schemas != spawn_context.tool_schemas:
-                        raise ValueError(
-                            "Fork tool contract changed after the parent model call"
-                        )
-                else:
-                    raw_schemas = child.metadata.get("parent_tool_schemas")
-                    if not isinstance(raw_schemas, list) or not raw_schemas:
-                        raise ValueError(
-                            "Fork resume requires its persisted tool contract"
-                        )
-                    expected_schemas = tuple(
-                        ToolSchemaSnapshot(
-                            name=str(item["name"]),
-                            description=str(item["description"]),
-                            parameters_json=str(item["parameters_json"]),
-                            prompt_contract=tuple(
-                                str(rule)
-                                for rule in item.get("prompt_contract", ())
-                            ),
-                        )
-                        for item in raw_schemas
-                        if isinstance(item, dict)
-                    )
-                    live_schemas = tuple(
-                        ToolSchemaSnapshot.capture(schema)
-                        for schema in inherited_registry.get_schemas()
-                    )
-                    if live_schemas != expected_schemas:
-                        raise ValueError(
-                            "Fork tool contract changed since its prior generation"
-                        )
-            # ── Snapshot parent pipeline state for child inheritance ──
-            # CC-aligned: subagents inherit parent's deny/allow rules,
-            # session_rules, and permission_mode (subject to constraints).
-            _inherited_state = self._base_registry.permission_inheritable_state()
-
-            child_result = run_child_agent(
-                agent_id=child.id,
-                request=request,
-                source_definition=definition,
-                repo_path=repo_path,
-                base_registry=self._base_registry,
-                backend=self._backend,
-                log_dir=self._log_dir,
-                root_agent_config=self._root_agent_config,
-                message_sink=_persist_child_messages,
-                contract=contract,
-                cancellation_token=cancellation_token,
-                parent_policy=parent_policy,
-                spawn_context=spawn_context,
-                inherited_registry=inherited_registry,
-                event_callback=self._event_callback,
-                persisted_messages=persisted_messages,
-                session_record=child,
-                session_runtime=self,
-                parent_pipeline_state=_inherited_state,
-            )
-            self._store.set_agent_result(child.id, child_result)
-            self._store.append_message(
-                child.id,
-                LLMMessage(role="assistant", content=child_result.summary),
-            )
-            return child_result
-        except Exception as exc:
-            child_error = str(exc) or type(exc).__name__
-            self._store.append_message(
-                child.id,
-                LLMMessage(role="assistant", content=f"Subagent failed: {exc}"),
-            )
-            raise
-        finally:
-            if child_result is not None and child_result.status is ForkStatus.CANCELLED:
-                self._store.update_status(
-                    child.id, SessionStatus.CANCELLED,
-                    error=child_result.error or child_result.summary,
-                )
-                self._store.set_summary(
-                    child.id, child_result.summary, status=SessionStatus.CANCELLED,
-                )
-            elif child_result is None or child_result.status is ForkStatus.FAILED:
-                summary = (
-                    child_result.summary if child_result is not None
-                    else "Subagent execution failed before producing a result"
-                )
-                error = (
-                    (child_result.error or summary)
-                    if child_result is not None else child_error or summary
-                )
-                self._store.update_status(child.id, SessionStatus.FAILED, error=error)
-                self._store.set_summary(
-                    child.id, summary, status=SessionStatus.FAILED,
-                )
-            elif child_result.status is ForkStatus.PARTIAL:
-                self._store.set_summary(
-                    child.id, child_result.summary, status=SessionStatus.PARTIAL,
-                )
-            else:
-                self._store.set_summary(
-                    child.id, child_result.summary, status=SessionStatus.COMPLETED,
-                )
-            completed_child = self._store.get_session(child.id)
-            if completed_child is not None:
-                self._emit_subagent_event(
-                    EventType.SUBAGENT_STOP,
-                    parent_session_id=parent.id,
-                    root_session_id=parent.root_id,
-                    child_session_id=child.id,
-                    agent_name=child_agent_type,
-                    status=completed_child.status,
-                    fork_result=child_result,
-                )
-            self._cancellation_tokens.pop(
-                (child.id, child.generation), None,
-            )
+    def _execute_child_session(self, **kwargs: Any) -> Any:
+        """Delegate to the canonical implementation in runtime_spawn.py."""
+        from agent.session.runtime_spawn import _execute_child_session as _impl
+        return _impl(self, **kwargs)
 
     def _start_background_execution(
         self,
@@ -3123,12 +2894,7 @@ class SessionRuntime:
         return getattr(self, '_pending_thinking', {}).pop(session_id, None)
 
     def set_pending_permission_mode_override(self, session_id: str, mode: str) -> None:
-        if not hasattr(self, '_pending_perm_modes'):
-            self._pending_perm_modes: dict[str, str] = {}
-        self._pending_perm_modes[session_id] = mode
-
-    def pop_pending_permission_mode_override(self, session_id: str) -> str | None:
-        return getattr(self, '_pending_perm_modes', {}).pop(session_id, None)
+        self.set_permission_mode_for_session(session_id, mode)
 
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
@@ -3174,7 +2940,7 @@ class SessionRuntime:
     def _build_runtime_messages(self, spec: AgentDefinition, task_description: str) -> list[LLMMessage]:
         """委托给 runtime_prompt_builder。"""
         from agent.session.runtime_prompt_builder import build_runtime_messages
-        skill_registry = getattr(self._base_registry, "_skill_registry", None)
+        skill_registry = self._base_registry.skill_registry
         return build_runtime_messages(
             spec, task_description,
             agent_registry=self._agent_registry,
@@ -3208,8 +2974,3 @@ def memory_freshness_text(name: str, store) -> str:
         return f"{age_days} days ago — verify against current code"
     except Exception:
         return ""
-
-# ── spawn_agent / _execute_child_session (extracted to runtime_spawn.py) ──
-from agent.session.runtime_spawn import spawn_agent, _execute_child_session
-SessionRuntime.spawn_agent = spawn_agent
-SessionRuntime._execute_child_session = _execute_child_session

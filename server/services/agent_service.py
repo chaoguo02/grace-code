@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -31,8 +32,6 @@ from typing import Any
 
 from agent.task import RunResult, TaskIntent
 from server.events import WsStatus
-
-from server.services.session_service import SessionService
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +121,15 @@ class AgentService:
 
         self._config: AppConfig = load_config(config_path)
         self._apply_cli_overrides(model, provider, api_key, base_url, max_steps)
+        from core.provider_governor import ProviderGovernor
+        self._provider_governor = ProviderGovernor(
+            self._config.resource_governance,
+        )
+        if self._event_bus is not None:
+            self._event_bus._queue_max_size = max(
+                0,
+                int(self._config.resource_governance.event.queue_max_size),
+            )
 
         # Save effective LLM config snapshot — preserves CLI overrides and
         # dynamic updates across model switches (P0-3).
@@ -147,6 +155,13 @@ class AgentService:
             "max_tokens": self._config.llm.max_tokens,
             "timeout_seconds": self._config.llm.timeout_seconds,
         })
+        from llm.provider_capacity import attach_provider_governor
+
+        attach_provider_governor(
+            self._backend,
+            self._provider_governor,
+            provider_name=self._config.llm.provider,
+        )
 
         # ── 3. Build ToolRegistry ──
         from entry.bootstrap.registry_factory import build_registry
@@ -234,7 +249,7 @@ class AgentService:
 
         # ── Semantic search stack (optional: needs fastembed) ──
         try:
-            import fastembed  # noqa: F401
+            importlib.import_module("fastembed")
             from memory.external_store import ExternalMemoryStore
             from memory.indexer import MemoryIndexer
             from memory.retriever import ProactiveRetriever
@@ -339,17 +354,102 @@ class AgentService:
             except RuntimeError:
                 logger.debug("Memory maintenance scheduler awaits server event loop")
 
-        # ── 5. Agent registry ──
+        # ── 5. Resource Governor ──
+        from core.resource_governor import ResourceGovernor
+        from core.resource_metrics import ResourceMetricsCollector
+        self._resource_governor = ResourceGovernor(self._config.resource_governance)
+        self._resource_metrics = ResourceMetricsCollector(
+            self._resource_governor,
+        )
+        def _on_resource_event(event: dict[str, Any]) -> None:
+            self._resource_metrics.collect()
+            from core.resource_governor import ResourceKind
+            snapshot = self._resource_governor.snapshot()
+            worker = snapshot.snapshots[ResourceKind.WORKER_SLOT]
+            event["governance"] = {
+                "mode": self._resource_governor.mode,
+                "worker": {
+                    "limit": worker.limit,
+                    "reserved": worker.reserved,
+                    "consumed": worker.consumed,
+                    "available": worker.available,
+                    "queued": worker.queued,
+                    "pressure": worker.pressure.value,
+                },
+                "active_leases": snapshot.active_leases,
+                "queue_depth": self._resource_governor.queue_depth,
+            }
+            task_id = str(event.get("task_id", ""))
+            resources = dict(event.get("resources") or {})
+            actual = dict(event.get("actual") or {})
+            phase = str(event.get("type", "")).removeprefix(
+                "delegation_resource_"
+            )
+            if task_id and str(event.get("type", "")).startswith(
+                "delegation_resource_"
+            ):
+                facts: dict[str, object] = {
+                    "outcome": event.get("outcome", ""),
+                    "queue_position": event.get("queue_position", 0),
+                    "wait_time_s": event.get("wait_time_s", 0.0),
+                    "reason": event.get("reason", ""),
+                    "updated_at": event.get("timestamp_s", 0.0),
+                }
+                if phase == "queued":
+                    facts["requested"] = resources
+                elif phase == "granted":
+                    facts["granted"] = resources
+                elif phase in {"reconciled", "released"}:
+                    facts["consumed"] = actual
+                    facts["refunded"] = {
+                        kind: max(
+                            0,
+                            int(amount) - int(actual.get(kind, 0)),
+                        )
+                        for kind, amount in resources.items()
+                    }
+                self._store.update_delegation_task_resource(
+                    task_id, facts,
+                )
+            if self._event_bus is not None:
+                session_id = str(event.get("session_id", ""))
+                if session_id:
+                    self._event_bus.publish_raw(
+                        session_id,
+                        {
+                            "type": event.get("type"),
+                            "payload": event,
+                        },
+                    )
+
+        self._resource_governor.on_event(_on_resource_event)
+        if self._resource_governor.mode == "observe":
+            logger.info(
+                "Resource governance running in OBSERVE mode — "
+                "calculating capacity facts but NOT blocking any requests. "
+                "Set resource_governance.mode to 'soft_enforce' or 'enforce' "
+                "in config/default.yaml to enable enforcement."
+            )
+
+        # ── 6. Agent registry ──
         from agent.session.agent_registry import AgentRegistryV2
         self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
 
-        # ── 6. Build ToolRegistry (with memory_store for LLM tools) ──
+        # ── 7. Build ToolRegistry (with memory_store for LLM tools) ──
         self._registry = build_registry(
             self._config,
             repo_path=self.repo_path,
             approval_mode="auto",
             memory_store=self._memory_store,
             external_store=getattr(self, "_external_store", None),
+        )
+        self._registry.attach_resource_governor(
+            self._resource_governor,
+            root_session_resolver=lambda session_id: (
+                (record.root_id or record.id)
+                if (record := self._store.get_session(session_id)) is not None
+                else session_id
+            ),
         )
         from entry.bootstrap.registry_factory import initialize_mcp_integration
         self._mcp_integration = initialize_mcp_integration(
@@ -360,13 +460,12 @@ class AgentService:
         # ── Load permission rules from settings.json ──
         self._loaded_rules = self._load_permission_rules()
 
-        # ── 6. Log directory ──
+        # ── 8. Log directory ──
         from core.state_paths import ProjectStatePaths
 
         self._log_dir = str(ProjectStatePaths.for_project(self.repo_path).logs)
 
-        # ── 7. SessionRuntime ──
-        from agent.core import AgentConfig
+        # ── 9. SessionRuntime ──
         from agent.session.runtime import SessionRuntime
 
         # ── HookDispatcher with memory consolidation STOP hook ──
@@ -416,6 +515,7 @@ class AgentService:
             hook_dispatcher=self._hook_dispatcher,
             mcp_integration=self._mcp_integration,
             event_callback=self._event_bus.publish if self._event_bus is not None else None,
+            governor=self._resource_governor,
         )
         # Mark as Web mode — child agents use this to create web callbacks
         self._runtime._is_web_mode = True
@@ -642,8 +742,8 @@ class AgentService:
         event_bus = self._event_bus
         from server.services.approval_broker import ApprovalRequest
 
-        def _confirm(request) -> "PromptDecision":
-            from hitl.pipeline import PromptDecision, PromptAction
+        def _confirm(request):
+            from hitl.pipeline import PromptAction
             decision_started = time.monotonic()
             ar = ApprovalRequest(
                 tool_name=request.tool_name,
@@ -738,7 +838,7 @@ class AgentService:
             self._root_session_id = self._root_session.id
         else:
             # Runtime not available yet (partial init) — use storage directly
-            from agent.session.models import SessionMode, SessionStatus, AgentKind, ContextOrigin, ExecutionPlacement, WorkspaceMode
+            from agent.session.models import SessionMode, AgentKind
             rec = self._storage.create_session(
                 agent_name="build", mode=SessionMode.PRIMARY,
                 repo_path=self.repo_path, title="Web MVP Root Session",
@@ -768,7 +868,7 @@ class AgentService:
         record = self._runtime.create_root_session(
             agent_name=agent_name,
             repo_path=repo_path or self.repo_path,
-            title=title or f"Session via Web API",
+            title=title or "Session via Web API",
         )
         logger.info("Created session: %s (agent=%s)", record.id, agent_name)
         return record.id
@@ -842,7 +942,7 @@ class AgentService:
         # Prevents agent from running before MCP tools are discovered.
         if self._mcp_integration is not None:
             _mcp_deadline = time.time() + 5.0
-            while not getattr(self._mcp_integration, '_connected', True):
+            while not self._mcp_integration.is_initialized:
                 if time.time() > _mcp_deadline:
                     logger.warning("MCP not ready after 5s — proceeding without MCP tools")
                     break
@@ -851,8 +951,6 @@ class AgentService:
         # Plan detection: explicit only.  Callers must pass agent_name="plan".
         # Intent is an execution hint, not a mode-switch — the agent definition
         # is the single source of truth for what tools/permissions are available.
-        _is_plan = agent_name == "plan"
-
         # ── Inject permission rules + mode into the runtime ──
         self._maybe_reload_rules()
         _pending_perm = self._runtime.pop_pending_permission_mode_override(
@@ -907,7 +1005,7 @@ class AgentService:
         session_id: str = "",
     ) -> str:
         """Validate and render one user-invocable Skill for Web execution."""
-        skill_registry = getattr(self._registry, "_skill_registry", None)
+        skill_registry = self._registry.skill_registry
         if skill_registry is None:
             raise ValueError("Skills are not available")
         normalized = name.strip()
@@ -1283,23 +1381,43 @@ class AgentService:
     # ── Cleanup ───────────────────────────────────────────────────────────
 
     async def shutdown(self) -> None:
-        """Release resources. Called on app shutdown."""
+        """Release resources. Called on app shutdown.
+
+        Phase 2 unified shutdown order:
+          1. Stop admission (governor)
+          2. Cancel running sessions
+          3. Close LLM backend streams
+          4. Dispose runtime (cancel tokens, drain threads, shutdown executor)
+          5. Memory maintenance
+          6. MCP disconnect
+        """
         logger.info("AgentService shutting down")
-        # Release all session runtime resources via centralized dispose
+
+        # 1. Stop resource admission
+        if self._resource_governor is not None:
+            self._resource_governor.shutdown()
+
+        # 2. Cancel running sessions
+        if self._runtime is not None:
+            for (session_id, gen) in list(self._runtime._cancellation_tokens.keys()):
+                self._runtime.cancel_session(
+                    session_id, detail="Server shutting down",
+                )
+
+        # 3. Close LLM backend streams
+        if hasattr(self._backend, "close"):
+            try:
+                self._backend.close()
+            except Exception:
+                logger.debug("Error closing LLM backend", exc_info=True)
+
+        # 4. Dispose runtime (cancels tokens, drains threads, shuts down executor)
         if self._runtime is not None:
             self._runtime.dispose()
-        # Stop memory maintenance daemon thread
+
+        # 5. Memory maintenance
         if hasattr(self, '_memory_maintenance_stop'):
             self._memory_maintenance_stop.set()
-        # Final memory prune on shutdown
-        if self._memory_store is not None:
-            try:
-                pruned = self._memory_store.prune_expired()
-                if pruned:
-                    logger.info("Shutdown memory prune: %d entries cleaned", pruned)
-            except Exception:
-                pass
-        # Cancel memory maintenance (legacy async task)
         if self._memory_stop_event is not None:
             self._memory_stop_event.set()
         if self._memory_maintenance_task is not None:
@@ -1310,19 +1428,6 @@ class AgentService:
                 pass
             except Exception:
                 logger.warning("Memory maintenance shutdown failed", exc_info=True)
-        # Disconnect MCP servers
-        if self._mcp_integration is not None:
-            try:
-                self._mcp_integration.shutdown()
-            except Exception:
-                logger.warning("MCP shutdown failed", exc_info=True)
-        # Cancel background runs
-        if self._runtime is not None:
-            with self._runtime._background_runs_lock:
-                for (sid, gen), thread in list(self._runtime._background_runs.items()):
-                    logger.debug("Cancelling background run: session=%s gen=%d", sid[:8], gen)
-            self._runtime._cancellation_tokens.clear()
-        # Final memory prune on shutdown
         if self._memory_store is not None:
             try:
                 pruned = self._memory_store.prune_expired()
@@ -1330,3 +1435,7 @@ class AgentService:
                     logger.info("Shutdown memory prune: %d entries cleaned", pruned)
             except Exception:
                 pass
+
+        # 6. Close the single Tool/Skills/MCP lifecycle root.
+        if self._registry is not None:
+            self._registry.close()

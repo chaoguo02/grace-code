@@ -18,8 +18,8 @@ import logging
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import field, dataclass
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -449,7 +449,6 @@ class BaseTool(ABC):
 # On POSIX: uses O_NOFOLLOW to atomically reject symlinks
 # On Windows: checks is_symlink() before open (no kernel-level symlink TOCTOU on Win)
 
-import errno as _errno
 import os as _os
 import sys as _sys
 from pathlib import Path as _Path
@@ -599,10 +598,14 @@ class ToolRegistry:
 
     def __init__(
         self,
-        hitl_manager: Any = None,
         permission_pipeline: Any = None,
         hook_dispatcher: Any = None,
         capability_registry: Any = None,
+        *,
+        artifact_store_ref: Any = None,
+        evidence_ledger_ref: Any = None,
+        skill_registry: Any = None,
+        skill_buffer: Any = None,
     ) -> None:
         """Create a tool registry with optional Runtime-owned intercept layers.
 
@@ -612,9 +615,19 @@ class ToolRegistry:
         self._tools: dict[str, BaseTool] = {}
         self._tool_aliases: dict[str, str] = {}
         self._permission_pipeline = permission_pipeline
-        self._hitl_manager = hitl_manager
         self._hook_dispatcher = hook_dispatcher
         self._capability_registry = capability_registry
+        self._artifact_store_ref = artifact_store_ref
+        self._evidence_ledger_ref = evidence_ledger_ref
+        self._skill_registry = skill_registry
+        self._skill_buffer = skill_buffer
+        self._closeables: list[Any] = []
+        self._closed = False
+        self._owns_lifecycle = True
+        self._pending_skill_modifier: Any = None
+        self._resource_governor = None
+        self._root_session_resolver = None
+        self._structure_lock = threading.RLock()
         self._stats_lock = threading.Lock()
         """Protects ``_timing_stats`` — multiple threads call ``execute_tool``
         concurrently in Web mode (ACC-4a)."""
@@ -625,18 +638,82 @@ class ToolRegistry:
         注册一个工具。支持链式调用：
             registry.register(ShellTool()).register(FileTool())
         """
-        if tool.name in self._tools:
-            raise ValueError(f"Tool '{tool.name}' is already registered.")
-        self._tools[tool.name] = tool
-        # Inject registry reference so signal tools can set mode-switch flags
-        tool._registry = self
-        # Register aliases (tool naming aligned with LLM prior knowledge)
-        for alias in getattr(tool, "aliases", ()):
-            if alias in self._tool_aliases:
-                logger.warning("Tool alias '%s' → '%s' shadowed by existing alias → '%s'",
-                               alias, tool.name, self._tool_aliases[alias])
-            self._tool_aliases[alias] = tool.name
+        from tools.factory import build_tool
+
+        tool = build_tool(tool=tool)
+        with self._structure_lock:
+            if tool.name in self._tools:
+                raise ValueError(f"Tool '{tool.name}' is already registered.")
+            self._tools[tool.name] = tool
+            # Inject registry reference so signal tools can set mode-switch flags
+            tool._registry = self
+            # Register aliases (tool naming aligned with LLM prior knowledge)
+            for alias in getattr(tool, "aliases", ()):
+                if alias in self._tool_aliases:
+                    logger.warning("Tool alias '%s' → '%s' shadowed by existing alias → '%s'",
+                                   alias, tool.name, self._tool_aliases[alias])
+                self._tool_aliases[alias] = tool.name
         return self
+
+    def register_many(self, tools: Iterable[BaseTool]) -> "ToolRegistry":
+        for tool in tools:
+            self.register(tool)
+        return self
+
+    def unregister(self, name: str) -> BaseTool | None:
+        """Remove one canonical tool and all aliases that point to it."""
+        canonical = self.resolve_name(name)
+        if canonical is None:
+            return None
+        with self._structure_lock:
+            tool = self._tools.pop(canonical)
+            self._tool_aliases = {
+                alias: target
+                for alias, target in self._tool_aliases.items()
+                if target != canonical
+            }
+        return tool
+
+    @property
+    def artifact_store_ref(self) -> Any:
+        return self._artifact_store_ref
+
+    @property
+    def evidence_ledger_ref(self) -> Any:
+        return self._evidence_ledger_ref
+
+    @property
+    def skill_registry(self) -> Any:
+        return self._skill_registry
+
+    @property
+    def skill_buffer(self) -> Any:
+        return self._skill_buffer
+
+    @property
+    def capability_registry(self) -> Any:
+        return self._capability_registry
+
+    def add_closeable(self, value: Any) -> None:
+        if value is not None and value not in self._closeables:
+            self._closeables.append(value)
+
+    def activate_skill(self, metadata: Any) -> None:
+        """Queue one turn-scoped Skill modifier for the next policy view."""
+        from skills.tool import SkillContextModifier
+
+        self._pending_skill_modifier = SkillContextModifier(
+            allowed_tools=metadata.allowed_tools,
+            disallowed_tools=metadata.disallowed_tools,
+            model=metadata.model,
+            effort=metadata.effort,
+            context=metadata.context,
+        )
+
+    def consume_skill_modifier(self) -> Any:
+        modifier = self._pending_skill_modifier
+        self._pending_skill_modifier = None
+        return modifier
 
     def resolve_name(self, name: str) -> str | None:
         """Resolve a possibly-aliased tool name to its canonical name.
@@ -675,7 +752,7 @@ class ToolRegistry:
     ) -> ToolResult:
         """
         按名称查找工具并执行。
-        如果有 HitlManager，先经过 HITL 审批。
+        所有调用统一经过 PermissionPipeline 审批。
         工具不存在时返回 error ToolResult（不抛异常，让 agent 继续运行）。
         """
         start = time.perf_counter()
@@ -697,11 +774,14 @@ class ToolRegistry:
 
         pipeline = ToolExecutionPipeline(
             permission_pipeline=self._permission_pipeline,
-            hitl_manager=self._hitl_manager,
             hook_dispatcher=self._hook_dispatcher,
             capability_registry=self._capability_registry,
             session_id=getattr(self, "_session_id", ""),
             budget=getattr(self, "_budget", None),
+            resource_governor=getattr(self, "_resource_governor", None),
+            root_session_resolver=getattr(
+                self, "_root_session_resolver", None
+            ),
         )
         result = pipeline.execute(
             tool,
@@ -714,30 +794,50 @@ class ToolRegistry:
         return result
 
     def get_schemas(self) -> list[LLMToolSchema]:
-        """返回所有已注册工具的 schema（按 name 排序，确保 prompt caching 稳定性）。"""
+        """Return schemas with a stable built-in prefix and MCP suffix."""
+        from tools.pool import assemble_tool_pool, is_mcp_tool
+        with self._structure_lock:
+            snapshot = tuple(self._tools.values())
+        tools = assemble_tool_pool(
+            (tool for tool in snapshot if not is_mcp_tool(tool)),
+            (tool for tool in snapshot if is_mcp_tool(tool)),
+        )
         schemas = [
             schema
-            for tool in self._tools.values()
+            for tool in tools
             if not (schema := tool.to_llm_schema()).deferred
         ]
-        schemas.sort(key=lambda s: s.name)
         return schemas
 
     @property
     def tool_names(self) -> list[str]:
-        return list(self._tools.keys())
+        with self._structure_lock:
+            return list(self._tools.keys())
+
+    @property
+    def tools(self) -> tuple[BaseTool, ...]:
+        with self._structure_lock:
+            return tuple(self._tools.values())
 
     def filtered(self, allowed_tools: set[str] | frozenset[str]) -> "ToolRegistry":
         """返回只包含指定工具的新注册表，保留所有拦截层（pipeline, HITL, hooks, capability）。"""
         filtered = ToolRegistry(
-            hitl_manager=self._hitl_manager,
             permission_pipeline=self._permission_pipeline,
             hook_dispatcher=self._hook_dispatcher,
             capability_registry=self._capability_registry,
+            artifact_store_ref=self._artifact_store_ref,
+            evidence_ledger_ref=self._evidence_ledger_ref,
+            skill_registry=self._skill_registry,
+            skill_buffer=self._skill_buffer,
         )
         for tool_name in self.tool_names:
             if tool_name in allowed_tools:
                 filtered._tools[tool_name] = self._tools[tool_name]
+        filtered._resource_governor = self._resource_governor
+        filtered._root_session_resolver = self._root_session_resolver
+        filtered._closeables = self._closeables
+        filtered._owns_lifecycle = False
+        filtered._pending_skill_modifier = self._pending_skill_modifier
         # Preserve aliases for filtered tools — critical for LLM tool name
         # compatibility (e.g. "file_read" → "Read", "search_text" → "Grep")
         for alias, canonical in self._tool_aliases.items():
@@ -756,6 +856,7 @@ class ToolRegistry:
     def with_permission_request_origin(self, agent_name: str) -> "ToolRegistry":
         """Clone registry policy and identify its child permission requester."""
         derived = copy.copy(self)
+        derived._owns_lifecycle = False
         derived._timing_stats = {}
         pipeline = self._permission_pipeline
         if isinstance(pipeline, AgentScopablePermissionPipeline):
@@ -781,6 +882,16 @@ class ToolRegistry:
         if callable(attach):
             attach(dispatcher)
 
+    def attach_resource_governor(
+        self,
+        governor: Any,
+        *,
+        root_session_resolver: Any = None,
+    ) -> None:
+        """Attach the single resource authority used by external tools."""
+        self._resource_governor = governor
+        self._root_session_resolver = root_session_resolver
+
     @property
     def hook_dispatcher(self) -> Any:
         """Read-only access to the configured lifecycle dispatcher."""
@@ -789,6 +900,7 @@ class ToolRegistry:
     def with_session_id(self, session_id: str) -> "ToolRegistry":
         """Return a shallow session-tagged registry view."""
         derived = copy.copy(self)
+        derived._owns_lifecycle = False
         derived._session_id = session_id
         return derived
 
@@ -818,11 +930,17 @@ class ToolRegistry:
                 context.repo_path or context.workspace_root
             )
         scoped = ToolRegistry(
-            hitl_manager=self._hitl_manager,
             permission_pipeline=permission_pipeline,
             hook_dispatcher=self._hook_dispatcher,
             capability_registry=self._capability_registry,
+            artifact_store_ref=self._artifact_store_ref,
+            evidence_ledger_ref=self._evidence_ledger_ref,
+            skill_registry=self._skill_registry,
+            skill_buffer=self._skill_buffer,
         )
+        scoped._resource_governor = self._resource_governor
+        scoped._root_session_resolver = self._root_session_resolver
+        scoped._owns_lifecycle = False
         for tool in self._tools.values():
             scoped.register(tool.bind_context(context))
         return scoped
@@ -832,6 +950,7 @@ class ToolRegistry:
         # Preserve registry-level dependency references and session metadata;
         # only tool instances and per-run counters belong to the new binding.
         bound = copy.copy(self)
+        bound._owns_lifecycle = False
         bound._tools = {}
         bound._tool_aliases = {}
         bound._timing_stats = {}
@@ -842,6 +961,41 @@ class ToolRegistry:
                 else tool
             )
         return bound
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Close registered lifecycle owners exactly once."""
+        if not self._owns_lifecycle:
+            return
+        if self._closed:
+            return
+        self._closed = True
+        seen: set[int] = set()
+        values = [*self._tools.values(), *self._closeables]
+        if self._skill_registry is not None:
+            values.append(self._skill_registry)
+        for value in reversed(values):
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            close = getattr(value, "close", None)
+            if not callable(close):
+                close = getattr(value, "shutdown", None)
+            if not callable(close):
+                continue
+            try:
+                close(timeout=timeout)
+            except TypeError:
+                close()
+            except Exception:
+                logger.warning(
+                    "Tool lifecycle close failed for %r",
+                    value,
+                    exc_info=True,
+                )
+        if self._skill_buffer is not None:
+            clear = getattr(self._skill_buffer, "clear", None)
+            if callable(clear):
+                clear()
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools

@@ -8,13 +8,14 @@ import logging
 import re
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from agent.session.models import ExplicitDelegationRequest, SessionMode
 from agent.session.task_contract import TaskContract
+from agent.session.executor_pool import borrowed_executor
 from agent.task import TaskIntent
 from context.workspace_facts import capture_workspace_snapshot
 from server.events import WsReviewUpdated
@@ -720,7 +721,8 @@ class ReviewService:
                 task for task in job["tasks"] if task["status"] == "queued"
             ]
             if tasks:
-                with ThreadPoolExecutor(
+                with borrowed_executor(
+                    self._runtime,
                     max_workers=len(tasks),
                     thread_name_prefix=f"review-{job_id}",
                 ) as pool:

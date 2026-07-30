@@ -1,26 +1,34 @@
-"""Adapters from MCP tools to runtime ConcreteTool objects."""
+"""Adapters from MCP metadata to canonical ``BaseTool`` objects."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import threading
 from typing import Any, Callable
 
-from agent.mcp.client import MCPToolBridge, MCPToolCallError
 from agent.mcp.types import MCPToolInfo, MCPToolProps
-from agent.mcp.tool_types import ToolResult, ToolUseContext, build_tool
+from core.base import RiskLevel, ToolResult
+from tools.factory import build_tool
+
+MCP_OUTPUT_WARN_CHARS = 10_000
+MCP_OUTPUT_MAX_CHARS = 25_000
 
 
-def mcp_tool_to_runtime_tool(bridge: MCPToolBridge, tool_info: MCPToolInfo, always_load: bool = False):
+def mcp_tool_to_runtime_tool(
+    manager: Any,
+    tool_info: MCPToolInfo,
+    always_load: bool = False,
+):
     """Create a fail-closed runtime tool wrapper for one MCP tool."""
 
-    async def call_fn(input: dict, _context: ToolUseContext) -> ToolResult[str]:
+    def execute(input: dict[str, Any]) -> ToolResult:
         try:
-            result = await bridge.call_tool(tool_info.name, input)
-        except MCPToolCallError as exc:
+            result = manager.execute_tool(tool_info.runtime_name, input)
+        except Exception as exc:
             return ToolResult(
+                success=False,
                 output="",
+                error=str(exc),
                 metadata={
                     "mcp_server": tool_info.server_name,
                     "mcp_tool": tool_info.name,
@@ -28,7 +36,10 @@ def mcp_tool_to_runtime_tool(bridge: MCPToolBridge, tool_info: MCPToolInfo, alwa
                 },
             )
 
-        output = _render_mcp_content(result.content)
+        output = _bounded_mcp_output(
+            tool_info.runtime_name,
+            _render_mcp_content(result.content),
+        )
         metadata = {
             "mcp_server": tool_info.server_name,
             "mcp_tool": tool_info.name,
@@ -36,16 +47,20 @@ def mcp_tool_to_runtime_tool(bridge: MCPToolBridge, tool_info: MCPToolInfo, alwa
         }
         if result.is_error:
             metadata["mcp_error"] = output or f"MCP tool '{tool_info.name}' returned an error"
-        return ToolResult(output=output, metadata=metadata)
+        return ToolResult(
+            success=not result.is_error,
+            output=output,
+            error=(output if result.is_error else ""),
+            metadata=metadata,
+        )
 
     tool = build_tool(
         name=tool_info.runtime_name,
-        input_schema=tool_info.input_schema,
-        call_fn=call_fn,
-        description_text=tool_info.description,
-        is_concurrency_safe=lambda _input: False,
+        parameters_schema=tool_info.input_schema,
+        execute=execute,
+        description=tool_info.description,
         is_read_only=lambda _input: False,
-        is_destructive=lambda _input: False,
+        risk=lambda _input: RiskLevel.MEDIUM,
         mcp_props=MCPToolProps(
             server_name=tool_info.server_name,
             original_tool_name=tool_info.name,
@@ -53,7 +68,6 @@ def mcp_tool_to_runtime_tool(bridge: MCPToolBridge, tool_info: MCPToolInfo, alwa
             is_deferred=not always_load,  # MCP tools are deferred unless always_load
         ),
     )
-    tool.metadata = dict(tool_info.metadata)  # keep for backward compat
     return tool
 
 
@@ -91,14 +105,16 @@ def deferred_mcp_tool(
                 raise
             state["connected"] = True
 
-    async def call_fn(input: dict, _context: ToolUseContext) -> ToolResult[str]:
+    def call_fn(input: dict[str, Any]) -> ToolResult:
         try:
             ensure_connected()
             result = execute_fn(input)
             return _coerce_execute_result(name, result)
         except Exception as exc:
             return ToolResult(
+                success=False,
                 output="",
+                error=str(exc),
                 metadata={
                     "mcp_server": server_name,
                     "mcp_tool": original_tool_name or name,
@@ -108,12 +124,11 @@ def deferred_mcp_tool(
 
     tool = build_tool(
         name=name,
-        input_schema=input_schema,
-        call_fn=call_fn,
-        description_text=description,
-        is_concurrency_safe=lambda _input: False,
+        parameters_schema=input_schema,
+        execute=call_fn,
+        description=description,
         is_read_only=lambda _input: False,
-        is_destructive=lambda _input: False,
+        risk=lambda _input: RiskLevel.MEDIUM,
         mcp_props=MCPToolProps(
             server_name=server_name,
             original_tool_name=original_tool_name or name,
@@ -122,9 +137,8 @@ def deferred_mcp_tool(
         ),
     )
 
-    tool.metadata = dict(metadata or {})
+    tool.source_metadata = dict(metadata or {})
     tool.ensure_connected = ensure_connected
-    tool.execute = lambda arguments: _sync_execute(tool, arguments)
     tool.is_connected = lambda: bool(state["connected"])
     tool.connect_error = lambda: state["connect_error"]
     tool.to_api_schema = lambda: {
@@ -171,59 +185,42 @@ def adapt_mcp_tools(tool_infos: list[MCPToolInfo], *, manager: Any, defer: bool 
                 metadata=info.metadata,
             ))
         else:
-            tools.append(mcp_tool_to_runtime_tool(bridge, info, always_load=True))
+            tools.append(mcp_tool_to_runtime_tool(manager, info, always_load=True))
     return tools
-
-
-def _sync_execute(tool: Any, arguments: dict[str, Any]) -> Any:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        result = asyncio.run(tool.call(arguments, ToolUseContext()))
-    else:
-        result_box: dict[str, Any] = {}
-        error_box: dict[str, BaseException] = {}
-
-        def _runner() -> None:
-            try:
-                result_box["result"] = asyncio.run(tool.call(arguments, ToolUseContext()))
-            except BaseException as exc:
-                error_box["error"] = exc
-
-        thread = threading.Thread(target=_runner, daemon=True)
-        thread.start()
-        thread.join()
-        if error_box:
-            raise error_box["error"]
-        result = result_box["result"]
-    if result.metadata.get("mcp_error"):
-        raise RuntimeError(result.metadata["mcp_error"])
-    return result.output
 
 
 # ── MCP Resource tools (ListMcpResourcesTool, ReadMcpResourceTool) ──
 
-def create_resource_list_tool(bridge: MCPToolBridge):
+def create_resource_list_tool(manager: Any, server_name: str):
     """Create a ListMcpResourcesTool wrapper for a connected MCP bridge."""
-    server_name = bridge.config.name
 
-    async def call_fn(input: dict, _context: ToolUseContext) -> ToolResult[str]:
+    def call_fn(_input: dict[str, Any]) -> ToolResult:
         try:
-            resources = await bridge.list_resources()
+            resources = manager.list_resources(server_name)
         except Exception as exc:
-            return ToolResult(output="", metadata={"mcp_error": str(exc)})
+            return ToolResult(
+                success=False,
+                output="",
+                error=str(exc),
+                metadata={"mcp_error": str(exc)},
+            )
         if not resources:
-            return ToolResult(output=f"No resources from MCP server '{server_name}'")
+            return ToolResult(
+                success=True,
+                output=f"No resources from MCP server '{server_name}'",
+            )
         lines = [f"MCP resources from '{server_name}':"]
         for r in resources:
             lines.append(f"  {r['uri']} — {r['name']} ({r.get('mimeType', '')})")
-        return ToolResult(output="\n".join(lines))
+        return ToolResult(success=True, output="\n".join(lines))
 
     return build_tool(
         name=f"mcp__{server_name}__list_resources",
-        description_text=f"List resources from MCP server '{server_name}'",
-        input_schema={"type": "object", "properties": {}, "required": []},
-        call_fn=call_fn,
+        description=f"List resources from MCP server '{server_name}'",
+        parameters_schema={
+            "type": "object", "properties": {}, "required": [],
+        },
+        execute=call_fn,
         mcp_props=MCPToolProps(
             server_name=server_name,
             original_tool_name="list_resources",
@@ -232,33 +229,45 @@ def create_resource_list_tool(bridge: MCPToolBridge):
     )
 
 
-def create_resource_read_tool(bridge: MCPToolBridge):
+def create_resource_read_tool(manager: Any, server_name: str):
     """Create a ReadMcpResourceTool wrapper for a connected MCP bridge."""
-    server_name = bridge.config.name
 
-    async def call_fn(input: dict, _context: ToolUseContext) -> ToolResult[str]:
+    def call_fn(input: dict[str, Any]) -> ToolResult:
         uri = input.get("uri", "")
         if not uri:
-            return ToolResult(output="", metadata={"mcp_error": "uri is required"})
+            return ToolResult(
+                success=False,
+                output="",
+                error="uri is required",
+                metadata={"mcp_error": "uri is required"},
+            )
         try:
-            result = await bridge.read_resource(uri)
+            result = manager.read_resource(server_name, uri)
         except Exception as exc:
-            return ToolResult(output="", metadata={"mcp_error": str(exc)})
+            return ToolResult(
+                success=False,
+                output="",
+                error=str(exc),
+                metadata={"mcp_error": str(exc)},
+            )
         contents = result.get("contents", [])
         if not contents:
-            return ToolResult(output=f"Resource '{uri}' returned empty content")
+            return ToolResult(
+                success=True,
+                output=f"Resource '{uri}' returned empty content",
+            )
         text = "\n".join(c.get("text", "") for c in contents)
-        return ToolResult(output=text)
+        return ToolResult(success=True, output=text)
 
     return build_tool(
         name=f"mcp__{server_name}__read_resource",
-        description_text=f"Read an MCP resource from '{server_name}' by URI",
-        input_schema={
+        description=f"Read an MCP resource from '{server_name}' by URI",
+        parameters_schema={
             "type": "object",
             "properties": {"uri": {"type": "string", "description": "Resource URI to read"}},
             "required": ["uri"],
         },
-        call_fn=call_fn,
+        execute=call_fn,
         mcp_props=MCPToolProps(
             server_name=server_name,
             original_tool_name="read_resource",
@@ -267,7 +276,7 @@ def create_resource_read_tool(bridge: MCPToolBridge):
     )
 
 
-def _coerce_execute_result(tool_name: str, result: Any) -> ToolResult[str]:
+def _coerce_execute_result(tool_name: str, result: Any) -> ToolResult:
     if isinstance(result, ToolResult):
         return result
     if hasattr(result, "content") and hasattr(result, "is_error"):
@@ -277,8 +286,13 @@ def _coerce_execute_result(tool_name: str, result: Any) -> ToolResult[str]:
         metadata["mcp_is_error"] = bool(getattr(result, "is_error", False))
         if metadata["mcp_is_error"]:
             metadata["mcp_error"] = output or f"MCP tool '{tool_name}' returned an error"
-        return ToolResult(output=output, metadata=metadata)
-    return ToolResult(output=str(result or ""))
+        return ToolResult(
+            success=not metadata["mcp_is_error"],
+            output=output,
+            error=(output if metadata["mcp_is_error"] else ""),
+            metadata=metadata,
+        )
+    return ToolResult(success=True, output=str(result or ""))
 
 
 def _render_mcp_content(content: list[Any]) -> str:
@@ -296,3 +310,20 @@ def _render_mcp_content(content: list[Any]) -> str:
             continue
         parts.append(str(block))
     return "\n".join(part for part in parts if part).strip()
+
+
+def _bounded_mcp_output(tool_name: str, output: str) -> str:
+    size = len(output)
+    if size > MCP_OUTPUT_MAX_CHARS:
+        return (
+            output[:MCP_OUTPUT_MAX_CHARS]
+            + f"\n\n[MCP output truncated: {size} chars -> "
+            + f"{MCP_OUTPUT_MAX_CHARS} chars]"
+        )
+    if size > MCP_OUTPUT_WARN_CHARS:
+        return (
+            output
+            + f"\n\n[Note: MCP tool '{tool_name}' returned {size} "
+            + "chars. Consider narrowing the request.]"
+        )
+    return output

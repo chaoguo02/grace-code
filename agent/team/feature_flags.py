@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 
+from config.env import bounded_float, bounded_int, env_flag
 
 @dataclass(frozen=True)
 class TeamFeatureConfig:
@@ -24,37 +25,32 @@ class TeamFeatureConfig:
 
     @classmethod
     def from_environment(
-        cls, environ: dict[str, str] | None = None
+        cls, environ: dict[str, str] | None = None, app_config: object | None = None,
     ) -> "TeamFeatureConfig":
+        """Load team feature config, preferring AppConfig when available (Phase 4)."""
         source = os.environ if environ is None else environ
-        enabled = source.get("GRACE_AGENT_TEAMS_ENABLED", "").lower() in {
-            "1", "true", "yes", "on",
-        }
-
-        def _int(name: str, default: int, minimum: int, maximum: int) -> int:
-            try:
-                value = int(source.get(name, str(default)))
-            except (TypeError, ValueError):
-                value = default
-            return max(minimum, min(value, maximum))
-
-        def _float(
-            name: str, default: float, minimum: float, maximum: float,
-        ) -> float:
-            try:
-                value = float(source.get(name, str(default)))
-            except (TypeError, ValueError):
-                value = default
-            return max(minimum, min(value, maximum))
+        enabled = env_flag(source, "GRACE_AGENT_TEAMS_ENABLED")
+        # Phase 4: override from AppConfig if present
+        if app_config is not None:
+            rg_cfg = getattr(app_config, "resource_governance", None)
+            if rg_cfg is not None:
+                enabled = getattr(rg_cfg, "team_enabled", enabled)
 
         return cls(
             enabled=enabled,
-            # Team activation remains approval-gated by design.  It cannot be
-            # disabled through environment configuration.
             require_user_approval=True,
-            max_members=_int("GRACE_AGENT_TEAM_MAX_MEMBERS", 4, 2, 8),
-            max_tasks=_int("GRACE_AGENT_TEAM_MAX_TASKS", 32, 1, 128),
-            lease_ttl_seconds=_float(
-                "GRACE_AGENT_TEAM_LEASE_TTL_SECONDS", 120.0, 10.0, 3600.0,
+            max_members=bounded_int(
+                source, "GRACE_AGENT_TEAM_MAX_MEMBERS", 4,
+                minimum=2, maximum=8,
+            ),
+            max_tasks=bounded_int(
+                source, "GRACE_AGENT_TEAM_MAX_TASKS", 32, maximum=128,
+            ),
+            lease_ttl_seconds=bounded_float(
+                source,
+                "GRACE_AGENT_TEAM_LEASE_TTL_SECONDS",
+                120.0,
+                minimum=10.0,
+                maximum=3600.0,
             ),
         )
