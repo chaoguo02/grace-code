@@ -1,0 +1,11 @@
+interface:
+  display_name: "城市天气"
+  short_description: "通过确定性天气 MCP 查询城市当前状况与多日预报流程"
+  default_prompt: "使用 $city-weather 查询北京未来两天天气并给出出行建议。"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "weather-mock"
+      description: "提供确定性的城市当前天气和多日预报测试数据"
+      transport: "stdio"

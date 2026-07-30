@@ -8,7 +8,10 @@ import random
 import threading
 import time
 from collections import defaultdict, deque
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    CancelledError as FutureCancelledError,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass
 from typing import Any
 
@@ -313,6 +316,16 @@ class SyncMCPToolManager:
                 self._inflight,
             )
         self._watchdog_future.cancel()
+        try:
+            self._watchdog_future.result(
+                timeout=max(0.1, close_timeout),
+            )
+        except FutureCancelledError:
+            pass
+        except FutureTimeoutError:
+            logger.error(
+                "leaked_operation: MCP watchdog did not stop",
+            )
         for server_name in list(self._bridges.keys()):
             bridge = self._bridges.pop(server_name)
             try:

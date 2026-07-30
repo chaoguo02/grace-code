@@ -38,6 +38,7 @@ class SkillContextModifier:
     """
     allowed_tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
+    mcp_servers: frozenset[str] = frozenset()
     model: str = ""
     effort: str = ""
     context: str = ""  # "" | "fork"
@@ -158,6 +159,7 @@ class SkillTool(BaseTool):
             modifier = SkillContextModifier(
                 allowed_tools=meta.allowed_tools,
                 disallowed_tools=meta.disallowed_tools,
+                mcp_servers=meta.mcp_servers,
                 model=meta.model,
                 effort=meta.effort,
                 context=meta.context,

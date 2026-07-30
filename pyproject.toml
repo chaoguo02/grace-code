@@ -33,7 +33,7 @@ dev = [
     "pytest-cov>=5.0.0",
 ]
 mcp = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2.0.0",
 ]
 rag = [
     "fastembed>=0.3.0",
@@ -48,7 +48,7 @@ full = [
     "tree-sitter-java>=0.22.0",
     "ddgs>=6.0.0",
     "readability-lxml>=0.8.0",
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2.0.0",
 ]
 
 [project.scripts]

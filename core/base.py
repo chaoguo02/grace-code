@@ -606,6 +606,7 @@ class ToolRegistry:
         evidence_ledger_ref: Any = None,
         skill_registry: Any = None,
         skill_buffer: Any = None,
+        mcp_integration: Any = None,
     ) -> None:
         """Create a tool registry with optional Runtime-owned intercept layers.
 
@@ -621,6 +622,7 @@ class ToolRegistry:
         self._evidence_ledger_ref = evidence_ledger_ref
         self._skill_registry = skill_registry
         self._skill_buffer = skill_buffer
+        self._mcp_integration = mcp_integration
         self._closeables: list[Any] = []
         self._closed = False
         self._owns_lifecycle = True
@@ -691,6 +693,23 @@ class ToolRegistry:
         return self._skill_buffer
 
     @property
+    def mcp_integration(self) -> Any:
+        return self._mcp_integration
+
+    def attach_mcp_integration(self, integration: Any) -> None:
+        """Attach the canonical MCP activation owner after bootstrap."""
+        self._mcp_integration = integration
+
+    def activate_mcp_servers(
+        self,
+        server_names: set[str] | frozenset[str],
+    ) -> list[str]:
+        """Activate deferred tools owned by declared MCP server dependencies."""
+        if self._mcp_integration is None or not server_names:
+            return []
+        return self._mcp_integration.activate_servers(set(server_names))
+
+    @property
     def capability_registry(self) -> Any:
         return self._capability_registry
 
@@ -702,13 +721,16 @@ class ToolRegistry:
         """Queue one turn-scoped Skill modifier for the next policy view."""
         from skills.tool import SkillContextModifier
 
+        mcp_servers = frozenset(getattr(metadata, "mcp_servers", frozenset()))
         self._pending_skill_modifier = SkillContextModifier(
             allowed_tools=metadata.allowed_tools,
             disallowed_tools=metadata.disallowed_tools,
+            mcp_servers=mcp_servers,
             model=metadata.model,
             effort=metadata.effort,
             context=metadata.context,
         )
+        self.activate_mcp_servers(mcp_servers)
 
     def consume_skill_modifier(self) -> Any:
         modifier = self._pending_skill_modifier
@@ -829,6 +851,7 @@ class ToolRegistry:
             evidence_ledger_ref=self._evidence_ledger_ref,
             skill_registry=self._skill_registry,
             skill_buffer=self._skill_buffer,
+            mcp_integration=self._mcp_integration,
         )
         for tool_name in self.tool_names:
             if tool_name in allowed_tools:
@@ -937,6 +960,7 @@ class ToolRegistry:
             evidence_ledger_ref=self._evidence_ledger_ref,
             skill_registry=self._skill_registry,
             skill_buffer=self._skill_buffer,
+            mcp_integration=self._mcp_integration,
         )
         scoped._resource_governor = self._resource_governor
         scoped._root_session_resolver = self._root_session_resolver

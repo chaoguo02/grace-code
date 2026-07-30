@@ -111,6 +111,15 @@ class MCPToolIntegration:
             activated.append(tool.name)
         return activated
 
+    def activate_servers(self, server_names: set[str]) -> list[str]:
+        """Activate all deferred tools owned by the named MCP servers."""
+        tool_names = {
+            tool_name
+            for server_name in server_names
+            for tool_name in self.server_tools.get(server_name, ())
+        }
+        return self.activate_tools(tool_names)
+
     def connection_errors(self) -> dict[str, str]:
         if self._manager is None:
             return {}

@@ -110,6 +110,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
             evidence_ledger_ref=base.evidence_ledger_ref,
             skill_registry=base.skill_registry,
             skill_buffer=base.skill_buffer,
+            mcp_integration=base.mcp_integration,
         )
         self._owns_lifecycle = False
         self._base = base
@@ -348,6 +349,8 @@ class PolicyAwareToolRegistry(ToolRegistry):
         from skills.tool import SkillContextModifier
         if not isinstance(modifier, SkillContextModifier):
             return
+
+        self.activate_mcp_servers(modifier.mcp_servers)
 
         owner = self._modifier_owner or self
         targets = (self,) if owner is self else (self, owner)

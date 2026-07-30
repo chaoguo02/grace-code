@@ -131,4 +131,10 @@ context:
 #     args: ["-y", "@anthropic/mcp-server-brave-search"]
 #     env:
 #       BRAVE_API_KEY: "${BRAVE_API_KEY}"
-mcp_servers: {}
+mcp_servers:
+  weather-mock:
+    transport: stdio
+    command: python
+    args: ["-m", "examples.mcp_servers.weather_mock_server"]
+    cwd: "."
+    timeout_seconds: 15

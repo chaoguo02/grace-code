@@ -96,6 +96,7 @@ class SkillMetadata:
     # ── Tool control ──
     allowed_tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
+    mcp_servers: frozenset[str] = frozenset()
     hooks: tuple[dict, ...] = ()
     source: str = "project"
     trusted: bool = True
@@ -481,10 +482,45 @@ class SkillRegistry:
             arguments=named_args,
             allowed_tools=_parse_tool_set(fm_dict.get("allowed-tools", [])),
             disallowed_tools=_parse_tool_set(fm_dict.get("disallowed-tools", [])),
+            mcp_servers=self._load_mcp_dependencies(skill_file.parent),
             hooks=hooks,
             source=source.name,
             trusted=source.trusted,
             file_path=str(skill_file),
+        )
+
+    @staticmethod
+    def _load_mcp_dependencies(skill_dir: Path) -> frozenset[str]:
+        """Read declarative MCP dependencies from agents/openai.yaml."""
+        metadata_file = skill_dir / "agents" / "openai.yaml"
+        if not metadata_file.is_file():
+            return frozenset()
+        try:
+            raw = yaml.safe_load(
+                metadata_file.read_text(encoding="utf-8"),
+            ) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(
+                "Invalid Skill UI metadata in %s: %s",
+                metadata_file,
+                exc,
+            )
+            return frozenset()
+        dependencies = raw.get("dependencies", {})
+        tools = dependencies.get("tools", []) if isinstance(
+            dependencies,
+            dict,
+        ) else []
+        if not isinstance(tools, list):
+            return frozenset()
+        return frozenset(
+            str(item.get("value", "")).strip()
+            for item in tools
+            if (
+                isinstance(item, dict)
+                and str(item.get("type", "")).strip().lower() == "mcp"
+                and str(item.get("value", "")).strip()
+            )
         )
 
     @staticmethod
@@ -899,7 +935,11 @@ class SkillRegistry:
                 if not root.exists():
                     facts.append(f"{source.name}:{directory}:missing")
                     continue
-                patterns = ("*.md",) if source.legacy_commands else ("SKILL.md",)
+                patterns = (
+                    ("*.md",)
+                    if source.legacy_commands
+                    else ("SKILL.md", "agents/openai.yaml")
+                )
                 for pattern in patterns:
                     for path in sorted(root.rglob(pattern)):
                         try:

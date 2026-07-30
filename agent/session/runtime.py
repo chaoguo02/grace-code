@@ -2900,10 +2900,11 @@ class SessionRuntime:
         if self._mcp_integration is None:
             return frozenset()
         from agent.capability_registry import CapabilityState
+        server_tools = self._mcp_integration.server_tools
+        raw_names: set[str] = set()
+
         # CC-aligned: resolve named mcpServers references from frontmatter
         if spec.mcp_servers:
-            server_tools = self._mcp_integration.server_tools
-            raw_names: set[str] = set()
             for entry in spec.mcp_servers:
                 if isinstance(entry, str):
                     raw_names.update(server_tools.get(entry, []))
@@ -2911,14 +2912,31 @@ class SessionRuntime:
                     # Inline definition — connected at agent start, tools lazy-registered
                     for name in entry:
                         raw_names.update(server_tools.get(name, []))
-            return frozenset(
-                n for n in raw_names
-                if self._capability_registry.state_for(n) is CapabilityState.AVAILABLE
-            )
         # Fallback (backward compat): EDIT-intent agents get session-level MCP tools
-        if spec.intent is not TaskIntent.EDIT:
-            return frozenset()
-        raw_names = getattr(self._mcp_integration, "tool_names", frozenset())
+        elif spec.intent is TaskIntent.EDIT:
+            raw_names.update(
+                getattr(self._mcp_integration, "tool_names", frozenset()),
+            )
+
+        # Skill dependencies remain deferred until invocation, but their tools
+        # must already exist in the session registry so activation can expose
+        # the schemas on the following model turn.  This also enables read-only
+        # Plan/Research agents to use explicitly declared Skill MCP dependencies
+        # without granting every unrelated global MCP server.
+        skill_registry = self._base_registry.skill_registry
+        if skill_registry is not None:
+            dependency_servers = {
+                server_name
+                for metadata in skill_registry.list_skills()
+                for server_name in getattr(
+                    metadata,
+                    "mcp_servers",
+                    frozenset(),
+                )
+            }
+            for server_name in dependency_servers:
+                raw_names.update(server_tools.get(server_name, ()))
+
         return frozenset(
             n
             for n in raw_names

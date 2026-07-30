@@ -164,6 +164,12 @@ class MCPToolBridge:
         self._connected = False
         self._fingerprint = ""
         self._launch_fingerprint = ""
+        # The MCP SDK builds AnyIO cancel scopes inside its async context
+        # managers.  Enter and exit must therefore happen in one long-lived
+        # owner Task; ordinary tool calls may still run in sibling Tasks.
+        self._owner_task: asyncio.Task[None] | None = None
+        self._close_requested: asyncio.Event | None = None
+        self._ready_future: asyncio.Future[list[MCPToolInfo]] | None = None
         # MCP-05: callback invoked when server sends notifications/tools/list_changed
         self._on_tools_changed: Any = None
 
@@ -201,6 +207,10 @@ class MCPToolBridge:
             return self.tools
         if not HAS_MCP:
             raise MCPNotInstalledError("Install the optional 'mcp' dependency to use runtime MCP bridge")
+        if self._owner_task is not None and not self._owner_task.done():
+            if self._ready_future is None:
+                raise RuntimeError("MCP owner task has no readiness future")
+            return await asyncio.shield(self._ready_future)
 
         env = dict(os.environ)
         if self.config.env:
@@ -215,36 +225,99 @@ class MCPToolBridge:
             env=env,
             cwd=self.config.cwd or os.getcwd(),
         )
-        self._transport_cm = stdio_client(params)
-        read_stream, write_stream = await self._transport_cm.__aenter__()
-
-        self._session_cm = ClientSession(read_stream, write_stream)
-        self._session = await self._session_cm.__aenter__()
-        initialize_result = await self._session.initialize()
-        self._fingerprint = _server_fingerprint(
-            initialize_result,
-            self.config,
+        loop = asyncio.get_running_loop()
+        self._close_requested = asyncio.Event()
+        self._ready_future = loop.create_future()
+        self._owner_task = loop.create_task(
+            self._run_owned_session(params),
+            name=f"mcp-owner:{self.config.name}",
         )
-        self._launch_fingerprint = _launch_fingerprint(self.config)
-
-        self._tools = await self.discover_tools()
-        # MCP-05: register for dynamic tool update notifications
-        if hasattr(self._session, "on_notification"):
-            self._session.on_notification("notifications/tools/list_changed")(self._on_list_changed)
-        self._connected = True
-        return self.tools
+        return await asyncio.shield(self._ready_future)
 
     async def close(self) -> None:
         """Close streams, then terminate a surviving stdio subprocess."""
+        owner = self._owner_task
+        if owner is not None and owner is not asyncio.current_task():
+            if self._close_requested is not None:
+                self._close_requested.set()
+            try:
+                async with asyncio.timeout(
+                    MCP_CLOSE_GRACE_SECONDS * 2
+                    + MCP_FORCE_KILL_WAIT_SECONDS,
+                ):
+                    await asyncio.shield(owner)
+            except TimeoutError:
+                _logger.warning(
+                    "MCP owner close timed out for %s",
+                    self.config.name,
+                )
+                await self._terminate_process()
+                owner.cancel()
+                try:
+                    await owner
+                except asyncio.CancelledError:
+                    pass
+            finally:
+                self._owner_task = None
+                self._close_requested = None
+                self._ready_future = None
+                self._connected = False
+            return
+
+        await self._close_contexts()
+        self._connected = False
+
+    async def _run_owned_session(self, params: Any) -> None:
+        """Own SDK context managers for their complete lifetime in one Task."""
+        ready = self._ready_future
+        try:
+            self._transport_cm = stdio_client(params)
+            read_stream, write_stream = await self._transport_cm.__aenter__()
+
+            self._session_cm = ClientSession(read_stream, write_stream)
+            self._session = await self._session_cm.__aenter__()
+            initialize_result = await self._session.initialize()
+            self._fingerprint = _server_fingerprint(
+                initialize_result,
+                self.config,
+            )
+            self._launch_fingerprint = _launch_fingerprint(self.config)
+            self._tools = await self.discover_tools()
+            if hasattr(self._session, "on_notification"):
+                self._session.on_notification(
+                    "notifications/tools/list_changed",
+                )(self._on_list_changed)
+            self._connected = True
+            if ready is not None and not ready.done():
+                ready.set_result(self.tools)
+            assert self._close_requested is not None
+            await self._close_requested.wait()
+        except asyncio.CancelledError:
+            if ready is not None and not ready.done():
+                ready.cancel()
+            raise
+        except BaseException as exc:
+            if ready is not None and not ready.done():
+                ready.set_exception(exc)
+            else:
+                _logger.warning(
+                    "MCP owner task failed for %s",
+                    self.config.name,
+                    exc_info=True,
+                )
+        finally:
+            self._connected = False
+            await self._close_contexts()
+
+    async def _close_contexts(self) -> None:
+        """Exit SDK contexts; caller must be the Task that entered them."""
         if self._session_cm is not None:
             try:
-                await asyncio.wait_for(
-                    self._session_cm.__aexit__(None, None, None),
-                    timeout=MCP_CLOSE_GRACE_SECONDS,
-                )
+                async with asyncio.timeout(MCP_CLOSE_GRACE_SECONDS):
+                    await self._session_cm.__aexit__(None, None, None)
             except Exception:
                 _logger.warning(
-                    "MCP session close timed out for %s",
+                    "MCP session close failed for %s",
                     self.config.name,
                     exc_info=True,
                 )
@@ -254,21 +327,17 @@ class MCPToolBridge:
 
         if self._transport_cm is not None:
             try:
-                await asyncio.wait_for(
-                    self._transport_cm.__aexit__(None, None, None),
-                    timeout=MCP_CLOSE_GRACE_SECONDS,
-                )
+                async with asyncio.timeout(MCP_CLOSE_GRACE_SECONDS):
+                    await self._transport_cm.__aexit__(None, None, None)
             except Exception:
                 _logger.warning(
-                    "MCP transport close timed out for %s",
+                    "MCP transport close failed for %s",
                     self.config.name,
                     exc_info=True,
                 )
                 await self._terminate_process()
             finally:
                 self._transport_cm = None
-
-        self._connected = False
 
     async def discover_tools(self) -> list[MCPToolInfo]:
         """Return normalized metadata for all server tools."""

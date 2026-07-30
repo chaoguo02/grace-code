@@ -32,6 +32,7 @@ def initialize_mcp_integration(cfg: Any, registry: Any) -> Any | None:
     integration = MCPToolIntegration({"mcp_servers": server_configs})
     integration.initialize()
     integration.register_into(registry)
+    registry.attach_mcp_integration(integration)
     registry.add_closeable(integration)
     for tool in registry.tools:
         if isinstance(tool, (ToolSearchTool, WaitForMcpServersTool)):
