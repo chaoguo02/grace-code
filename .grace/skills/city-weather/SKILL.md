@@ -10,17 +10,18 @@ tools; it does not contain weather data itself.
 
 ## Workflow
 
-1. Extract every requested city and the forecast length. Default to 2 days and
-   accept only 1-5 days.
+1. Extract every requested city and determine whether the user asked for
+   current conditions, a forecast, or both. Preserve explicit output limits
+   such as an exact number of lines.
 2. For each city, call
    `mcp__weather_mock__weather_get_current` with `{"city": "<city>"}`.
-3. For each city, call
-   `mcp__weather_mock__weather_get_forecast` with
-   `{"city": "<city>", "days": <days>}`.
-4. Check that both results identify the same normalized city and include
+3. Only when the user asks for future weather, a forecast, a trend, or a
+   number of days, call `mcp__weather_mock__weather_get_forecast` with
+   `{"city": "<city>", "days": <days>}`. Default to 2 days and accept 1-5.
+4. Check that every result identifies the same normalized city and includes
    `fixture: grace-code-weather-mock-v1`.
-5. Summarize the returned conditions and give brief advice based only on those
-   conditions. For multiple cities, add a direct comparison.
+5. Summarize only the requested facts. Add advice or a city comparison only
+   when requested or when it fits without violating an explicit format limit.
 
 Independent calls for different cities may run in parallel. Do not create a
 subagent merely because this skill was invoked.
@@ -32,20 +33,22 @@ subagent merely because this skill was invoked.
 - State clearly that results are deterministic mock data intended for MCP/Skill
   integration testing.
 - If a city is unsupported, report the MCP error and its supported-city list.
-- If either required MCP tool is unavailable, stop and name the missing tool.
+- If a required MCP tool is unavailable, stop and name the missing tool.
 - Do not expose hidden reasoning or repeat raw tool payloads unnecessarily.
 
 ## Output
 
-For one city, return:
+When the user does not specify a format, use:
 
 ```text
 城市：<normalized city>
 当前：<condition and temperature>
-未来：<one line per forecast day>
-建议：<brief advice grounded in the returned data>
+未来：<one line per forecast day, only when requested>
+建议：<brief advice, only when requested>
 数据：weather-mock fixture
 ```
 
 For multiple cities, give each city the same compact block followed by a
-comparison. Produce one final answer after all calls complete.
+comparison when requested. Explicit user constraints such as "three lines",
+"JSON", or "current weather only" override this default template. Produce one
+final answer after all calls complete.
