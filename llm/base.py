@@ -26,14 +26,21 @@ StreamCallback = Callable[[str], None]
 # ---------------------------------------------------------------------------
 
 class MessageKind(str, Enum):
-    """Type-safe message kind for control flow — NOT parsed from text."""
-    USER = "user"
-    ASSISTANT = "assistant"
-    SYSTEM = "system"
-    TOOL_RESULT = "tool_result"
-    COMPACTION_BOUNDARY = "compaction_boundary"
+    """Non-standard message marker for storage and display filtering.
+
+    Only ``RUNTIME_NOTICE`` is set at message creation time.  Messages
+    read back from the database leave ``kind`` as ``None`` — the ``role``
+    field is sufficient for all display and control-flow purposes.
+
+    **Contract for RUNTIME_NOTICE**: This value couples two distinct
+    semantics: "do not persist to DB" AND "do not show in frontend."
+    It is exclusively for transient control-flow messages injected into
+    the LLM context that must leave no trace in storage or UI.  If a
+    future use case needs only one of these properties (e.g., "persist
+    but don't display" or "display but don't persist"), split this into
+    two values rather than overloading this one.
+    """
     RUNTIME_NOTICE = "runtime_notice"
-    PLAN_CONTEXT = "plan_context"
 
 
 @dataclass
@@ -44,7 +51,8 @@ class LLMMessage:
     content: 纯文本 str，或 content blocks 列表（Anthropic cache_control 格式）。
     tool_call_id 仅在 role=="tool" 时使用（工具执行结果关联到对应的 tool_use）。
     tool_calls 仅在 role=="assistant" 时使用（native function calling 模式）。
-    kind: MessageKind — 类型化的消息种类, 替代文本前缀匹配。
+    kind: Optional[MessageKind] — 仅在 RUNTIME_NOTICE 时设置。
+          所有常规消息的 kind=None，role 字段已足够分类。
     """
     role: str
     content: "str | list[dict[str, Any]]"

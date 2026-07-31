@@ -625,7 +625,7 @@ class SessionStore:
         if self.get_session(session_id) is None:
             raise ValueError(f"Unknown session: {session_id}")
         # Skip Runtime-only messages that should never appear in the frontend
-        if message.kind in (MessageKind.RUNTIME_NOTICE, MessageKind.PLAN_CONTEXT):
+        if message.kind is MessageKind.RUNTIME_NOTICE:
             return
         tool_name = None
         tool_calls_json = None
@@ -814,7 +814,7 @@ class SessionStore:
                 content=row["content"],
                 tool_call_id=row["tool_call_id"],
                 tool_calls=tool_calls,
-                kind=MessageKind.USER if row["role"] == "user" else MessageKind.ASSISTANT,
+                kind=None,  # kind is never persisted — role field is sufficient
                 created_at=row["created_at"],
             ))
             # Attach DB id for incremental reload (subagent S4: live steering)
