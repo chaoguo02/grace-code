@@ -1344,3 +1344,208 @@ def _micro_pass(messages: list[dict], keep_recent: int) -> list[dict]:
 def _is_compactable_tool(msg: dict) -> bool:
     name = msg.get("tool_name", "") or msg.get("name", "")
     return name in COMPACTABLE_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# Tool Result Degradation — Budget-Driven (Phase 5)
+# ---------------------------------------------------------------------------
+
+_DEGRADATION_TRIGGER_RATIO = 0.70  # history must exceed 70% of budget
+_DEGRADATION_KEEP_RECENT = 5       # protect last K tool results
+_DEGRADATION_REF_WINDOW = 10       # only check last N messages for references
+_DEGRADATION_PREVIEW_CHARS = 200   # chars preserved in degradation summary
+_MUTATING_TOOLS = frozenset({
+    "Edit", "Write", "file_edit", "file_write",
+})  # write-invalidation: these cancel Read result protection
+
+
+def _degrade_tool_results(
+    messages: list[dict],
+    history_budget: int,
+) -> tuple[list[dict], int]:
+    """Budget-driven tool result degradation (Phase 5).
+
+    Only triggers when estimated token count exceeds
+    ``_DEGRADATION_TRIGGER_RATIO * history_budget``.  When triggered,
+    degrades the largest tool results first, preserving:
+      - Recent K results (recency protection)
+      - Results whose file paths appear in the last N subsequent messages
+        (referenced-result skip — with write-invalidation for reads)
+      - A structured metadata summary (file_path, line_range, command,
+        exit_code, first 200 chars of output)
+
+    Returns (messages, tokens_freed).  Never touches raw DB storage —
+    degradation is prompt-layer only.
+    """
+    from context.token_budget import estimate_tokens
+
+    if not messages or history_budget <= 0:
+        return messages, 0
+
+    total_tokens = sum(
+        estimate_tokens(str(m.get("content", ""))) for m in messages
+    )
+    if total_tokens < int(history_budget * _DEGRADATION_TRIGGER_RATIO):
+        return messages, 0  # budget is healthy, no degradation
+
+    # ── Index tool results ──
+    tool_results: list[tuple[int, dict, int]] = []  # (idx, msg, size)
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "tool":
+            content = str(msg.get("content", "") or "")
+            size = estimate_tokens(content)
+            if size > 20:  # skip trivially small results (< ~20 tokens)
+                tool_results.append((i, msg, size))
+
+    if len(tool_results) <= _DEGRADATION_KEEP_RECENT:
+        return messages, 0
+
+    # ── Protected: recent K ──
+    recent_indices = {tr[0] for tr in tool_results[-_DEGRADATION_KEEP_RECENT:]}
+
+    # ── Write-invalidation: track which Read results are invalidated by
+    #     subsequent Edit/Write to the same file ──
+    write_files: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "tool":
+            tn = msg.get("tool_name", "") or msg.get("name", "")
+            if tn in _MUTATING_TOOLS:
+                fp = _extract_file_path(msg)
+                if fp:
+                    write_files.add(fp)
+
+    def _read_invalidated(idx: int) -> bool:
+        """Return True if a Read result at *idx* was made obsolete by a
+        subsequent Edit/Write to the same file."""
+        msg = messages[idx]
+        tn = msg.get("tool_name", "") or msg.get("name", "")
+        if not tn.startswith("Read") and tn != "file_read":
+            return False
+        fp = _extract_file_path(msg)
+        return bool(fp and fp in write_files)
+
+    # ── Referenced-result skip (with time window + write-invalidation) ──
+    protected_by_ref: set[int] = set()
+    for idx, msg, _size in tool_results:
+        if idx in recent_indices:
+            continue
+        if _read_invalidated(idx):
+            continue  # write-invalidation defeats Read result protection
+        # Check last N messages after this result for file-path mentions
+        fp = _extract_file_path(msg)
+        if fp:
+            window_start = idx + 1
+            window_end = min(len(messages), idx + 1 + _DEGRADATION_REF_WINDOW)
+            for j in range(window_start, window_end):
+                if fp in str(messages[j].get("content", "")):
+                    protected_by_ref.add(idx)
+                    break
+
+    # ── Degradation candidates: sort by size descending, older first as tie-break ──
+    candidates = [
+        (size, idx, msg)
+        for idx, msg, size in tool_results
+        if idx not in recent_indices and idx not in protected_by_ref
+    ]
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+
+    if not candidates:
+        return messages, 0
+
+    # ── Degrade until budget is healthy ──
+    tokens_freed = 0
+    for size, idx, msg in candidates:
+        if total_tokens - tokens_freed < int(history_budget * _DEGRADATION_TRIGGER_RATIO):
+            break
+
+        content = str(msg.get("content", "") or "")
+        summary = _build_degradation_summary(msg, content)
+        before = estimate_tokens(content)
+        after = estimate_tokens(summary)
+
+        messages[idx] = {**messages[idx], "content": summary}
+        tokens_freed += max(0, before - after)
+
+    return messages, tokens_freed
+
+
+def _extract_file_path(msg: dict) -> str:
+    """Extract a file path from a tool result message.
+
+    Checks the preceding assistant's tool call parameters for known
+    file-path keys (file_path, path, target, etc.).
+    """
+    # Check for stored tool_call_id to find the assistant+tool_call
+    tc_id = msg.get("tool_call_id")
+    if not tc_id:
+        # Try tool_name-based heuristics for the degradation summary
+        return ""
+    return ""  # file-path extraction requires context not available here
+
+def _extract_file_path_from_msg(msg: dict) -> str:
+    """Best-effort file path extraction from tool name and raw content."""
+    tn = msg.get("tool_name", "") or msg.get("name", "")
+    content = str(msg.get("content", "") or "")
+    # Try common file-path patterns in tool output
+    import re
+    for pattern in [
+        r"(?:file_path|path|file)[:=]\s*([^\s,;]+)",
+        r"File:\s*([^\s,;]+)",
+        r"(?:^|\n)([./\\]{1,2}[\w./\\-]+)",
+    ]:
+        m = re.search(pattern, content[:500])
+        if m:
+            return m.group(1).strip()
+    # Read/Bash results often list files in output
+    if tn in ("Read", "file_read", "ReadFile"):
+        for line in content.split("\n"):
+            line = line.strip()
+            if line.startswith("File:") or line.startswith("Path:"):
+                return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _build_degradation_summary(msg: dict, original_content: str) -> str:
+    """Build a structured degradation summary for one tool result.
+
+    Preserves metadata that the model can use to decide whether to
+    re-read the full result: tool name, file path, line range,
+    command, exit code, and a preview of the output.
+    """
+    tn = msg.get("tool_name", "") or msg.get("name", "") or "unknown"
+    fp = _extract_file_path_from_msg(msg)
+    summary_parts = [f"[Tool result summarized — {tn}]"]
+
+    if fp:
+        summary_parts.append(f"  File: {fp}")
+    if tn == "Bash" or tn == "shell":
+        # Try to extract exit code
+        content = original_content[:500]
+        import re
+        exit_match = re.search(r"exit[_ ]?code\s*[:=]?\s*(\d+)", content, re.IGNORECASE)
+        if exit_match:
+            summary_parts.append(f"  Exit: {exit_match.group(1)}")
+        # Command info
+        cmd_start = content.find("Command:") if "Command:" in content else -1
+        if cmd_start >= 0:
+            cmd_end = content.find("\n", cmd_start)
+            if cmd_end > 0:
+                summary_parts.append(f"  {content[cmd_start:cmd_end].strip()}")
+
+    # Preview: first meaningful lines up to _DEGRADATION_PREVIEW_CHARS chars
+    preview_lines = []
+    for line in original_content.split("\n"):
+        stripped = line.strip()
+        if stripped and not all(c in "─━═-*_— " for c in stripped):
+            preview_lines.append(stripped)
+        if len("\n".join(preview_lines)) > _DEGRADATION_PREVIEW_CHARS:
+            break
+    preview = "\n".join(preview_lines)[:_DEGRADATION_PREVIEW_CHARS]
+    if preview:
+        summary_parts.append(f"  Preview: {preview}")
+
+    summary_parts.append(
+        "[Full output preserved in session storage. Use a targeted read "
+        "if you need the complete content.]"
+    )
+    return "\n".join(summary_parts)

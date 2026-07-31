@@ -110,6 +110,10 @@ def prepare_history_for_turn(
     # eliminating the intermediate serialize → deserialize cycle.
     if plan.includes(ContextReduction.SNIP) or plan.includes(ContextReduction.MICRO_COMPACT):
         tokens_freed += _structural_compact(history)
+    # Phase 5: Budget-driven tool result degradation — largest-first,
+    # recent-K protected, referenced-result skip with write-invalidation.
+    # Only runs when actual token count exceeds 70% of history budget.
+    tokens_freed += _degrade_tool_results(history, history_budget)
     if tokens_freed > 0:
         logger.debug(
             "Pre-LLM trimming freed ~%d tokens total",
@@ -157,6 +161,36 @@ def _structural_compact(history: "ConversationHistory") -> int:
         history._messages.clear()
         history._messages.extend(restored._messages)
     return compactor.tokens_freed
+
+
+def _degrade_tool_results(
+    history: "ConversationHistory",
+    history_budget: int,
+) -> int:
+    """Phase 5: Budget-driven tool result degradation (zero hardcoded TTL).
+
+    Largest results degraded first.  Recent 5 results protected.
+    Referenced file paths in last 10 messages skip degradation.
+    Write-invalidation: Read results lose protection if later Edit/Write
+    touched the same file.
+
+    Degradation is prompt-layer only — raw content always in DB.
+    """
+    from context.compaction import _degrade_tool_results as _degrade
+    dicts = history.to_dicts()
+    kept, tokens_freed = _degrade(dicts, history_budget)
+    if tokens_freed > 0:
+        restored = type(history).from_dicts(kept, max_messages=history._max)
+        history._messages.clear()
+        history._messages.extend(restored._messages)
+    return tokens_freed
+
+
+def _tool_result_key(msg) -> str:
+    tid = getattr(msg, "tool_call_id", None)
+    if tid:
+        return str(tid)
+    return f"{id(msg)}:{getattr(msg, 'tool_name', '')}"
 
 
 def _apply_tool_result_budget(

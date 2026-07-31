@@ -11796,3 +11796,21 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+
+/* Secondary data colors stay distinct without returning to blue/purple. */
+.context-budget-system { background: #66776d; }
+.context-budget-memory { background: #a78356; }
+.context-budget-session { background: var(--accent); }
+.context-budget-task { background: #bd8245; }
+.context-budget-other { background: #8b8c82; }
+.context-chip-list > span.skill {
+  border-color: color-mix(in srgb, var(--warning) 38%, var(--border));
+  color: var(--warning);
+}
+.diff-line-hunk {
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+}
+.paired-run-stage-action {
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
+}
