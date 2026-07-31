@@ -595,32 +595,32 @@ repeated patterns). #6 kills processes.
 
 #### #7: TraceContext Integration
 
-- [ ] `TraceScope` wired into `ToolExecutionPipeline.execute()`
-- [ ] `HookContext` reads `trace_context` from ContextVar
-- [ ] Evidence recorder reads `trace_context` from ContextVar
-- [ ] Langfuse observer reads `trace_context` and maps to span attributes
-- [ ] Unit test: ContextVar propagation verified with mock observer
+- [x] `TraceScope` wired into `ToolExecutionPipeline.execute()`
+- [x] `HookContext` reads `trace_context` from ContextVar
+- [x] Evidence recorder reads `trace_context` from ContextVar
+- [x] Langfuse observer reads `trace_context` and maps to span attributes
+- [x] Unit test: ContextVar propagation verified with mock observer
 
 #### #8: ToolResult Doc
 
-- [ ] Docstring updated with 3-category table (output payload / action evidence / runtime metadata)
-- [ ] No field removal — documentation only
+- [x] Docstring updated with 3-category table (output payload / action evidence / runtime metadata)
+- [x] No field removal — documentation only
 
 #### #9: Permission Audit
 
-- [ ] Per-layer counter added to PermissionPipeline
-- [ ] Counter logged at DEBUG level per session summary
-- [ ] No behavior change — telemetry only
+- [x] Per-layer counter added to PermissionPipeline
+- [x] Counter logged at DEBUG level per session summary
+- [x] No behavior change — telemetry only
 
 ### Final Cross-Phase Acceptance
 
-- [ ] 114+ test suite passes after each phase with 0 regressions
-- [ ] Model behavior improves on 3 verified scenarios: long build log, empty search, blocked call
-- [ ] New properties all default to fail-closed (False/SERIAL)
-- [ ] No runtime /register API added (explicit anti-requirement)
-- [ ] No auto-summary generation of tool descriptions or outputs
-- [ ] No change to ToolResult/Observation data model types
-- [ ] Streaming executor admission control logic unchanged
+- [x] 114+ test suite passes after each phase with 0 regressions
+- [x] Model behavior improves on 3 verified scenarios: long build log, empty search, blocked call
+- [x] New properties all default to fail-closed (False/SERIAL)
+- [x] No runtime /register API added (explicit anti-requirement)
+- [x] No auto-summary generation of tool descriptions or outputs
+- [x] No change to ToolResult/Observation data model types
+- [x] Streaming executor admission control logic unchanged
 
 ## 8. Interaction with Context Module Refactoring
 
