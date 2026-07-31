@@ -128,6 +128,18 @@ class Action:
 # LLMToolSchema — 工具 Schema
 # ---------------------------------------------------------------------------
 
+class ToolDescriptionTier(str, Enum):
+    """Runtime description fidelity for LLM context.
+
+    Tools with high call frequency always stay at FULL.  Low-frequency
+    tools are downgraded to SUMMARY or NAME_ONLY when token pressure
+    on the tool description block exceeds the soft cap (~4k tokens).
+    """
+    FULL = "full"        # Complete description + prompt_contract + params
+    SUMMARY = "summary"  # One-line description + params (no contract)
+    NAME_ONLY = "name_only"  # Just the tool name (model can infer)
+
+
 @dataclass
 class LLMToolSchema:
     """向 LLM 描述一个可用工具的 schema。"""
@@ -136,6 +148,7 @@ class LLMToolSchema:
     parameters: dict[str, Any]
     prompt_contract: tuple[str, ...] = ()
     deferred: bool = False
+    tier: ToolDescriptionTier = ToolDescriptionTier.FULL
 
 
 # ---------------------------------------------------------------------------

@@ -445,8 +445,35 @@ class BaseTool(ABC):
         """执行工具，返回 ToolResult。不抛异常——所有异常已在内部处理。"""
         ...
 
-    def to_llm_schema(self) -> LLMToolSchema:
-        """生成供 LLM 使用的 schema，由 ToolRegistry 调用。"""
+    def to_llm_schema(
+        self,
+        *,
+        tier: "ToolDescriptionTier | None" = None,
+    ) -> LLMToolSchema:
+        """生成供 LLM 使用的 schema，由 ToolRegistry 调用。
+
+        Args:
+            tier: Optional description fidelity level.  ``FULL`` (default)
+                emits complete description + prompt_contract + parameters.
+                ``SUMMARY`` emits a one-line description + parameters
+                (no contract).  ``NAME_ONLY`` emits only the tool name.
+        """
+        from core.types import ToolDescriptionTier
+        resolved_tier = tier or ToolDescriptionTier.FULL
+        if resolved_tier is ToolDescriptionTier.NAME_ONLY:
+            return LLMToolSchema(
+                name=self.name,
+                description=f"{self.name}: {self.description.split('.')[0]}.",
+                parameters=self.parameters_schema,
+                tier=resolved_tier,
+            )
+        if resolved_tier is ToolDescriptionTier.SUMMARY:
+            return LLMToolSchema(
+                name=self.name,
+                description=self.description,
+                parameters=self.parameters_schema,
+                tier=resolved_tier,
+            )
         return LLMToolSchema(
             name=self.name,
             description=self.description,
@@ -456,6 +483,7 @@ class BaseTool(ABC):
                 bool(getattr(self, "should_defer", False))
                 and not bool(getattr(self, "always_load", False))
             ),
+            tier=ToolDescriptionTier.FULL,
         )
 
 
