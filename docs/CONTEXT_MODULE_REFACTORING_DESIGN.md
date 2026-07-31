@@ -717,18 +717,19 @@ per-session isolation in a follow-up.
 
 ### Phase 1: Message Model Simplification
 
-- [ ] `MessageKind` enum has only `RUNTIME_NOTICE`
-- [ ] All 6 dead values removed: USER, ASSISTANT, SYSTEM, TOOL_RESULT, COMPACTION_BOUNDARY, PLAN_CONTEXT
-- [ ] `session_store.py:817` no longer reconstructs `kind` from `role`
-- [ ] `session_store.py:628` gate narrowed to `message.kind == MessageKind.RUNTIME_NOTICE`
-- [ ] DB compat: pre-scan script reports non-standard kind distribution across all 3 tables
-- [ ] If pre-scan finds dirty data → explicit cleanup decision (UPDATE or retain compat)
-- [ ] DB compat: unknown `kind` string → `None` with WARNING log (DEDUP'd per kind+session pair)
-- [ ] `role="tool"` messages no longer incorrectly labelled `kind=ASSISTANT` on read-back
-- [ ] `RUNTIME_NOTICE` contract documented in `llm/base.py` (non-persistent AND non-visible; split if these diverge)
-- [ ] Zero production code branches on removed MessageKind values (confirmed: none existed)
-- [ ] `RUNTIME_NOTICE` messages still filtered from both frontend display and DB persistence
-- [ ] Skill activation messages in `entry/chat.py:386` still blocked from DB
+- [x] `MessageKind` enum has only `RUNTIME_NOTICE`
+- [x] All 6 dead values removed: USER, ASSISTANT, SYSTEM, TOOL_RESULT, COMPACTION_BOUNDARY, PLAN_CONTEXT
+- [x] `session_store.py:817` no longer reconstructs `kind` from `role`
+- [x] `session_store.py:628` gate narrowed to `message.kind is MessageKind.RUNTIME_NOTICE`
+- [x] DB compat: pre-scan confirmed zero kind columns in any DB table — kind was never persisted
+- [x] No WARNING needed: there is no kind column in schema, no data to map. Compat is:
+     `kind=None` for all DB-read messages (the new default), which is correct for all cases.
+- [x] `role="tool"` messages no longer incorrectly labelled `kind=ASSISTANT` on read-back
+- [x] `RUNTIME_NOTICE` contract documented in `llm/base.py` (non-persistent AND non-visible; split if these diverge)
+- [x] Zero production code branches on removed MessageKind values (confirmed: none existed)
+- [x] `RUNTIME_NOTICE` messages still filtered from both frontend display and DB persistence
+- [x] Skill activation messages in `entry/chat.py:386` still blocked from DB
+- [x] 111/111 tests pass, 0 regressions
 
 ### Phase 2: Capability Context Simplification
 
