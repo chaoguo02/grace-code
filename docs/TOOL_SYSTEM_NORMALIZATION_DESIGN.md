@@ -515,18 +515,18 @@ repeated patterns). #6 kills processes.
 
 #### #1: Result Compression
 
-- [ ] `ToolResultFacts` dataclass defined with exit_code, file_paths, match_count, error_lines, preview
-- [ ] **PREREQUISITE (implemented BEFORE `compress_tool_result()`)**: Bash executor writes `exit_code` into `ToolResult.metadata` at process completion.  Verified by standalone test: `ShellTool.execute(cmd)` → `result.metadata["exit_code"]` is non-empty string.
-- [ ] `_extract_facts()` reads ONLY from `Observation.metadata` explicit keys — **zero regex** on output text
-- [ ] `_truncate_body()` implements 3-tier truncation; Tier 2 preserves both head (40%) AND tail (40%)
-- [ ] No free-text "summary line" — structured facts ARE the summary
-- [ ] `compress_tool_result()` replaces `truncate_output()` in both rendering call sites
-- [ ] Empty result semantics: 5 Outcome markers → explicit model text
-- [ ] Long Bash output: exit code always visible regardless of truncation tier
-- [ ] Long Read output: file path always visible in facts block
-- [ ] Empty Grep: explicit "(no matches found)"
-- [ ] Permission denied: explicit "(blocked: Permission denied)"
-- [ ] No change to Observation/ToolResult types — pure rendering layer
+- [x] `ToolResultFacts` dataclass defined with exit_code, file_paths, match_count, error_lines, preview
+- [x] **PREREQUISITE (implemented BEFORE `compress_tool_result()`)**: Bash executor writes `exit_code` into `ToolResult.metadata` at process completion.  Verified by standalone test: `ShellTool.execute(cmd)` → `result.metadata["exit_code"]` is non-empty string.
+- [x] `_extract_facts()` reads ONLY from `Observation.metadata` explicit keys — **zero regex** on output text
+- [x] `_truncate_body()` implements 3-tier truncation; Tier 2 preserves both head (40%) AND tail (40%)
+- [x] No free-text "summary line" — structured facts ARE the summary
+- [x] `compress_tool_result()` replaces `truncate_output()` in both rendering call sites
+- [x] Empty result semantics: 5 Outcome markers → explicit model text
+- [x] Long Bash output: exit code always visible regardless of truncation tier
+- [x] Long Read output: file path always visible in facts block
+- [x] Empty Grep: explicit "(no matches found)"
+- [x] Permission denied: explicit "(blocked: Permission denied)"
+- [x] No change to Observation/ToolResult types — pure rendering layer
 
 #### #2: MCP Effect Inference
 
@@ -537,21 +537,21 @@ repeated patterns). #6 kills processes.
 
 #### #3: Parallel Safety
 
-- [ ] `BaseTool.parallel_safe` property defined (default `False`, fail-closed)
+- [x] `BaseTool.parallel_safe` property defined (default `False`, fail-closed)
 - [ ] `BaseTool.concurrency_mode()` derives from `parallel_safe`
-- [ ] `BuiltTool._parallel_safe` field + property override
-- [ ] `build_tool()` accepts `parallel_safe` parameter
-- [ ] Read, ViewFile → `parallel_safe = True`
-- [ ] Grep, Glob, FindSymbol → `parallel_safe = True`
-- [ ] WebSearch, WebFetch → `parallel_safe = True`
-- [ ] GitStatus → `parallel_safe = True`
-- [ ] MemoryRead, MemoryList, MemorySearch → `parallel_safe = True`
-- [ ] Edit, Write → `parallel_safe = False` (unchanged)
-- [ ] Bash → `concurrency_mode()` override unchanged
-- [ ] MCP tools default to `parallel_safe = False`
-- [ ] `StreamingToolExecutor` admission control unchanged
-- [ ] New test: two WebFetch calls run IN parallel
-- [ ] New test: Read+WebFetch run IN parallel
+- [x] `BuiltTool._parallel_safe` field + property override
+- [x] `build_tool()` accepts `parallel_safe` parameter
+- [x] Read, ViewFile → `parallel_safe = True`
+- [x] Grep, Glob, FindSymbol → `parallel_safe = True`
+- [x] WebSearch, WebFetch → `parallel_safe = True`
+- [x] GitStatus → `parallel_safe = True`
+- [x] MemoryRead, MemoryList, MemorySearch → `parallel_safe = True`
+- [x] Edit, Write → `parallel_safe = False` (unchanged)
+- [x] Bash → `concurrency_mode()` override unchanged
+- [x] MCP tools default to `parallel_safe = False`
+- [x] `StreamingToolExecutor` admission control unchanged
+- [x] New test: two WebFetch calls run IN parallel
+- [x] New test: Read+WebFetch run IN parallel
 
 ### Phase 2: Experience-Level Alignment
 
