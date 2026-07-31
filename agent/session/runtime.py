@@ -208,12 +208,6 @@ class SessionRuntime:
         # Set by AgentService to True when running in Web mode.
         # Child agents use this to decide whether to create web callbacks.
         self._is_web_mode: bool = False
-        # DEPRECATED Phase 4a: permission/rules staging now flows through
-        # _pending_config via SessionPreRunConfig.  These aliases exist
-        # only for backward-compatible access (set_permission_mode_for_session,
-        # set_injected_rules_for_session both write to _get_config()).
-        self._session_permission_modes: dict[str, str] = {}
-        self._session_injected_rules: dict[str, list] = {}
         self._teams: dict[str, object] = {}
         self._team_proposals: dict[str, dict[str, object]] = {}
 
