@@ -366,12 +366,12 @@ subsequent discoveries.
 
 ### Phase 3
 
-- [ ] Agent-scoped tools stored in per-agent dict on MCPToolIntegration
-- [ ] `_mcp_tool_names_for_spec()` resolves from per-agent dict
-- [ ] Cleanup removes agent entry entirely
-- [ ] `_replace_server_tools` calls mark_available for each loaded tool
-- [ ] `_call_count`, `_call_error_count`, `_reconnect_count` counters added
-- [ ] #10 DOCUMENTATION: `MCPToolProps` mutation pattern documented as intentional (no code change)
+- [-] Agent-scoped MCP isolation DEFERRED (requires per-agent tool storage redesign) dict on MCPToolIntegration
+- [-] Per-agent dict integration deferred with #7
+- [-] Agent cleanup deferred with #7
+- [x] `_replace_server_tools` calls mark_available for each loaded tool
+- [x] `_call_count`, `_call_error_count`, `_reconnect_count` counters added
+- [x] #10 DOCUMENTATION: `MCPToolProps` mutation pattern documented as intentional (no code change)
 
 ### Final Cross-Phase
 
