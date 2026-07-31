@@ -316,6 +316,29 @@ class ContextManager:
                 cacheable=True,
             ))
 
+        # ── Capability context moves into system prompt ──────────────────
+        # Phase 2: Static capability descriptions (Skills, MCP tools,
+        # Subagents) carry system-level instruction priority.  The model
+        # must treat them as permanent rules, not transient user requests.
+        # They join the stable prompt-cache prefix (cacheable=True).
+        capability_selected: list = []
+        capability_trimmed_count = 0
+        if capability_sections:
+            from capabilities.context import render_capability_selection
+            capability_context, capability_selected, capability_trimmed_count = (
+                render_capability_selection(
+                    capability_sections,
+                    max_tokens=min(12_000, max(1, plan.repo_map)),
+                )
+            )
+            if capability_context:
+                structured_ctx.add_layer(ContextLayer(
+                    name="capability_context",
+                    priority=ContextPriority.PROJECT,
+                    content=capability_context,
+                    cacheable=True,
+                ))
+
         system_content = structured_ctx.build_system_content(
             enable_caching=self._cfg.enable_caching,
         )
@@ -370,30 +393,8 @@ class ContextManager:
         # Assemble messages
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_content)]
 
-        capability_context = ""
-        capability_selected: list = []
-        capability_trimmed_count = 0
-        if capability_sections:
-            from capabilities.context import render_capability_selection
-            capability_context, capability_selected, capability_trimmed_count = (
-                render_capability_selection(
-                    capability_sections,
-                    max_tokens=min(12_000, max(1, plan.repo_map)),
-                )
-            )
-        if capability_context:
-            messages.append(LLMMessage(role="user", content=capability_context))
-            messages.append(LLMMessage(
-                role="assistant",
-                content="Understood. I will use the available capabilities as needed.",
-            ))
-
         if long_term_context:
             messages.append(LLMMessage(role="user", content=long_term_context))
-            messages.append(LLMMessage(
-                role="assistant",
-                content="Understood. I have the project context and memory index. Proceeding with the task.",
-            ))
 
         for d in trimmed_history_dicts:
             tool_calls = None

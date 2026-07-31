@@ -66,7 +66,12 @@ def build_runtime_messages(
 
     capability_context = ""
     if inject_capability_context:
-        # TODO(capabilities): Migrate capability context injection to ContextManager.
+        # DEPRECATED: Capability context now lives in the system prompt
+        # (ContextManager.build_request_messages → StructuredContext layer).
+        # This path is never reached in normal operation because
+        # SessionRuntime calls _build_runtime_messages with
+        # inject_capability_context=False, and capability sections are
+        # passed to ContextManager.build_request_messages() instead.
         from capabilities import build_capability_context
         capability_context = build_capability_context(
             spec=spec,
@@ -74,10 +79,6 @@ def build_runtime_messages(
             mcp_integration=mcp_integration,
             agent_registry=agent_registry,
         )
-    if not capability_context and inject_capability_context and skill_registry is not None and "Skill" in spec.tools and hasattr(skill_registry, "format_for_prompt"):
-        skill_listing = skill_registry.format_for_prompt(llm_invocable_only=True)
-        if skill_listing:
-            capability_context = "[CAPABILITY CONTEXT]\n\n## Skills\n" + skill_listing
     if capability_context:
         messages.append(LLMMessage(role="user", content=capability_context))
 

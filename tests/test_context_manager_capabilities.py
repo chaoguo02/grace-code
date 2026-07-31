@@ -28,12 +28,19 @@ def test_context_manager_injects_capabilities_before_long_term_context() -> None
         capability_sections=sections,
     )
 
+    # Phase 2: Capabilities are in the system prompt (index 0), NOT a
+    # separate user message.  Memory is now a single user message at
+    # index 1 with no synthetic assistant acknowledgment.
     contents = [message.content for message in result.messages]
-    capability_index = next(i for i, content in enumerate(contents) if str(content).startswith("[CAPABILITY CONTEXT]"))
+    system_msg = result.messages[0]
+    assert system_msg.role == "system"
+    assert "[CAPABILITY CONTEXT]" in str(system_msg.content)
+    assert "## Skills" in str(system_msg.content)
+
     memory_index = next(i for i, content in enumerate(contents) if str(content).startswith("[MEMORY]"))
-    assert capability_index < memory_index
-    assert result.messages[capability_index + 1].role == "assistant"
-    assert "available capabilities" in result.messages[capability_index + 1].content
+    assert memory_index == 1  # memory is first user message after system
+    # No assistant ack messages anywhere
+    assert not any("Understood" in str(m.content) for m in result.messages)
 
 
 def test_context_manager_trims_lower_priority_capability_sections() -> None:
@@ -64,12 +71,16 @@ def test_context_manager_trims_lower_priority_capability_sections() -> None:
         max_context_window=8_000,
     )
 
-    capability_message = next(
-        message.content for message in result.messages
-        if str(message.content).startswith("[CAPABILITY CONTEXT]")
+    # Phase 2: Capabilities in system prompt.  Budget trimming still works —
+    # only high-priority sections survive in the capability layer.
+    system_content = str(result.messages[0].content)
+    assert "## High" in system_content
+    assert "## Low" not in system_content
+    # No separate capability message in user position
+    assert not any(
+        str(m.content).startswith("[CAPABILITY CONTEXT]")
+        for m in result.messages[1:]
     )
-    assert "## High" in capability_message
-    assert "## Low" not in capability_message
 
 
 def test_context_manager_does_not_put_capabilities_in_system_prompt() -> None:
@@ -91,9 +102,14 @@ def test_context_manager_does_not_put_capabilities_in_system_prompt() -> None:
         capability_sections=sections,
     )
 
+    # Phase 2: Capabilities are explicitly placed in the system prompt
+    # (StructuredContext, PROJECT priority, cacheable=True).  This gives
+    # them system-level instruction priority rather than user-message status.
     assert result.messages[0].role == "system"
-    assert "CAPABILITY CONTEXT" not in str(result.messages[0].content)
-    assert any(
+    assert "[CAPABILITY CONTEXT]" in str(result.messages[0].content)
+    assert "Use `ToolSearch`" in str(result.messages[0].content)
+    # No separate capability user message — it's in the system prompt now
+    assert not any(
         str(message.content).startswith("[CAPABILITY CONTEXT]")
         for message in result.messages[1:]
     )

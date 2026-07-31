@@ -12,6 +12,16 @@ from skills.tool import SkillTool
 
 
 class _PromptSkillRegistry:
+    def list_skill_entries(self):
+        from skills.registry import SkillMetadata
+        return [
+            ("review", SkillMetadata(
+                name="review",
+                display_name="Review",
+                description="Review code for correctness",
+            )),
+        ]
+
     def format_for_prompt(self, *, llm_invocable_only: bool = True) -> str:
         assert llm_invocable_only is True
         return "## Available Skills\n- **review**: Review code"
@@ -35,7 +45,7 @@ def test_skill_listing_does_not_depend_on_delegation() -> None:
         skill_registry=_PromptSkillRegistry(),
     )
 
-    assert any("Available Skills" in message.content for message in messages)
+    assert any("## Skills" in message.content for message in messages)
 
 
 def test_skill_listing_is_not_injected_without_skill_tool() -> None:
@@ -45,7 +55,7 @@ def test_skill_listing_is_not_injected_without_skill_tool() -> None:
         skill_registry=_PromptSkillRegistry(),
     )
 
-    assert not any("Available Skills" in message.content for message in messages)
+    assert not any("## Skills" in message.content for message in messages)
 
 
 def test_nested_skill_prompt_uses_canonical_invocation_name(tmp_path) -> None:
