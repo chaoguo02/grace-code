@@ -17,7 +17,13 @@ from typing import Any, Callable, Mapping
 
 
 class EvidenceKind(str, Enum):
-    SKILL_LOADED = "skill_loaded"
+    """Kinds of run evidence.
+
+    Phase 4: SKILL_LOADED is deprecated as of v2.0 (sunset v2.0+60d).
+    Skill activations through ToolExecutionPipeline produce TOOL_CALL_COMPLETED.
+    Lifecycle paths (preload/CLI/HTTP) retain SKILL_LOADED until sunset.
+    """
+    SKILL_LOADED = "skill_loaded"  # @deprecated(since="v2.0", sunset="v2.0+60d")
     MCP_CONNECTED = "mcp_connected"
     MCP_TOOLS_EXPOSED = "mcp_tools_exposed"
     TOOL_CALL_STARTED = "tool_call_started"
@@ -513,12 +519,25 @@ class RunEvidenceStore:
 
         for skill_name in sorted(requirements.required_skills):
             total += 1
+            # Phase 4: Dual evidence — accept both TOOL_CALL_COMPLETED (tool path)
+            # and SKILL_LOADED (lifecycle path). TOOL_CALL_COMPLETED uses flat
+            # original name from SkillActivationTool; SKILL_LOADED uses "skill:{name}".
+            found = None
+            # Priority: check TOOL_CALL_COMPLETED first (primary path, flat name)
             found = next((
                 e for e in entries
-                if e.kind == EvidenceKind.SKILL_LOADED
+                if e.kind == EvidenceKind.TOOL_CALL_COMPLETED
                 and e.status == EvidenceStatus.SUCCEEDED
-                and e.tool_name == f"skill:{skill_name}"
+                and e.tool_name == skill_name
             ), None)
+            # Fallback: check SKILL_LOADED (lifecycle path, "skill:{name}" format)
+            if found is None:
+                found = next((
+                    e for e in entries
+                    if e.kind == EvidenceKind.SKILL_LOADED
+                    and e.status == EvidenceStatus.SUCCEEDED
+                    and e.tool_name == f"skill:{skill_name}"
+                ), None)
             if found:
                 satisfied += 1
                 satisfied_ids.append(found.evidence_id)

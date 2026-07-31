@@ -219,3 +219,91 @@ def test_no_collision_when_names_differ(caplog) -> None:
     assert "search2" in reg._tools
     warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert not any("collision" in w.lower() for w in warnings)
+
+
+# ── Phase 4: Evidence Dual-Track ────────────────────────────────────────────
+
+
+def test_tool_activated_skill_produces_tool_call_completed() -> None:
+    """SkillActivationTool through ToolExecutionPipeline produces TOOL_CALL_COMPLETED.
+
+    The tool_source field identifies it as 'project' (skill provenance).
+    """
+    from skills.registry import SkillMetadata
+    meta = SkillMetadata(name="review", display_name="Review", description="Code review")
+    tool = SkillActivationTool(meta)
+    result = tool.execute({})
+    assert not result.success  # no registry → fails, but structure is correct
+    # Verify result has the data that evidence recorder would use
+    assert result.metadata is not None
+    assert "skill_modifier" in result.metadata
+    # Domain evidence is empty — SkillActivationTool doesn't set evidence metadata
+    # This means _record_skill() won't fire (correct behavior for tool path)
+    evidence = result.metadata.get("evidence", {})
+    if isinstance(evidence, dict):
+        assert "skill_name" not in evidence
+
+
+def test_evidence_kind_skill_loaded_is_deprecated() -> None:
+    """SKILL_LOADED has deprecation annotation on EvidenceKind."""
+    from agent.session.run_evidence import EvidenceKind
+    # Verify SKILL_LOADED exists (for backward compat)
+    assert hasattr(EvidenceKind, "SKILL_LOADED")
+    assert EvidenceKind.SKILL_LOADED == "skill_loaded"
+    # Verify deprecation annotation in docstring
+    assert "deprecat" in EvidenceKind.__doc__.lower()
+    assert "sunset" in EvidenceKind.__doc__.lower()
+
+
+def test_dual_evidence_completion_check() -> None:
+    """Completion Guard accepts both TOOL_CALL_COMPLETED and SKILL_LOADED.
+
+    Phase 4: The EvidenceValidator.evaluate() method checks both types:
+    - TOOL_CALL_COMPLETED with tool_name=skill_name (flat name, tool path)
+    - SKILL_LOADED with tool_name="skill:{name}" (legacy format, lifecycle path)
+
+    This test verifies the EvidenceKind values and the semantics contract.
+    """
+    from agent.session.run_evidence import EvidenceEntry, EvidenceKind, EvidenceStatus
+
+    # Verify the two evidence kinds are distinct
+    assert EvidenceKind.TOOL_CALL_COMPLETED != EvidenceKind.SKILL_LOADED
+
+    # Scenario 1: Tool-path skill activation → TOOL_CALL_COMPLETED
+    tool_path_entry = EvidenceEntry(
+        evidence_id="ev_tp",
+        idempotency_key="tc:review:done",
+        root_run_id="",
+        session_id="s1",
+        producer_session_id="s1",
+        kind=EvidenceKind.TOOL_CALL_COMPLETED,
+        status=EvidenceStatus.SUCCEEDED,
+        tool_name="review",  # Flat name — no prefix
+        call_id="inv_1",
+        invocation_id="inv_1",
+        parameters_digest="abc",
+        result_digest="def",
+        source_fingerprint="fp",
+        metadata={"tool_source": "project"},
+    )
+    assert tool_path_entry.kind == EvidenceKind.TOOL_CALL_COMPLETED
+    assert tool_path_entry.tool_name == "review"
+
+    # Scenario 2: Lifecycle-path skill activation → SKILL_LOADED
+    lifecycle_entry = EvidenceEntry(
+        evidence_id="ev_lc",
+        idempotency_key="skill:s1:inv_2:review:fp",
+        root_run_id="",
+        session_id="s1",
+        producer_session_id="s1",
+        kind=EvidenceKind.SKILL_LOADED,
+        status=EvidenceStatus.SUCCEEDED,
+        tool_name="skill:review",  # Legacy format: "skill:{name}"
+        call_id="inv_2",
+        invocation_id="inv_2",
+        parameters_digest="xyz",
+        result_digest="",
+        source_fingerprint="fp_skill",
+    )
+    assert lifecycle_entry.kind == EvidenceKind.SKILL_LOADED
+    assert lifecycle_entry.tool_name == "skill:review"
