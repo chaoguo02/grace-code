@@ -359,12 +359,22 @@ class ShellTool(BaseTool):
         if len(output) > MAX_OUTPUT_CHARS:
             output = truncate_output(output, MAX_OUTPUT_CHARS)
 
+        # Phase 2 #6: Check if cancellation token fired during execution
+        cancelled = False
+        token = getattr(self, "_cancellation_token", None)
+        if token is not None:
+            cancelled = token.is_cancelled
+
         return ToolResult(
-            success=run_result.success,
+            success=run_result.success and not cancelled,
             output=output,
-            error=getattr(run_result, "error", None) or None,
+            error=(
+                getattr(run_result, "error", None)
+                or ("Cancelled by user" if cancelled else None)
+            ),
             metadata={
                 "exit_code": str(getattr(run_result, "returncode", 0) or 0),
+                **({"cancelled": True} if cancelled else {}),
             },
         )
 

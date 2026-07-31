@@ -131,13 +131,19 @@ class Action:
 class ToolDescriptionTier(str, Enum):
     """Runtime description fidelity for LLM context.
 
-    Tools with high call frequency always stay at FULL.  Low-frequency
-    tools are downgraded to SUMMARY or NAME_ONLY when token pressure
-    on the tool description block exceeds the soft cap (~4k tokens).
+    Tools with high call frequency stay at FULL.  Low-frequency tools
+    are downgraded to SUMMARY or SCHEMA_ONLY when context pressure
+    exceeds the dynamic budget.
+
+    SCHEMA_ONLY preserves the parameter schema — the model can still
+    invoke the tool correctly even without the full description text.
+    NAME_ONLY was removed (Phase 2 #5) because a tool without visible
+    parameters is effectively invisible to the model.
     """
-    FULL = "full"        # Complete description + prompt_contract + params
-    SUMMARY = "summary"  # One-line description + params (no contract)
-    NAME_ONLY = "name_only"  # Just the tool name (model can infer)
+    FULL = "full"              # Complete description + prompt_contract + params
+    SUMMARY = "summary"        # One-line description + params (no contract)
+    SCHEMA_ONLY = "schema_only"  # Name + first-sentence description + full params
+    NAME_ONLY = "name_only"    # DEPRECATED — kept for backward compat, never selected
 
 
 @dataclass

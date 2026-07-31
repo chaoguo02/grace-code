@@ -237,6 +237,9 @@ class PermissionPipeline:
         self._approved_prompts: list[dict[str, str]] = []
         self._write_allowed: bool = True
         """When False, all write-effect tools are denied."""
+        # Phase 2 #4: Session-level trust accumulator
+        from hitl.trust_accumulator import SessionTrustAccumulator
+        self._trust_accumulator = SessionTrustAccumulator(threshold=2)
 
         for r in (rules or []):
             if r.tier is PermissionRuleTier.DENY:
@@ -666,6 +669,23 @@ class PermissionPipeline:
                     self._stats.record(result)
                     return self._apply_tool_check(result, tool, params)
 
+        # Step 5.5: Session Trust Accumulator (Phase 2 #4)
+        # Check BEFORE the interactive callback.  If the same tool+path+digest
+        # has been explicitly approved >= threshold times in this session,
+        # auto-approve without prompting.  Never bypasses Layers 1-5 (deny
+        # rules, ask rules, path sandbox, write_allowed, plan mode).
+        from hitl.trust_accumulator import compute_trust_key
+        trust_key = compute_trust_key(tool_name, original_params)
+        if self._trust_accumulator.is_trusted(trust_key):
+            result = PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.RULE,
+                reason=f"Trust accumulated — {self._trust_accumulator._approved.get(trust_key, 0)} prior approvals",
+                updated_params=dict(hook_updates) or None,
+            )
+            self._stats.record(result)
+            return self._apply_tool_check(result, tool, params)
+
         # Step 6: canUseTool Callback
         if hook_proposal.approved and not force_interactive:
             result = PermissionResult(
@@ -700,6 +720,8 @@ class PermissionPipeline:
                 result = mandatory_denial
         if result.decision is PermissionDecision.ALLOW:
             result.updated_params = final_updates or None
+            # Phase 2 #4: Record explicit user approval for trust accumulation
+            self._trust_accumulator.record_approval(trust_key)
 
         self._stats.record(result)
         return self._apply_tool_check(result, tool, final_params)

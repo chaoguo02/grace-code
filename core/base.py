@@ -489,9 +489,21 @@ class BaseTool(ABC):
         from core.types import ToolDescriptionTier
         resolved_tier = tier or ToolDescriptionTier.FULL
         if resolved_tier is ToolDescriptionTier.NAME_ONLY:
+            # DEPRECATED: Phase 2 #5 replaced NAME_ONLY with SCHEMA_ONLY.
+            # NAME_ONLY is kept for backward compat — same behavior as SCHEMA_ONLY.
             return LLMToolSchema(
                 name=self.name,
                 description=f"{self.name}: {self.description.split('.')[0]}.",
+                parameters=self.parameters_schema,
+                tier=ToolDescriptionTier.SCHEMA_ONLY,
+            )
+        if resolved_tier is ToolDescriptionTier.SCHEMA_ONLY:
+            return LLMToolSchema(
+                name=self.name,
+                description=(
+                    self.description.split(".")[0]
+                    + "." if "." in self.description else self.description[:80]
+                ),
                 parameters=self.parameters_schema,
                 tier=resolved_tier,
             )

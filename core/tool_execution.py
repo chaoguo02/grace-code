@@ -83,6 +83,9 @@ class ToolExecutionPipeline:
                 self._NEVER_CANCELLED = CancellationToken()
             cancellation_token = self._NEVER_CANCELLED
 
+        # Phase 2 #6: Store cancellation token for _run_with_cancellation
+        self._cancellation = cancellation_token
+
         validation_error = self._validate_params(tool, params)
         if validation_error is not None:
             return validation_error
@@ -220,7 +223,7 @@ class ToolExecutionPipeline:
             or (tool.metadata.effects & governed_effects)
         )
         if not needs_slot or self._resource_governor is None:
-            return tool.execute(params)
+            return self._run_with_cancellation(tool, params)
 
         from core.base import ToolResult
         from core.resource_governor import (
@@ -278,7 +281,7 @@ class ToolExecutionPipeline:
             }
             return error
         try:
-            return tool.execute(params)
+            return self._run_with_cancellation(tool, params)
         finally:
             admission.lease.release()
 
@@ -390,6 +393,28 @@ class ToolExecutionPipeline:
             error_type=ToolErrorType.UNAVAILABLE,
             detail=f"Tool '{tool.name}' blocked: {feedback}",
         )
+
+    def _run_with_cancellation(
+        self,
+        tool: "BaseTool",
+        params: dict[str, Any],
+    ) -> "ToolResult":
+        """Execute tool, injecting CancellationToken if tool supports it.
+
+        Phase 2 #6: Tools that declare ``supports_cancellation=True``
+        receive a ``_cancellation_token`` attribute before ``execute()``
+        and have it cleared after.  The tool is responsible for checking
+        the token during execution (e.g., Bash sends SIGTERM when the
+        token fires).
+        """
+        token = getattr(self, "_cancellation", None)
+        if getattr(tool, "supports_cancellation", False) and token is not None:
+            tool._cancellation_token = token  # type: ignore[attr-defined]
+            try:
+                return tool.execute(params)
+            finally:
+                tool._cancellation_token = None  # type: ignore[attr-defined]
+        return tool.execute(params)
 
     def _fire_post_tool_hook(
         self,
