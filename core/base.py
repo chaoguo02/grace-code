@@ -42,6 +42,7 @@ from core.types import (
     ToolDependency,
     ToolEffect,
     ToolMetadata,
+    TOOL_SOURCE_PRIORITY,
     RetryMode,
     RetryPolicy,
     IdempotencyStrategy,
@@ -737,15 +738,23 @@ class ToolRegistry:
 
     def register(self, tool: BaseTool) -> "ToolRegistry":
         """
-        注册一个工具。支持链式调用：
+        Register a tool. Supports chaining:
             registry.register(ShellTool()).register(FileTool())
+
+        Phase 3: namespace collision resolution — priority-based rejection.
+        system(3) > project(2) > mcp(1). Same priority → first-wins.
+        Per-session: collision only matters within one build_registry_for_session() call.
         """
         from tools.factory import build_tool
 
         tool = build_tool(tool=tool)
         with self._structure_lock:
-            if tool.name in self._tools:
-                raise ValueError(f"Tool '{tool.name}' is already registered.")
+            existing = self._tools.get(tool.name)
+            if existing is not None:
+                self._resolve_collision(tool.name, existing, tool)
+            if tool.name in self._tools and self._tools[tool.name] is not tool:
+                # Collision resolution rejected the new tool — skip registration
+                return self
             self._tools[tool.name] = tool
             # Inject registry reference so signal tools can set mode-switch flags
             tool._registry = self
@@ -756,6 +765,47 @@ class ToolRegistry:
                                    alias, tool.name, self._tool_aliases[alias])
                 self._tool_aliases[alias] = tool.name
         return self
+
+    def _resolve_collision(
+        self, name: str, existing: BaseTool, new_tool: BaseTool,
+    ) -> None:
+        """Phase 3: resolve name conflict via source priority.
+
+        Higher priority replaces lower. Same priority → first-wins (reject new).
+        Always logs WARNING so collisions are never silent.
+        """
+        existing_source = self._tool_source_for(existing)
+        new_source = self._tool_source_for(new_tool)
+        existing_pri = TOOL_SOURCE_PRIORITY.get(existing_source, 0)
+        new_pri = TOOL_SOURCE_PRIORITY.get(new_source, 0)
+
+        if new_pri > existing_pri:
+            logger.warning(
+                "Tool '%s' collision: %r (source=%s, priority=%d) replaces "
+                "%r (source=%s, priority=%d)",
+                name, type(new_tool).__name__, new_source, new_pri,
+                type(existing).__name__, existing_source, existing_pri,
+            )
+            del self._tools[name]  # allow replacement
+        elif new_pri == existing_pri:
+            logger.warning(
+                "Tool '%s' collision: %r (source=%s) rejected — same priority "
+                "as existing %r (source=%s). First-wins semantics.",
+                name, type(new_tool).__name__, new_source,
+                type(existing).__name__, existing_source,
+            )
+        else:
+            logger.warning(
+                "Tool '%s' collision: %r (source=%s, priority=%d) rejected — "
+                "lower priority than existing %r (source=%s, priority=%d)",
+                name, type(new_tool).__name__, new_source, new_pri,
+                type(existing).__name__, existing_source, existing_pri,
+            )
+
+    @staticmethod
+    def _tool_source_for(tool: BaseTool) -> str:
+        """Extract canonical source from tool metadata (Phase 3)."""
+        return getattr(getattr(tool, "metadata", None), "source", "") or "system"
 
     def register_many(self, tools: Iterable[BaseTool]) -> "ToolRegistry":
         for tool in tools:

@@ -56,6 +56,20 @@ class BuiltTool(BaseTool):
         self.is_mcp = mcp_props is not None
         self._always_load = False
         self._should_defer = False
+        # Phase 3: auto-tag source for namespace collision
+        source = getattr(self.metadata, "source", "system") or "system"
+        if source == "system" and mcp_props is not None:
+            self.metadata = ToolMetadata(
+                effects=self.metadata.effects,
+                path_access=self.metadata.path_access,
+                path_parameter=self.metadata.path_parameter,
+                dependency=self.metadata.dependency,
+                roles=self.metadata.roles,
+                required_permissions=self.metadata.required_permissions,
+                requires_user_interaction=self.metadata.requires_user_interaction,
+                retry_policy=self.metadata.retry_policy,
+                source="mcp",
+            )
 
     @property
     def name(self) -> str:

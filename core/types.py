@@ -289,3 +289,6 @@ class ToolMetadata:
     """
     retry_policy: RetryPolicy | None = None
     """Explicit override.  None derives a safe policy from call effects."""
+    source: str = "system"
+    """Tool provenance: "system" (native/builtin), "project" (skill), "mcp" (MCP transport).
+    Phase 3: used for namespace collision resolution priority."""
