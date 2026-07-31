@@ -287,10 +287,17 @@ tools — no degradation marker, no logged warning.
 
 **Decision**: In `discover_tools()` (called right after initialize),
 compare the returned tool set against the declared capabilities.
-If the server declared `tools` capability but returned zero tools
-(and the server had tools at its last known good connection), log a
-WARNING: "Server {name} declares tools capability but returned 0 tools
-(N expected from prior connection). Server may be degraded."
+If the server declared `tools` capability but returned zero tools:
+
+- If `_last_tool_counts` has a prior record > 0: log WARNING
+  "Server {name} declares tools capability but returned 0 tools
+  (N expected from prior connection). Server may be degraded."
+- If this is the first connection (`_last_tool_counts` has no record):
+  log WARNING "Server {name} declares tools capability but returned
+  0 tools on first connection. Verify server configuration."
+
+This covers both degraded reconnects and misconfigured first connects
+without false positives.
 
 **Implementation**: Store the tool count from each successful discovery
 in `SyncMCPToolManager._last_tool_counts: dict[str, int]`. Compare on
@@ -364,8 +371,7 @@ subsequent discoveries.
 - [ ] Cleanup removes agent entry entirely
 - [ ] `_replace_server_tools` calls mark_available for each loaded tool
 - [ ] `_call_count`, `_call_error_count`, `_reconnect_count` counters added
-- [ ] `set_always_load()` / `set_is_deferred()` methods on MCPToolProps
-- [ ] `_apply_loading_mode()` and BuiltTool setters use new methods
+- [ ] #10 DOCUMENTATION: `MCPToolProps` mutation pattern documented as intentional (no code change)
 
 ### Final Cross-Phase
 
