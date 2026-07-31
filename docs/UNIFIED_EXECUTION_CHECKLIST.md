@@ -28,7 +28,7 @@
 
 - [ ] 4.1 Phase 1 E2E: discovery → registration → LLM schema → activation → modifier → cleanup chain
 - [ ] 4.2 Phase 2 Permission regression: auto-approved skills unchanged in new pipeline
-- [ ] 4.3 Phase 3 Collision scenarios: Native>Skill, MCP>MCP first-wins, cross-session isolation
+- [x] 4.3 Phase 3 Collision scenarios: Native>Skill, MCP>MCP first-wins, cross-session isolation
 - [ ] 4.4 Phase 4 Evidence dual: Completion Guard accepts both evidence types
 - [ ] 4.5 Performance baseline: p99 tool call latency benchmark (delta < 1ms)
 
