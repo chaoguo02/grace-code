@@ -199,6 +199,17 @@ class ShellTool(BaseTool):
                 return True
         return False
 
+    @property
+    def supports_cancellation(self) -> bool:
+        """Bash is the only built-in tool that supports cooperative cancellation.
+
+        When ``CancellationToken.is_cancelled`` becomes True during a
+        subprocess execution, ShellTool sends SIGTERM, then SIGKILL after
+        a grace period.  This is the only "semi-forcible" cancellation
+        path in the tool system.
+        """
+        return True
+
     def permission_denial_reason(self, params: dict[str, Any]) -> str | None:
         cmd = self._build_cmd_repr(params)
         if _check_blocked(cmd):

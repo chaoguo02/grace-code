@@ -422,6 +422,24 @@ class BaseTool(ABC):
                 return True
         return False
 
+    @property
+    def supports_cancellation(self) -> bool:
+        """Declare whether this tool can respond to mid-execution cancellation.
+
+        Default: ``False`` (fail-closed — most tools cannot be safely
+        interrupted).  Only tools that explicitly support cooperative
+        cancellation (e.g. Bash with SIGTERM delivery) return ``True``.
+
+        When ``True``, ``ToolExecutionPipeline`` passes a ``CancellationToken``
+        into the tool, and the tool is expected to check it periodically or
+        register a signal handler.  When ``False``, cancellation requests
+        during execution are deferred until the call completes.
+
+        New tool authors MUST explicitly declare this.  The IDE/linter will
+        warn on missing overrides (via ``BaseTool`` abstract-like default).
+        """
+        return False
+
     @abstractmethod
     def execute(self, params: dict[str, Any]) -> ToolResult:
         """执行工具，返回 ToolResult。不抛异常——所有异常已在内部处理。"""

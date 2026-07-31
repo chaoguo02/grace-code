@@ -50,6 +50,7 @@ class BuiltTool(BaseTool):
         )
         self._risk = risk or (lambda _params: RiskLevel.MEDIUM)
         self._close = close
+        self._supports_cancellation = False
         self.mcp_props = mcp_props
         self.is_mcp = mcp_props is not None
         self._always_load = False
@@ -82,6 +83,10 @@ class BuiltTool(BaseTool):
 
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
         return self._is_read_only(params or {})
+
+    @property
+    def supports_cancellation(self) -> bool:
+        return self._supports_cancellation
 
     def is_enabled(self) -> bool:
         return bool(self._is_enabled())
@@ -135,6 +140,7 @@ def build_tool(
     risk: Callable[[dict[str, Any]], str] | None = None,
     close: Callable[[float], None] | None = None,
     mcp_props: Any = None,
+    supports_cancellation: bool = False,
 ) -> BaseTool:
     """Build or validate one canonical tool with fail-closed defaults."""
     if tool is not None:
@@ -147,7 +153,7 @@ def build_tool(
         raise ValueError(
             "dynamic tools require name, parameters_schema, and execute",
         )
-    return BuiltTool(
+    tool_obj = BuiltTool(
         name=name,
         description=description,
         parameters_schema=parameters_schema,
@@ -161,6 +167,8 @@ def build_tool(
         close=close,
         mcp_props=mcp_props,
     )
+    tool_obj._supports_cancellation = supports_cancellation
+    return tool_obj
 
 
 # Architecture-document spelling for external integrations.

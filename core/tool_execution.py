@@ -52,6 +52,8 @@ class ToolExecutionPipeline:
         self._root_session_resolver = root_session_resolver
         self._evidence_recorder = evidence_recorder
 
+    _NEVER_CANCELLED: "CancellationToken | None" = None  # lazy-init sentinel
+
     def execute(
         self,
         tool: "BaseTool",
@@ -59,10 +61,27 @@ class ToolExecutionPipeline:
         *,
         thought: str = "",
         invocation_id: str = "",
+        cancellation_token: "CancellationToken | None" = None,
     ) -> "ToolResult":
-        """Validate and execute one logical call, including safe retries."""
+        """Validate and execute one logical call, including safe retries.
+
+        Args:
+            cancellation_token: If the tool declares
+                ``supports_cancellation=True``, this token is passed to the
+                tool for cooperative cancellation.  If ``None`` and the
+                tool supports cancellation, a never-cancelled sentinel is
+                auto-created.  If the tool does NOT support cancellation,
+                this parameter is ignored (the tool cannot be interrupted).
+        """
         from core.base import ToolResult
         from core.types import RetryMode
+
+        # Resolve cancellation token: auto-create sentinel if tool supports it
+        if cancellation_token is None and tool.supports_cancellation:
+            if self._NEVER_CANCELLED is None:
+                from agent.session.run_context import CancellationToken
+                self._NEVER_CANCELLED = CancellationToken()
+            cancellation_token = self._NEVER_CANCELLED
 
         validation_error = self._validate_params(tool, params)
         if validation_error is not None:
