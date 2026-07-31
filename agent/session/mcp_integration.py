@@ -383,6 +383,11 @@ class MCPToolIntegration:
             for tool in tools:
                 if tool.name not in self._registry:
                     self._registry.register(tool)
+            # Phase 3 #8: Clear stale UNAVAILABLE marks on reconnect
+            guard = getattr(self._registry, "_tool_availability_guard", None)
+            if guard is not None:
+                for tool in tools:
+                    guard.mark_available(tool.name)
 
 
 def _parse_raw_config(raw_config: dict[str, Any]) -> tuple[list[MCPServerConfig], list[str], list[str]]:

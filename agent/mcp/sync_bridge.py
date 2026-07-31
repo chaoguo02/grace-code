@@ -129,6 +129,10 @@ class SyncMCPToolManager:
         self._REFRESH_COOLDOWN: float = 10.0
         # Phase 2 #13: Track tool counts for capability gating
         self._last_tool_counts: dict[str, int] = {}
+        # Phase 3 #9: Health metrics counters (v1 — converges to OTel spans)
+        self._call_count: int = 0
+        self._call_error_count: int = 0
+        self._reconnect_count: int = 0
 
     @property
     def bridges(self) -> dict[str, MCPToolBridge]:
@@ -205,6 +209,7 @@ class SyncMCPToolManager:
     ) -> MCPCallResult:
         """Call a connected MCP tool with sync-side timeout and retry policy."""
         self._ensure_open()
+        self._call_count += 1  # Phase 3 #9
         active_policy = policy or self._default_policy
         max_attempts = 1 if not idempotent else 1 + active_policy.max_retries
         last_error: BaseException | None = None
@@ -433,6 +438,7 @@ class SyncMCPToolManager:
     # ── MCP-04: Automatic reconnection ──────────────────────────────
 
     async def _reconnect(self, name: str, bridge: MCPToolBridge) -> bool:
+        self._reconnect_count += 1  # Phase 3 #9
         """Respawn one ephemeral bridge under the shared sliding window."""
         config = self._configs.get(name)
         if config is None or not self._restart_allowed(name):
