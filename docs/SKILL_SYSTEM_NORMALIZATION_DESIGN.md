@@ -152,7 +152,7 @@ but only imports it inside `TYPE_CHECKING` block (line 10).
 
 **Decision**: Move `Any` import to the top-level imports.
 
-### 4.1 Phase 1: Defect Fixes
+### 4.1 Phase 1: Defect & Security Fixes
 
 #### #3: MCP Dependency Validation at Skill Load
 
@@ -281,6 +281,10 @@ inspector.  This makes discovery failures visible at the UI level.
 - [ ] `_mcp_validation_warnings` stored on SkillMetadata
 - [ ] Missing skill preload: ERROR log + runtime notice appended
 - [ ] Agent sees explicit "(skill X failed to load)" in preload block
+- [ ] _sanitize_untrusted_content() strips injection patterns for non-builtin skills
+- [ ] Builtin skills bypass sanitization
+- [ ] Description validation rejects empty / >2000 token / malformed descriptions
+- [ ] Non-compliant skills marked degraded with visible annotation
 
 ### Phase 2
 
@@ -290,6 +294,8 @@ inspector.  This makes discovery failures visible at the UI level.
 - [ ] #10: Skill activation audit trail records (turn, intent, skill_name, match_reason, outcome) per activation
 - [ ] #10: Audit entries stored in session trace for diagnostic queries
 - [ ] Blocked commands visible in log for audit
+- [ ] Activation audit record: turn_id, intent, matched_skill, match_reason, result
+- [ ] Audit records queryable via architecture inspector
 
 ### Phase 3
 
