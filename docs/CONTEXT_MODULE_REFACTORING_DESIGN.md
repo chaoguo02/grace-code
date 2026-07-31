@@ -708,7 +708,7 @@ per-session isolation in a follow-up.
 
 - [x] `ContextPlanner` lifecycle audited: confirmed per-agent-run (not shared).  If shared, fixed to per-agent-run — no lock added.
 - [x] `McpCapabilityProvider.list_descriptors()` applies `sanitize_error()` to error text
-- [-] `ConversationHistory.to_dicts()` and `to_list()` — downgraded: documented read-only contract + `_to_dicts_mutable()` instead of `tuple` — type-level immutability, no runtime `copy()`
+- [x] `ConversationHistory.to_dicts()` and `to_list()` return `tuple` — type-level immutability. 17 call sites confirmed read-only, zero mutations — type-level immutability, no runtime `copy()`
 - [x] `ConversationHistory` internal mutation paths use documented `_mutate()` context
 - [x] `_RUNTIME_PREFIXES` moved to single shared constant (not two copies)
 - [x] Prefix matching is length-descending sorted or Trie-based — not arbitrary `startswith` iteration

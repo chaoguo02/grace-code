@@ -219,10 +219,11 @@ class ConversationHistory:
     """
     对话历史管理器，带滑动窗口。
 
-    **Read-only contract**: ``to_list()`` and ``to_dicts()`` return copies.
-    Callers must not mutate the returned objects.  Internal mutation paths
-    (``_trim()``, compaction replacement) use the ``_mutate()`` context
-    manager which documents the exception explicitly.
+    **Read-only contract**: ``to_list()`` and ``to_dicts()`` return
+    ``tuple`` — type-level immutability.  Callers that need to mutate
+    the result must use explicit ``list()`` conversion.  Internal
+    mutation paths (``_trim()``, compaction replacement) operate on
+    ``self._messages`` directly.
 
     用法：
         history = ConversationHistory(max_messages=20)
@@ -250,12 +251,12 @@ class ConversationHistory:
         self._messages.extend(messages)
         self._trim()
 
-    def to_list(self) -> list[LLMMessage]:
-        """返回完整历史的浅拷贝。调用方不得修改返回列表。"""
-        return list(self._messages)
+    def to_list(self) -> "tuple[LLMMessage, ...]":
+        """返回完整历史的浅拷贝（tuple — 类型级不可变）。"""
+        return tuple(self._messages)
 
-    def to_dicts(self) -> list[dict]:
-        """转为 dict 列表的浅拷贝，供 TokenBudget 等只读消费者使用。"""
+    def to_dicts(self) -> "tuple[dict, ...]":
+        """转为 dict 列表的浅拷贝（tuple — 类型级不可变）。"""
         result = []
         for m in self._messages:
             d: dict = {"role": m.role, "content": m.content}
@@ -264,33 +265,7 @@ class ConversationHistory:
             if m.tool_calls is not None:
                 d["tool_calls"] = [tc.to_dict() for tc in m.tool_calls]
             result.append(d)
-        return result
-
-    # ── Internal mutation path ──────────────────────────────────────────
-
-    _MUTABLE_GUARD_ENABLED: bool = False  # Set True in test/CI to catch misuse
-
-    def _to_dicts_mutable(self) -> list[dict]:
-        """Return mutable dict list for internal compaction/trimming operations.
-
-        ⚠️ MUTABLE ACCESS — callers MUST NOT modify the returned list
-        unless they are part of the compaction or trimming pipeline.
-        This is a documented exception to the read-only contract on
-        ``to_list()`` and ``to_dicts()``.
-
-        **Internal use only.** Compaction and trimming pipelines need to
-        modify the message list in place (MicroCompact replaces tool output
-        content, SnipCompactor removes entire turns). This accessor
-        exists to make those mutation paths visible and greppable.
-
-        Tech debt: ``to_dicts()`` should return ``tuple`` for type-level
-        immutability.  17 call sites currently depend on the mutable list
-        return value.  Tracked in: context/history.py ``to_dicts()`` →
-        ``tuple`` migration (see comments above).
-        """
-        if self._MUTABLE_GUARD_ENABLED:
-            return _GuardList(self.to_dicts())
-        return self.to_dicts()
+        return tuple(result)
 
     @classmethod
     def from_dicts(cls, dicts: list[dict], max_messages: int = 40) -> "ConversationHistory":
@@ -376,50 +351,3 @@ class ConversationHistory:
 
     def __repr__(self) -> str:
         return f"ConversationHistory(messages={len(self._messages)}, max={self._max})"
-
-
-# ── Guard wrapper (Phase 0 review: to_dicts() tuple migration) ────────────
-
-
-class _GuardList(list):
-    """Shallow wrapper that prevents mutation in CI/test environments.
-
-    Inherits from ``list`` to preserve all behaviors (iteration,
-    slicing, ``len()``, etc.) while overriding mutation methods to
-    raise ``RuntimeError``.  Used only when
-    ``ConversationHistory._MUTABLE_GUARD_ENABLED`` is True.
-
-    Overrides only the 5 mutation entry points; all read operations
-    pass through to the underlying list.
-    """
-
-    def __setitem__(self, index, value):
-        raise RuntimeError(
-            "MUTABLE ACCESS VIOLATION: attempt to modify a read-only "
-            "ConversationHistory dict list. Use _to_dicts_mutable() only "
-            "in compaction/trimming pipeline code."
-        )
-
-    def __delitem__(self, index):
-        raise RuntimeError(
-            "MUTABLE ACCESS VIOLATION: attempt to delete from a read-only "
-            "ConversationHistory dict list."
-        )
-
-    def append(self, _value):
-        raise RuntimeError(
-            "MUTABLE ACCESS VIOLATION: attempt to append to a read-only "
-            "ConversationHistory dict list."
-        )
-
-    def extend(self, _values):
-        raise RuntimeError(
-            "MUTABLE ACCESS VIOLATION: attempt to extend a read-only "
-            "ConversationHistory dict list."
-        )
-
-    def insert(self, _index, _value):
-        raise RuntimeError(
-            "MUTABLE ACCESS VIOLATION: attempt to insert into a read-only "
-            "ConversationHistory dict list."
-        )
