@@ -265,9 +265,9 @@ inspector.  This makes discovery failures visible at the UI level.
 
 - [ ] `SkillMetadata.agent_kind` computed property — returns NAMED_SUBAGENT
 - [ ] `SkillMetadata.intent` computed property — returns EDIT
-- [ ] CLI `/skill-name` with context=fork → spawns subagent without AttributeError
-- [ ] `Any` imported at top level in runtime_prompt_builder.py
-- [ ] No NameError on type introspection
+- [x] CLI `/skill-name` with context=fork → spawns subagent without AttributeError
+- [x] `Any` imported at top level in runtime_prompt_builder.py
+- [x] No NameError on type introspection
 
 ### Phase 1
 
@@ -279,12 +279,12 @@ inspector.  This makes discovery failures visible at the UI level.
 - [ ] #11: Skills failing validation are registered as degraded with WARNING log
 - [ ] #11: Degraded skills still appear in listing with "(description unavailable)" marker
 - [ ] `_mcp_validation_warnings` stored on SkillMetadata
-- [ ] Missing skill preload: ERROR log + runtime notice appended
-- [ ] Agent sees explicit "(skill X failed to load)" in preload block
+- [x] Missing skill preload: ERROR log + runtime notice appended
+- [x] Agent sees explicit "(skill X failed to load)" in preload block
 - [ ] _sanitize_untrusted_content() strips injection patterns for non-builtin skills
-- [ ] Builtin skills bypass sanitization
-- [ ] Description validation rejects empty / >2000 token / malformed descriptions
-- [ ] Non-compliant skills marked degraded with visible annotation
+- [x] Builtin skills bypass sanitization
+- [x] Description validation rejects empty / >2000 token / malformed descriptions
+- [x] Non-compliant skills marked degraded with visible annotation
 
 ### Phase 2
 
@@ -299,7 +299,7 @@ inspector.  This makes discovery failures visible at the UI level.
 
 ### Phase 3
 
-- [ ] `triggers` field detection → INFO log with deprecation message
+- [x] `triggers` field detection → INFO log with deprecation message
 - [ ] `_source_errors` dict populated on source discovery failure
 - [ ] Architecture inspector exposes source errors
 
