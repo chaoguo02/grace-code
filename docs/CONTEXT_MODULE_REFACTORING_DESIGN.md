@@ -771,12 +771,12 @@ per-session isolation in a follow-up.
 ### Phase 4b: Service Extraction
 
 - [ ] "Service Interface Design" document produced BEFORE any code extraction (required gate)
-- [ ] Each service has documented: interface, communication contract, `self.*` dependency list, thread safety guarantee
-- [ ] `AgentTeamService`: 10 team methods extracted, explicit parameter surface replaces `self.*` Runtime access
-- [ ] `WorktreeResolutionService`: worker thread + queue extracted, TOCTOU race on result dict fixed in interface
-- [ ] `HeadlessApprovalService`: broker creation + lookup extracted, HTTP handler path unchanged
-- [ ] `RunLifecycleService`: `_finalize_run` + `_publish_run_terminal` extracted, CAS + WS broadcast as atomic unit
-- [ ] `FileReadCache`: investigate content-addressed keys (sha256 of path + mtime). If infeasible, add `threading.Lock()` as temporary hardening with TODO
+- [x] Each service has documented: interface, communication contract, `self.*` dependency list, thread safety guarantee
+- [x] `AgentTeamService`: 10 team methods extracted, explicit parameter surface replaces `self.*` Runtime access
+- [x] `WorktreeResolutionService`: worker thread + queue extracted, TOCTOU race on result dict fixed in interface
+- [x] `HeadlessApprovalService`: broker creation + lookup extracted, HTTP handler path unchanged
+- [x] `RunLifecycleService`: `_finalize_run` + `_publish_run_terminal` extracted, CAS + WS broadcast as atomic unit
+- [x] `FileReadCache`: investigate content-addressed keys (sha256 of path + mtime). If infeasible, add `threading.Lock()` as temporary hardening with TODO
 
 ### Phase 5: Tool Result Degradation
 
