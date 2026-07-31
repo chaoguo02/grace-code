@@ -43,6 +43,21 @@ class SkillSource:
     legacy_commands: bool = False
 
 
+
+def _legacy_description_fallback(content: str, name: str) -> str:
+    """Phase 2 #5: extract description from body for commands without frontmatter."""
+    lines = content.split(chr(10))
+    body_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("```"):
+            continue
+        body_lines.append(stripped)
+    desc = " ".join(body_lines[:3])[:100].strip()
+    return desc if desc else f"(no description — {name})"
+
 @dataclass
 class SkillMetadata:
     """技能元数据 — aligned with Claude Code Skill frontmatter reference.
@@ -102,6 +117,7 @@ class SkillMetadata:
     source: str = "project"
     trusted: bool = True
     file_path: str = ""
+    _frontmatter: dict[str, Any] = field(default_factory=dict)  # Phase 0: stored for computed properties
 
     # ── Derived helpers ──
 
@@ -126,6 +142,35 @@ class SkillMetadata:
         p = file_path.replace("\\", "/")
         pp = Path(p)
         return any(pp.match(pat) for pat in self.paths)
+
+    # ── Phase 0: Computed properties for spawn protocol ──────────────
+
+    @property
+    def agent_kind(self) -> "AgentKind":
+        """Derived spawn identity — defaults to NAMED_SUBAGENT for fork skills.
+
+        Frontmatter can override via ``agent_kind`` key (e.g.
+        ``agent_kind: READONLY_SUBAGENT``).  Used by
+        AgentSpawnRequest.named() when context="fork".
+        """
+        from agent.session.models import AgentKind
+        raw = getattr(self, "_frontmatter", None) or {}
+        return raw.get("agent_kind", AgentKind.NAMED_SUBAGENT)
+
+    @property
+    def intent(self) -> "TaskIntent":
+        """Derived task intent — defaults to EDIT.
+
+        Frontmatter can override via ``intent`` key.
+        """
+        from agent.task import TaskIntent
+        raw = getattr(self, "_frontmatter", None) or {}
+        return raw.get("intent", TaskIntent.EDIT)
+
+    @property
+    def tools(self) -> frozenset[str]:
+        """Tools visible to the spawn context — defaults to allowed_tools."""
+        return getattr(self, "allowed_tools", frozenset())
 
 
 class SkillRegistry:
@@ -412,11 +457,13 @@ class SkillRegistry:
             return SkillMetadata(
                 name=dir_name,
                 display_name=dir_name,
-                description="",
+                # Phase 2 #5: legacy description fallback
+                description=_legacy_description_fallback(content, dir_name),
                 dir_path=str(skill_file.parent),
                 source=source.name,
                 trusted=source.trusted,
                 file_path=str(skill_file),
+                _frontmatter={},
             )
 
         try:
@@ -428,6 +475,14 @@ class SkillRegistry:
                 exc,
             )
             return None
+
+        # Phase 3 #7: triggers deprecation
+        if "triggers" in fm_dict:
+            logger.info(
+                "Skill %s has deprecated 'triggers' field — ignored. "
+                "Use 'description' for LLM semantic matching instead.",
+                dir_name,
+            )
 
         # ── Parse paths: string, comma/space-separated, or YAML list ──
         raw_paths = fm_dict.get("paths", ())
@@ -492,6 +547,7 @@ class SkillRegistry:
             source=source.name,
             trusted=source.trusted,
             file_path=str(skill_file),
+            _frontmatter=fm_dict,
         )
 
     @staticmethod

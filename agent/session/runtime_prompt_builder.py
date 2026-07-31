@@ -7,7 +7,7 @@ SessionRuntime should call this, not own the prompt-building details.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from agent.session.models import DelegationMode, SessionMode
 
