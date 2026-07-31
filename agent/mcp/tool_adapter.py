@@ -6,6 +6,7 @@ import json
 import threading
 from typing import Any, Callable
 
+from agent.mcp.effect_inference import infer_mcp_is_read_only
 from agent.mcp.types import MCPToolInfo, MCPToolProps
 from core.base import RiskLevel, ToolResult
 from tools.factory import build_tool
@@ -59,7 +60,10 @@ def mcp_tool_to_runtime_tool(
         parameters_schema=tool_info.input_schema,
         execute=execute,
         description=tool_info.description,
-        is_read_only=lambda _input: False,
+        is_read_only=lambda _input: infer_mcp_is_read_only(
+            tool_info.name, tool_info.description,
+            metadata=getattr(tool_info, "metadata", None),
+        ),
         risk=lambda _input: RiskLevel.MEDIUM,
         mcp_props=MCPToolProps(
             server_name=tool_info.server_name,
@@ -127,7 +131,10 @@ def deferred_mcp_tool(
         parameters_schema=input_schema,
         execute=call_fn,
         description=description,
-        is_read_only=lambda _input: False,
+        is_read_only=lambda _input: infer_mcp_is_read_only(
+            original_tool_name or name, description,
+            metadata=metadata,
+        ),
         risk=lambda _input: RiskLevel.MEDIUM,
         mcp_props=MCPToolProps(
             server_name=server_name,
@@ -221,6 +228,7 @@ def create_resource_list_tool(manager: Any, server_name: str):
             "type": "object", "properties": {}, "required": [],
         },
         execute=call_fn,
+        is_read_only=lambda _input: True,
         mcp_props=MCPToolProps(
             server_name=server_name,
             original_tool_name="list_resources",
@@ -268,6 +276,7 @@ def create_resource_read_tool(manager: Any, server_name: str):
             "required": ["uri"],
         },
         execute=call_fn,
+        is_read_only=lambda _input: True,
         mcp_props=MCPToolProps(
             server_name=server_name,
             original_tool_name="read_resource",
