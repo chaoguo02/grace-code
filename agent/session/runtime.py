@@ -163,7 +163,6 @@ class SessionRuntime:
         # Per-session ApprovalBroker instances for headless Web mode.
         # CC-aligned: each session has its own blocking approval queue,
         # equivalent to CC's per-session stdin control_request channel.
-        self._approval_brokers: dict[str, "ApprovalBroker"] = {}
         # Per-session web_confirm_callback factories, set by agent_service
         # before run_session().  keyed by session_id.
         # Phase 4a: All pre-run staging state unified into a single dataclass.
@@ -176,6 +175,9 @@ class SessionRuntime:
         from agent.session.pre_run_config import SessionPreRunConfig
         self._pending_config: dict[str, "SessionPreRunConfig"] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
+        # Phase 4b: Approval broker registry extracted to HeadlessApprovalService.
+        from server.services.headless_approval import HeadlessApprovalService
+        self._approval_service = HeadlessApprovalService()
         self._backend_store: dict[str, "LLMBackend"] = {}
         # Live-steering message tracking state — per-session last-seen DB id.
         self._claim_cursors: dict[str, int] = {}
@@ -308,7 +310,7 @@ class SessionRuntime:
                 logger.debug(
                     "Per-session backend close failed", exc_info=True,
                 )
-        self._approval_brokers.clear()
+        self._approval_service.clear()
         self._pending_config.clear()
         self._claim_cursors.clear()
         self._cancellation_tokens.clear()
@@ -962,14 +964,14 @@ class SessionRuntime:
         """Release all runtime resources associated with a session.
 
         Callers (e.g. HTTP delete handler) must use this instead of reaching
-        into runtime internals like _approval_brokers, _web_confirm_callbacks,
+        into runtime internals like _approval_service, _pending_config,
         or _cancellation_tokens directly.
         """
         # 1. Cancel any running execution
         self.cancel_session(session_id)
 
         # 2. Clean up approval broker (prevents memory leak)
-        self._approval_brokers.pop(session_id, None)
+        self._approval_service.remove(session_id)
 
         # 3. Clean up pre-run config (unified staging — Phase 4a)
         self._pending_config.pop(session_id, None)
@@ -1351,6 +1353,7 @@ class SessionRuntime:
         import threading as _th
         self._worktree_queue: _q.Queue = _q.Queue()
         self._worktree_results: dict[str, dict] = {}
+        self._worktree_results_lock = _th.Lock()  # Phase 4b: fix TOCTOU race
         self._worktree_worker_started = True
 
         def _worker():
@@ -1362,18 +1365,20 @@ class SessionRuntime:
                         break
                     parent_id, child_id, action, expected_revision = cmd
                     cmd_key = f"{child_id}_{action}"
-                    self._worktree_results[cmd_key] = {
-                        "status": "processing", "child_session_id": child_id,
-                        "action": action,
-                        "expected_revision": expected_revision,
-                    }
+                    with self._worktree_results_lock:
+                        self._worktree_results[cmd_key] = {
+                            "status": "processing", "child_session_id": child_id,
+                            "action": action,
+                            "expected_revision": expected_revision,
+                        }
                     result = self._resolve_worktree_sync(
                         parent_id,
                         child_id,
                         action,
                         expected_revision=expected_revision,
                     )
-                    self._worktree_results[cmd_key] = result
+                    with self._worktree_results_lock:
+                        self._worktree_results[cmd_key] = result
                     # Notify server layer via injected callback — clean layering.
                     _cb = getattr(self, '_worktree_completion_callback', None)
                     if _cb is not None:
@@ -1406,24 +1411,25 @@ class SessionRuntime:
             raise ValueError("expected_revision is required")
         expected_revision = expected_revision.strip()
         cmd_key = f"{child_session_id}_{action}"
-        _existing = getattr(self, '_worktree_results', {}).get(cmd_key)
-        if (
-            _existing
-            and _existing.get("expected_revision") == expected_revision
-            and _existing.get("status") in {
-                "queued", "processing", "applied", "discarded",
-                "retained", "no_changes",
+        with self._worktree_results_lock:
+            _existing = getattr(self, '_worktree_results', {}).get(cmd_key)
+            if (
+                _existing
+                and _existing.get("expected_revision") == expected_revision
+                and _existing.get("status") in {
+                    "queued", "processing", "applied", "discarded",
+                    "retained", "no_changes",
+                }
+            ):
+                return cmd_key  # already enqueued — idempotent
+            self._worktree_results[cmd_key] = {
+                "status": "queued", "child_session_id": child_session_id,
+                "action": action,
+                "expected_revision": expected_revision,
             }
-        ):
-            return cmd_key  # already enqueued — idempotent
         self._worktree_queue.put(
             (parent_session_id, child_session_id, action, expected_revision)
         )
-        self._worktree_results[cmd_key] = {
-            "status": "queued", "child_session_id": child_session_id,
-            "action": action,
-            "expected_revision": expected_revision,
-        }
         return cmd_key
 
     def get_worktree_command_status(self, child_session_id: str, action: str) -> dict | None:
@@ -3042,26 +3048,15 @@ class SessionRuntime:
         child_mode = child.permission_mode if child else ""
         return child_mode or parent_mode
 
-    # ── Headless Web Approval (CC control_request/control_response equivalent) ─
+    # ── Headless Web Approval (Phase 4b: delegated to HeadlessApprovalService) ─
 
     def _ensure_approval_broker(self, session_id: str) -> "ApprovalBroker":
-        """Get or create the per-session ApprovalBroker.
-
-        One broker per session.  The agent thread blocks on
-        ``broker.wait_for_decision()``; the HTTP handler resolves via
-        ``broker.resolve()``.  This is the exact same synchronous-blocking
-        pattern as CC's stdin ``control_response``.
-        """
-        with self._active_sessions_lock:
-            if session_id not in self._approval_brokers:
-                from server.services.approval_broker import ApprovalBroker
-                self._approval_brokers[session_id] = ApprovalBroker(session_id)
-            return self._approval_brokers[session_id]
+        """Get or create the per-session ApprovalBroker (delegated)."""
+        return self._approval_service.get_or_create(session_id)
 
     def get_approval_broker(self, session_id: str) -> "ApprovalBroker | None":
-        """Return the ApprovalBroker for *session_id*, if one exists."""
-        with self._active_sessions_lock:
-            return self._approval_brokers.get(session_id)
+        """Return the ApprovalBroker for *session_id*, if one exists (delegated)."""
+        return self._approval_service.get(session_id)
 
     def set_web_confirm_callback(
         self, session_id: str, callback: "WebConfirmCallback",

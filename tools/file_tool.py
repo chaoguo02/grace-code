@@ -21,6 +21,7 @@ tools/file_tool.py
 from __future__ import annotations
 
 import logging
+import threading
 import os as _os
 import os
 from dataclasses import dataclass, field
@@ -66,19 +67,19 @@ class _CacheEntry:
 class FileReadCache:
     """Session-global cache of file read results with mtime verification.
 
-    Shared across parent agent and ALL subagents. Unlike the previous
-    per-agent isolation design, this uses filesystem mtime to guarantee
-    freshness: if a file hasn't been modified since it was cached, there
-    is zero benefit to re-reading it from disk — the content is identical.
+    Shared across parent agent and ALL subagents.  Uses filesystem mtime to
+    guarantee freshness: if a file hasn't been modified since it was cached,
+    there is zero benefit to re-reading it from disk.
 
-    Write tools (file_write, file_edit) call invalidate() to purge cached
-    entries for modified paths, so subsequent reads always get fresh content.
+    **Phase 4b**: ``_cache_lock`` protects ``entries`` dict mutations from
+    concurrent background subagent tool calls sharing the base registry.
 
     Key: normalized absolute path
     Value: list of cached ranges, each with stored mtime
     """
 
     entries: dict[str, list[_CacheEntry]] = field(default_factory=dict)
+    _cache_lock: object = field(default_factory=threading.Lock)
     _hit_count: int = 0   # diagnostics: total cache hits this session
     MAX_ENTRIES: int = 200
     MAX_TOTAL_BYTES: int = 50 * 1024 * 1024  # 50 MB
@@ -106,7 +107,8 @@ class FileReadCache:
             return None
         first_entry = entries[0]
         if first_entry.mtime_ns != 0 and current_mtime != 0 and current_mtime != first_entry.mtime_ns:
-            del self.entries[normalized_path]
+            with self._cache_lock:
+                self.entries.pop(normalized_path, None)
             logger.debug("FileReadCache invalidated (mtime changed): %s", normalized_path)
             return None
         # Any entry qualifies — the agent has seen this file's contents
