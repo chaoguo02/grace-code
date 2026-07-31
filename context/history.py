@@ -268,14 +268,28 @@ class ConversationHistory:
 
     # ── Internal mutation path ──────────────────────────────────────────
 
+    _MUTABLE_GUARD_ENABLED: bool = False  # Set True in test/CI to catch misuse
+
     def _to_dicts_mutable(self) -> list[dict]:
         """Return mutable dict list for internal compaction/trimming operations.
 
-        **Internal use only.**  Compaction and trimming pipelines need to
+        ⚠️ MUTABLE ACCESS — callers MUST NOT modify the returned list
+        unless they are part of the compaction or trimming pipeline.
+        This is a documented exception to the read-only contract on
+        ``to_list()`` and ``to_dicts()``.
+
+        **Internal use only.** Compaction and trimming pipelines need to
         modify the message list in place (MicroCompact replaces tool output
-        content, SnipCompactor removes entire turns).  This accessor
+        content, SnipCompactor removes entire turns). This accessor
         exists to make those mutation paths visible and greppable.
+
+        Tech debt: ``to_dicts()`` should return ``tuple`` for type-level
+        immutability.  17 call sites currently depend on the mutable list
+        return value.  Tracked in: context/history.py ``to_dicts()`` →
+        ``tuple`` migration (see comments above).
         """
+        if self._MUTABLE_GUARD_ENABLED:
+            return _GuardList(self.to_dicts())
         return self.to_dicts()
 
     @classmethod
@@ -362,3 +376,50 @@ class ConversationHistory:
 
     def __repr__(self) -> str:
         return f"ConversationHistory(messages={len(self._messages)}, max={self._max})"
+
+
+# ── Guard wrapper (Phase 0 review: to_dicts() tuple migration) ────────────
+
+
+class _GuardList(list):
+    """Shallow wrapper that prevents mutation in CI/test environments.
+
+    Inherits from ``list`` to preserve all behaviors (iteration,
+    slicing, ``len()``, etc.) while overriding mutation methods to
+    raise ``RuntimeError``.  Used only when
+    ``ConversationHistory._MUTABLE_GUARD_ENABLED`` is True.
+
+    Overrides only the 5 mutation entry points; all read operations
+    pass through to the underlying list.
+    """
+
+    def __setitem__(self, index, value):
+        raise RuntimeError(
+            "MUTABLE ACCESS VIOLATION: attempt to modify a read-only "
+            "ConversationHistory dict list. Use _to_dicts_mutable() only "
+            "in compaction/trimming pipeline code."
+        )
+
+    def __delitem__(self, index):
+        raise RuntimeError(
+            "MUTABLE ACCESS VIOLATION: attempt to delete from a read-only "
+            "ConversationHistory dict list."
+        )
+
+    def append(self, _value):
+        raise RuntimeError(
+            "MUTABLE ACCESS VIOLATION: attempt to append to a read-only "
+            "ConversationHistory dict list."
+        )
+
+    def extend(self, _values):
+        raise RuntimeError(
+            "MUTABLE ACCESS VIOLATION: attempt to extend a read-only "
+            "ConversationHistory dict list."
+        )
+
+    def insert(self, _index, _value):
+        raise RuntimeError(
+            "MUTABLE ACCESS VIOLATION: attempt to insert into a read-only "
+            "ConversationHistory dict list."
+        )

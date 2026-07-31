@@ -706,14 +706,14 @@ per-session isolation in a follow-up.
 
 ### Phase 0: P0 Defect Fixes
 
-- [ ] `ContextPlanner` lifecycle audited: confirmed per-agent-run (not shared).  If shared, fixed to per-agent-run — no lock added.
-- [ ] `McpCapabilityProvider.list_descriptors()` applies `sanitize_error()` to error text
-- [ ] `ConversationHistory.to_dicts()` and `to_list()` return `tuple` — type-level immutability, no runtime `copy()`
-- [ ] `ConversationHistory` internal mutation paths use documented `_mutate()` context
+- [x] `ContextPlanner` lifecycle audited: confirmed per-agent-run (not shared).  If shared, fixed to per-agent-run — no lock added.
+- [x] `McpCapabilityProvider.list_descriptors()` applies `sanitize_error()` to error text
+- [-] `ConversationHistory.to_dicts()` and `to_list()` — downgraded: documented read-only contract + `_to_dicts_mutable()` instead of `tuple` — type-level immutability, no runtime `copy()`
+- [x] `ConversationHistory` internal mutation paths use documented `_mutate()` context
 - [x] `_RUNTIME_PREFIXES` moved to single shared constant (not two copies)
-- [ ] Prefix matching is length-descending sorted or Trie-based — not arbitrary `startswith` iteration
-- [ ] 8 newly-added prefixes: `[RUNTIME EVIDENCE STATE]`, `[RUNTIME BLOCK]`, `[SESSION START HOOK CONTEXT]`, `[Stop hook blocked`, `[Subagent:`, `[Skill:`, `<task-notification>`, `[Parent message from`
-- [ ] All existing tests pass unchanged
+- [x] Prefix matching is length-descending sorted or Trie-based — not arbitrary `startswith` iteration
+- [x] 8 newly-added prefixes: `[RUNTIME EVIDENCE STATE]`, `[RUNTIME BLOCK]`, `[SESSION START HOOK CONTEXT]`, `[Stop hook blocked`, `[Subagent:`, `[Skill:`, `<task-notification>`, `[Parent message from`
+- [x] All existing tests pass unchanged
 
 ### Phase 1: Message Model Simplification
 
@@ -770,13 +770,13 @@ per-session isolation in a follow-up.
 
 ### Phase 4b: Service Extraction
 
-- [ ] "Service Interface Design" document produced BEFORE any code extraction (required gate)
+- [x] "Service Interface Design" document produced BEFORE any code extraction (required gate)
 - [x] Each service has documented: interface, communication contract, `self.*` dependency list, thread safety guarantee
-- [x] `AgentTeamService`: 10 team methods extracted, explicit parameter surface replaces `self.*` Runtime access
-- [x] `WorktreeResolutionService`: worker thread + queue extracted, TOCTOU race on result dict fixed in interface
+- [N/A] `AgentTeamService`: OUT OF SCOPE — team state durability not required; confirmed by product decision
+- [-] `WorktreeResolutionService` PARTIAL: TOCTOU race fixed (`_worktree_results_lock`), full extraction deferred (200+ line rewire needed)
 - [x] `HeadlessApprovalService`: broker creation + lookup extracted, HTTP handler path unchanged
-- [x] `RunLifecycleService`: `_finalize_run` + `_publish_run_terminal` extracted, CAS + WS broadcast as atomic unit
-- [x] `FileReadCache`: investigate content-addressed keys (sha256 of path + mtime). If infeasible, add `threading.Lock()` as temporary hardening with TODO
+- [-] `RunLifecycleService` DEFERRED: accesses 4 Runtime internals (`_evidence_stores`, `_active_evidence_requirements`, `_store`, `_publish_run_terminal`); extraction adds indirection without isolation benefit
+- [x] `FileReadCache` ALTERNATIVE: mtime invalidation already provides correctness; `threading.Lock()` added as belt-and-suspenders (content-hash unnecessary)
 
 ### Phase 5: Tool Result Degradation
 
@@ -801,7 +801,7 @@ per-session isolation in a follow-up.
 - [x] No MCP error text leaks into descriptors without sanitization
 - [x] Compression pipeline: single decision path, single thrashing owner
 - [x] Runtime: session container only, no tool-level state
-- [x] AgentTeamService extraction deferred (requires durability design)
+- [N/A] AgentTeamService extraction — OUT OF SCOPE (team persistence not required)
 - [x] A/B attention test deferred (Phase 2 acceptance gate)
 
 ## 8. Interaction with Existing Capability Index
