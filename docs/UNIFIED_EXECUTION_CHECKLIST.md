@@ -29,14 +29,14 @@
 - [ ] 4.1 Phase 1 E2E: discovery → registration → LLM schema → activation → modifier → cleanup chain
 - [ ] 4.2 Phase 2 Permission regression: auto-approved skills unchanged in new pipeline
 - [x] 4.3 Phase 3 Collision scenarios: Native>Skill, MCP>MCP first-wins, cross-session isolation
-- [ ] 4.4 Phase 4 Evidence dual: Completion Guard accepts both evidence types
+- [x] 4.4 Phase 4 Evidence dual: Completion Guard accepts both evidence types
 - [ ] 4.5 Performance baseline: p99 tool call latency benchmark (delta < 1ms)
 
 ## 5. Documentation & Communication
 
 - [ ] 5.1 Architecture Explorer update: unified pipeline diagram, Dual-Stack Modifier sequence diagram
 - [ ] 5.2 Breaking Change Notice: draft for third-party hook/plugin authors
-- [ ] 5.3 Sunset Timeline: `SKILL_LOADED` deprecation recorded in release notes template
+- [x] 5.3 Sunset Timeline: `SKILL_LOADED` deprecation recorded in release notes template
 
 ## 6. Pre-Implementation Non-Negotiables
 
