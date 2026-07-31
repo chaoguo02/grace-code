@@ -12,6 +12,7 @@ from capabilities.models import (
     CapabilityRuntimeState,
     CapabilityStatus,
 )
+from capabilities.sanitize import sanitize_error
 
 
 class McpCapabilityProvider:
@@ -34,7 +35,8 @@ class McpCapabilityProvider:
         if CapabilityKind.MCP_SERVER in query.kinds:
             for server_name in server_names:
                 tool_count = len(server_tools.get(server_name, ()))
-                error = str(failed_servers.get(server_name, "") or "")
+                raw_error = str(failed_servers.get(server_name, "") or "")
+                error = sanitize_error(raw_error) if raw_error else ""
                 status = CapabilityStatus.FAILED if server_name in failed_servers else CapabilityStatus.AVAILABLE
                 descriptor = CapabilityDescriptor(
                     metadata=CapabilityMetadata(
@@ -65,7 +67,8 @@ class McpCapabilityProvider:
                     status = CapabilityStatus.FAILED
                     visible = False
                     activation = ""
-                    error = str(failed_servers.get(server_name, "") or "")
+                    raw_tool_error = str(failed_servers.get(server_name, "") or "")
+                    error = sanitize_error(raw_tool_error) if raw_tool_error else ""
                 elif deferred:
                     status = CapabilityStatus.DEFERRED
                     visible = False

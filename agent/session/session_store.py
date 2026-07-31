@@ -775,15 +775,14 @@ class SessionStore:
                 ).fetchall()
             ]
 
-    # Runtime-injected prompt-engineering messages start with these
-    # prefixes — they should never appear in the frontend.
-    _RUNTIME_PREFIXES: tuple[str, ...] = (
-        "[TASK ANCHOR]", "[ENVIRONMENT]", "[PRELOADED SKILLS]",
-        "[AGENT MEMORY]", "[TASK MODE]", "[ACTIVE POLICY]",
-        "[FEEDBACK]", "[PREVIOUS SESSION CONTEXT]", "[SYSTEM]",
-        "[MEMORY RESTORED]", "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]",
-        "[Conversation compacted", "[Earlier conversation summarized",
-    )
+    # Runtime-injected messages start with these prefixes — they must never
+    # appear in the frontend.  The single source of truth is
+    # ``context.constants.matches_runtime_prefix()`` which uses a
+    # length-descending list to prevent substring shadowing.
+    #
+    # Kept as a class attribute for backward compatibility with tests that
+    # import ``SessionStore._RUNTIME_PREFIXES`` directly.
+    _RUNTIME_PREFIXES: tuple[str, ...] = ()  # deprecated — use context.constants
 
     def list_messages(self, session_id: str) -> list[LLMMessage]:
         with self._connect() as conn:
@@ -798,9 +797,10 @@ class SessionStore:
                 (session_id,),
             ).fetchall()
         result: list[LLMMessage] = []
+        from context.constants import matches_runtime_prefix
         for row in rows:
             content = row["content"] or ""
-            if any(content.startswith(p) for p in self._RUNTIME_PREFIXES):
+            if matches_runtime_prefix(content):
                 continue  # skip Runtime-injected prompt engineering
             tool_calls = None
             raw_tool_calls = row["tool_calls_json"]

@@ -2108,13 +2108,7 @@ class SessionRuntime:
             # (snip/micro-compact) rebuilds history objects in-place.
             import hashlib
 
-            _RUNTIME_PREFIXES = ("[TASK ANCHOR]", "[ENVIRONMENT]", "[PRELOADED SKILLS]",
-                                 "[AGENT MEMORY]", "[TASK MODE]", "[ACTIVE POLICY]",
-                                 "[FEEDBACK]", "[PREVIOUS SESSION CONTEXT]",
-                                 "[SYSTEM]", "[MEMORY RESTORED]",
-                                 "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]",
-                                 "[Conversation compacted",
-                                 "[Earlier conversation summarized")
+            from context.constants import matches_runtime_prefix
 
             def _msg_fingerprint(msg: LLMMessage) -> str:
                 """Stable content fingerprint — survives object recreation."""
@@ -2149,7 +2143,7 @@ class SessionRuntime:
                     if _msg_fingerprint(message) in _pre_run_fingerprints:
                         continue
                     content = str(message.content or "")
-                    if any(content.startswith(p) for p in _RUNTIME_PREFIXES):
+                    if matches_runtime_prefix(content):
                         continue
                     if _tid:
                         message.turn_id = _tid

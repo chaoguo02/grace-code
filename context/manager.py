@@ -106,7 +106,20 @@ class ContextReductionPlan:
 
 
 class ContextPlanner:
-    """Single owner of normal in-turn context reduction decisions."""
+    """Single owner of normal in-turn context reduction decisions.
+
+    **Lifecycle contract**: One ``ContextPlanner`` per ``ReActAgent`` run.
+    ``ContextManager`` creates its own planner in ``__init__``, and
+    ``AgentFactory.create()`` creates a fresh ``ReActAgent`` (and thus
+    a fresh ``ContextManager`` + ``ContextPlanner``) per ``run_session()``.
+    This means counters (``_steps_since_compaction``, etc.) are scoped to
+    a single agent execution — no lock is needed and no thread ever shares
+    a planner instance.
+
+    If this lifecycle ever changes (e.g., a planner is reused across
+    agent runs), the counters MUST become lock-protected or the planner
+    MUST be re-instantiated on each run.
+    """
 
     def __init__(
         self,

@@ -219,6 +219,11 @@ class ConversationHistory:
     """
     对话历史管理器，带滑动窗口。
 
+    **Read-only contract**: ``to_list()`` and ``to_dicts()`` return copies.
+    Callers must not mutate the returned objects.  Internal mutation paths
+    (``_trim()``, compaction replacement) use the ``_mutate()`` context
+    manager which documents the exception explicitly.
+
     用法：
         history = ConversationHistory(max_messages=20)
         history.add(LLMMessage(role="user", content="Fix the bug"))
@@ -246,11 +251,11 @@ class ConversationHistory:
         self._trim()
 
     def to_list(self) -> list[LLMMessage]:
-        """返回完整历史列表（浅拷贝）。"""
+        """返回完整历史的浅拷贝。调用方不得修改返回列表。"""
         return list(self._messages)
 
     def to_dicts(self) -> list[dict]:
-        """转为 dict 列表，供 TokenBudget.trim_history() 使用。"""
+        """转为 dict 列表的浅拷贝，供 TokenBudget 等只读消费者使用。"""
         result = []
         for m in self._messages:
             d: dict = {"role": m.role, "content": m.content}
@@ -260,6 +265,18 @@ class ConversationHistory:
                 d["tool_calls"] = [tc.to_dict() for tc in m.tool_calls]
             result.append(d)
         return result
+
+    # ── Internal mutation path ──────────────────────────────────────────
+
+    def _to_dicts_mutable(self) -> list[dict]:
+        """Return mutable dict list for internal compaction/trimming operations.
+
+        **Internal use only.**  Compaction and trimming pipelines need to
+        modify the message list in place (MicroCompact replaces tool output
+        content, SnipCompactor removes entire turns).  This accessor
+        exists to make those mutation paths visible and greppable.
+        """
+        return self.to_dicts()
 
     @classmethod
     def from_dicts(cls, dicts: list[dict], max_messages: int = 40) -> "ConversationHistory":
