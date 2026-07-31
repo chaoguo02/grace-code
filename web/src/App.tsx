@@ -14,7 +14,6 @@ import { ReplayLab } from "./components/ReplayLab";
 import { SafetyCenter } from "./components/SafetyCenter";
 import { MultiAgentControlPlane } from "./components/MultiAgentControlPlane";
 import { ReliabilityDashboard } from "./components/ReliabilityDashboard";
-import { StatsDashboard } from "./components/StatsDashboard";
 import { ProjectOverview } from "./components/ProjectOverview";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
@@ -95,6 +94,7 @@ export default function App() {
   const openSession = useSessionStore((state) => state.openSession);
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
+  const [mobileSessionsOpen, setMobileSessionsOpen] = useState(false);
   const lastViewByModule = useRef<Partial<Record<ModuleName, ViewName>>>({
     [navigation.module]: navigation.view,
   });
@@ -107,6 +107,7 @@ export default function App() {
   ) => {
     lastViewByModule.current[next.module] = next.view;
     setNavigation(next);
+    setMobileSessionsOpen(false);
     const search = buildNavigationSearch(
       window.location.search,
       next,
@@ -157,6 +158,7 @@ export default function App() {
       const next = parseNavigation(window.location.search);
       lastViewByModule.current[next.module] = next.view;
       setNavigation(next);
+      setMobileSessionsOpen(false);
       const sessionId = parseNavigationSession(window.location.search);
       if (
         sessionId
@@ -189,9 +191,11 @@ export default function App() {
   }, [navigation.view]);
 
   const appClass = [
+    "adaptive-shell",
     activeView === "chat" ? "has-event-sidebar" : "",
     leftCollapsed ? "left-collapsed" : "",
     rightCollapsed ? "right-collapsed" : "",
+    mobileSessionsOpen ? "mobile-sessions-open" : "",
   ].filter(Boolean).join(" ");
 
   return (
@@ -200,7 +204,19 @@ export default function App() {
         Skip to main content
       </a>
       <div id="app" className={appClass}>
-        <div className={`left-rail${leftCollapsed ? " collapsed" : ""}`}>
+        {mobileSessionsOpen && (
+          <button
+            className="mobile-rail-backdrop"
+            type="button"
+            aria-label="Close sessions"
+            onClick={() => setMobileSessionsOpen(false)}
+          />
+        )}
+
+        <div
+          id="session-navigation"
+          className={`left-rail${leftCollapsed ? " collapsed" : ""}`}
+        >
           {leftCollapsed ? (
             <div className="left-rail-collapsed-strip">
               <button
@@ -215,7 +231,10 @@ export default function App() {
           ) : (
             <ErrorBoundary>
               <SessionSidebar
-                onToggleCollapse={() => setLeftCollapsed(true)}
+                onToggleCollapse={() => {
+                  setLeftCollapsed(true);
+                  setMobileSessionsOpen(false);
+                }}
                 onOpenSession={(sessionId) => {
                   writeNavigation(
                     navigationForView("chat"),
@@ -237,6 +256,19 @@ export default function App() {
           >
             <header className="topbar topbar-workbench topbar-compact topbar-module-navigation">
               <div className="topbar-left">
+                <button
+                  className="mobile-session-toggle"
+                  type="button"
+                  aria-controls="session-navigation"
+                  aria-expanded={mobileSessionsOpen}
+                  onClick={() => {
+                    setLeftCollapsed(false);
+                    setMobileSessionsOpen((open) => !open);
+                  }}
+                >
+                  <span aria-hidden="true">☰</span>
+                  Sessions
+                </button>
                 <PrimaryNavigation
                   activeModule={navigation.module}
                   onSelect={navigateModule}

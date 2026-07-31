@@ -923,10 +923,10 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
           {!hasContent && !isLoadingSession && (
             <div className="welcome welcome-hero">
               <div className="welcome-hero-badge">✦</div>
-              <h1>Welcome to Grace Code</h1>
+              <h1>What should we shape next?</h1>
               <p>
-                Your AI software engineer that plans, builds, and ships with clarity.
-                Describe what you want to build or coordinate across specialist agents.
+                Describe the outcome you need. Grace can investigate, plan, implement,
+                and verify the work while keeping every decision inspectable.
               </p>
               <div className="welcome-grid welcome-grid-four">
                 {HERO_CARDS.map((card) => (

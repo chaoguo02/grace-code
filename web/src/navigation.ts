@@ -1,9 +1,8 @@
 export type ModuleName =
-  | "overview"
   | "workbench"
-  | "inspect"
-  | "control"
-  | "quality";
+  | "changes"
+  | "history"
+  | "system";
 
 export type ScopeName = "project" | "session" | "run" | "hybrid";
 
@@ -53,13 +52,6 @@ export interface ModuleDefinition {
 
 export const MODULES: readonly ModuleDefinition[] = [
   {
-    key: "overview",
-    label: "Overview",
-    icon: "O",
-    defaultView: "overview",
-    views: [{ key: "overview", label: "Overview", level: "core", scope: "project" }],
-  },
-  {
     key: "workbench",
     label: "Workbench",
     icon: "W",
@@ -67,40 +59,41 @@ export const MODULES: readonly ModuleDefinition[] = [
     views: [
       { key: "chat", label: "Chat", level: "core", scope: "session" },
       { key: "plans", label: "Plans", level: "standard", scope: "hybrid" },
-      { key: "reviews", label: "Changes", level: "core", scope: "hybrid" },
-      { key: "memory", label: "Memory", level: "advanced", scope: "hybrid" },
     ],
   },
   {
-    key: "inspect",
-    label: "Inspect",
-    icon: "I",
-    defaultView: "runs",
+    key: "changes",
+    label: "Changes",
+    icon: "C",
+    defaultView: "reviews",
     views: [
-      { key: "runs", label: "Run Summary", level: "core", scope: "session" },
+      { key: "reviews", label: "Review", level: "core", scope: "hybrid" },
+    ],
+  },
+  {
+    key: "history",
+    label: "History",
+    icon: "H",
+    defaultView: "memory",
+    views: [
+      { key: "memory", label: "Memory", level: "core", scope: "hybrid" },
+      { key: "runs", label: "Runs", level: "core", scope: "session" },
       { key: "context", label: "Context", level: "advanced", scope: "session" },
       { key: "replay", label: "Replay", level: "advanced", scope: "session" },
-      { key: "events", label: "Event Trace", level: "expert", scope: "session" },
+      { key: "events", label: "Event trace", level: "expert", scope: "session" },
     ],
   },
   {
-    key: "control",
-    label: "Control",
-    icon: "C",
-    defaultView: "architecture",
+    key: "system",
+    label: "System",
+    icon: "S",
+    defaultView: "overview",
     views: [
-      { key: "architecture", label: "Architecture", level: "standard", scope: "hybrid" },
+      { key: "overview", label: "Overview", level: "core", scope: "project" },
       { key: "agents", label: "Agents", level: "core", scope: "session" },
-      { key: "safety", label: "Safety", level: "core", scope: "hybrid" },
-    ],
-  },
-  {
-    key: "quality",
-    label: "Quality",
-    icon: "Q",
-    defaultView: "reliability",
-    views: [
       { key: "reliability", label: "Health", level: "core", scope: "project" },
+      { key: "safety", label: "Safety", level: "core", scope: "hybrid" },
+      { key: "architecture", label: "Architecture", level: "advanced", scope: "hybrid" },
       { key: "evaluations", label: "Evaluations", level: "advanced", scope: "project" },
     ],
   },
@@ -127,9 +120,16 @@ const VIEW_ALIASES: Record<string, ViewName> = {
   run: "runs",
 };
 
+const LEGACY_MODULE_DEFAULTS: Record<string, ViewName> = {
+  overview: "overview",
+  inspect: "runs",
+  control: "architecture",
+  quality: "reliability",
+};
+
 export const DEFAULT_NAVIGATION: NavigationState = {
-  module: "overview",
-  view: "overview",
+  module: "workbench",
+  view: "chat",
 };
 
 export function isModuleName(value: string): value is ModuleName {
@@ -148,7 +148,7 @@ export function navigationForView(
   target: NavigationTarget = {},
 ): NavigationState {
   return {
-    module: MODULE_BY_VIEW.get(view) || "overview",
+    module: MODULE_BY_VIEW.get(view) || "workbench",
     view,
     ...target,
   };
@@ -160,7 +160,7 @@ export function defaultNavigationForModule(
   const module = MODULE_BY_NAME.get(moduleName);
   return {
     module: moduleName,
-    view: module?.defaultView || "overview",
+    view: module?.defaultView || "chat",
   };
 }
 
@@ -177,10 +177,12 @@ export function parseNavigation(search: string): NavigationState {
         : undefined,
     });
   }
+
   const moduleName = params.get("module") || "";
-  return isModuleName(moduleName)
-    ? defaultNavigationForModule(moduleName)
-    : DEFAULT_NAVIGATION;
+  if (isModuleName(moduleName)) return defaultNavigationForModule(moduleName);
+
+  const legacyView = LEGACY_MODULE_DEFAULTS[moduleName];
+  return legacyView ? navigationForView(legacyView) : DEFAULT_NAVIGATION;
 }
 
 export function parseNavigationSession(search: string): string {
@@ -212,7 +214,7 @@ export function moduleDefinition(moduleName: ModuleName): ModuleDefinition {
 }
 
 export function viewDefinition(viewName: ViewName): ViewDefinition {
-  const moduleName = MODULE_BY_VIEW.get(viewName) || "overview";
+  const moduleName = MODULE_BY_VIEW.get(viewName) || "workbench";
   return moduleDefinition(moduleName).views.find((view) => view.key === viewName)
     || MODULES[0].views[0];
 }

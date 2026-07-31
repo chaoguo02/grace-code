@@ -269,10 +269,10 @@ export function DiffReviewView() {
       <div className="plan-page review-page">
         <div className="plan-hero review-hero">
           <div>
-            <div className="summary-label">Review Workspace</div>
-            <h2 className="plan-hero-title">Quality, changes, and readiness</h2>
+            <div className="summary-label">Changes</div>
+            <h2 className="plan-hero-title">Review what changed, then hand it off</h2>
             <p className="plan-hero-body">
-              Use this page after or during a run to understand what changed, what was verified, and what still needs a decision.
+              Resolve pending decisions first, then confirm verification and supporting review evidence before handoff.
             </p>
           </div>
           <div className="plan-hero-stats">

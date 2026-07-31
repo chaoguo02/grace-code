@@ -176,7 +176,7 @@ export function TraceView({
             )}
           </div>
         )}
-        <div style={{
+        <div className="trace-filter-bar" style={{
           padding: "8px 20px",
           borderBottom: "1px solid var(--border)",
           background: "var(--bg)",

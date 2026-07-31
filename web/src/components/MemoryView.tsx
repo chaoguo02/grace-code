@@ -245,11 +245,10 @@ export function MemoryView() {
       <div className="memory-page">
         <div className="memory-hero">
           <div className="memory-hero-copy">
-            <div className="summary-label">Memory Workspace</div>
-            <h2 className="memory-hero-title">Persistent memory, made inspectable</h2>
+            <div className="summary-label">History</div>
+            <h2 className="memory-hero-title">Long-term memory, with its evidence intact</h2>
             <p className="memory-hero-body">
-              Surface user, feedback, project, and reference memories in one place, with lifecycle,
-              scope, confidence, and retention visible instead of hidden behind MEMORY.md files.
+              Revisit durable project knowledge, inspect why it was retained, and manage lifecycle, scope, confidence, and provenance.
             </p>
             <div className="memory-hero-chips">
               <span className="trace-pill">Two-tier store</span>

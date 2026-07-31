@@ -11814,3 +11814,1334 @@ body {
 .paired-run-stage-action {
   border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
 }
+
+
+/* ── Visual QA closure: four-entry shell and responsive contract ──────── */
+.mobile-session-toggle,
+.mobile-rail-backdrop {
+  display: none;
+}
+
+/* The shell owns viewport height; each product surface owns one scroll axis. */
+html,
+body,
+#root,
+#app-shell {
+  height: 100%;
+  overflow: hidden;
+}
+
+#app,
+#app.has-event-sidebar {
+  grid-template-columns: 220px minmax(0, 1fr);
+}
+
+#app.has-event-sidebar {
+  grid-template-columns: 210px minmax(0, 1fr) 244px;
+}
+
+#app > *,
+.main,
+.main-content,
+.main-content > *,
+.view.active {
+  min-width: 0;
+}
+
+.main-content {
+  overflow: hidden;
+}
+
+.main-content > .view.active {
+  width: 100%;
+  overflow: hidden;
+}
+
+/* Product pages scroll at the page level; inner tables may scroll horizontally. */
+.plan-page,
+.memory-page,
+.project-overview,
+.architecture-explorer,
+.agent-control-plane,
+.reliability-dashboard,
+.safety-center,
+.replay-lab,
+.context-page,
+.eval-page,
+.run-inspector {
+  width: 100%;
+  max-width: none;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+}
+
+.plan-page,
+.memory-page {
+  max-width: 1240px;
+  margin: 0 auto;
+}
+
+/* Keep the conversation readable and guarantee the composer never overlays it. */
+.chat-shell,
+.chat.view,
+.composer,
+.composer-shell,
+.composer-card,
+.composer-main,
+#prompt-input {
+  min-width: 0;
+}
+
+.chat.view {
+  scroll-padding-bottom: 24px;
+}
+
+#messages {
+  padding-bottom: 28px;
+}
+
+.composer {
+  position: relative;
+  z-index: 8;
+  flex: 0 0 auto;
+}
+
+.composer-main textarea {
+  width: 100%;
+}
+
+/* Quiet Craft hierarchy: one opening statement, then compact evidence. */
+.review-hero,
+.memory-hero-copy,
+.memory-context-card {
+  box-shadow: none;
+}
+
+.review-hero {
+  padding: 18px 2px 20px;
+  border-width: 0 0 1px;
+  border-radius: 0;
+  background: transparent;
+}
+
+.review-hero .plan-hero-title,
+.memory-hero-title {
+  font-size: clamp(24px, 3vw, 34px);
+  font-weight: 680;
+  letter-spacing: -0.04em;
+}
+
+.review-page .stats-card,
+.memory-metric-card,
+.memory-catalog,
+.memory-detail,
+.memory-side-card {
+  border-color: color-mix(in srgb, var(--border) 82%, transparent);
+}
+
+.review-page > .multi-review-panel {
+  padding: 16px;
+}
+
+.review-page > .multi-review-panel .empty-state {
+  padding: 22px 12px;
+}
+
+.memory-metric-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.memory-metric-card {
+  min-height: 112px;
+}
+
+@media (max-width: 1200px) {
+  #app,
+  #app.has-event-sidebar {
+    grid-template-columns: 206px minmax(0, 1fr);
+  }
+
+  #app.has-event-sidebar > .event-sidebar,
+  #app.has-event-sidebar > .right-rail-collapsed {
+    display: none;
+  }
+
+  .memory-metric-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  #app,
+  #app.has-event-sidebar {
+    grid-template-columns: 190px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .topbar-module-navigation .status-cluster,
+  .topbar-module-navigation .view-scope {
+    display: none;
+  }
+
+  .memory-metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  html,
+  body,
+  #root,
+  #app-shell {
+    width: 100%;
+    height: 100%;
+    min-height: 100%;
+    overflow: hidden;
+  }
+
+  #app-shell {
+    padding: 0;
+  }
+
+  #app,
+  #app.has-event-sidebar,
+  #app.left-collapsed,
+  #app.right-collapsed,
+  #app.left-collapsed.right-collapsed,
+  #app.has-event-sidebar.left-collapsed,
+  #app.has-event-sidebar.right-collapsed,
+  #app.has-event-sidebar.left-collapsed.right-collapsed {
+    position: relative;
+    display: grid;
+    width: 100%;
+    height: 100dvh;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    overflow: hidden;
+  }
+
+  #app > .left-rail {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 120;
+    display: flex !important;
+    width: min(320px, 88vw);
+    height: 100dvh;
+    padding: 8px;
+    overflow: hidden;
+    background: var(--bg);
+    box-shadow: 18px 0 48px rgba(28, 29, 25, 0.18);
+    transform: translateX(-105%);
+    transition: transform 180ms ease;
+  }
+
+  #app.mobile-sessions-open > .left-rail {
+    transform: translateX(0);
+  }
+
+  #app > .mobile-rail-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 110;
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: rgba(23, 25, 22, 0.38);
+    backdrop-filter: blur(2px);
+  }
+
+  .left-rail .sidebar {
+    height: auto;
+    max-height: none;
+    flex: 1;
+  }
+
+  .mobile-session-toggle {
+    display: inline-flex;
+    grid-row: 1 / span 2;
+    align-items: center;
+    align-self: start;
+    gap: 6px;
+    min-height: 32px;
+    padding: 0 9px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-panel);
+    color: var(--text);
+    font-size: 10px;
+    font-weight: 700;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .main,
+  .main-workbench {
+    width: 100%;
+    min-width: 0;
+    height: 100dvh;
+    border: 0;
+    border-radius: 0;
+    overflow: hidden;
+  }
+
+  .topbar-module-navigation,
+  .topbar-workbench {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 6px;
+    min-height: 78px;
+    padding: 8px 10px !important;
+  }
+
+  .topbar-module-navigation .topbar-left {
+    display: grid;
+    width: 100%;
+    min-width: 0;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    gap: 4px 7px;
+  }
+
+  .topbar-module-navigation .primary-navigation,
+  .topbar-module-navigation .secondary-navigation {
+    grid-column: 2;
+    width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: none;
+  }
+
+  .topbar-module-navigation .primary-navigation {
+    grid-row: 1;
+  }
+
+  .topbar-module-navigation .secondary-navigation {
+    grid-row: 2;
+    padding-top: 2px;
+    border-top: 1px solid var(--border);
+  }
+
+  .topbar-module-navigation .primary-navigation::-webkit-scrollbar,
+  .topbar-module-navigation .secondary-navigation::-webkit-scrollbar {
+    display: none;
+  }
+
+  .primary-navigation button,
+  .secondary-navigation button {
+    flex: 0 0 auto;
+    min-height: 28px;
+    padding: 4px 8px;
+    font-size: 10px;
+  }
+
+  .primary-navigation button > span,
+  .secondary-navigation-label {
+    display: none;
+  }
+
+  .topbar-module-navigation .topbar-right {
+    grid-column: 2;
+    align-self: start;
+    padding: 0;
+  }
+
+  .topbar-module-navigation .topbar-right > :not(.theme-toggle) {
+    display: none;
+  }
+
+  .theme-toggle {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+  }
+
+  .main-content,
+  .main-content > .view.active {
+    width: 100%;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .plan-page,
+  .memory-page,
+  .project-overview,
+  .architecture-explorer,
+  .agent-control-plane,
+  .reliability-dashboard,
+  .safety-center,
+  .replay-lab,
+  .context-page,
+  .eval-page,
+  .run-inspector {
+    width: 100%;
+    max-width: 100%;
+    padding: 18px 14px 36px;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .chat.view {
+    width: 100%;
+    padding: 10px 14px 8px !important;
+  }
+
+  .welcome,
+  .welcome-hero {
+    width: 100%;
+    padding: 24px 0 18px;
+  }
+
+  .welcome h1 {
+    font-size: clamp(28px, 10vw, 38px);
+  }
+
+  .welcome-grid,
+  .welcome-grid-four {
+    margin-top: 22px;
+  }
+
+  .composer {
+    width: 100%;
+    padding: 7px 10px 9px;
+  }
+
+  .composer-card,
+  .composer-card-elevated {
+    width: 100%;
+    padding: 9px 10px !important;
+  }
+
+  .composer-main {
+    position: relative;
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  #prompt-input {
+    width: 100%;
+    min-height: 92px;
+    padding: 8px 4px 52px;
+  }
+
+  .composer-actions-floating {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    width: auto;
+    max-width: calc(100% - 4px);
+    flex-direction: row;
+    justify-content: flex-end;
+  }
+
+  .send-cluster {
+    max-width: 100%;
+  }
+
+  .composer-send-btn {
+    width: auto;
+    min-width: 92px;
+    padding-inline: 12px;
+  }
+
+  .composer-send-caret {
+    width: 34px;
+  }
+
+  .composer-bottom-row {
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .composer-bottom-left,
+  .composer-bottom-right {
+    width: 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .composer-status-line {
+    width: 100%;
+    padding-inline: 4px;
+  }
+
+  .plan-hero,
+  .review-card-header,
+  .memory-hero,
+  .memory-toolbar,
+  .arch-hero,
+  .overview-hero,
+  .reliability-hero,
+  .safety-hero {
+    align-items: stretch;
+    grid-template-columns: minmax(0, 1fr);
+    flex-direction: column;
+  }
+
+  .plan-hero-stats,
+  .review-card-actions,
+  .memory-filter-group {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .plan-hero-stats {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .stats-grid,
+  .memory-layout,
+  .memory-side,
+  .memory-metric-grid,
+  .arch-two-column,
+  .arch-contracts,
+  .overview-lower-grid,
+  .reliability-main-grid,
+  .reliability-secondary-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .memory-search {
+    width: 100%;
+    min-width: 0;
+    flex-basis: auto;
+  }
+
+  .memory-filter-group {
+    flex-wrap: nowrap;
+    padding-bottom: 4px;
+    overflow-x: auto;
+  }
+
+  .memory-filter-group > * {
+    flex: 0 0 auto;
+  }
+
+  .memory-catalog-list,
+  .plan-scroll {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .memory-catalog,
+  .memory-detail,
+  .memory-side {
+    min-width: 0;
+  }
+
+  .arch-metrics,
+  .overview-headline,
+  .reliability-metrics,
+  .safety-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .arch-tool-table,
+  .safety-tool-table,
+  .reliability-tool-table,
+  .reliability-run-table,
+  .eval-result-table,
+  .replay-taxonomy-table {
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+  }
+
+  .toast {
+    right: 12px;
+    bottom: 12px;
+    max-width: calc(100vw - 24px);
+  }
+}
+
+@media (max-width: 420px) {
+  .topbar-module-navigation,
+  .topbar-workbench {
+    grid-template-columns: minmax(0, 1fr) 32px;
+    padding-inline: 8px !important;
+  }
+
+  .mobile-session-toggle {
+    width: 34px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .mobile-session-toggle:not(:focus) {
+    font-size: 0;
+  }
+
+  .mobile-session-toggle span {
+    font-size: 14px;
+  }
+
+  .primary-navigation button,
+  .secondary-navigation button {
+    padding-inline: 7px;
+  }
+
+  .review-hero .plan-hero-title,
+  .memory-hero-title,
+  .arch-hero h1 {
+    font-size: 26px;
+  }
+
+  .plan-page,
+  .memory-page,
+  .project-overview,
+  .architecture-explorer,
+  .agent-control-plane,
+  .reliability-dashboard,
+  .safety-center,
+  .replay-lab,
+  .context-page,
+  .eval-page,
+  .run-inspector {
+    padding-inline: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #app > .left-rail {
+    transition: none;
+  }
+}
+
+
+/* ── Canonical adaptive layout foundation ───────────────────────────────
+   One shell owns the viewport. One workspace owns vertical composition.
+   Product grids respond to their actual container, never the window width. */
+#app.adaptive-shell {
+  --shell-gap: 10px;
+  --left-rail-size: 220px;
+  --right-rail-size: 244px;
+  display: grid;
+  grid-template-columns: var(--left-rail-size) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  inline-size: 100%;
+  block-size: calc(100dvh - 20px);
+  min-inline-size: 0;
+  min-block-size: 0;
+  gap: var(--shell-gap);
+  overflow: hidden;
+}
+
+#app.adaptive-shell.has-event-sidebar {
+  grid-template-columns: 210px minmax(0, 1fr) var(--right-rail-size);
+}
+
+#app.adaptive-shell.left-collapsed {
+  grid-template-columns: 40px minmax(0, 1fr);
+}
+
+#app.adaptive-shell.has-event-sidebar.left-collapsed {
+  grid-template-columns: 40px minmax(0, 1fr) var(--right-rail-size);
+}
+
+#app.adaptive-shell.has-event-sidebar.right-collapsed {
+  grid-template-columns: 210px minmax(0, 1fr) 32px;
+}
+
+#app.adaptive-shell.has-event-sidebar.left-collapsed.right-collapsed {
+  grid-template-columns: 40px minmax(0, 1fr) 32px;
+}
+
+#app.adaptive-shell > *,
+#app.adaptive-shell :where(.main-workbench, .main-content, .view, .view.active),
+#app.adaptive-shell :where(.topbar-left, .topbar-right, .primary-navigation, .secondary-navigation),
+#app.adaptive-shell :where(.plan-page, .memory-page, .project-overview, .architecture-explorer),
+#app.adaptive-shell :where(.agent-control-plane, .reliability-dashboard, .safety-center, .replay-lab),
+#app.adaptive-shell :where(.context-page, .eval-page, .run-inspector),
+#app.adaptive-shell :where(.stats-card, .memory-catalog, .memory-detail, .memory-side),
+#app.adaptive-shell :where(.review-page, .review-orchestration, .review-topology) {
+  min-inline-size: 0;
+  min-block-size: 0;
+}
+
+/* Workspace rows never overlap: navigation is auto-sized; content receives
+   exactly the remaining block size. */
+#app.adaptive-shell .main-workbench {
+  container: workspace / inline-size;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  inline-size: 100%;
+  block-size: 100%;
+  overflow: hidden;
+}
+
+#app.adaptive-shell .main-content {
+  position: relative;
+  display: block;
+  inline-size: 100%;
+  block-size: 100%;
+  overflow: hidden;
+}
+
+#app.adaptive-shell .main-content > * {
+  min-inline-size: 0;
+  min-block-size: 0;
+}
+
+#app.adaptive-shell .main-content > .view.active,
+#app.adaptive-shell .main-content > .project-overview,
+#app.adaptive-shell .main-content > .architecture-explorer,
+#app.adaptive-shell .main-content > .agent-control-plane,
+#app.adaptive-shell .main-content > .reliability-dashboard,
+#app.adaptive-shell .main-content > .safety-center,
+#app.adaptive-shell .main-content > .replay-lab {
+  inline-size: 100%;
+  block-size: 100%;
+}
+
+/* The top bar is a two-column grid. Both navigation rows may shrink and
+   scroll locally; status controls can never cross into them. */
+#app.adaptive-shell .topbar-module-navigation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  min-block-size: 0;
+  gap: 8px 12px;
+  padding: 8px 12px !important;
+}
+
+#app.adaptive-shell .topbar-module-navigation .topbar-left {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  inline-size: 100%;
+}
+
+#app.adaptive-shell .primary-navigation,
+#app.adaptive-shell .secondary-navigation,
+#app.adaptive-shell .secondary-navigation > div {
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+}
+
+#app.adaptive-shell .primary-navigation,
+#app.adaptive-shell .secondary-navigation > div {
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: none;
+}
+
+#app.adaptive-shell :where(.primary-navigation, .secondary-navigation > div)::-webkit-scrollbar {
+  display: none;
+}
+
+#app.adaptive-shell :where(.primary-navigation button, .secondary-navigation button) {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+#app.adaptive-shell .topbar-right {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  align-self: start;
+  gap: 6px;
+  min-inline-size: 0;
+  white-space: nowrap;
+}
+
+#app.adaptive-shell #status-text {
+  display: block;
+  max-inline-size: clamp(90px, 12vw, 180px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Every product page owns one vertical scrollport. Nested regions only
+   scroll horizontally when their data format requires it. */
+#app.adaptive-shell :where(
+  .plan-page,
+  .memory-page,
+  .project-overview,
+  .architecture-explorer,
+  .agent-control-plane,
+  .reliability-dashboard,
+  .safety-center,
+  .replay-lab,
+  .context-page,
+  .eval-page,
+  .main-content-runs
+) {
+  inline-size: 100%;
+  block-size: 100%;
+  max-inline-size: none;
+  box-sizing: border-box;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+#app.adaptive-shell .eval-page {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+#app.adaptive-shell .eval-page > * {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  box-sizing: border-box;
+}
+
+#app.adaptive-shell .run-inspector {
+  inline-size: min(1440px, 100%);
+  min-block-size: 100%;
+  overflow: visible;
+}
+
+#app.adaptive-shell :where(.memory-catalog-list, .plan-scroll) {
+  max-block-size: none;
+  overflow: visible;
+}
+
+#app.adaptive-shell .trace-filter-bar {
+  max-inline-size: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+}
+
+#app.adaptive-shell .trace-filter-bar > * {
+  flex: 0 0 auto;
+}
+
+#app.adaptive-shell :where(
+  .arch-tool-table,
+  .safety-tool-table,
+  .reliability-tool-table,
+  .reliability-run-table,
+  .eval-result-table,
+  .replay-taxonomy-table,
+  .agent-context-table,
+  .run-tool-table
+) {
+  max-inline-size: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+}
+
+/* Chat is a four-row flow: conversation, approvals, background activity,
+   composer. No status surface is fixed over another surface. */
+#app.adaptive-shell .main-content-chat > div {
+  position: relative;
+  display: flex !important;
+  flex-direction: column !important;
+  inline-size: 100%;
+  block-size: 100%;
+  min-inline-size: 0 !important;
+  min-block-size: 0 !important;
+  overflow: hidden !important;
+}
+
+#app.adaptive-shell .main-content-chat .chat-shell {
+  order: 1;
+  flex: 1 1 auto;
+  inline-size: 100%;
+  min-inline-size: 0;
+  min-block-size: 0;
+  overflow: hidden;
+}
+
+#app.adaptive-shell .main-content-chat .chat.view {
+  inline-size: 100%;
+  min-block-size: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+#app.adaptive-shell .main-content-chat .permission-dock {
+  order: 2;
+  flex: 0 1 auto;
+  max-block-size: min(34dvh, 300px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+#app.adaptive-shell .main-content-chat .subagent-progress-container {
+  position: static;
+  inset: auto;
+  z-index: auto;
+  order: 3;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  flex: 0 1 auto;
+  gap: 6px;
+  inline-size: auto;
+  max-inline-size: 940px;
+  max-block-size: min(28dvh, 190px);
+  margin: 0 auto 6px;
+  padding: 7px 10px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  box-shadow: none;
+  scrollbar-gutter: stable;
+}
+
+#app.adaptive-shell .subagent-progress-header-bar {
+  grid-column: 1 / -1;
+  min-inline-size: 0;
+}
+
+#app.adaptive-shell .subagent-progress-card {
+  min-inline-size: 0;
+  padding: 8px 10px;
+  box-shadow: none;
+}
+
+#app.adaptive-shell .main-content-chat .composer {
+  order: 4;
+  position: relative;
+  z-index: 4;
+  flex: 0 0 auto;
+  inline-size: 100%;
+  min-inline-size: 0;
+}
+
+#app.adaptive-shell :where(.composer-shell, .composer-card, .composer-main, #prompt-input) {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+
+#app.adaptive-shell .composer-panel {
+  max-block-size: min(56dvh, 520px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+#app.adaptive-shell :where(.composer-toolbar, .composer-bottom-row, .composer-bottom-left, .composer-bottom-right) {
+  min-inline-size: 0;
+  flex-wrap: wrap;
+}
+
+/* Text is always allowed to contribute a zero min-content width. */
+#app.adaptive-shell :where(
+  h1, h2, h3, h4, p, code, pre, strong, small, span,
+  .plan-hero-body, .memory-context-title, .memory-list-name,
+  .memory-list-description, .stats-card-title, .multi-review-location,
+  .overview-runtime-line, .arch-health-row, .safety-approval-copy
+) {
+  overflow-wrap: anywhere;
+}
+
+#app.adaptive-shell :where(
+  .plan-hero, .plan-hero-stats, .stats-card-header, .review-card-header,
+  .review-card-actions, .multi-review-header, .multi-review-actions,
+  .memory-toolbar, .memory-panel-head, .overview-section-heading,
+  .arch-section-heading, .safety-section-heading, .replay-section-heading,
+  .run-inspector-header, .context-section-heading, .eval-section-head
+) {
+  min-inline-size: 0;
+}
+
+#app.adaptive-shell :where(
+  .plan-hero-stats, .review-card-actions, .multi-review-actions,
+  .memory-filter-group, .permission-actions, .quality-header-actions
+) {
+  flex-wrap: wrap;
+}
+
+/* Intrinsic grids choose their column count from real available space. */
+#app.adaptive-shell .memory-metric-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
+}
+
+#app.adaptive-shell .overview-headline {
+  grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
+}
+
+#app.adaptive-shell :where(.arch-metrics, .reliability-metrics, .safety-metrics, .eval-metrics) {
+  grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
+}
+
+#app.adaptive-shell :where(.overview-capability-grid, .overview-signal-grid) {
+  grid-template-columns: repeat(auto-fit, minmax(min(230px, 100%), 1fr));
+}
+
+#app.adaptive-shell :where(.stats-grid, .session-drawer-grid) {
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+}
+
+#app.adaptive-shell .memory-side {
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+}
+
+/* Container breakpoints are based on workspace width after rails are removed. */
+@container workspace (min-width: 1180px) {
+  #app.adaptive-shell .memory-layout {
+    grid-template-columns: minmax(240px, .82fr) minmax(0, 1.3fr) minmax(220px, .72fr);
+  }
+
+  #app.adaptive-shell .memory-side {
+    display: grid;
+    grid-column: auto;
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@container workspace (max-width: 1179px) {
+  #app.adaptive-shell .memory-layout {
+    grid-template-columns: minmax(230px, .72fr) minmax(0, 1.28fr);
+  }
+
+  #app.adaptive-shell .memory-side {
+    grid-column: 1 / -1;
+  }
+}
+
+@container workspace (max-width: 940px) {
+  #app.adaptive-shell :where(
+    .memory-hero, .memory-layout, .overview-hero, .overview-lower-grid,
+    .arch-two-column, .arch-contracts, .arch-overlay-grid,
+    .reliability-main-grid, .reliability-secondary-grid,
+    .safety-pipeline-grid, .safety-main-grid, .safety-catalog-grid,
+    .agent-control-grid, .agent-control-lower-grid, .agent-routing-layout,
+    .context-main-grid, .context-capability-grid, .eval-main-grid,
+    .run-inspector-primary-grid, .run-inspector-secondary-grid,
+    .replay-detail-grid, .review-orchestration-grid
+  ) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #app.adaptive-shell :where(
+    .plan-hero, .multi-review-header, .multi-review-actions,
+    .memory-toolbar, .overview-section-heading, .arch-hero,
+    .reliability-hero, .safety-hero, .replay-hero, .context-hero, .eval-hero
+  ) {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  #app.adaptive-shell .review-stage-rail {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+  }
+
+  #app.adaptive-shell .review-stage:not(:last-child)::after {
+    top: 24px;
+    bottom: -8px;
+    left: 12px;
+    inline-size: 1px;
+    block-size: auto;
+  }
+
+  #app.adaptive-shell :where(.review-task-detail-grid, .review-aggregation-strip) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container workspace (max-width: 680px) {
+  #app.adaptive-shell :where(
+    .plan-page, .memory-page, .project-overview, .architecture-explorer,
+    .agent-control-plane, .reliability-dashboard, .safety-center,
+    .replay-lab, .context-page, .eval-page, .run-inspector
+  ) {
+    padding: 16px 12px 32px;
+  }
+
+  #app.adaptive-shell :where(
+    .memory-layout, .memory-side, .overview-journey-grid,
+    .review-task-detail-grid, .review-aggregation-strip,
+    .context-injection-card, .replay-causal-chain,
+    .replay-snapshot-grid, .agent-task, .agent-message
+  ) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #app.adaptive-shell .review-agent-lanes {
+    grid-template-columns: minmax(0, 1fr);
+    padding-top: 0;
+  }
+
+  #app.adaptive-shell :where(
+    .review-agent-lanes::before, .review-agent-node::before,
+    .review-topology-connector, .replay-causal-stage::after
+  ) {
+    display: none;
+  }
+
+  #app.adaptive-shell .memory-filter-group {
+    flex-wrap: nowrap;
+    max-inline-size: 100%;
+    padding-block-end: 4px;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+  }
+
+  #app.adaptive-shell .memory-filter-group > * {
+    flex: 0 0 auto;
+  }
+
+  #app.adaptive-shell .composer-main {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  #app.adaptive-shell #prompt-input {
+    grid-column: 1;
+    grid-row: 1;
+    inline-size: 100%;
+    min-block-size: 64px;
+    padding: 8px 4px;
+  }
+
+  #app.adaptive-shell .composer-actions-floating {
+    position: static;
+    inset: auto;
+    display: flex;
+    grid-column: 1;
+    grid-row: 2;
+    inline-size: auto;
+    max-inline-size: 100%;
+    justify-self: end;
+    flex-direction: row;
+  }
+
+  #app.adaptive-shell .composer-send-btn {
+    inline-size: auto;
+    min-inline-size: 86px;
+    padding-inline: 11px;
+  }
+
+  #app.adaptive-shell .composer-send-caret {
+    inline-size: 34px;
+  }
+
+  #app.adaptive-shell .subagent-progress-container {
+    inline-size: calc(100% - 20px);
+    max-block-size: min(24dvh, 150px);
+  }
+}
+
+/* Rails are either stable desktop columns or an off-canvas drawer. There is
+   no intermediate squeezed-rail state. */
+@media (max-width: 1500px) {
+  #app.adaptive-shell.has-event-sidebar,
+  #app.adaptive-shell.has-event-sidebar.right-collapsed {
+    grid-template-columns: var(--left-rail-size) minmax(0, 1fr);
+  }
+
+  #app.adaptive-shell.has-event-sidebar.left-collapsed,
+  #app.adaptive-shell.has-event-sidebar.left-collapsed.right-collapsed {
+    grid-template-columns: 40px minmax(0, 1fr);
+  }
+
+  #app.adaptive-shell > :where(.event-sidebar, .right-rail-collapsed) {
+    display: none;
+  }
+}
+
+@media (max-width: 1100px) {
+  #app-shell {
+    padding: 0;
+  }
+
+  #app.adaptive-shell,
+  #app.adaptive-shell.has-event-sidebar,
+  #app.adaptive-shell.left-collapsed,
+  #app.adaptive-shell.right-collapsed,
+  #app.adaptive-shell.left-collapsed.right-collapsed,
+  #app.adaptive-shell.has-event-sidebar.left-collapsed,
+  #app.adaptive-shell.has-event-sidebar.right-collapsed,
+  #app.adaptive-shell.has-event-sidebar.left-collapsed.right-collapsed {
+    position: relative;
+    grid-template-columns: minmax(0, 1fr);
+    inline-size: 100%;
+    block-size: 100dvh;
+    gap: 0;
+  }
+
+  #app.adaptive-shell > .left-rail {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 120;
+    display: flex !important;
+    inline-size: min(320px, 88vw);
+    block-size: 100dvh;
+    padding: 8px;
+    overflow: hidden;
+    background: var(--bg);
+    box-shadow: 18px 0 48px rgba(28, 29, 25, .18);
+    transform: translateX(-105%);
+    transition: transform 180ms ease;
+  }
+
+  #app.adaptive-shell.mobile-sessions-open > .left-rail {
+    transform: translateX(0);
+  }
+
+  #app.adaptive-shell > .mobile-rail-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 110;
+    display: block;
+    inline-size: 100%;
+    block-size: 100%;
+    border: 0;
+    background: rgba(23, 25, 22, .38);
+    backdrop-filter: blur(2px);
+  }
+
+  #app.adaptive-shell .left-rail .sidebar {
+    block-size: auto;
+    max-block-size: none;
+    flex: 1;
+  }
+
+  #app.adaptive-shell .mobile-session-toggle {
+    display: inline-flex;
+    grid-row: 1 / span 2;
+    align-items: center;
+    align-self: start;
+    gap: 6px;
+    min-block-size: 32px;
+    padding: 0 9px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-panel);
+    color: var(--text);
+    font-size: 10px;
+    font-weight: 700;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  #app.adaptive-shell :where(.main, .main-workbench) {
+    inline-size: 100%;
+    block-size: 100dvh;
+    border: 0;
+    border-radius: 0;
+  }
+
+  #app.adaptive-shell .topbar-module-navigation {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  #app.adaptive-shell .topbar-module-navigation .topbar-left {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    gap: 4px 7px;
+  }
+
+  #app.adaptive-shell .topbar-module-navigation :where(.primary-navigation, .secondary-navigation) {
+    grid-column: 2;
+  }
+
+  #app.adaptive-shell .topbar-module-navigation .primary-navigation {
+    grid-row: 1;
+  }
+
+  #app.adaptive-shell .topbar-module-navigation .secondary-navigation {
+    grid-row: 2;
+  }
+
+  #app.adaptive-shell .topbar-right > :where(.view-scope, .status-cluster) {
+    display: none;
+  }
+}
+
+@media (max-width: 520px) {
+  #app.adaptive-shell .topbar-module-navigation {
+    grid-template-columns: minmax(0, 1fr) 32px;
+    gap: 5px;
+    padding: 7px 8px !important;
+  }
+
+  #app.adaptive-shell .mobile-session-toggle {
+    inline-size: 34px;
+    padding: 0;
+    justify-content: center;
+    font-size: 0;
+  }
+
+  #app.adaptive-shell .mobile-session-toggle span {
+    font-size: 14px;
+  }
+
+  #app.adaptive-shell .topbar-right > :not(.theme-toggle) {
+    display: none;
+  }
+
+  #app.adaptive-shell .theme-toggle {
+    inline-size: 32px;
+    block-size: 32px;
+    padding: 0;
+  }
+
+  #app.adaptive-shell :where(.primary-navigation button, .secondary-navigation button) {
+    min-block-size: 27px;
+    padding: 4px 7px;
+    font-size: 10px;
+  }
+
+  #app.adaptive-shell :where(.primary-navigation button > span, .secondary-navigation-label) {
+    display: none;
+  }
+
+  #app.adaptive-shell .composer {
+    padding: 6px 9px 8px;
+  }
+
+  #app.adaptive-shell :where(.composer-card, .composer-card-elevated) {
+    padding: 8px 9px !important;
+  }
+
+  #app.adaptive-shell :where(.plan-hero-stats, .memory-detail-grid, .memory-meta-grid) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-height: 560px) {
+  #app.adaptive-shell .topbar-module-navigation {
+    padding-block: 5px !important;
+  }
+
+  #app.adaptive-shell .chat.view {
+    padding-block: 6px !important;
+  }
+
+  #app.adaptive-shell .composer {
+    padding-block: 4px 6px;
+  }
+
+  #app.adaptive-shell #prompt-input {
+    min-block-size: 52px;
+  }
+
+  #app.adaptive-shell .permission-dock,
+  #app.adaptive-shell .subagent-progress-container {
+    max-block-size: 22dvh;
+  }
+
+  #app.adaptive-shell .composer-panel {
+    max-block-size: 48dvh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #app.adaptive-shell > .left-rail {
+    transition: none;
+  }
+}
