@@ -106,10 +106,10 @@ def prepare_history_for_turn(
             history,
             budget_state=state.tool_budget,
         )
-    if plan.includes(ContextReduction.SNIP):
-        tokens_freed += _snip_history(history)
-    if plan.includes(ContextReduction.MICRO_COMPACT):
-        tokens_freed += _micro_compact(history)
+    # Phase 3: StructuralCompactor unifies Snip + Micro into one call,
+    # eliminating the intermediate serialize → deserialize cycle.
+    if plan.includes(ContextReduction.SNIP) or plan.includes(ContextReduction.MICRO_COMPACT):
+        tokens_freed += _structural_compact(history)
     if tokens_freed > 0:
         logger.debug(
             "Pre-LLM trimming freed ~%d tokens total",
@@ -138,18 +138,25 @@ def _tool_result_key(msg) -> str:
     return f"{id(msg)}:{getattr(msg, 'tool_name', '')}"
 
 
-def _snip_history(history: "ConversationHistory") -> int:
-    """Remove low-value turns via SnipCompactor. Returns tokens freed."""
-    from context.compaction import SnipCompactor
+def _structural_compact(history: "ConversationHistory") -> int:
+    """Phase 3: Snip + Micro merged — single dict round-trip.
+
+    Creates one StructuralCompactor, runs both Snip and Micro on the dict
+    list, then restores history once.  This replaces the old two-call
+    pattern (_snip_history → restore → _micro_compact → restore) which
+    serialized/deserialized the history list twice.
+    """
+    from context.compaction import StructuralCompactor
+    from context.token_budget import estimate_tokens
     dicts = history.to_dicts()
-    snipper = SnipCompactor()
-    kept = snipper.snip(dicts)
-    if len(kept) == len(dicts):
-        return 0
-    restored = type(history).from_dicts(kept, max_messages=history._max)
-    history._messages.clear()
-    history._messages.extend(restored._messages)
-    return snipper.tokens_freed
+    before = sum(estimate_tokens(str(d.get("content", ""))) for d in dicts)
+    compactor = StructuralCompactor(keep_recent=5)
+    kept = compactor.compact(dicts)
+    if len(kept) != len(dicts) or compactor.tokens_freed > 0:
+        restored = type(history).from_dicts(kept, max_messages=history._max)
+        history._messages.clear()
+        history._messages.extend(restored._messages)
+    return compactor.tokens_freed
 
 
 def _apply_tool_result_budget(
@@ -279,16 +286,3 @@ def _apply_context_collapse(
     return max(0, before - after), store
 
 
-def _micro_compact(history: "ConversationHistory") -> int:
-    """CC: microCompact — clear old tool output content (zero API calls)."""
-    from context.compaction import MicroCompactor
-    from context.token_budget import estimate_tokens
-    dicts = history.to_dicts()
-    before = sum(estimate_tokens(str(d.get("content", ""))) for d in dicts)
-    mc = MicroCompactor(keep_recent=5)
-    kept = mc.compact(dicts)
-    after = sum(estimate_tokens(str(d.get("content", ""))) for d in kept)
-    restored = type(history).from_dicts(kept, max_messages=history._max)
-    history._messages.clear()
-    history._messages.extend(restored._messages)
-    return max(0, before - after)

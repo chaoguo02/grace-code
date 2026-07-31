@@ -74,11 +74,30 @@ class CollapseStore:
         return len(self.entries) == 0
 
     def to_dicts(self) -> list[dict[str, Any]]:
+        """Phase 3: serialize collapse entries for cross-restart persistence."""
         return [e.to_dict() for e in self.entries]
 
     @classmethod
     def from_dicts(cls, dicts: list[dict[str, Any]]) -> "CollapseStore":
+        """Phase 3: deserialize collapse entries from persisted state."""
         return cls(entries=[CollapseEntry.from_dict(d) for d in dicts])
+
+    def to_json(self) -> str:
+        """Serialize to JSON string for storage in sessions.metadata_json."""
+        import json
+        return json.dumps(self.to_dicts(), ensure_ascii=True, separators=(",", ":"))
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "CollapseStore":
+        """Deserialize from JSON string (returns empty store on any failure)."""
+        import json
+        try:
+            dicts = json.loads(json_str)
+            if isinstance(dicts, list):
+                return cls.from_dicts(dicts)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return cls()
 
 
 # ── Project View ────────────────────────────────────────────────────────────

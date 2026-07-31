@@ -264,6 +264,7 @@ def main() -> int:
         entry = {
             "scenario": name,
             "description": scenario["description"],
+            "input": inp,
             "input_count": len(inp),
             "after_snip_count": len(after_snip),
             "after_micro_count": len(after_micro),

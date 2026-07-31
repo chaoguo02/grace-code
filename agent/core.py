@@ -119,8 +119,7 @@ from agent.recovery import (
 )
 from agent.context_trimming import (
     ContextTrimmingState,
-    _micro_compact,
-    _snip_history,
+    _structural_compact,
     prepare_history_for_turn,
 )
 from agent.loop.types import CompletionBlockTracker
@@ -3696,8 +3695,7 @@ class ReActAgent:
         # Tier 1: drain — zero-cost SnipCompact + MicroCompact
         drained = 0
         try:
-            drained += _snip_history(history)
-            drained += _micro_compact(history)
+            drained += _structural_compact(history)
             if drained > 0:
                 logger.info(
                     "Drain freed ~%d tokens — retrying LLM call", drained,

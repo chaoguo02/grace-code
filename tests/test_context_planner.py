@@ -57,13 +57,8 @@ def test_pre_provider_trimming_pipeline_owns_order_and_state(monkeypatch) -> Non
     )
     monkeypatch.setattr(
         trimming,
-        "_snip_history",
-        lambda history: calls.append("snip") or 20,
-    )
-    monkeypatch.setattr(
-        trimming,
-        "_micro_compact",
-        lambda history: calls.append("micro") or 30,
+        "_structural_compact",
+        lambda history: calls.append("structural") or 50,
     )
 
     def _collapse(history, compactor, *, collapse_store):
@@ -98,7 +93,8 @@ def test_pre_provider_trimming_pipeline_owns_order_and_state(monkeypatch) -> Non
 
     assert first.tokens_freed == 0
     assert second.tokens_freed == 100
-    assert calls == ["budget", "snip", "micro", "collapse"]
+    # Phase 3: Snip + Micro merged into StructuralCompactor — one call instead of two
+    assert calls == ["budget", "structural", "collapse"]
     assert state.collapse_store == "persisted-store"
 
 

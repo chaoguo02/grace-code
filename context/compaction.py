@@ -120,8 +120,6 @@ class ConversationCompactor:
         self._usage_callback = usage_callback
         self._max_consecutive = max_consecutive
         self._cooldown_steps = cooldown_steps
-        self._consecutive_compactions = 0
-        self._steps_since_last_compact = cooldown_steps  # 初始允许触发
 
     def set_usage_callback(self, callback) -> None:
         """Set the run-scoped billable-token sink for semantic compaction."""
@@ -130,19 +128,24 @@ class ConversationCompactor:
     # ------------------------------------------------------------------
     # 判断是否需要 compaction
     # ------------------------------------------------------------------
+    #
+    # Phase 3: Thrashing counters (_consecutive_compactions,
+    # _steps_since_last_compact) have been removed from this class.
+    # ContextPlanner is the single source of thrashing truth — it owns
+    # the cooldown clock and the max-consecutive limit.  This compactor
+    # only handles the mechanical summarization; policy decisions are
+    # upstream.
 
     @property
     def is_thrashing(self) -> bool:
-        """连续 compaction 次数是否超过阈值。"""
-        return self._consecutive_compactions >= self._max_consecutive
+        """Deprecated — ContextPlanner owns thrashing decisions."""
+        return False
 
     def reset_thrashing_counter(self) -> None:
-        """重置 thrashing 计数器（用户主动输入后调用）。"""
-        self._consecutive_compactions = 0
+        """Deprecated — ContextPlanner resets its own counters."""
 
     def tick_step(self) -> None:
-        """每步调用一次，推进冷却计数器。"""
-        self._steps_since_last_compact += 1
+        """Deprecated — ContextPlanner.tick_step() handles cooldown."""
 
     def snip_history(self, history_dicts: list[dict]) -> tuple[list[dict], int]:
         """CC-aligned SnipCompact: remove low-value turns before message assembly.
@@ -168,32 +171,14 @@ class ConversationCompactor:
         tokens_freed: int = 0,
     ) -> bool:
         """
-        判断是否需要 compaction。
-
-        CC-aligned: *tokens_freed* from SnipCompact + MicroCompact is subtracted
-        from the effective token count so AutoCompact doesn't fire unnecessarily
-        when cheap layers already freed enough space.
-
-        内置 thrashing 保护：连续触发超过阈值时返回 False。
+        判断是否需要 compaction。纯 token 阈值判断，不含 thrashing 保护（由 ContextPlanner 负责）。
         """
         if len(history_dicts) < self._min_history:
-            return False
-
-        if self.is_thrashing:
-            logger.warning(
-                "Compaction thrashing detected (%d consecutive). "
-                "Skipping auto-compaction — user interaction will reset.",
-                self._consecutive_compactions,
-            )
-            return False
-
-        if self._steps_since_last_compact < self._cooldown_steps:
             return False
 
         total_tokens = sum(
             estimate_tokens(m.get("content", "")) for m in history_dicts
         )
-        # CC: effective = raw - freed_by_cheap_layers
         effective = max(0, total_tokens - tokens_freed)
         threshold = int(history_budget * self._trigger_ratio)
         return effective > threshold
@@ -227,8 +212,9 @@ class ConversationCompactor:
         if not history_dicts:
             return history_dicts
 
-        self._consecutive_compactions += 1
-        self._steps_since_last_compact = 0
+        # Phase 3: Thrashing tracking is owned by ContextPlanner.
+        # ContextPlanner.record_compaction() is called after compact_history()
+        # returns.  We no longer maintain a duplicate counter here.
 
         budget = max_tokens or self._compact_budget
         first = history_dicts[0]  # 保留首条任务描述
@@ -1148,7 +1134,6 @@ class SnipCompactor:
 
     def __init__(self) -> None:
         self.tokens_freed: int = 0
-        """Cumulative tokens freed — passed to AutoCompact threshold (CC: snipTokensFreed)."""
 
     def snip(self, messages: list[dict]) -> list[dict]:
         """Remove low-value turns. Returns filtered message list."""
@@ -1158,11 +1143,6 @@ class SnipCompactor:
         if not messages:
             return messages
 
-        # Walk backward to find tool_result + preceding assistant pairs.
-        # When an assistant has multiple tool_calls, snip all its tool_results
-        # together to avoid orphaning: if one tool_result is empty, all results
-        # for that assistant are candidates.  Otherwise the surviving results
-        # lose their preceding assistant and break snapshot pairing.
         to_remove: set[int] = set()
         i = len(messages) - 1
         while i > 0:
@@ -1173,19 +1153,16 @@ class SnipCompactor:
             if msg.get("role") != "tool":
                 i -= 1
                 continue
-            if not self._is_snippable(msg):
+            if not _is_snippable_result(msg):
                 i -= 1
                 continue
             # Find the assistant message that produced this tool call.
-            # It may be immediately before this result (single call) or several
-            # positions back (parallel calls: assistant → result_A → result_B).
             assistant_idx = -1
             for j in range(i - 1, -1, -1):
                 prev = messages[j]
                 if prev.get("role") == "assistant" and prev.get("tool_calls"):
                     assistant_idx = j
                     break
-                # Stop at user/system messages — can't pair across turn boundary
                 if prev.get("role") in ("user", "system"):
                     break
 
@@ -1193,31 +1170,33 @@ class SnipCompactor:
                 i -= 1
                 continue
 
-            # Count how many tool_results belong to this assistant
             tool_call_count = len(messages[assistant_idx].get("tool_calls") or [])
             if tool_call_count == 0:
                 i -= 1
                 continue
 
             # Find all tool_results after this assistant (consecutive tool role messages)
-            result_indices = []
+            result_indices = [
+                k for k in range(assistant_idx + 1, len(messages))
+                if messages[k].get("role") == "tool"
+            ]
+            # Take only consecutive results up to the next non-tool message
+            consecutive = []
             for k in range(assistant_idx + 1, len(messages)):
                 if messages[k].get("role") == "tool":
-                    result_indices.append(k)
+                    consecutive.append(k)
                 else:
-                    break  # next non-tool message ends the result block
+                    break
 
             # Only snip if ALL results for this assistant are snippable.
-            # If any result has useful content, keep everything (don't orphan).
             if all(
-                self._is_snippable(messages[k])
-                for k in result_indices
+                _is_snippable_result(messages[k])
+                for k in consecutive
                 if k not in to_remove
             ):
                 to_remove.add(assistant_idx)
-                for k in result_indices:
+                for k in consecutive:
                     to_remove.add(k)
-                # Skip past this entire block
                 i = assistant_idx - 1
             else:
                 i = assistant_idx - 1 if assistant_idx > 0 else 0
@@ -1232,22 +1211,136 @@ class SnipCompactor:
         self.tokens_freed = estimate_tokens(removed_content)
         return kept
 
-    @staticmethod
-    def _is_snippable(msg: dict) -> bool:
-        """Check if a tool_result is eligible for snipping."""
-        content = str(msg.get("content", "") or "")
-        # Empty / cleared results
-        if content.strip() in _SNIP_EMPTY_PATTERNS:
-            return True
-        # Grep/Glob-style "no match" output
-        if content.strip().startswith("No ") and any(
-            kw in content for kw in ("match", "file", "result")
+
+def _is_snippable_result(msg: dict) -> bool:
+    """Check if a tool_result is eligible for snipping."""
+    content = str(msg.get("content", "") or "")
+    if content.strip() in _SNIP_EMPTY_PATTERNS:
+        return True
+    if content.strip().startswith("No ") and any(
+        kw in content for kw in ("match", "file", "result")
+    ):
+        return True
+    if any(marker in content for marker in _SNIP_REJECT_MARKERS):
+        return True
+    if content.strip().startswith("Error:") and len(content) < 200:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# StructuralCompactor — unified Snip + Micro in a single class (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class StructuralCompactor:
+    """Unified structural pre-processing: Snip + Micro in one pass.
+
+    Runs two logical phases on a single message-dict list, eliminating
+    the intermediate serialization/deserialization cycle that existed
+    when SnipCompactor and MicroCompactor were called separately.
+
+    Phase A — Snip: removes entire (assistant + tool_result) pairs for
+      empty, rejected, or error results.
+    Phase B — Micro: replaces old compactable tool outputs with
+      ``[Old tool result content cleared]``, keeping the most recent
+      N results intact.
+    """
+
+    _CLEARED_MARKER = "[Old tool result content cleared]"
+
+    def __init__(self, keep_recent: int = 5) -> None:
+        self._keep_recent = keep_recent
+        self.tokens_freed: int = 0
+
+    def compact(self, messages: list[dict]) -> list[dict]:
+        """Run Snip (remove pairs) then Micro (clear old outputs)."""
+        from context.token_budget import estimate_tokens
+
+        if not messages:
+            self.tokens_freed = 0
+            return messages
+
+        before_tokens = sum(
+            estimate_tokens(str(m.get("content", ""))) for m in messages
+        )
+
+        # ── Phase A: Snip — remove low-value (assistant + tool) pairs ──
+        messages = _snip_pass(messages)
+
+        # ── Phase B: Micro — clear old compactable tool outputs ──
+        messages = _micro_pass(messages, self._keep_recent)
+
+        after_tokens = sum(
+            estimate_tokens(str(m.get("content", ""))) for m in messages
+        )
+        self.tokens_freed = max(0, before_tokens - after_tokens)
+        return messages
+
+
+def _snip_pass(messages: list[dict]) -> list[dict]:
+    """Remove assistant+tool pairs for empty/rejected/error results."""
+    to_remove: set[int] = set()
+    i = len(messages) - 1
+    while i > 0:
+        if i in to_remove:
+            i -= 1
+            continue
+        msg = messages[i]
+        if msg.get("role") != "tool" or not _is_snippable_result(msg):
+            i -= 1
+            continue
+        # Find preceding assistant with tool_calls
+        assistant_idx = -1
+        for j in range(i - 1, -1, -1):
+            prev = messages[j]
+            if prev.get("role") == "assistant" and prev.get("tool_calls"):
+                assistant_idx = j
+                break
+            if prev.get("role") in ("user", "system"):
+                break
+        if assistant_idx < 0:
+            i -= 1
+            continue
+        # Find all consecutive tool results after this assistant
+        consecutive = []
+        for k in range(assistant_idx + 1, len(messages)):
+            if messages[k].get("role") == "tool":
+                consecutive.append(k)
+            else:
+                break
+        if not consecutive:
+            i -= 1
+            continue
+        if all(
+            _is_snippable_result(messages[k])
+            for k in consecutive if k not in to_remove
         ):
-            return True
-        # Rejected by user or policy
-        if any(marker in content for marker in _SNIP_REJECT_MARKERS):
-            return True
-        # Error messages with no useful output
-        if content.strip().startswith("Error:") and len(content) < 200:
-            return True
-        return False
+            to_remove.add(assistant_idx)
+            to_remove.update(consecutive)
+            i = assistant_idx - 1
+        else:
+            i = assistant_idx - 1 if assistant_idx > 0 else 0
+
+    if not to_remove:
+        return messages
+    return [m for idx, m in enumerate(messages) if idx not in to_remove]
+
+
+def _micro_pass(messages: list[dict], keep_recent: int) -> list[dict]:
+    """Clear old compactable tool outputs, keeping the most recent N."""
+    result_indices = [
+        i for i, msg in enumerate(messages)
+        if msg.get("role") == "tool" and _is_compactable_tool(msg)
+    ]
+    if len(result_indices) <= keep_recent:
+        return messages
+    to_clear = result_indices[: -keep_recent]
+    for i in to_clear:
+        messages[i] = {**messages[i], "content": StructuralCompactor._CLEARED_MARKER}
+    return messages
+
+
+def _is_compactable_tool(msg: dict) -> bool:
+    name = msg.get("tool_name", "") or msg.get("name", "")
+    return name in COMPACTABLE_TOOLS
