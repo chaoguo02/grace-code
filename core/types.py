@@ -209,6 +209,33 @@ class ToolConcurrency(str, Enum):
     PARALLEL_SAFE = "parallel_safe"
 
 
+class ModifierScope(str, Enum):
+    """Skill modifier lifecycle scope.
+
+    TURN: modifier applies only during the turn where the tool was called.
+          Auto-deactivated when ToolExecutionPipeline.after_tool_use fires.
+    RUN:  modifier applies for the entire agent run. Deactivated at
+          PolicyAwareToolRegistry.deactivate_skill_modifier() end-of-run.
+    """
+    TURN = "turn"
+    RUN = "run"
+
+
+# Phase 1: tool source constants for unified evidence and namespace tracking.
+# Single source of truth — no hardcoded strings in recorder or guard code.
+_TOOL_SOURCE_SYSTEM = "system"
+_TOOL_SOURCE_MCP = "mcp"
+_TOOL_SOURCE_PROJECT = "project"
+
+
+TOOL_SOURCE_PRIORITY: dict[str, int] = {
+    _TOOL_SOURCE_SYSTEM: 3,
+    _TOOL_SOURCE_PROJECT: 2,
+    _TOOL_SOURCE_MCP: 1,
+}
+"""Tool source priority for namespace collision resolution. System > Project > MCP."""
+
+
 class RetryMode(str, Enum):
     NEVER = "never"
     AUTOMATIC = "automatic"

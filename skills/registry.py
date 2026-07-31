@@ -268,6 +268,7 @@ class SkillRegistry:
         self._lock = threading.RLock()
         self._fingerprint = ""
         self._change_detector: SkillChangeDetector | None = None
+        self._tool_registry: Any = None  # Phase 1: unified registry (None = rollback safe)
         self._discover()
         if live_reload:
             self._change_detector = SkillChangeDetector(self)
@@ -400,6 +401,45 @@ class SkillRegistry:
 
         total = len(metadata) + len(nested)
         logger.info("Discovered %d skills total (%d root, %d nested)", total, len(self._metadata), len(self._nested_metadata))
+
+        # Phase 1: Register skills as first-class tools in ToolRegistry
+        if self._tool_registry is not None:
+            self._register_skills_as_tools()
+
+    # ── Phase 1: Unified Tool Registration ──────────────────────────
+
+    def attach_tool_registry(self, registry: Any) -> None:
+        """Wire this SkillRegistry into a ToolRegistry for unified execution.
+
+        Phase 1: When a ToolRegistry is attached, discovered skills are
+        registered as ``SkillActivationTool`` instances in the unified
+        ``_tools`` dict.  When ``registry`` is ``None``, this is a no-op
+        (rollback safety — skills continue to work via the old
+        ``_metadata`` path with zero behavior change).
+        """
+        self._tool_registry = registry
+        if registry is not None and self._metadata:
+            self._register_skills_as_tools()
+
+    def _register_skills_as_tools(self) -> None:
+        """Register all discovered skills as SkillActivationTool instances."""
+        if self._tool_registry is None:
+            return
+        from skills.tool import SkillActivationTool
+        all_skills = {**self._metadata, **self._nested_metadata}
+        for name, meta in all_skills.items():
+            tool = SkillActivationTool(
+                meta,
+                skill_registry=self,
+                source=meta.source if getattr(meta, "trusted", True) else "mcp",
+            )
+            try:
+                self._tool_registry.register(tool)
+            except ValueError:
+                logger.warning(
+                    "Skill %r already registered in ToolRegistry — skipped",
+                    name,
+                )
 
     def _discover_source(
         self,

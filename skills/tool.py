@@ -18,7 +18,7 @@ import copy
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
-from core.base import BaseTool, ToolResult
+from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 
 if TYPE_CHECKING:
     from skills.registry import SkillRegistry
@@ -35,6 +35,7 @@ class SkillContextModifier:
       - model → 覆盖 LLM 模型
       - effort → 覆盖推理力度
       - context → "fork" 时在隔离子代理中执行 (S2)
+      - scope → TURN (auto-popped after tool call) or RUN (cleaned at end-of-run)
     """
     allowed_tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
@@ -42,27 +43,22 @@ class SkillContextModifier:
     model: str = ""
     effort: str = ""
     context: str = ""  # "" | "fork"
+    scope: str = "turn"  # "turn" | "run" — Phase 1 ModifierScope
 
 
 class SkillTool(BaseTool):
     """
-    LLM-initiated skill invocation tool (fallback — aligned with Claude Code).
+    LLM-initiated skill invocation tool (fallback).
+
+    DEPRECATED Phase 1: Replaced by per-skill ``SkillActivationTool``
+    instances registered directly in ``ToolRegistry._tools``.  Renamed
+    to ``__legacy_skill_loader`` with ``visible_to_llm=False`` —
+    excluded from LLM schemas.  Preserved only for internal CLI/HTTP
+    paths that still use the generic loader pattern.
 
     PRIMARY PATH (Claude Code alignment): users type /skill-name directly
     in the chat REPL → content is injected into shared_history without a
     tool_use round-trip (see entry/chat.py:_handle_slash_skill).
-
-    THIS TOOL (fallback): the LLM can also invoke Skill(skill_name=...)
-    to load a skill mid-turn. This is the path used when:
-    - The LLM semantically matches a skill from the system prompt listing
-    - The model chooses to load a skill autonomously (not user-triggered)
-
-    Flow:
-    1. LLM calls Skill(skill_name="code-review", arguments="...")
-    2. SkillTool loads and renders the skill from SkillRegistry
-    3. SkillContextBuffer manages context budget
-    4. Returns ToolResult with rendered skill content as output
-    5. Agent sees the skill content in the next turn's observation
     """
 
     def __init__(
@@ -79,7 +75,11 @@ class SkillTool(BaseTool):
 
     @property
     def name(self) -> str:
-        return "Skill"
+        return "__legacy_skill_loader"  # Phase 1: deprecated
+
+    @property
+    def visible_to_llm(self) -> bool:
+        return False  # Phase 1: excluded from LLM schemas
 
     @property
     def description(self) -> str:
@@ -203,6 +203,116 @@ class SkillTool(BaseTool):
         if runtime is not None:
             bound._runtime = runtime
         return bound
+
+
+# ── SkillActivationTool — Phase 1 Unified Execution ────────────────────
+
+
+class SkillActivationTool(BaseTool):
+    """A Skill modeled as a first-class BaseTool in the unified ToolRegistry.
+
+    Phase 1: Each discovered skill is registered as a SkillActivationTool
+    with the skill's original frontmatter name (no prefixes).  The LLM
+    sees skills alongside native and MCP tools as flat-namespace entries.
+
+    execute() delegates to the existing SkillTool._internal_execute() logic
+    and returns a SkillContextModifier with scope=TURN (auto-popped by
+    ToolExecutionPipeline after this tool call completes).
+    """
+
+    def __init__(
+        self,
+        metadata: "SkillMetadata",
+        *,
+        skill_registry: Any = None,
+        skill_buffer: Any = None,
+        source: str = "project",
+    ) -> None:
+        self._meta = metadata
+        self._skill_registry = skill_registry
+        self._skill_buffer = skill_buffer
+        self._source = source
+
+    @property
+    def name(self) -> str:
+        """Original frontmatter name — flat namespace, no prefix."""
+        return self._meta.name
+
+    @property
+    def description(self) -> str:
+        return (
+            self._meta.description
+            or f"Activate the '{self._meta.name}' skill"
+        )
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+
+    @property
+    def metadata(self) -> "ToolMetadata":
+        return ToolMetadata(
+            effects=frozenset({
+                ToolEffect.READ_AGENT_STATE,
+                ToolEffect.WRITE_AGENT_STATE,
+            }),
+            source=self._source,
+        )
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False  # skill activation modifies agent state
+
+    def execute(self, params: dict[str, Any]) -> ToolResult:
+        """Delegate to SkillTool's internal execution logic."""
+        if self._skill_registry is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Skill registry not available for activation",
+            )
+        rendered = self._skill_registry.load_and_render(
+            self._meta.name,
+            project_dir=getattr(self._skill_registry, "_project_dir", ""),
+        )
+        if rendered is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Skill '{self._meta.name}' failed to load",
+            )
+        return ToolResult(
+            success=True,
+            output=f"[Skill: {self._meta.name}]\n\n{rendered}",
+            metadata={
+                "skill_modifier": SkillContextModifier(
+                    allowed_tools=self._meta.allowed_tools,
+                    disallowed_tools=self._meta.disallowed_tools,
+                    mcp_servers=self._meta.mcp_servers,
+                    model=self._meta.model,
+                    effort=self._meta.effort,
+                    context=self._meta.context,
+                    scope="turn",
+                ),
+            },
+        )
+
+    # ── Schema visibility ──────────────────────────────────────────
+    # Phase 1: Legacy generic loader renamed to __legacy_skill_loader
+    # with visible_to_llm=False.  SkillActivationTool is the new
+    # per-skill entry point — always visible.
+
+    @property
+    def visible_to_llm(self) -> bool:
+        # Override default True for __legacy_skill_loader; normal skills are True
+        return getattr(self, "_visible_to_llm", True)
+
+    @visible_to_llm.setter
+    def visible_to_llm(self, value: bool) -> None:
+        self._visible_to_llm = value
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
