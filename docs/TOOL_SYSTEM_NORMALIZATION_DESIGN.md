@@ -557,39 +557,39 @@ repeated patterns). #6 kills processes.
 
 #### #4: Trust Accumulation
 
-- [ ] `SessionTrustAccumulator` class defined with approval threshold
-- [ ] Accumulator integrated into `PermissionPipeline._layer3_rules()`
-- [ ] Accumulator only auto-approves after ≥2 explicit user approvals
-- [ ] Accumulator never bypasses Layer 1 (safety floor — protected paths, cmd injection)
-- [ ] Trust resets on session restart (in-memory only)
-- [ ] Trust key includes: tool_name, path_parameter, params_digest
-- [ ] params_digest calculation rule documented (Read→sha256(path), Write→sha256(path+"|"+tool), Shell→sha256(cmd_word), Network→sha256(domain))
-- [ ] New test: 1st approval prompts, 3rd identical call auto-approves
-- [ ] New test: different path on same tool → fresh prompt (not trusted)
-- [ ] New test: same path, different operation type (Read vs Edit) → separate trust (not shared)
+- [x] `SessionTrustAccumulator` class defined with approval threshold
+- [x] Accumulator integrated into `PermissionPipeline._layer3_rules()`
+- [x] Accumulator only auto-approves after ≥2 explicit user approvals
+- [x] Accumulator never bypasses Layer 1 (safety floor — protected paths, cmd injection)
+- [x] Trust resets on session restart (in-memory only)
+- [x] Trust key includes: tool_name, path_parameter, params_digest
+- [x] params_digest calculation rule documented (Read→sha256(path), Write→sha256(path+"|"+tool), Shell→sha256(cmd_word), Network→sha256(domain))
+- [x] New test: 1st approval prompts, 3rd identical call auto-approves
+- [x] New test: different path on same tool → fresh prompt (not trusted)
+- [x] New test: same path, different operation type (Read vs Edit) → separate trust (not shared)
 
 #### #5: Progressive Disclosure
 
-- [ ] **PREREQUISITE GATE (blocks selection logic implementation)**: Audit all built-in tool descriptions. Any >200 tokens must be trimmed to ≤200. One-time audit script runs and **exits non-zero if ANY tool exceeds limit**. Selection logic implementation is BLOCKED on zero failures.
-- [ ] Tools called in last 5 turns → FULL tier
-- [ ] Top 5 most-called tools → FULL tier
-- [ ] Remaining tools → SUMMARY tier
+- [x] **PREREQUISITE GATE (blocks selection logic implementation)**: Audit all built-in tool descriptions. Any >200 tokens must be trimmed to ≤200. One-time audit script runs and **exits non-zero if ANY tool exceeds limit**. Selection logic implementation is BLOCKED on zero failures.
+- [x] Tools called in last 5 turns → FULL tier
+- [x] Top 5 most-called tools → FULL tier
+- [x] Remaining tools → SUMMARY tier
 - [ ] Dynamic budget calculation implemented: `remaining_for_tools = max(1000, available_context - conversation_tokens - system_prompt_tokens - RESERVE_FOR_RESPONSE)`. No static token budget constant exists.
-- [ ] Phase 3 #9 telemetry includes `tool_desc_degraded_to_schema_only` counter for budget tuning feedback
+- [x] Phase 3 #9 telemetry includes `tool_desc_degraded_to_schema_only` counter for budget tuning feedback
 - [ ] Integrated into `get_schemas()` or `format_tool_descriptions()` call path
-- [ ] Zero behavior change for sessions with < 20 tools
-- [ ] New test: mock 30-tool session, verify some tools are SUMMARY
-- [ ] New test: tool called once → promoted to FULL on next turn
+- [x] Zero behavior change for sessions with < 20 tools
+- [x] New test: mock 30-tool session, verify some tools are SUMMARY
+- [x] New test: tool called once → promoted to FULL on next turn
 
 #### #6: SIGTERM Integration
 
-- [ ] ShellTool executor sends OS signal on CancellationToken.cancel()
-- [ ] Windows: CTRL_BREAK_EVENT; Unix: SIGTERM
-- [ ] 5-second grace period before SIGKILL/TerminateProcess
-- [ ] Cancellation token passed through ToolExecutionPipeline.execute()
-- [ ] Non-shell tools unaffected (supports_cancellation=False path unchanged)
-- [ ] New test: cancel kills long-running subprocess within 10 seconds
-- [ ] New test: cancel during short command → no kill needed (already exited)
+- [-] ShellTool PARTIAL: token plumbing + post-execution check done; SIGTERM signal delivery to subprocess deferred (requires LocalRuntime._current_proc access from ShellTool)
+- [x] Windows: CTRL_BREAK_EVENT; Unix: SIGTERM
+- [-] 5-second grace period before SIGKILL/TerminateProcess
+- [x] Cancellation token passed through ToolExecutionPipeline.execute()
+- [x] Non-shell tools unaffected (supports_cancellation=False path unchanged)
+- [-] New test: cancel kills long-running subprocess within 10 seconds
+- [-] New test: cancel during short command → no kill needed (already exited)
 
 ### Phase 3: Engineering Cleanup
 
