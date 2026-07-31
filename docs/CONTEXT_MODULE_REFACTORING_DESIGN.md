@@ -710,7 +710,7 @@ per-session isolation in a follow-up.
 - [ ] `McpCapabilityProvider.list_descriptors()` applies `sanitize_error()` to error text
 - [ ] `ConversationHistory.to_dicts()` and `to_list()` return `tuple` — type-level immutability, no runtime `copy()`
 - [ ] `ConversationHistory` internal mutation paths use documented `_mutate()` context
-- [ ] `_RUNTIME_PREFIXES` moved to single shared constant (not two copies)
+- [x] `_RUNTIME_PREFIXES` moved to single shared constant (not two copies)
 - [ ] Prefix matching is length-descending sorted or Trie-based — not arbitrary `startswith` iteration
 - [ ] 8 newly-added prefixes: `[RUNTIME EVIDENCE STATE]`, `[RUNTIME BLOCK]`, `[SESSION START HOOK CONTEXT]`, `[Stop hook blocked`, `[Subagent:`, `[Skill:`, `<task-notification>`, `[Parent message from`
 - [ ] All existing tests pass unchanged
@@ -757,16 +757,16 @@ per-session isolation in a follow-up.
 
 ### Phase 4a: Runtime Staging Rationalization
 
-- [ ] `SessionPreRunConfig` dataclass defined — unifies 11 staging dicts, includes `created_at` timestamp + `is_stale` property
-- [ ] `_pending_config: dict[str, SessionPreRunConfig]` replaces all `_pending_*` / `_*_callbacks` dicts
-- [ ] 4 lazy `hasattr` initializations removed (`_pending_model_switches`, `_pending_effort`, `_pending_thinking`, `_pending_skill_modifiers`)
-- [ ] `chat_pipeline.py` sets `SessionPreRunConfig` fields instead of calling Runtime staging methods
-- [ ] `agent_service.py` uses `SessionPreRunConfig` for permission mode + rules staging
-- [ ] Staleness guard: config >30s old at consumption → logged warning + discarded
-- [ ] `dispose()` and `cleanup_session()` pop `_pending_config[session_id]` on ALL exit paths
-- [ ] `_claim_new_messages()`: last-seen cursor moved to `ReActAgent` local state. Runtime signature: `claim_new_messages(session_id, since_id) → list` with zero stored state on self
-- [ ] Dead `_completion_verifiers` code removed (registered but never invoked)
-- [ ] `_RUNTIME_PREFIXES` moved to shared constant imported by both `session_store.py` and `runtime.py`
+- [x] `SessionPreRunConfig` dataclass defined with created_at + is_stale property — unifies 11 staging dicts, includes `created_at` timestamp + `is_stale` property
+- [x] `_pending_config: dict[str, SessionPreRunConfig]` replaces all `_pending_*` / `_*_callbacks` dicts
+- [x] 4 lazy `hasattr` initializations removed (`_pending_model_switches`, `_pending_effort`, `_pending_thinking`, `_pending_skill_modifiers`)
+- [x] `chat_pipeline.py` sets `SessionPreRunConfig` fields instead of calling Runtime staging methods
+- [x] `agent_service.py` uses `SessionPreRunConfig` for permission mode + rules staging
+- [x] Staleness guard: config >30s old at consumption → logged warning + discarded
+- [x] `dispose()` and `cleanup_session()` pop `_pending_config[session_id]` on ALL exit paths
+- [x] `_claim_new_messages()`: last-seen cursor moved to `ReActAgent` local state. Runtime signature: `claim_new_messages(session_id, since_id) → list` with zero stored state on self
+- [x] Dead `_completion_verifiers` code removed (registered but never invoked)
+- [x] `_RUNTIME_PREFIXES` moved to shared constant imported by both `session_store.py` and `runtime.py`
 
 ### Phase 4b: Service Extraction
 
