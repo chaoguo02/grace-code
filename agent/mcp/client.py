@@ -855,14 +855,12 @@ class SseMCPBridge(HttpMCPBridge):
             _logger.debug("SSE non-notification method: %s", method)
 
     async def _route_sse_response(self, rpc_id: int | str, msg: dict[str, Any]) -> None:
-        """Route a JSON-RPC response from SSE to the caller waiting on RPC id."""
-        _logger = __import__("logging").getLogger(__name__)
-        # SSE responses are uncommon (most servers reply via POST response),
-        # but the spec allows them. Store for retrieval by callers.
-        if not hasattr(self, "_sse_responses"):
-            self._sse_responses: dict[int | str, dict[str, Any]] = {}
-        self._sse_responses[rpc_id] = msg
-        _logger.debug("SSE response routed for id=%s", rpc_id)
+        """Handle SSE-pushed notification (tools/list_changed, etc.).
+
+        Phase 2 #4: Removed _sse_responses storage — SSE-pushed RPC responses
+        are never retrieved by _rpc_call (which uses the POST response path).
+        Only notifications/tools/list_changed is dispatched through this path.
+        """
 
     def _create_http_client(self) -> Any:
         client = super()._create_http_client()
@@ -885,6 +883,7 @@ class WsMCPBridge(HttpMCPBridge):
     def __init__(self, config: MCPServerConfig) -> None:
         super().__init__(config)
         self._ws: Any = None  # websockets.WebSocketClientProtocol
+        self._rpc_lock = asyncio.Lock()  # Phase 2 #5: sequential request-response
 
     async def connect(self) -> list[MCPToolInfo]:
         if self._connected:
@@ -932,37 +931,41 @@ class WsMCPBridge(HttpMCPBridge):
     async def _rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if self._ws is None:
             raise RuntimeError("WsMCPBridge is not connected")
-        import json as _json
-        async with self._id_lock:
-            self._next_id += 1
-            request_id = self._next_id
-        body = {
-            "jsonrpc": self.JSONRPC_VERSION,
-            "id": request_id,
-            "method": method,
-            "params": params,
-        }
-        try:
-            await asyncio.wait_for(
-                self._ws.send(_json.dumps(body)),
-                timeout=self.config.timeout_seconds,
-            )
-            raw = await asyncio.wait_for(
-                self._ws.recv(),
-                timeout=self.config.timeout_seconds,
-            )
-            data: dict[str, Any] = _json.loads(raw)
-        except asyncio.TimeoutError as exc:
-            raise MCPToolCallError(
-                f"MCP WS call '{method}' to '{self.config.name}' timed out"
-            ) from exc
-        except Exception as exc:
-            raise MCPToolCallError(
-                f"MCP WS request to '{self.config.name}' failed: {exc}"
-            ) from exc
-        if "error" in data:
-            err = data["error"]
-            raise MCPToolCallError(
-                f"MCP JSON-RPC error {err.get('code', '')}: {err.get('message', str(err))}"
-            )
-        return data.get("result", {})
+        # Phase 2 #5: Sequential request-response — MCP has no response
+        # routing by ID, so concurrent calls on one WebSocket would corrupt
+        # the receive stream.
+        async with self._rpc_lock:
+            import json as _json
+            async with self._id_lock:
+                self._next_id += 1
+                request_id = self._next_id
+            body = {
+                "jsonrpc": self.JSONRPC_VERSION,
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }
+            try:
+                await asyncio.wait_for(
+                    self._ws.send(_json.dumps(body)),
+                    timeout=self.config.timeout_seconds,
+                )
+                raw = await asyncio.wait_for(
+                    self._ws.recv(),
+                    timeout=self.config.timeout_seconds,
+                )
+                data: dict[str, Any] = _json.loads(raw)
+            except asyncio.TimeoutError as exc:
+                raise MCPToolCallError(
+                    f"MCP WS call '{method}' to '{self.config.name}' timed out"
+                ) from exc
+            except Exception as exc:
+                raise MCPToolCallError(
+                    f"MCP WS request to '{self.config.name}' failed: {exc}"
+                ) from exc
+            if "error" in data:
+                err = data["error"]
+                raise MCPToolCallError(
+                    f"MCP JSON-RPC error {err.get('code', '')}: {err.get('message', str(err))}"
+                )
+            return data.get("result", {})

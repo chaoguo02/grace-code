@@ -103,7 +103,7 @@ class SyncMCPToolManager:
         self._thread = threading.Thread(
             target=self._run_loop,
             name="runtime-mcp-tools",
-            daemon=False,
+            daemon=True,  # Phase 2 #6: watchdog is not critical to graceful shutdown
         )
         self._thread.start()
         self._bridges: dict[str, MCPToolBridge] = {}
@@ -127,6 +127,8 @@ class SyncMCPToolManager:
         # Phase 1 #3: Rate limit tool map refreshes — max 1 per server per 10s
         self._last_refresh: dict[str, float] = {}
         self._REFRESH_COOLDOWN: float = 10.0
+        # Phase 2 #13: Track tool counts for capability gating
+        self._last_tool_counts: dict[str, int] = {}
 
     @property
     def bridges(self) -> dict[str, MCPToolBridge]:
@@ -521,6 +523,25 @@ class SyncMCPToolManager:
                         bridge.discover_tools(),
                         timeout=min(10.0, self._health_interval),
                     )
+                    # Phase 2 #13: Capability gating — warn if server
+                    # declares tools capability but returns zero tools
+                    if not tools:
+                        prior = self._last_tool_counts.get(name)
+                        if prior is not None and prior > 0:
+                            logger.warning(
+                                "MCP server %s declares tools capability "
+                                "but returned 0 tools (%d expected from "
+                                "prior connection). Server may be degraded.",
+                                name, prior,
+                            )
+                        elif prior is None:
+                            logger.warning(
+                                "MCP server %s declares tools capability "
+                                "but returned 0 tools on first connection. "
+                                "Verify server configuration.", name,
+                            )
+                    if tools:
+                        self._last_tool_counts[name] = len(tools)
                     current = {
                         tool_name
                         for tool_name in self._server_tools.get(name, ())
