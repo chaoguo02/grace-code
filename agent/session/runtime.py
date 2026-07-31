@@ -166,16 +166,19 @@ class SessionRuntime:
         self._approval_brokers: dict[str, "ApprovalBroker"] = {}
         # Per-session web_confirm_callback factories, set by agent_service
         # before run_session().  keyed by session_id.
-        self._web_confirm_callbacks: dict[str, "WebConfirmCallback"] = {}
-        self._stream_callbacks: dict[str, "StreamCallback"] = {}
-        self._text_lifecycle_callbacks: dict[str, object] = {}
-        self._text_delta_callbacks: dict[str, object] = {}
+        # Phase 4a: All pre-run staging state unified into a single dataclass.
+        # The 11 separate dicts (_web_confirm_callbacks, _stream_callbacks,
+        # _text_lifecycle_callbacks, _text_delta_callbacks,
+        # _pending_skill_activations, _session_permission_modes,
+        # _session_injected_rules, _pending_model_switches, _pending_effort,
+        # _pending_thinking, _pending_skill_modifiers) are replaced by one
+        # dict of SessionPreRunConfig, keyed by session_id.
+        from agent.session.pre_run_config import SessionPreRunConfig
+        self._pending_config: dict[str, "SessionPreRunConfig"] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
         self._backend_store: dict[str, "LLMBackend"] = {}
-        # Pre-run Skill activations are isolated by session.  Once a run owns
-        # its Store, activations are recorded directly instead of passing
-        # through shared mutable "current run" state.
-        self._pending_skill_activations: dict[str, list[dict[str, object]]] = {}
+        # Live-steering message tracking state — per-session last-seen DB id.
+        self._claim_cursors: dict[str, int] = {}
         self._active_evidence_stores: dict[str, object] = {}
         self._active_evidence_requirements: dict[str, object] = {}
         from agent.session.run_evidence import EvidenceStoreManager
@@ -203,6 +206,10 @@ class SessionRuntime:
         # Set by AgentService to True when running in Web mode.
         # Child agents use this to decide whether to create web callbacks.
         self._is_web_mode: bool = False
+        # DEPRECATED Phase 4a: permission/rules staging now flows through
+        # _pending_config via SessionPreRunConfig.  These aliases exist
+        # only for backward-compatible access (set_permission_mode_for_session,
+        # set_injected_rules_for_session both write to _get_config()).
         self._session_permission_modes: dict[str, str] = {}
         self._session_injected_rules: dict[str, list] = {}
         self._teams: dict[str, object] = {}
@@ -302,29 +309,37 @@ class SessionRuntime:
                     "Per-session backend close failed", exc_info=True,
                 )
         self._approval_brokers.clear()
-        self._web_confirm_callbacks.clear()
-        self._stream_callbacks.clear()
-        self._text_lifecycle_callbacks.clear()
-        self._text_delta_callbacks.clear()
+        self._pending_config.clear()
+        self._claim_cursors.clear()
         self._cancellation_tokens.clear()
 
-    # ── P1-10 thin adapter methods (used by ChatPipeline) ────────────────
+    # ── Pre-run config staging (Phase 4a: unified into SessionPreRunConfig) ──
+
+    def _get_config(self, session_id: str) -> "SessionPreRunConfig":
+        """Return or create the pre-run config for *session_id*."""
+        from agent.session.pre_run_config import SessionPreRunConfig
+        if session_id not in self._pending_config:
+            self._pending_config[session_id] = SessionPreRunConfig(
+                created_at=time.perf_counter(),
+            )
+        return self._pending_config[session_id]
 
     def set_permission_mode_for_session(
         self, session_id: str, mode: str,
     ) -> None:
-        self._session_permission_modes[session_id] = mode
+        self._get_config(session_id).permission_mode = mode
 
     def set_injected_rules_for_session(
         self, session_id: str, rules: list,
     ) -> None:
-        self._session_injected_rules[session_id] = rules
+        self._get_config(session_id).injected_rules = tuple(rules)
 
     def pop_pending_permission_mode_override(self, session_id: str) -> str | None:
-        return self._session_permission_modes.pop(session_id, None)
+        return self._get_config(session_id).permission_mode
 
     def pop_injected_rules(self, session_id: str) -> list | None:
-        return self._session_injected_rules.pop(session_id, None)
+        rules = self._get_config(session_id).injected_rules
+        return list(rules) if rules else None
 
     # ── Backend store accessors ──────────────────────────────────────────
 
@@ -956,11 +971,9 @@ class SessionRuntime:
         # 2. Clean up approval broker (prevents memory leak)
         self._approval_brokers.pop(session_id, None)
 
-        # 3. Clean up web confirm callback
-        self._web_confirm_callbacks.pop(session_id, None)
-
-        # 4. Clean up stream callback
-        self._stream_callbacks.pop(session_id, None)
+        # 3. Clean up pre-run config (unified staging — Phase 4a)
+        self._pending_config.pop(session_id, None)
+        self._claim_cursors.pop(session_id, None)
 
         # 5. Clean up cancellation tokens for this session and its children
         keys_to_remove = [
@@ -1316,19 +1329,6 @@ class SessionRuntime:
                 + "\n\n".join(sections)
             ),
         )
-
-    def add_completion_verifier(
-        self, verifier: "Callable[[CompletionContext], CompletionCheckResult | None]",
-    ) -> None:
-        """Register an external completion condition.
-
-        Verifiers run after the built-in checks (git diff, worktree disposition).
-        Return a CompletionCheckResult to block completion, or None to pass.
-        The *verifier* receives the CompletionContext (files read/written, etc.).
-        """
-        if not hasattr(self, '_completion_verifiers'):
-            self._completion_verifiers: list = []
-        self._completion_verifiers.append(verifier)
 
     # ── Worktree resolution (Gap 15, async queue) ─────────────────────
 
@@ -1755,9 +1755,19 @@ class SessionRuntime:
             )
             self._active_evidence_stores[session_id] = _evidence_store
 
+            # ── Phase 4a: Consume pre-run config once ──
+            _pre_cfg = self._pending_config.pop(session_id, None)
+            if _pre_cfg is not None and _pre_cfg.is_stale:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    'Session %s pre-run config is stale (%.1fs) — discarded',
+                    session_id[:8], _time.perf_counter() - _pre_cfg.created_at,
+                )
+                _pre_cfg = None
+
             # ── Flush pending skill activations into evidence ──
-            _pending_activations = self._pending_skill_activations.pop(
-                session_id, [],
+            _pending_activations = (
+                _pre_cfg.pending_skill_activations if _pre_cfg is not None else []
             )
             _flush_skill_activations(_evidence_store, _pending_activations)
             if self._mcp_integration is not None:
@@ -1900,7 +1910,7 @@ class SessionRuntime:
             # sessions cannot interfere.
             from hitl.pipeline import PermissionSessionConfig
 
-            _web_cb = self._web_confirm_callbacks.pop(session_id, None)
+            _web_cb = _pre_cfg.web_confirm_callback if _pre_cfg is not None else None
             agent._full_registry.configure_permission_session(
                 PermissionSessionConfig(
                     mode=inject_permission_mode,
@@ -2840,27 +2850,23 @@ class SessionRuntime:
         First call seeds the tracker with the max existing id — no messages
         are returned until new ones are appended.
         """
-        key = f"_last_msg_id_{session_id}"
+        # Phase 4a: Per-session claim cursor (replaces setattr/dynamic attr)
         all_msgs = self._store.list_messages(session_id)
-        # Find the max existing id
-        max_existing = 0
-        for msg in all_msgs:
-            msg_id = getattr(msg, "db_id", 0) or 0
-            if msg_id > max_existing:
-                max_existing = msg_id
-        # Seed on first call
-        last_id = getattr(self, key, None)
+        max_existing = max(
+            (getattr(msg, "db_id", 0) or 0 for msg in all_msgs),
+            default=0,
+        )
+        last_id = self._claim_cursors.get(session_id)
         if last_id is None:
-            setattr(self, key, max_existing)
+            self._claim_cursors[session_id] = max_existing
             return []
-        # Return messages newer than last check
         new_msgs: list[LLMMessage] = []
         for msg in all_msgs:
             msg_id = getattr(msg, "db_id", 0) or 0
             if msg_id > last_id:
                 new_msgs.append(msg)
         if new_msgs:
-            setattr(self, key, max_existing)
+            self._claim_cursors[session_id] = max_existing
             logger.debug("Live steering: %d new message(s) for session %s", len(new_msgs), session_id)
         return new_msgs
 
@@ -3065,7 +3071,7 @@ class SessionRuntime:
         Called by agent_service before run_session().  The callback is
         injected into the PermissionPipeline during registry construction.
         """
-        self._web_confirm_callbacks[session_id] = callback
+        self._get_config(session_id).web_confirm_callback = callback
 
     def set_stream_callback(
         self, session_id: str, callback: "StreamCallback",
@@ -3076,7 +3082,7 @@ class SessionRuntime:
         each text delta is forwarded to this callback so the frontend can
         render thoughts as they arrive instead of waiting for completion.
         """
-        self._stream_callbacks[session_id] = callback
+        self._get_config(session_id).stream_callback = callback
 
     def set_text_stream_callbacks(
         self,
@@ -3090,32 +3096,29 @@ class SessionRuntime:
           - lifecycle_callback("start"|"end"|"aborted", block_id, reason)
           - delta_callback(block_id, text)
         """
-        self._text_lifecycle_callbacks[session_id] = lifecycle_callback
-        self._text_delta_callbacks[session_id] = delta_callback
+        cfg = self._get_config(session_id)
+        cfg.text_lifecycle_callback = lifecycle_callback
+        cfg.text_delta_callback = delta_callback
 
     # ── Model switching (mid-session) ────────────────────────────────────
 
     def set_pending_model(self, session_id: str, model: str, provider: str = "") -> None:
-        """Queue a model switch for the next run of *session_id*.
-
-        The switch takes effect on the next call to run_session() —
-        the backend is rebuilt before the agent starts.
-        """
-        if not hasattr(self, '_pending_model_switches'):
-            self._pending_model_switches: dict[str, tuple[str, str]] = {}
-        self._pending_model_switches[session_id] = (model, provider)
+        cfg = self._get_config(session_id)
+        cfg.model_switch = model
+        cfg.model_provider = provider
 
     def pop_pending_model(self, session_id: str) -> tuple[str, str] | None:
-        """Pop and return a queued model switch, or None."""
-        return getattr(self, '_pending_model_switches', {}).pop(session_id, None)
+        cfg = self._pending_config.get(session_id)
+        if cfg is None or not cfg.model_switch:
+            return None
+        return (cfg.model_switch, cfg.model_provider)
 
     def set_pending_effort(self, session_id: str, effort: str) -> None:
-        if not hasattr(self, '_pending_effort'):
-            self._pending_effort: dict[str, str] = {}
-        self._pending_effort[session_id] = effort
+        self._get_config(session_id).effort = effort
 
     def pop_pending_effort(self, session_id: str) -> str | None:
-        return getattr(self, '_pending_effort', {}).pop(session_id, None)
+        cfg = self._pending_config.get(session_id)
+        return cfg.effort if cfg is not None else None
 
     def record_skill_activation(
         self, skill_name: str, *, source: str = "", fingerprint: str = "",
@@ -3135,28 +3138,21 @@ class SessionRuntime:
         if active_store is not None:
             _flush_skill_activations(active_store, [activation])
             return
-        self._pending_skill_activations.setdefault(session_id, []).append(
-            activation,
-        )
+        self._get_config(session_id).pending_skill_activations.append(activation)
 
     def set_pending_skill_modifier(self, session_id: str, modifier: Any) -> None:
-        if not hasattr(self, "_pending_skill_modifiers"):
-            self._pending_skill_modifiers: dict[str, Any] = {}
-        self._pending_skill_modifiers[session_id] = modifier
+        self._get_config(session_id).skill_modifier = modifier
 
     def pop_pending_skill_modifier(self, session_id: str) -> Any:
-        return getattr(self, "_pending_skill_modifiers", {}).pop(
-            session_id,
-            None,
-        )
+        cfg = self._pending_config.get(session_id)
+        return cfg.skill_modifier if cfg is not None else None
 
     def set_pending_thinking(self, session_id: str, enabled: bool) -> None:
-        if not hasattr(self, '_pending_thinking'):
-            self._pending_thinking: dict[str, bool] = {}
-        self._pending_thinking[session_id] = enabled
+        self._get_config(session_id).thinking = enabled
 
     def pop_pending_thinking(self, session_id: str) -> bool | None:
-        return getattr(self, '_pending_thinking', {}).pop(session_id, None)
+        cfg = self._pending_config.get(session_id)
+        return cfg.thinking if cfg is not None else None
 
     def set_pending_permission_mode_override(self, session_id: str, mode: str) -> None:
         self.set_permission_mode_for_session(session_id, mode)

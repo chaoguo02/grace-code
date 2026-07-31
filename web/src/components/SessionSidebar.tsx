@@ -164,9 +164,9 @@ export function SessionSidebar({
         </div>
 
         {storeError && (
-          <div className="session-error-banner" role="alert" style={{ padding: 8, background: "var(--error)", color: "#fff", borderRadius: 6, margin: 8 }}>
-            <span style={{ fontSize: 12 }}>{storeError}</span>
-            <button onClick={() => loadSessions()} style={{ marginLeft: 8, fontSize: 11, background: "rgba(255,255,255,0.2)", border: "none", borderRadius: 3, color: "#fff", cursor: "pointer", padding: "2px 8px" }}>Retry</button>
+          <div className="session-error-banner" role="alert">
+            <span>{storeError}</span>
+            <button type="button" onClick={() => loadSessions()}>Retry</button>
           </div>
         )}
         <div id="session-list" className="session-list">

@@ -913,13 +913,9 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
         <section className="chat view active" data-view-name="chat">
           {/* Compact permission bar — only visible when there are pending approvals */}
           {pendingApprovals > 0 && (
-            <div style={{
-              padding: "6px 20px", fontSize: 12, background: "var(--accent-soft)",
-              borderBottom: "1px solid var(--border)", color: "var(--accent)",
-              display: "flex", alignItems: "center", gap: 12,
-            }}>
-              <span>⏳ {pendingApprovals} tool approval{pendingApprovals > 1 ? "s" : ""} pending</span>
-              {planApproval?.isWaiting && <span>· Plan waiting for review</span>}
+            <div className="chat-notice chat-notice-approval" role="status">
+              <span>{pendingApprovals} tool approval{pendingApprovals > 1 ? "s" : ""} pending</span>
+              {planApproval?.isWaiting && <span>Plan waiting for review</span>}
             </div>
           )}
 
@@ -956,25 +952,10 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
 
           {/* Plan mode progress indicator */}
           {isRunning && mode === "plan" && (
-            <div style={{
-              margin: "0 20px 12px",
-              padding: "10px 16px",
-              background: "var(--accent-soft)",
-              border: "1px solid var(--accent)",
-              borderRadius: 8,
-              fontSize: 13,
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-            }}>
-              <span style={{
-                color: "var(--accent)",
-                fontSize: 14,
-              }}>◎</span>
-              <span style={{ color: "var(--accent)", fontWeight: 600 }}>
-                Planning in progress…
-              </span>
-              <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
+            <div className="chat-notice chat-notice-plan" role="status">
+              <span className="chat-notice-icon">◎</span>
+              <strong>Planning in progress…</strong>
+              <span className="chat-notice-meta">
                 Step {steps} · {tokens.toLocaleString()} tokens
               </span>
             </div>
