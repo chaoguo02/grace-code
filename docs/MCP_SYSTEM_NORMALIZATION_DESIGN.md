@@ -342,15 +342,15 @@ subsequent discoveries.
 
 ### Phase 1
 
-- [ ] `list_resources()` overridden on HttpMCPBridge — returns empty list (not RuntimeError)
-- [ ] `read_resource()` overridden on HttpMCPBridge — returns structured error
-- [ ] Duplicate `_parse_server_config` removed from mcp_integration.py
-- [ ] All callers use config.py version
-- [ ] `_last_refresh` dict added — max 1 refresh per server per 10s
-- [ ] Rapid `list_changed` notifications within 10s window → only first triggers reload
-- [ ] #11: Two servers with same un-prefixed tool name produce distinct runtime names (tested)
-- [ ] #12: `_sanitize_env()` implemented on MCPToolBridge — strips sensitive env vars
-- [ ] #12: Allowlist includes PATH, HOME, LANG, TMP, SHELL + explicit config env vars only
+- [x] `list_resources()` overridden on HttpMCPBridge — returns empty list (not RuntimeError)
+- [x] `read_resource()` overridden on HttpMCPBridge — returns structured error
+- [x] Duplicate `_parse_server_config` removed from mcp_integration.py
+- [x] All callers use config.py version
+- [x] `_last_refresh` dict added — max 1 refresh per server per 10s
+- [x] Rapid `list_changed` notifications within 10s window → only first triggers reload
+- [x] #11: Two servers with same un-prefixed tool name produce distinct runtime names (tested)
+- [x] #12: `_sanitize_env()` implemented on MCPToolBridge — strips sensitive env vars
+- [x] #12: Allowlist includes PATH, HOME, LANG, TMP, SHELL + explicit config env vars only
 
 ### Phase 2
 
