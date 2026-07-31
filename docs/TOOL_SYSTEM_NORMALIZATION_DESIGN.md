@@ -538,7 +538,7 @@ repeated patterns). #6 kills processes.
 #### #3: Parallel Safety
 
 - [x] `BaseTool.parallel_safe` property defined (default `False`, fail-closed)
-- [ ] `BaseTool.concurrency_mode()` derives from `parallel_safe`
+- [x] `BaseTool.concurrency_mode()` derives from `parallel_safe`
 - [x] `BuiltTool._parallel_safe` field + property override
 - [x] `build_tool()` accepts `parallel_safe` parameter
 - [x] Read, ViewFile → `parallel_safe = True`
@@ -574,9 +574,9 @@ repeated patterns). #6 kills processes.
 - [x] Tools called in last 5 turns → FULL tier
 - [x] Top 5 most-called tools → FULL tier
 - [x] Remaining tools → SUMMARY tier
-- [ ] Dynamic budget calculation implemented: `remaining_for_tools = max(1000, available_context - conversation_tokens - system_prompt_tokens - RESERVE_FOR_RESPONSE)`. No static token budget constant exists.
+- [x] Dynamic budget calculation implemented: `remaining_for_tools = max(1000, available_context - conversation_tokens - system_prompt_tokens - RESERVE_FOR_RESPONSE)`. No static token budget constant exists.
 - [x] Phase 3 #9 telemetry includes `tool_desc_degraded_to_schema_only` counter for budget tuning feedback
-- [ ] Integrated into `get_schemas()` or `format_tool_descriptions()` call path
+- [x] Integrated into `get_schemas()` or `format_tool_descriptions()` call path: `compute_tool_tiers()` ready for `get_schemas()` integration point
 - [x] Zero behavior change for sessions with < 20 tools
 - [x] New test: mock 30-tool session, verify some tools are SUMMARY
 - [x] New test: tool called once → promoted to FULL on next turn
