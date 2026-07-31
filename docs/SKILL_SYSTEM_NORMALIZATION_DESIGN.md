@@ -17,45 +17,70 @@ already work correctly in the common case.  The gaps are in edge-case
 error handling (fork crash, missing-dependency silence, legacy-format
 description gaps), not in architectural redesign.
 
-### 2.2 Skills are On-Demand Instruction Injection
+### 2.2 Skill = Prompt Template, Not Code Plugin
 
-Skills inject instructional content into the model context — they are
-NOT permanent tool modifiers.  A skill's allowed_tools/disallowed_tools
-are active only while the skill's `SkillContextModifier` is applied to
-the `PolicyAwareToolRegistry`.  When the modifier is deactivated (at
-end of run), the registry returns to its base policy.  This principle
-governs: why `context="fork"` spawns a subagent (#1), why preload
-injection is a distinct path from tool-call activation, and why
-model/effort overrides are scoped to the skill's active duration.
+A skill is a structured prompt fragment with metadata — it is NOT an
+executable module.  All "execution" is the LLM interpreting the prompt
+and calling tools through the standard pipeline.  A skill itself contains
+no runtime logic.  This principle governs: why `SkillMetadata` only
+needs to satisfy the minimum spawn protocol for `context="fork"` (#1),
+why inline commands (`!cmd`) are blocked for untrusted skills (#6),
+and why skill content is injected as a user message rather than
+executed as code.
 
-### 2.3 LLM Semantic Matching, Not Keyword Triggers
+### 2.3 Activation is Semantic, Not Syntactic
 
-CC's skills are matched by the LLM based on `description` and
-`when_to_use` — not by regex-based path triggers.  The `triggers` field
-was explicitly removed from the frontmatter reference (#7 docstring note).
-`paths` in `SkillMetadata` is informational for the model, not a
-mechanical activation gate.  This principle governs: why we don't
-auto-activate skills on file path match, and why the description is the
-primary discovery mechanism.
+Skill activation is driven by the LLM matching `description` and
+`when_to_use` against the current task — never by filename, path, regex
+trigger, or manual rule engine.  `paths` in `SkillMetadata` is
+informational for the model, not a mechanical activation gate.  The
+`triggers` field was explicitly removed from the frontmatter reference.
+This principle governs: why we don't auto-activate on file path match,
+why the description is the primary discovery mechanism (#5), and why
+description fidelity matters (#14).
 
-### 2.4 Four Activation Paths, One Evidence Contract
+### 2.4 Trust Boundary = Provenance
 
-All four activation paths (tool call, HTTP request, CLI slash, preload)
-produce identical evidence — `SKILL_LOADED` entries with consistent
-fingerprint and MCP dependency metadata.  This guarantees traceability
-regardless of how the skill was activated.  Governs: why preload
-failures must surface errors (#4) and why MCP dependencies must be
-validated at load time (#3).
+A skill's trust level is determined by its source (builtin, project,
+user, MCP) — NOT by its content.  Untrusted skills (`trusted=False`)
+have inline commands blocked at load time and are subject to content
+sanitization.  This principle governs: why untrusted skill command
+blocking must be auditable (#6), why content sanitization applies at
+load time not runtime (#11), and why MCP dependency validation is a
+load-time concern (#3).
 
-### 2.5 Untrusted Skills Have Restricted Capabilities
+### 2.5 Skill Isolation = Session Scope
 
-Skills from MCP sources (`trusted=False`) have inline commands (`!cmd`)
-blocked before execution.  The block is absolute — no configuration
-can override it.  This principle governs: why untrusted skill audit
-logging matters (#6) — the block is a security event that must be
-observable.
+Skill effects (model/effort overrides, tool allow/deny modifications)
+are scoped to the session and do not persist across runs or affect
+the global registry.  The `SkillContextModifier` is applied at the
+start of each run and deactivated at completion.  This principle
+governs: why `context="fork"` spawns a subagent rather than forking
+the current process (#1), and why preload is a distinct path from
+tool-call activation.
 
-### 2.6 明确不做
+### 2.6 Description Fidelity is Non-Negotiable
+
+The skill description is the LLM's sole basis for choosing whether to
+activate the skill.  Any programmatic modification of the description
+(truncation, splicing, generation) must preserve semantic integrity.
+An empty or excessively long description makes the skill invisible to
+the LLM.  This principle governs: why legacy-command descriptions must
+be meaningful (#5), why descriptions must be validated at registration
+time (#14), and why auto-generated descriptions are explicitly
+rejected (anti-requirements).
+
+### 2.7 Activation Audit Trail
+
+Every skill activation produces a complete audit record: which turn,
+what user intent, which skill was selected, and whether it succeeded.
+This is not just observability — it is the verifiability guarantee of
+semantic activation.  If a user reports "my skill wasn't activated,"
+the audit trail provides the diagnostic evidence.  Governs: why
+activation decisions need tracing (#12) and why discovery errors
+must be stored (#8).
+
+### 2.8 明确不做
 
 | Anti-requirement | Reason |
 |-----------------|--------|
@@ -109,15 +134,15 @@ allowed_tools from metadata) as computed properties for the spawn path.
 @property
 def agent_kind(self) -> "AgentKind":
     from agent.session.models import AgentKind
-    return AgentKind.NAMED_SUBAGENT
+    return self._frontmatter.get("agent_kind", AgentKind.NAMED_SUBAGENT)
 
 @property
 def intent(self) -> "TaskIntent":
     from agent.task import TaskIntent
-    return TaskIntent.EDIT
+    return self._frontmatter.get("intent", TaskIntent.EDIT)
 ```
 
-This is the minimum viable fix — `SkillMetadata` satisfies the duck-type
+Defaults are NAMED_SUBAGENT and EDIT, but frontmatter can override via agent_kind/intent keys. This satisfies — `SkillMetadata` satisfies the duck-type
 requirements of `AgentSpawnRequest.named()` without becoming an AgentDefinition.
 
 #### #2: Any import location
@@ -208,13 +233,16 @@ inspector.  This makes discovery failures visible at the UI level.
 - #1: Fork-via-SkillMetadata AttributeError
 - #2: Any import fix
 
-### Phase 1: Defect Fixes (2 items)
+### Phase 1: Defect and Security Fixes (4 items)
 - #3: MCP dependency validation
 - #4: Missing skill surface error
+- #9: Untrusted skill content sanitization
+- #11: Description validation at registration
 
-### Phase 2: Experience and Security (2 items)
+### Phase 2: Experience and Security (3 items)
 - #5: Legacy commands description
 - #6: Untrusted skill audit log
+- #10: Skill activation audit trail
 
 ### Phase 3: Engineering Cleanup (2 items)
 - #7: triggers deprecation warning
@@ -245,6 +273,11 @@ inspector.  This makes discovery failures visible at the UI level.
 
 - [ ] `_load_mcp_dependencies` cross-references session MCP config
 - [ ] WARNING logged for each unmatched MCP server at discovery time
+- [ ] #9:  function strips system-prompt-injection patterns from untrusted skills
+- [ ] #9: Sanitization runs at load time (parse_frontmatter), not at activation time
+- [ ] #11: Description validation at registration — non-empty, < 2000 chars, no markdown artifacts
+- [ ] #11: Skills failing validation are registered as degraded with WARNING log
+- [ ] #11: Degraded skills still appear in listing with "(description unavailable)" marker
 - [ ] `_mcp_validation_warnings` stored on SkillMetadata
 - [ ] Missing skill preload: ERROR log + runtime notice appended
 - [ ] Agent sees explicit "(skill X failed to load)" in preload block
@@ -254,6 +287,8 @@ inspector.  This makes discovery failures visible at the UI level.
 - [ ] Legacy commands without frontmatter get body-trimmed description
 - [ ] Description length capped at 100 chars from body
 - [ ] Untrusted skill inline command block: WARNING logged with cmd details
+- [ ] #10: Skill activation audit trail records (turn, intent, skill_name, match_reason, outcome) per activation
+- [ ] #10: Audit entries stored in session trace for diagnostic queries
 - [ ] Blocked commands visible in log for audit
 
 ### Phase 3
