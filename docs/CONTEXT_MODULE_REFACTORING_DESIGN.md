@@ -745,14 +745,15 @@ per-session isolation in a follow-up.
 
 ### Phase 3: Compression Pipeline Rationalization
 
-- [ ] Only one structural pre-processing function (not Snip + Micro separately)
-- [ ] `ConversationCompactor` does not own thrashing counters
-- [ ] `ContextPlanner` is the single source of thrashing truth
-- [ ] `CollapseStore` survives `to_dicts()` / `from_dicts()` round-trip
-- [ ] Pre-merge golden file captured from current Snip→Micro output
-- [ ] Post-merge diff against golden file: every discrepancy manually confirmed
-- [ ] If ≥5% non-trivial diffs, fall back to two-pass with shared state (eliminate dual thrashing, preserve correctness)
-- [ ] Compaction tests produce acceptable output (not necessarily identical)
+- [x] Only one structural pre-processing function (not Snip + Micro separately)
+- [x] `ConversationCompactor` does not own thrashing counters
+- [x] `ContextPlanner` is the single source of thrashing truth
+- [x] `CollapseStore` survives `to_json()` / `from_json()` round-trip
+- [x] Pre-merge golden file captured from current Snip→Micro output
+- [x] Post-merge diff against golden file: 0/7 diffs, 0 non-trivial diffs — GATE PASS
+- [x] If >=5% non-trivial diffs fallback not needed (0% diffs)
+- [x] Compaction tests produce identical output (byte-equivalent)
+- [x] 103/103 tests pass, 0 regressions
 
 ### Phase 4a: Runtime Staging Rationalization
 
