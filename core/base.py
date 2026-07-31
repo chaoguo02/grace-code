@@ -709,6 +709,28 @@ class ToolRegistry:
             self.register(tool)
         return self
 
+    def register_plugin(self, config: "Any") -> list[str]:
+        """Register tools from a ``ToolPlugin`` configuration entry.
+
+        Resolves the plugin by name from the in-process registry,
+        validates config, creates tools, and registers them normally.
+        Returns the list of registered tool names.
+
+        Raises ``ValueError`` if the plugin cannot be resolved or
+        config validation fails.
+        """
+        from core.tool_plugin import resolve_plugin
+        plugin = resolve_plugin(config.plugin)
+        if plugin is None:
+            raise ValueError(
+                f"Plugin {config.plugin!r} not found in registry. "
+                f"Registered plugins: {list(_plugin_registry.keys())}"
+            )
+        plugin.validate_config(config.config)
+        tool = plugin.create_tool(config.config)
+        self.register(tool)
+        return [tool.name]
+
     def unregister(self, name: str) -> BaseTool | None:
         """Remove one canonical tool and all aliases that point to it."""
         canonical = self.resolve_name(name)
