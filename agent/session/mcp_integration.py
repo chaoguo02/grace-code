@@ -403,55 +403,15 @@ def _parse_raw_config(raw_config: dict[str, Any]) -> tuple[list[MCPServerConfig]
 
 
 def _parse_server_config(name: str, raw: Any) -> MCPServerConfig | None:
-    if not isinstance(raw, dict):
-        return None
-    transport = raw.get("transport", raw.get("type", "stdio"))
-    if transport not in ("stdio", "http", "sse", "ws"):
-        logger.warning("Skipping MCP server %s: unsupported transport %s", name, transport)
-        return None
-    if transport == "stdio":
-        command = raw.get("command")
-        if not isinstance(command, str) or not command.strip():
-            logger.warning("Skipping MCP server %s: missing command for stdio", name)
-            return None
-    else:
-        command = raw.get("command") or ""
-    url = raw.get("url", "")
-    if transport in ("http", "sse", "ws") and not url:
-        logger.warning("Skipping MCP server %s: missing url for %s transport", name, transport)
-        return None
-    args = raw.get("args", [])
-    if not isinstance(args, list):
-        logger.warning("Skipping MCP server %s: args must be a list", name)
-        return None
-    env = raw.get("env")
-    if env is not None and not isinstance(env, dict):
-        logger.warning("Skipping MCP server %s: env must be a dict", name)
-        return None
-    cwd = raw.get("cwd")
-    if cwd is not None and not isinstance(cwd, str):
-        logger.warning("Skipping MCP server %s: cwd must be a string", name)
-        return None
-    try:
-        timeout_seconds = float(raw.get("timeout_seconds", raw.get("timeout", 60.0)))
-    except (TypeError, ValueError):
-        timeout_seconds = 60.0
-    headers_raw = raw.get("headers", {})
-    if isinstance(headers_raw, dict):
-        headers = {str(k): str(v) for k, v in headers_raw.items()}
-    else:
-        headers = None
-    return MCPServerConfig(
-        name=name,
-        type=transport,
-        command=command,
-        args=[str(a) for a in args],
-        url=url,
-        headers=headers,
-        env={str(key): str(value) for key, value in env.items()} if env else None,
-        cwd=cwd,
-        timeout_seconds=timeout_seconds,
-    )
+    """Parse MCP server config — delegates to agent/mcp/config.py (#2 unification).
+
+    The canonical parser lives in config.py.  This wrapper adds backward-compatible
+    defaults for callers that don't pass a base_dir (programmatic/API and frontmatter
+    inline definitions).
+    """
+    from pathlib import Path
+    from agent.mcp.config import _parse_server_config as _config_parse
+    return _config_parse(name, raw, base_dir=Path.cwd())
 
 
 def _string_list(value: Any) -> list[str]:

@@ -124,6 +124,9 @@ class SyncMCPToolManager:
             self._loop,
         )
         self._tools_changed_callback: Any = None
+        # Phase 1 #3: Rate limit tool map refreshes — max 1 per server per 10s
+        self._last_refresh: dict[str, float] = {}
+        self._REFRESH_COOLDOWN: float = 10.0
 
     @property
     def bridges(self) -> dict[str, MCPToolBridge]:
@@ -543,7 +546,17 @@ class SyncMCPToolManager:
     def _refresh_tool_map(
         self, server_name: str, bridge: MCPToolBridge, tools: list[Any],
     ) -> None:
-        """Update the tool map for a reconnected bridge."""
+        """Update the tool map for a reconnected bridge.
+
+        Phase 1 #3: Rate limited — max 1 refresh per server per cooldown.
+        """
+        import time as _time_module
+        _now = _time_module.monotonic()
+        _last = self._last_refresh.get(server_name, 0.0)
+        if _now - _last < self._REFRESH_COOLDOWN:
+            return  # within cooldown window — suppress refresh
+        self._last_refresh[server_name] = _now
+
         # Remove old entries for this server
         stale = [k for k, v in self._tool_map.items() if v[0] == server_name]
         for k in stale:

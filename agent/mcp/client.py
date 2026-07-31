@@ -212,9 +212,7 @@ class MCPToolBridge:
                 raise RuntimeError("MCP owner task has no readiness future")
             return await asyncio.shield(self._ready_future)
 
-        env = dict(os.environ)
-        if self.config.env:
-            env.update(self.config.env)
+        env = self._sanitize_env(os.environ, self.config)
         # MCP-07: set CLAUDE_PROJECT_DIR for stdio servers
         project_dir = os.environ.get("FORGE_AGENT_PROJECT_DIR", os.getcwd())
         env.setdefault("CLAUDE_PROJECT_DIR", project_dir)
@@ -266,6 +264,46 @@ class MCPToolBridge:
 
         await self._close_contexts()
         self._connected = False
+
+    # ── Environment sanitization (Phase 1 #12) ────────────────────
+
+    @staticmethod
+    def _sanitize_env(
+        base_env: dict[str, str],
+        config: MCPServerConfig,
+    ) -> dict[str, str]:
+        """Strip sensitive env vars before spawning stdio subprocess.
+
+        CC Principle: Trust Boundary (#2.3) — servers must not inherit
+        host credentials.  Only a safe allowlist plus explicitly-configured
+        env vars from the MCP config are passed through.
+        """
+        # CC-aligned allowlist
+        ALLOWLIST = frozenset({
+            "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE",
+            "TMPDIR", "TEMP", "TMP", "USER", "LOGNAME", "SHELL",
+            "SYSTEMROOT", "SystemRoot", "WINDIR", "COMSPEC",
+        })
+        # Sensitive patterns — stripped if their key contains any of these
+        STRIP_PATTERNS = (
+            "API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD",
+            "CREDENTIAL", "AUTH", "CERT", "PRIVATE_KEY",
+        )
+
+        result: dict[str, str] = {}
+        for key, value in base_env.items():
+            upper = key.upper()
+            if key in ALLOWLIST or upper in ALLOWLIST:
+                result[key] = value
+            elif not any(pattern in upper for pattern in STRIP_PATTERNS):
+                result[key] = value
+
+        # Explicitly-configured env vars from MCP config take priority
+        if hasattr(config, "env") and config.env:
+            for key, value in config.env.items():
+                result[key] = str(value)
+
+        return result
 
     async def _run_owned_session(self, params: Any) -> None:
         """Own SDK context managers for their complete lifetime in one Task."""
@@ -709,6 +747,19 @@ class HttpMCPBridge(MCPToolBridge):
                 f"MCP JSON-RPC error {err.get('code', '')}: {err.get('message', str(err))}"
             )
         return data.get("result", {})
+
+    # ── Resource overrides (Phase 1 #1) ────────────────────────────
+    # MCP resources/list is only available on the SDK session (stdio).
+    # HTTP/SSE/WS bridges do not have an SDK session — protocol
+    # compliance principle: return structured error, don't emulate.
+
+    async def list_resources(self) -> list[dict[str, Any]]:
+        """HTTP bridges do not support MCP resources/list."""
+        return []
+
+    async def read_resource(self, uri: str) -> dict[str, Any]:
+        """HTTP bridges do not support MCP resources/read."""
+        return {"contents": [], "error": "MCP resources not available on HTTP transport"}
 
 
 # ---------------------------------------------------------------------------
