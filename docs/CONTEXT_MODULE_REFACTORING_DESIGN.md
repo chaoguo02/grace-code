@@ -780,17 +780,17 @@ per-session isolation in a follow-up.
 
 ### Phase 5: Tool Result Degradation
 
-- [ ] All Turn-based TTL code deleted: `created_at_turn`, `_tool_ttl_tier()`, tier constants
-- [ ] `StructuralCompactor.degrade_tool_results(messages, budget)` implemented
-- [ ] Degradation only triggers when TokenBudget reports history over threshold
-- [ ] Largest results degraded first; older as tie-breaker (not primary sort key)
-- [ ] Recent K=5 results protected regardless of size
-- [ ] Referenced-result skip: only last N=10 messages checked; file mentions ≥10 turns old do not protect
-- [ ] Write-invalidation: Read result for file X loses protection if subsequent Edit/Write for file X exists
-- [ ] Degraded result shows structured metadata: file_path, line_range, command, exit_code, 200-char summary
-- [ ] Storage layer unchanged — raw content always in DB; degradation is prompt-layer only
-- [ ] 30-turn coding session test: zero read-forget-reread dead loops
-- [ ] Zero hardcoded turn thresholds anywhere in the codebase
+- [x] All Turn-based TTL code deleted: `created_at_turn`, `_tool_ttl_tier()`, tier constants
+- [x] `StructuralCompactor.degrade_tool_results(messages, budget)` implemented
+- [x] Degradation only triggers when TokenBudget reports history over threshold
+- [x] Largest results degraded first; older as tie-breaker (not primary sort key)
+- [x] Recent K=5 results protected regardless of size
+- [x] Referenced-result skip: only last N=10 messages checked; file mentions ≥10 turns old do not protect
+- [x] Write-invalidation: Read result for file X loses protection if subsequent Edit/Write for file X exists
+- [x] Degraded result shows structured metadata: file_path, line_range, command, exit_code, 200-char summary
+- [x] Storage layer unchanged — raw content always in DB; degradation is prompt-layer only
+- [x] 30-turn coding session test: zero read-forget-reread dead loops
+- [x] Zero hardcoded turn thresholds anywhere in the codebase
 
 ### Final Cross-Phase Acceptance
 
