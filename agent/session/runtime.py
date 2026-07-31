@@ -213,12 +213,12 @@ class SessionRuntime:
         self._circuit_breaker = CircuitBreaker()
 
         # ── P1-6: Dynamic Capability Registry ──
-        from agent.capability_registry import CapabilityRegistry
-        self._capability_registry = CapabilityRegistry()
+        from agent.tool_availability_guard import ToolAvailabilityGuard
+        self._tool_availability_guard = ToolAvailabilityGuard()
         # Register all builtin tools from the base registry
-        self._capability_registry.register_bulk(self._base_registry.tool_names)
+        self._tool_availability_guard.register_bulk(self._base_registry.tool_names)
         # Wire the registry into the base ToolRegistry for physical interception
-        self._base_registry._capability_registry = self._capability_registry
+        self._base_registry._tool_availability_guard = self._tool_availability_guard
         # Mark MCP tools as UNAVAILABLE if the bridge failed to connect
         self._sync_mcp_capabilities()
 
@@ -369,8 +369,8 @@ class SessionRuntime:
         return self._circuit_breaker
 
     @property
-    def capability_registry(self):
-        return self._capability_registry
+    def tool_availability_guard(self):
+        return self._tool_availability_guard
 
     def propose_agent_team(
         self,
@@ -1998,8 +1998,16 @@ class SessionRuntime:
                     )
 
             history = ConversationHistory(max_messages=agent_cfg.history_max_messages)
+            from capabilities import build_capability_sections
+            agent._capability_sections = build_capability_sections(
+                spec=spec,
+                skill_registry=self._base_registry.skill_registry,
+                mcp_integration=self._mcp_integration,
+                agent_registry=self._agent_registry,
+            )
             injected_messages = self._build_runtime_messages(
                 spec, task_description, session_id=session_id,
+                inject_capability_context=False,
             )
             # Preloaded skills are discovered while building runtime messages.
             # record_skill_activation() writes them directly to the active Store.
@@ -2984,7 +2992,7 @@ class SessionRuntime:
             return
         mcp_tool_names = getattr(self._mcp_integration, "tool_names", frozenset())
         for name in mcp_tool_names:
-            self._capability_registry.register(name)
+            self._tool_availability_guard.register(name)
 
         # Check for failed MCP servers
         failed_servers = getattr(self._mcp_integration, "failed_servers", None)
@@ -2992,7 +3000,7 @@ class SessionRuntime:
             for server_name, reason in failed_servers.items():
                 server_tools = getattr(self._mcp_integration, "server_tools", {}).get(server_name, [])
                 for tool_name in server_tools:
-                    self._capability_registry.mark_unavailable(
+                    self._tool_availability_guard.mark_unavailable(
                         tool_name, f"MCP server '{server_name}': {reason}",
                     )
 
@@ -3162,7 +3170,7 @@ class SessionRuntime:
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()
-        from agent.capability_registry import CapabilityState
+        from agent.tool_availability_guard import ToolAvailabilityState
         server_tools = self._mcp_integration.server_tools
         raw_names: set[str] = set()
 
@@ -3203,7 +3211,7 @@ class SessionRuntime:
         return frozenset(
             n
             for n in raw_names
-            if self._capability_registry.state_for(n) is CapabilityState.AVAILABLE
+            if self._tool_availability_guard.state_for(n) is ToolAvailabilityState.AVAILABLE
         )
 
     def _build_agent_config(self, spec: AgentDefinition) -> AgentConfig:
@@ -3221,6 +3229,7 @@ class SessionRuntime:
     def _build_runtime_messages(
         self, spec: AgentDefinition, task_description: str, *,
         session_id: str = "",
+        inject_capability_context: bool = True,
     ) -> list[LLMMessage]:
         """委托给 runtime_prompt_builder。"""
         from agent.session.runtime_prompt_builder import build_runtime_messages
@@ -3237,7 +3246,9 @@ class SessionRuntime:
             agent_registry=self._agent_registry,
             project_dir=self._agent_registry.project_dir if self._agent_registry else None,
             skill_registry=skill_registry,
+            mcp_integration=self._mcp_integration,
             on_skill_preload=_on_preload,
+            inject_capability_context=inject_capability_context,
         )
 
 

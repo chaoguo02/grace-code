@@ -146,7 +146,8 @@ class PromptRenderer:
 
     @staticmethod
     def sub_agent_system(tools: list[LLMToolSchema]) -> str:
-        tool_desc = PromptAssembler._format_tool_descriptions(tools)
+        from capabilities.render import format_tool_descriptions
+        tool_desc = format_tool_descriptions(tools)
         return (
             "You are a focused coding assistant. Use the tools below to "
             "complete your task.\n\n"
@@ -249,7 +250,8 @@ def build_system_prompt(
 
 
 def _format_tool_descriptions(tools: list[LLMToolSchema]) -> str:
-    return PromptAssembler._format_tool_descriptions(tools)
+    from capabilities.render import format_tool_descriptions
+    return format_tool_descriptions(tools)
 
 
 def reflection_test_failed() -> str:

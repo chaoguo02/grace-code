@@ -8,6 +8,16 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from capabilities import (
+    CapabilityIndex,
+    CapabilityKind,
+    CapabilityQuery,
+    CapabilityStatus,
+)
+from capabilities.providers.mcp_provider import McpCapabilityProvider
+from capabilities.providers.skill_provider import SkillCapabilityProvider
+from capabilities.sanitize import sanitize_error, sanitize_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,6 +32,27 @@ class ArchitectureService:
         self._service = agent_service
 
     def get_snapshot(self, session_id: str = "") -> dict[str, Any]:
+        # Build a capability fingerprint from available providers.
+        # Providers are lightweight adapters — building the index here
+        # does no I/O and is cheap even when _skills() / _mcp() also
+        # construct their own per-kind indexes internally.
+        providers: list[Any] = []
+        skill_registry = getattr(self._service._registry, "skill_registry", None)
+        if skill_registry is not None:
+            providers.append(
+                SkillCapabilityProvider(skill_registry, llm_invocable_only=False),
+            )
+        mcp = self._service._mcp_integration
+        if mcp is not None:
+            providers.append(McpCapabilityProvider(mcp))
+
+        fingerprint = ""
+        if providers:
+            cap_snapshot = CapabilityIndex(providers).snapshot(
+                CapabilityQuery(visible_to_model=None),
+            )
+            fingerprint = cap_snapshot.fingerprint
+
         return {
             "components": self._components(),
             "edges": self._edges(),
@@ -40,6 +71,7 @@ class ArchitectureService:
                 "session_facts": "persisted_session_steps_and_trace",
                 "prompt_contents_included": False,
             },
+            "fingerprint": fingerprint,
         }
 
     def _components(self) -> list[dict[str, Any]]:
@@ -223,23 +255,40 @@ class ArchitectureService:
         registry = self._service._registry.skill_registry
         if registry is None:
             return []
-        return [
-            {
-                "name": name,
-                "display_name": metadata.display_name,
-                "description": metadata.description[:240],
-                "model_invocable": metadata.model_invocable,
-                "user_invocable": metadata.user_can_invoke,
-                "context": metadata.context or "current",
-                "agent": metadata.agent,
-                "model": metadata.model or "inherit",
-                "effort": metadata.effort or "inherit",
-                "allowed_tools": sorted(metadata.allowed_tools),
-                "disallowed_tools": sorted(metadata.disallowed_tools),
-                "path_scopes": list(metadata.paths),
-            }
-            for name, metadata in registry.list_skill_entries()
-        ]
+
+        query = CapabilityQuery(
+            kinds=frozenset({CapabilityKind.SKILL}),
+            visible_to_model=None,
+        )
+        index = CapabilityIndex([
+            SkillCapabilityProvider(registry, llm_invocable_only=False),
+        ])
+        snapshot = index.snapshot(query)
+
+        # Build name → metadata lookup for UI-only fields the provider
+        # intentionally excludes (they are not relevant to prompt context).
+        reg_map = dict(registry.list_skill_entries())
+
+        result: list[dict[str, Any]] = []
+        for descriptor in snapshot.by_kind(CapabilityKind.SKILL):
+            metadata = reg_map.get(descriptor.metadata.name)
+            if metadata is None:
+                continue
+            result.append({
+                "name": descriptor.metadata.name,
+                "display_name": getattr(metadata, "display_name", descriptor.metadata.name),
+                "description": sanitize_text(descriptor.metadata.description),
+                "model_invocable": descriptor.metadata.model_invocable,
+                "user_invocable": descriptor.metadata.user_invocable,
+                "context": getattr(metadata, "context", None) or "current",
+                "agent": getattr(metadata, "agent", None),
+                "model": getattr(metadata, "model", None) or "inherit",
+                "effort": getattr(metadata, "effort", None) or "inherit",
+                "allowed_tools": sorted(descriptor.metadata.allowed_tools),
+                "disallowed_tools": sorted(descriptor.metadata.disallowed_tools),
+                "path_scopes": list(descriptor.metadata.path_scopes),
+            })
+        return result
 
     def _mcp(self) -> dict[str, Any]:
         integration = self._service._mcp_integration
@@ -250,24 +299,45 @@ class ArchitectureService:
                 "tool_names": [],
                 "failed_servers": [],
             }
-        server_tools = integration.server_tools
-        failed = integration.failed_servers
-        server_names = sorted(set(server_tools) | set(failed))
+
+        query = CapabilityQuery(
+            kinds=frozenset({CapabilityKind.MCP_SERVER, CapabilityKind.MCP_TOOL}),
+            visible_to_model=None,
+        )
+        index = CapabilityIndex([McpCapabilityProvider(integration)])
+        snapshot = index.snapshot(query)
+
+        server_descriptors = snapshot.by_kind(CapabilityKind.MCP_SERVER)
+        tool_descriptors = snapshot.by_kind(CapabilityKind.MCP_TOOL)
+
+        # Group tool names per server from MCP_TOOL descriptors
+        server_tool_map: dict[str, list[str]] = {}
+        for d in tool_descriptors:
+            if d.metadata.server_name:
+                server_tool_map.setdefault(d.metadata.server_name, []).append(
+                    d.metadata.name,
+                )
+
+        servers: list[dict[str, Any]] = []
+        for d in server_descriptors:
+            servers.append({
+                "name": d.metadata.name,
+                "status": (
+                    "failed"
+                    if d.runtime.status is CapabilityStatus.FAILED
+                    else "connected"
+                ),
+                "tools": sorted(server_tool_map.get(d.metadata.name, [])),
+                "error": sanitize_error(d.runtime.error),
+            })
+
         return {
             "initialized": integration.is_initialized,
-            "servers": [
-                {
-                    "name": name,
-                    "status": "failed" if name in failed else "connected",
-                    "tools": sorted(server_tools.get(name, [])),
-                    "error": failed.get(name, ""),
-                }
-                for name in server_names
-            ],
-            "tool_names": sorted(integration.tool_names),
+            "servers": servers,
+            "tool_names": sorted(d.metadata.name for d in tool_descriptors),
             "failed_servers": [
-                {"name": name, "error": error}
-                for name, error in sorted(failed.items())
+                {"name": name, "error": sanitize_error(error)}
+                for name, error in sorted(integration.failed_servers.items())
             ],
         }
 

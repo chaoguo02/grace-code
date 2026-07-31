@@ -3189,6 +3189,7 @@ class ReActAgent:
             system_core_text=core_text,
             variable_text=variable_text,
             long_term_context=long_term,
+            capability_sections=getattr(self, "_capability_sections", None),
             task_anchor=anchor,
             artifact_store=self._artifact_store,
             consumed_tokens=consumed_tokens,

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+from capabilities.render import build_tool_contract_rules
 from prompts.builder import PromptRenderer
-from prompts.assembler import PromptAssembler
 from llm.base import LLMToolSchema
 
 
@@ -57,7 +57,7 @@ def test_tool_prompt_contract_is_declarative_not_name_based() -> None:
         parameters={"type": "object"},
     )
 
-    rendered = PromptAssembler._build_tool_contract_rules(
+    rendered = build_tool_contract_rules(
         [custom, misleading_name],
     )
 

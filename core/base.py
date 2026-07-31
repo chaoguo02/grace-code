@@ -603,7 +603,7 @@ class ToolRegistry:
         self,
         permission_pipeline: Any = None,
         hook_dispatcher: Any = None,
-        capability_registry: Any = None,
+        tool_availability_guard: Any = None,
         *,
         artifact_store_ref: Any = None,
         skill_registry: Any = None,
@@ -619,7 +619,7 @@ class ToolRegistry:
         self._tool_aliases: dict[str, str] = {}
         self._permission_pipeline = permission_pipeline
         self._hook_dispatcher = hook_dispatcher
-        self._capability_registry = capability_registry
+        self._tool_availability_guard = tool_availability_guard
         self._artifact_store_ref = artifact_store_ref
         self._skill_registry = skill_registry
         self._skill_buffer = skill_buffer
@@ -707,8 +707,8 @@ class ToolRegistry:
         return self._mcp_integration.activate_servers(set(server_names))
 
     @property
-    def capability_registry(self) -> Any:
-        return self._capability_registry
+    def tool_availability_guard(self) -> Any:
+        return self._tool_availability_guard
 
     def add_closeable(self, value: Any) -> None:
         if value is not None and value not in self._closeables:
@@ -811,7 +811,7 @@ class ToolRegistry:
         pipeline = ToolExecutionPipeline(
             permission_pipeline=self._permission_pipeline,
             hook_dispatcher=self._hook_dispatcher,
-            capability_registry=self._capability_registry,
+            tool_availability_guard=self._tool_availability_guard,
             session_id=getattr(self, "_session_id", ""),
             budget=getattr(self, "_budget", None),
             resource_governor=getattr(self, "_resource_governor", None),
@@ -861,7 +861,7 @@ class ToolRegistry:
         filtered = ToolRegistry(
             permission_pipeline=self._permission_pipeline,
             hook_dispatcher=self._hook_dispatcher,
-            capability_registry=self._capability_registry,
+            tool_availability_guard=self._tool_availability_guard,
             artifact_store_ref=self._artifact_store_ref,
             skill_registry=self._skill_registry,
             skill_buffer=self._skill_buffer,
@@ -969,7 +969,7 @@ class ToolRegistry:
         scoped = ToolRegistry(
             permission_pipeline=permission_pipeline,
             hook_dispatcher=self._hook_dispatcher,
-            capability_registry=self._capability_registry,
+            tool_availability_guard=self._tool_availability_guard,
             artifact_store_ref=self._artifact_store_ref,
             skill_registry=self._skill_registry,
             skill_buffer=self._skill_buffer,

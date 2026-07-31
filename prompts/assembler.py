@@ -192,7 +192,31 @@ class PromptAssembler:
         tools: list,
         repo_summary: str | None = None,
     ) -> str:
-        return self.render_system_core_result(repo_path, tools, repo_summary).text
+        """Render base.md with tool descriptions, contracts, and platform info.
+
+        Deprecated: callers should compute the three variables themselves via
+        ``capabilities.render.format_tool_descriptions``,
+        ``capabilities.render.build_tool_contract_rules``, and
+        ``capabilities.render.build_platform_info``, then call
+        ``render("base.md", ...)`` directly.
+        """
+        from capabilities.render import (
+            build_platform_info as _build_platform_info,
+            build_tool_contract_rules as _build_tool_contract_rules,
+            format_tool_descriptions as _format_tool_descriptions,
+        )
+        tool_descriptions = _format_tool_descriptions(tools)
+        tool_contract_rules = _build_tool_contract_rules(tools)
+        platform_info = _build_platform_info()
+        summary = repo_summary or "(Repository summary not yet available - use find_files and file_read to explore)"
+        return self.render(
+            "base.md",
+            repo_path=repo_path,
+            repo_summary=summary,
+            tool_descriptions=tool_descriptions,
+            tool_contract_rules=tool_contract_rules,
+            platform_info=platform_info,
+        )
 
     def render_system_core_result(
         self,
@@ -200,9 +224,15 @@ class PromptAssembler:
         tools: list,
         repo_summary: str | None = None,
     ) -> PromptRenderResult:
-        tool_descriptions = self._format_tool_descriptions(tools)
-        tool_contract_rules = self._build_tool_contract_rules(tools)
-        platform_info = self._build_platform_info()
+        """Deprecated: see ``render_system_core``."""
+        from capabilities.render import (
+            build_platform_info as _build_platform_info,
+            build_tool_contract_rules as _build_tool_contract_rules,
+            format_tool_descriptions as _format_tool_descriptions,
+        )
+        tool_descriptions = _format_tool_descriptions(tools)
+        tool_contract_rules = _build_tool_contract_rules(tools)
+        platform_info = _build_platform_info()
         summary = repo_summary or "(Repository summary not yet available - use find_files and file_read to explore)"
         return self.render_result(
             "base.md",
@@ -271,46 +301,18 @@ class PromptAssembler:
 
     @staticmethod
     def _build_platform_info() -> str:
-        """Declare the platform truth to the LLM — control plane, not secret translation."""
-        import platform as _platform
-        system = _platform.system()
-        if system == "Windows":
-            return (
-                "## Platform\n"
-                "You are running on **Windows**. Available shell: **PowerShell**.\n"
-                "- Use PowerShell commands. Do NOT use Linux commands (wc, grep, find, cat, ls).\n"
-                "- wc → `(Get-Content file).Count`\n"
-                "- grep → `Select-String`\n"
-                "- find → `Get-ChildItem -Recurse`\n"
-                "- cat → `Get-Content`\n"
-                "- ls → `dir` or `Get-ChildItem`\n"
-                "- which → `where` or `Get-Command`"
-            )
-        return (
-            "## Platform\n"
-            "You are running on **Linux/macOS**. Available shell: **bash**.\n"
-        )
+        """Deprecated: use ``capabilities.render.build_platform_info`` instead."""
+        from capabilities.render import build_platform_info
+        return build_platform_info()
 
     @staticmethod
     def _format_tool_descriptions(tools: list) -> str:
-        if not tools:
-            return "(no tools available)"
-        sorted_tools = sorted(tools, key=lambda t: t.name)
-        lines = [f"- **{tool.name}**: {tool.description}" for tool in sorted_tools]
-        return "\n".join(lines)
+        """Deprecated: use ``capabilities.render.format_tool_descriptions`` instead."""
+        from capabilities.render import format_tool_descriptions
+        return format_tool_descriptions(tools)
 
     @staticmethod
     def _build_tool_contract_rules(tools: list) -> str:
-        """Generate mandatory tool usage rules from schema metadata.
-
-        Tool definitions own these rules; the assembler only formats them.
-        """
-        rules = []
-        for tool in tools:
-            for contract in getattr(tool, "prompt_contract", ()):
-                rules.append(
-                    f"- **{tool.name}**: {contract}"
-                )
-        if rules:
-            return "\n## CRITICAL TOOL USAGE RULES\n" + "\n".join(rules)
-        return ""
+        """Deprecated: use ``capabilities.render.build_tool_contract_rules`` instead."""
+        from capabilities.render import build_tool_contract_rules
+        return build_tool_contract_rules(tools)

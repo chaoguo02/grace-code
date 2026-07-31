@@ -841,54 +841,14 @@ class SkillRegistry:
         """
         Format skill list for system prompt injection.
 
-        Aligned with Claude Code frontmatter:
-        - Skills with disable_model_invocation=true are hidden from LLM listing.
-          The user can still invoke them via /name, but the LLM won't auto-load.
-        - user-invocable=false skills are still listed (LLM can auto-load them).
-        - when_to_use is appended to description for semantic matching.
-
-        Args:
-            llm_invocable_only: if True (default), exclude skills that set
-                               disable-model-invocation: true.
+        Compatibility wrapper: prompt-facing skill catalog rendering is owned by
+        capabilities.SkillCapabilityProvider + CapabilityPromptRenderer.
         """
-        entries = self.list_skill_entries()
-        if not entries:
-            return ""
-
-        user_skills = [
-            (name, meta)
-            for name, meta in entries
-            if meta.user_can_invoke
-        ]
-        model_skills = [
-            (name, meta)
-            for name, meta in entries
-            if meta.model_invocable
-        ]
-
-        lines = [
-            "## Available Skills",
-        ]
-
-        # Skills the user can invoke via /name
-        if user_skills:
-            names = ", ".join(f"/{name}" for name, _ in user_skills)
-            lines.append(f"User-invocable: {names}")
-
-        # Skills the LLM can auto-load (respects disable_model_invocation)
-        visible = model_skills if llm_invocable_only else entries
-
-        if visible:
-            lines.append("Use the `Skill` tool to load a skill (PREFERRED — saves context by injecting instructions without duplicating):")
-            for name, meta in visible:
-                desc = meta.description or "(no description)"
-                if meta.when_to_use:
-                    desc += f" (Use when: {meta.when_to_use})"
-                if meta.paths:
-                    desc += f" (Path scope: {', '.join(meta.paths)})"
-                lines.append(f"- **{name}**: {desc}")
-
-        return "\n".join(lines)
+        from capabilities import format_skills_for_prompt
+        return format_skills_for_prompt(
+            self,
+            llm_invocable_only=llm_invocable_only,
+        )
 
     def refresh(self) -> None:
         """Clear discovery memoization and atomically reload changed sources."""

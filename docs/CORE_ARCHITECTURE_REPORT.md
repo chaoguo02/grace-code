@@ -521,7 +521,7 @@ sendChat(prompt)
 ```
 ToolRegistry.execute_tool(name, params)
   │
-  ├── Layer 1: CapabilityRegistry 检查
+  ├── Layer 1: ToolAvailabilityGuard 检查
   │   工具是否物理可用? (MCP 离线 → block)
   │
   ├── Layer 2: Tool.permission_denial_reason()

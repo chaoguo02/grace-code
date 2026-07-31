@@ -105,7 +105,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
     ) -> None:
         super().__init__(
             hook_dispatcher=base.hook_dispatcher,
-            capability_registry=base.capability_registry,
+            tool_availability_guard=base.tool_availability_guard,
             artifact_store_ref=base.artifact_store_ref,
             skill_registry=base.skill_registry,
             skill_buffer=base.skill_buffer,

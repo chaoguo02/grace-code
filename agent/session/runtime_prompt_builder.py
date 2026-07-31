@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from agent.session.models import DelegationMode, SessionMode, WorkspaceMode
+from agent.session.models import DelegationMode, SessionMode
 
 if TYPE_CHECKING:
     from agent.session.models import AgentDefinition
@@ -23,7 +23,9 @@ def build_runtime_messages(
     agent_registry=None,
     project_dir: str | None = None,
     skill_registry=None,
+    mcp_integration=None,
     on_skill_preload: Any = None,
+    inject_capability_context: bool = True,
 ) -> list["LLMMessage"]:
     """Build runtime-injected messages for a session.
 
@@ -32,8 +34,7 @@ def build_runtime_messages(
       - Persistent memory context (if spec.memory is set)
     For primary agents additionally injects:
       - Plan mode injection (for analysis agents)
-      - Subagent delegation rules + available subagent list
-      - Available Skills listing (CC-aligned Phase 1)
+      - One unified capability context for Skills, MCP, and Subagents
     """
     from llm.base import LLMMessage
     messages: list[LLMMessage] = []
@@ -63,12 +64,22 @@ def build_runtime_messages(
                         "from previous sessions. Update it after completing work."
             ))
 
-    if skill_registry is not None and "Skill" in spec.tools:
-        skill_listing = skill_registry.format_for_prompt(
-            llm_invocable_only=True,
+    capability_context = ""
+    if inject_capability_context:
+        # TODO(capabilities): Migrate capability context injection to ContextManager.
+        from capabilities import build_capability_context
+        capability_context = build_capability_context(
+            spec=spec,
+            skill_registry=skill_registry,
+            mcp_integration=mcp_integration,
+            agent_registry=agent_registry,
         )
+    if not capability_context and inject_capability_context and skill_registry is not None and "Skill" in spec.tools and hasattr(skill_registry, "format_for_prompt"):
+        skill_listing = skill_registry.format_for_prompt(llm_invocable_only=True)
         if skill_listing:
-            messages.append(LLMMessage(role="user", content=skill_listing))
+            capability_context = "[CAPABILITY CONTEXT]\n\n## Skills\n" + skill_listing
+    if capability_context:
+        messages.append(LLMMessage(role="user", content=capability_context))
 
     if spec.mode != SessionMode.PRIMARY:
         return messages
@@ -102,80 +113,6 @@ def build_runtime_messages(
         return messages
     if agent_registry is None:
         raise ValueError("delegation prompt requires an agent registry")
-
-    # Dynamically generate subagent descriptions from the registry
-    available_subagents = (
-        agent_registry.delegatable_by(spec)
-    )
-    if not available_subagents:
-        return messages
-    subagent_descriptions = "\n".join(
-        f"- **{s.name}** (workspace={s.workspace_mode.value}): {s.description}"
-        for s in available_subagents
-    )
-    has_worktree_subagent = any(
-        child.workspace_mode is WorkspaceMode.WORKTREE
-        for child in available_subagents
-    )
-    worktree_review_protocol = (
-        "\nWorktree Result Protocol (MANDATORY):\n"
-        "- A worktree child edits an isolated Git worktree; its changes are NOT "
-        "automatically present in the parent workspace.\n"
-        "- If task-notification reports worktree-disposition=preserved, call "
-        "subagent_worktree_inspect with that child session id.\n"
-        "- Apply an acceptable result with subagent_worktree_apply using the exact "
-        "revision returned by inspection, then verify the parent workspace.\n"
-        "- If you do not apply it, report the preserved path and revision. Never "
-        "claim that preserved changes landed in the parent workspace. First call "
-        "subagent_worktree_retain with the inspected revision so the decision is "
-        "recorded as an objective state transition.\n"
-        "- Discard only when the result is definitively unwanted; discarding is "
-        "permanent and also requires the inspected revision.\n"
-        if has_worktree_subagent
-        else ""
-    )
-    from agent.session.models import DelegationScope
-    delegation_boundary = (
-        "- This session has a read-only delegation scope. Never delegate "
-        "edits, shell execution, or any other write-capable work.\n"
-        if spec.effective_delegation_scope is DelegationScope.READ_ONLY
-        else ""
-    )
-    content = (
-        "[Available Subagents]\n"
-        f"Available subagent types:\n{subagent_descriptions}\n"
-        f"{delegation_boundary}"
-        "- Select only from the listed types. To delegate, call Agent(subagent_type=\"explore\").\n\n"
-        "Delegation rules (Runtime-enforced where possible):\n"
-        "- Subagents run in FRESH context — include ALL needed context in the prompt.\n"
-        "- Each task MUST specify SCOPE (1-3 files), CONSTRAINTS (at least one "
-        "negative), and DELIVERABLE (exact output expected).\n"
-        "- Do simple or tightly coupled work yourself. Delegate only when "
-        "specialization, context isolation, or parallelism has a clear benefit.\n"
-        "- Use Agent for one bounded worker. For 2-4 independent tasks or a "
-        "small dependency chain, use AgentBatch once with explicit task ids, "
-        "scope, dependencies, expected files, write files, and deliverables.\n"
-        "- If ProposeAgentTeam is available, use it only when peers must "
-        "message one another or coordinate through a shared task board. A "
-        "proposal never implies user approval or teammate activation.\n"
-        "- Independent read-only or isolated-worktree tasks may fan out. "
-        "Dependent tasks run in later waves; shared-workspace edits are serial.\n"
-        "- Select the specialist whose description matches the task; do not "
-        "route every investigation to the same generic worker.\n"
-        "- Runtime enforces retry limits, loop detection, and circuit breaking — "
-        "no need to count retries yourself.\n"
-        "- When a subagent fails, read its <failure-diagnosis> and either retry "
-        "once or handle the work yourself.\n"
-        "- After a subagent completes, you can resume it with a follow-up task "
-        "using SendMessage(to=\"{session_id}\") — the <resume-hint> in each "
-        "completion notification shows the session ID.\n\n"
-        "Result review:\n"
-        "- Prefer structured findings from submit_findings (<subagent-report> XML).\n"
-        "- Claims without file path + line + code evidence → mark [UNVERIFIED].\n"
-        "- Never verbatim-forward — re-express in your own words.\n"
-        f"{worktree_review_protocol}"
-    )
-    messages.append(LLMMessage(role="user", content=content))
 
     return messages
 

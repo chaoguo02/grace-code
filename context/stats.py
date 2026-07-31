@@ -33,6 +33,13 @@ class ContextStats:
     repo_map_tokens: int = 0       # repo map 单独拆出（project 的子集）
     artifact_summary_tokens: int = 0  # artifact 摘要
 
+    # capability context metadata
+    capability_fingerprint: str = ""
+    capability_descriptor_count: int = 0
+    capability_sections: list[str] = field(default_factory=list)
+    capability_token_estimate: int = 0
+    capability_trimmed_count: int = 0
+
     # broad analysis phase metadata
     analysis_phase: str = ""
     analysis_files_read: int = 0
@@ -76,6 +83,13 @@ class ContextStats:
         ]
         if self.artifact_summary_tokens:
             parts.append(f"artifacts {_k(self.artifact_summary_tokens)}")
+        if self.capability_sections:
+            parts.append(
+                f"capabilities {self.capability_fingerprint or 'none'} "
+                f"sections {len(self.capability_sections)} "
+                f"tokens {_k(self.capability_token_estimate)} "
+                f"trimmed {self.capability_trimmed_count}"
+            )
         if self.analysis_phase:
             parts.append(
                 f"analysis {self.analysis_phase} "
@@ -126,6 +140,11 @@ class ContextTrace:
                 "task_tokens": self.stats.task_tokens,
                 "repo_map_tokens": self.stats.repo_map_tokens,
                 "artifact_summary_tokens": self.stats.artifact_summary_tokens,
+                "capability_fingerprint": self.stats.capability_fingerprint,
+                "capability_descriptor_count": self.stats.capability_descriptor_count,
+                "capability_sections": list(self.stats.capability_sections),
+                "capability_token_estimate": self.stats.capability_token_estimate,
+                "capability_trimmed_count": self.stats.capability_trimmed_count,
                 "analysis_phase": self.stats.analysis_phase,
                 "analysis_files_read": self.stats.analysis_files_read,
                 "analysis_inspect_reads": self.stats.analysis_inspect_reads,

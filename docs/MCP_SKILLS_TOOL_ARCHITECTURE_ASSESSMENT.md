@@ -77,7 +77,7 @@ Pipeline       ✅           ✅           ⚠️ filtered()丢cb  N/A
 | C3 | `agent/mcp/client.py:452` | class-level `_next_id` 无锁 → 并发 MCP 调用 request ID 冲突 |
 | C4 | `agent/mcp/sync_bridge.py:92` | daemon thread → 硬退出时 MCP 子进程变孤儿进程 |
 | C5 | `core/policy_registry.py:329-355` | Skill modifier 跨 turn 累积不清除 |
-| C6 | `core/base.py:738-742` | `filtered()` 创建新 registry 不传 `capability_registry` |
+| C6 | `core/base.py:738-742` | `filtered()` 创建新 registry 不传 `tool_availability_guard` |
 | C7 | `core/tool_execution.py:169-232` | 仅 MCP 工具有 resource governance + timeout，ShellTool 无保护 |
 
 #### 🟡 High
@@ -381,7 +381,7 @@ McpRegistry.connect_all()                    MCPManager.start()
 | C1 | `build_tool()` 工厂模式 — 替代手动 import+register |
 | C2 | 工具缓存分区排序 — built-in 前缀稳定 prompt cache |
 | C3 | 渐进式 MCP tool 加载 — ToolSearch 模式 |
-| C4 | `filtered()` 修复 — 传递 `capability_registry` |
+| C4 | `filtered()` 修复 — 传递 `tool_availability_guard` |
 | C5 | 非 MCP 工具也接入 ResourceGovernor + timeout |
 
 ---
@@ -402,7 +402,7 @@ McpRegistry.connect_all()                    MCPManager.start()
 
 - **Skill modifier 跨 turn 累积** 是最隐蔽的 bug——它不会 crash，不会报错，只是让 Skill 的 allowed-tools/disallowed-tools 限制逐渐偏离预期。
 - **MCP 僵尸进程挂死 shutdown** 在生产环境中是真实风险——一旦发生，进程无法优雅退出，需要外部 kill。
-- **`filtered()` 丢失 `capability_registry`** 意味着特定场景下工具拦截静默失效——这是安全漏洞。
+- **`filtered()` 丢失 `tool_availability_guard`** 意味着特定场景下工具拦截静默失效——这是安全漏洞。
 
 ### 哪些可以先放放？
 

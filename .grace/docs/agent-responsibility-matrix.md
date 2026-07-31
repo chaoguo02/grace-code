@@ -14,12 +14,12 @@
 | **限制时间** | — | ✅ | `CircuitBreaker.elapsed_seconds` | 超时强制终止 |
 | **声明"完成"** | 提议 | ✅ | `CompletionGuard` | LLM调用FINISH只是提议，Runtime验证后才接受 |
 | **任务状态转换** | — | ✅ | `TaskStateMachine` | PENDING→RUNNING→COMPLETING→COMPLETED，非法转换抛ValueError |
-| **创建子Agent** | 提议(via task tool) | ✅ | `CircuitBreaker` + `CapabilityRegistry` | 限制数量、类型，循环检测后物理阻止 |
+| **创建子Agent** | 提议(via task tool) | ✅ | `CircuitBreaker` + `ToolAvailabilityGuard` | 限制数量、类型，循环检测后物理阻止 |
 | **子Agent工具集** | — | ✅ | `AgentDefinition.tools` + `disallowed_tools` | 代码层过滤，子Agent看不到无权使用的工具 |
 | **重试失败** | — | ✅ | LLM重试+指数退避（`_call_with_retry`）/ 工具级熔断（`CircuitBreaker`） | 代码决定重试策略 |
 | **循环检测** | — | ✅ | `_is_looping()` + `MacroLoopDetector` | 检测到循环立即终止，不注入提示 |
 | **熔断** | — | ✅ | `CircuitBreaker` | CLOSED→HALF_OPEN→OPEN，每一步检查 |
-| **工具可用性** | — | ✅ | `CapabilityRegistry` | ACTIVE→CIRCUIT_OPEN→HALF_OPEN→UNAVAILABLE |
+| **工具可用性** | — | ✅ | `ToolAvailabilityGuard` | ACTIVE→CIRCUIT_OPEN→HALF_OPEN→UNAVAILABLE |
 | **权限检查** | — | ✅ | `PermissionPipeline` (5层) | 安全黑名单不可覆盖 |
 | **上下文窗口** | — | ✅ | `ContextManager` + Compaction | Token预算约束，自动压缩 |
 | **记忆分类** | ✅ (内容提取) | ✅ (scope/TTL管理) | `memory/store.py` + `extractor.py` | LLM提取内容，Runtime管理生命周期 |
@@ -44,7 +44,7 @@ LLM调用FINISH只是一个**提议**。Runtime通过`CompletionGuard`验证：
 ### 2. 模型不能绕过工具限制
 即使LLM"认为"它需要某个工具，如果该工具：
 - 不在Agent定义的允许列表中
-- 被CapabilityRegistry标记为不可用
+- 被ToolAvailabilityGuard标记为不可用
 - 被PermissionPipeline拒绝
 
 则Runtime会阻止执行，模型只能看到错误反馈。
@@ -61,7 +61,7 @@ LLM调用FINISH只是一个**提议**。Runtime通过`CompletionGuard`验证：
 - 受限工具集（由AgentDefinition定义）
 - 独立熔断器（父熔断器不受影响）
 - 共享Token预算（子Agent消耗计入父Agent）
-- 可被物理阻止（循环检测后CapabilityRegistry移除该类型）
+- 可被物理阻止（循环检测后ToolAvailabilityGuard移除该类型）
 
 ## 反模式（应该避免）
 
@@ -72,4 +72,4 @@ LLM调用FINISH只是一个**提议**。Runtime通过`CompletionGuard`验证：
 | 信任模型的"我已完成"声明 | 模型可能过早声明完成 | Runtime验证所有完成条件 |
 | 让模型管理自己的预算 | 模型不理解token概念 | ExecutionBudget代码层强制执行 |
 | 用提示限制子Agent行为 | 提示不可靠 | AgentDefinition工具限制+熔断器 |
-| 在提示中处理工具不可用 | 模型会反复尝试 | CapabilityRegistry物理移除工具 |
+| 在提示中处理工具不可用 | 模型会反复尝试 | ToolAvailabilityGuard物理移除工具 |

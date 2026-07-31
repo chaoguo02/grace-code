@@ -36,7 +36,7 @@ class ToolExecutionPipeline:
         *,
         permission_pipeline: Any = None,
         hook_dispatcher: Any = None,
-        capability_registry: Any = None,
+        tool_availability_guard: Any = None,
         session_id: str = "",
         budget: Any = None,
         resource_governor: Any = None,
@@ -45,7 +45,7 @@ class ToolExecutionPipeline:
     ) -> None:
         self._permission_pipeline = permission_pipeline
         self._hook_dispatcher = hook_dispatcher
-        self._capability_registry = capability_registry
+        self._tool_availability_guard = tool_availability_guard
         self._session_id = session_id
         self._budget = budget
         self._resource_governor = resource_governor
@@ -68,9 +68,9 @@ class ToolExecutionPipeline:
         if validation_error is not None:
             return validation_error
 
-        capability_error = self._check_capability(tool)
-        if capability_error is not None:
-            return capability_error
+        availability_error = self._check_tool_availability(tool)
+        if availability_error is not None:
+            return availability_error
 
         # ── Per-tool budget gate (EXHAUSTED only — WARNING/CRITICAL
         #     are handled per-step to avoid double-penalty message injection) ──
@@ -351,16 +351,16 @@ class ToolExecutionPipeline:
             detail=validation.error_message,
         )
 
-    def _check_capability(self, tool: "BaseTool") -> "ToolResult | None":
-        if self._capability_registry is None:
+    def _check_tool_availability(self, tool: "BaseTool") -> "ToolResult | None":
+        if self._tool_availability_guard is None:
             return None
 
         import json
 
-        from agent.capability_registry import InterceptDecision
+        from agent.tool_availability_guard import InterceptDecision
         from core.base import ToolResult
 
-        intercept = self._capability_registry.intercept(
+        intercept = self._tool_availability_guard.intercept(
             tool.name,
             session_id=self._session_id,
         )

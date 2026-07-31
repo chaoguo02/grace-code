@@ -12,7 +12,7 @@ pytest.importorskip("mcp.server")
 
 from agent.mcp.client import MCPToolBridge
 from agent.mcp.types import MCPServerConfig
-from agent.capability_registry import CapabilityRegistry
+from agent.tool_availability_guard import ToolAvailabilityGuard
 from agent.session.agent_registry import AgentRegistryV2
 from agent.session.mcp_integration import MCPToolIntegration
 from agent.session.runtime import SessionRuntime
@@ -180,14 +180,14 @@ def test_plan_session_includes_skill_mcp_dependencies_as_deferred_tools() -> Non
         integration.initialize()
         integration.register_into(registry)
         registry.attach_mcp_integration(integration)
-        capability_registry = CapabilityRegistry()
+        tool_availability_guard = ToolAvailabilityGuard()
         for name in integration.tool_names:
-            capability_registry.register(name)
+            tool_availability_guard.register(name)
 
         runtime = SessionRuntime.__new__(SessionRuntime)
         runtime._mcp_integration = integration
         runtime._base_registry = registry
-        runtime._capability_registry = capability_registry
+        runtime._tool_availability_guard = tool_availability_guard
         plan_spec = AgentRegistryV2(PROJECT_ROOT).get("plan")
 
         names = runtime._mcp_tool_names_for_spec(plan_spec)

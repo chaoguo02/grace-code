@@ -247,6 +247,7 @@ class ContextManager:
         system_core_text: str,
         variable_text: str = "",
         long_term_context: str | None = None,
+        capability_sections: list | None = None,
         task_anchor: str | None = None,
         artifact_store: "ArtifactStore | None" = None,
         consumed_tokens: int = 0,
@@ -268,6 +269,7 @@ class ContextManager:
             system_core_text: 系统核心 prompt 文本（已含 repo_map）
             variable_text: 可变 prompt 部分（auto_memory 指导等）
             long_term_context: 长期记忆上下文
+            capability_sections: 结构化能力上下文 sections（Skills/MCP/Subagents）
             task_anchor: 任务锚点 prompt
             artifact_store: artifact 存储（用于统计）
             consumed_tokens: 本轮之前已消耗 token
@@ -355,6 +357,24 @@ class ContextManager:
         # Assemble messages
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_content)]
 
+        capability_context = ""
+        capability_selected: list = []
+        capability_trimmed_count = 0
+        if capability_sections:
+            from capabilities.context import render_capability_selection
+            capability_context, capability_selected, capability_trimmed_count = (
+                render_capability_selection(
+                    capability_sections,
+                    max_tokens=min(12_000, max(1, plan.repo_map)),
+                )
+            )
+        if capability_context:
+            messages.append(LLMMessage(role="user", content=capability_context))
+            messages.append(LLMMessage(
+                role="assistant",
+                content="Understood. I will use the available capabilities as needed.",
+            ))
+
         if long_term_context:
             messages.append(LLMMessage(role="user", content=long_term_context))
             messages.append(LLMMessage(
@@ -391,6 +411,8 @@ class ContextManager:
             compact_triggered=compact_triggered,
             artifact_store=artifact_store,
             repo_map_text=repo_map_text,
+            capability_selected=capability_selected,
+            capability_trimmed_count=capability_trimmed_count,
         )
         if context_plan is not None:
             stats.compact_reason = context_plan.reason
@@ -492,6 +514,8 @@ class ContextManager:
         compact_triggered: bool,
         artifact_store: "ArtifactStore | None" = None,
         repo_map_text: str = "",
+        capability_selected: list | None = None,
+        capability_trimmed_count: int = 0,
     ) -> ContextStats:
         """测量 context stats。"""
         from context.token_budget import _estimate_msg_tokens
@@ -517,6 +541,26 @@ class ContextManager:
         if artifact_store and artifact_store.count > 0:
             artifact_summary_tokens = artifact_store.total_tokens_stored
 
+        # --- capability stats ---
+        capability_selected = capability_selected or []
+        capability_fingerprint = ""
+        capability_descriptor_count = 0
+        capability_section_titles: list[str] = []
+        capability_token_estimate = 0
+
+        if capability_selected:
+            from capabilities.context import capability_sections_fingerprint
+            capability_fingerprint = capability_sections_fingerprint(capability_selected)
+            capability_descriptor_count = sum(
+                getattr(s, "descriptor_count", 0) for s in capability_selected
+            )
+            capability_section_titles = [
+                getattr(s, "title", "") for s in capability_selected
+            ]
+            capability_token_estimate = sum(
+                getattr(s, "token_estimate", 0) for s in capability_selected
+            )
+
         return ContextStats(
             request_budget_tokens=budget_total,
             estimated_total_tokens=total_est,
@@ -529,4 +573,9 @@ class ContextManager:
             artifact_summary_tokens=artifact_summary_tokens,
             omitted_tokens=max(0, original_history_tokens - task_tokens),
             compact_triggered=compact_triggered,
+            capability_fingerprint=capability_fingerprint,
+            capability_descriptor_count=capability_descriptor_count,
+            capability_sections=capability_section_titles,
+            capability_token_estimate=capability_token_estimate,
+            capability_trimmed_count=capability_trimmed_count,
         )
