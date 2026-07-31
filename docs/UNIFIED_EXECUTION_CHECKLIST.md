@@ -40,7 +40,7 @@
 
 ## 6. Pre-Implementation Non-Negotiables
 
-- [ ] 6.1 Dual-Stack `_turn_modifiers` / `_run_modifiers` data structures are in Phase 1 (not deferred to Phase 3)
+- [x] 6.1 Dual-Stack `_turn_modifiers` / `_run_modifiers` data structures are in Phase 1 (not deferred to Phase 3)
 - [ ] 6.2 `__legacy_skill_loader` has zero production code-path dependencies (audit before Phase 1 ships)
 - [x] 6.3 `TURN` modifier fault injection test: `SkillActivationTool.execute()` raises → `after_tool_use` still pops
-- [ ] 6.4 Evidence `tool_source` literals (`"system"` / `"mcp"` / `"project"`) defined in single module (core/types.py)
+- [x] 6.4 Evidence `tool_source` literals (`"system"` / `"mcp"` / `"project"`) defined in single module (core/types.py)
