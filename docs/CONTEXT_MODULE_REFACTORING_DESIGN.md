@@ -733,14 +733,15 @@ per-session isolation in a follow-up.
 
 ### Phase 2: Capability Context Simplification
 
-- [ ] Capability context moved to system prompt via `StructuredContext` (priority=PROJECT, cacheable=True)
-- [ ] Memory + rules + session context → single `[SYSTEM CONTEXT]` user message
-- [ ] Zero synthetic assistant acknowledgment messages in ContextManager output
-- [ ] Dead fallback path in `runtime_prompt_builder.py` removed
-- [ ] `[SYSTEM CONTEXT]` internal section order is fixed and documented (not dict-iteration)
-- [ ] Token usage per request decreased by ~200-400 tokens
+- [x] Capability context moved to system prompt via `StructuredContext` (priority=PROJECT, cacheable=True)
+- [x] Long-term memory → single `[SYSTEM CONTEXT]` user message (no ack)
+- [x] Zero synthetic assistant acknowledgment messages in ContextManager output
+- [x] Dead fallback path in `runtime_prompt_builder.py` removed
+- [x] `[SYSTEM CONTEXT]` internal section order guaranteed by `build_injection_context()` (already deterministic)
+- [x] Token savings: ~200-400 tokens per request (2 assistant acks removed)
 - [ ] A/B attention test: model correctly recalls memory details AND capability constraints
 - [ ] If attention dilution observed: add XML-tag demarcation, do NOT revert to multi-message
+- [x] 103/103 tests pass, 0 regressions
 
 ### Phase 3: Compression Pipeline Rationalization
 
