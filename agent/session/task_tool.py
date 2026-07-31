@@ -135,6 +135,9 @@ class AgentTool(BaseTool):
         self._caller_agent_name = caller_agent_name
         self._circuit_breaker = circuit_breaker
         self._run_context = None
+        self._restrict_to_foreground: bool = False
+        """When True, execution_placement schema allows only 'foreground'.
+        Set by registry_builder for Plan/Build (serial) modes."""
         delegation_scope = (
             runtime.agent_registry.get(caller_agent_name)
             .effective_delegation_scope
@@ -530,13 +533,20 @@ class AgentTool(BaseTool):
                 },
                 "execution_placement": {
                     "type": "string",
-                    "enum": [
-                        ExecutionPlacement.AUTO.value,
-                        ExecutionPlacement.FOREGROUND.value,
-                        ExecutionPlacement.BACKGROUND.value,
-                    ],
+                    "enum": (
+                        [ExecutionPlacement.FOREGROUND.value]
+                        if self._restrict_to_foreground
+                        else [
+                            ExecutionPlacement.AUTO.value,
+                            ExecutionPlacement.FOREGROUND.value,
+                            ExecutionPlacement.BACKGROUND.value,
+                        ]
+                    ),
                     "description": (
-                        "Use foreground when this result is required before the "
+                        "Serial mode: only foreground is available. "
+                        "The worker must complete before the parent continues."
+                        if self._restrict_to_foreground
+                        else "Use foreground when this result is required before the "
                         "next step; use background for independent concurrent work."
                     ),
                 },
@@ -612,6 +622,15 @@ class AgentTool(BaseTool):
             facts=plan.facts,
             run_context=run_context,
         )
+
+        # ── Serial mode: force foreground, ignore model's background request ──
+        _mp = getattr(run_context, "mode_policy", None)
+        if (
+            _mp is not None
+            and _mp.delegation_strategy == "serial"
+            and execution_placement is ExecutionPlacement.BACKGROUND
+        ):
+            execution_placement = ExecutionPlacement.FOREGROUND
 
         prompt = (
             plan.user_prompt
@@ -696,6 +715,9 @@ class AgentTool(BaseTool):
                 budget_tokens=run_context.delegation_token_limit,
                 parent_max_steps=run_context.delegation_step_limit,
                 cancellation_token=run_context.cancellation,
+                mode_policy=getattr(run_context, "mode_policy", None),
+                evidence_store=getattr(run_context, "evidence_store", None),
+                evidence_scope=getattr(run_context, "evidence_scope", None),
                 parent_policy=(
                     run_context.phase_policy
                     if plan.facts.is_fork

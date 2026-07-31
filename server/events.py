@@ -136,6 +136,8 @@ class WsObservation:
     step: int = 0
     id: str = ""
     diff: str = ""
+    evidence: dict | None = None
+    """Evidence metadata: {evidence_id, kind, status, cached, source_fingerprint}"""
     child_session_id: str = ""
     timestamp: str = ""
     # ── EventEnvelope ──
@@ -146,6 +148,24 @@ class WsObservation:
     sequence: int = 0
     block_id: str = ""       # NOT created — observation updates tool_use block
     tool_call_id: str = ""   # matches tool_call's id
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+@dataclass
+class WsEvidenceRecord:
+    """One persisted evidence row projected to trace/WS after DB commit."""
+
+    type: Literal["evidence_record"] = "evidence_record"
+    evidence: dict = field(default_factory=dict)
+    session_id: str = ""
+    run_id: str = ""
+    turn_id: str = ""
+    event_id: str = ""
+    sequence: int = 0
+    block_id: str = ""
+    tool_call_id: str = ""
 
     def to_dict(self) -> dict:
         return _to_dict(self)
@@ -437,6 +457,7 @@ class WsRunTerminal:
     verification_reason: str = ""
     verification: dict = field(default_factory=dict)
     workspace_delta: dict = field(default_factory=dict)
+    evidence_summary: dict = field(default_factory=dict)
     timestamp: str = ""
     session_id: str = ""
     event_id: str = ""

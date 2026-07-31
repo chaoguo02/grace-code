@@ -83,20 +83,16 @@ def build_restricted_registry(
         )
         restricted_registry.register(submit_findings_tool)
 
-    if session is not None:
-        if agent_registry is None or runtime is None:
-            raise ValueError(
-                "Nested delegation registry requires agent_registry and runtime"
-            )
-        from agent.session.registry_builder import attach_delegation_tools
-        attach_delegation_tools(
-            restricted_registry,
-            definition,
-            session,
-            agent_registry=agent_registry,
-            runtime=runtime,
-            circuit_breaker=circuit_breaker,
-        )
+    # ── Worker delegation prevention (Layer 1 — structural) ──
+    # Workers NEVER get Agent/AgentBatch. This applies to ALL child types:
+    # named subagent, fork, and background resume.
+    # Three-layer defense:
+    #   1. excluding_roles({ToolRole.DELEGATE}) above removes all DELEGATE tools
+    #   2. attach_delegation_tools is NOT called for any worker
+    #   3. spawn_agent depth check (Layer 2) is the runtime backstop
+    # Worker definitions may declare Agent/AgentBatch in disallowed_tools
+    # for readability (Layer 3), but the structural Layers 1+2 are the
+    # authoritative source of truth.
 
     # Phase-policy wrap
     wrapped_registry = PolicyAwareToolRegistry(

@@ -358,6 +358,20 @@ class ChatSession:
         rendered = self._skill_registry.load_and_render(name, args, runtime=self._runtime)
         if rendered is None:
             return None
+        from skills.activation import SkillActivationService
+        activation = SkillActivationService(self._skill_registry).activate(
+            name,
+            source="cli_slash",
+            session_id=self._root_session_id,
+        )
+        if activation is not None:
+            self._runtime.record_skill_activation(
+                activation.skill_name,
+                source=activation.source,
+                fingerprint=activation.fingerprint,
+                mcp_dependencies=list(activation.mcp_dependencies),
+                session_id=activation.session_id,
+            )
         if meta.context == "fork":
             self._run_skill_fork(name, rendered, meta)
         else:

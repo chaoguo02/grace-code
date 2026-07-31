@@ -21,6 +21,7 @@ from agent.session.models import (
     
     SessionMode,
     SessionStatus,
+    WorktreeDisposition,
 )
 from agent.session.run_context import AgentSpawnContext, CancellationToken, ToolSchemaSnapshot
 from agent.session.task_contract import TaskContract
@@ -62,6 +63,9 @@ def spawn_agent(
     child_metadata: dict[str, object] | None = None,
     child_created_callback=None,
     parent_budget=None,
+    mode_policy=None,
+    evidence_store=None,
+    evidence_scope=None,
 ):
     from core.policy import PhasePolicy
     if budget_tokens <= 0:
@@ -89,6 +93,16 @@ def spawn_agent(
             f"Maximum configured subagent depth reached ({max_depth})"
         )
     parent_definition = self._agent_registry.get(parent.agent_name)
+
+    # ── Serial delegation enforcement via ResourceGovernor ──
+    # Build/Plan modes use the governor to enforce at-most-one worker.
+    # The governor's per-run capacity is set via set_limit_for_run() with
+    # the root_session_id as the scope key (serial is per-session-tree).
+    _is_serial = (
+        mode_policy is not None
+        and mode_policy.delegation_strategy == "serial"
+    )
+
     if request.agent_kind is AgentKind.NAMED_SUBAGENT:
         definition = request.definition
         if definition is None:
@@ -171,24 +185,55 @@ def spawn_agent(
             queue_timeout = float(
                 getattr(queue_cfg, "timeout_seconds", 120.0)
             )
+            # ── Serial mode: enforce at-most-one worker via governor ──
+            if _is_serial:
+                governor.set_limit_for_run(
+                    root_id, ResourceKind.WORKER_SLOT, 1,
+                )
             metadata = child_metadata or {}
             gov_request = ResourceRequest(
                 request_id=f"spawn-{uuid.uuid4().hex}",
                 root_session_id=root_id,
                 session_id=parent.id,
-                run_id=str(metadata.get("delegation_run_id", "")),
+                run_id=(
+                    root_id
+                    if _is_serial
+                    else str(metadata.get("delegation_run_id", ""))
+                ),
                 task_id=str(metadata.get("delegation_task_id", "")),
                 resources={ResourceKind.WORKER_SLOT: 1},
-                timeout_s=queue_timeout,
+                timeout_s=(
+                    0.0 if _is_serial
+                    else queue_timeout
+                ),
                 cancel_token=cancellation_token,
             )
-            gov_result = governor.admit_wait(gov_request)
+            if _is_serial:
+                # fail-fast: don't queue in serial mode
+                gov_result = governor.admit(gov_request)
+                if gov_result.outcome == AdmissionOutcome.QUEUED:
+                    governor.cancel_request(gov_request.request_id)
+                    raise ResourceAdmissionError(
+                        AdmissionOutcome.CAPACITY_TIMEOUT,
+                        ResourceKind.WORKER_SLOT,
+                        "Serial delegation busy: a worker is already active. "
+                        "Build/Plan mode runs workers one at a time.",
+                    )
+                if gov_result.outcome != AdmissionOutcome.GRANTED:
+                    raise ResourceAdmissionError(
+                        gov_result.outcome,
+                        ResourceKind.WORKER_SLOT,
+                        gov_result.reason,
+                    )
+            else:
+                gov_result = governor.admit_wait(gov_request)
             if gov_result.outcome != AdmissionOutcome.GRANTED:
-                raise ResourceAdmissionError(
-                    gov_result.outcome,
-                    ResourceKind.WORKER_SLOT,
-                    gov_result.reason,
-                )
+                if not _is_serial:  # serial already raised above
+                    raise ResourceAdmissionError(
+                        gov_result.outcome,
+                        ResourceKind.WORKER_SLOT,
+                        gov_result.reason,
+                    )
             gov_lease = gov_result.lease
             if budget_reservation is not None:
                 budget_event_request = ResourceRequest(
@@ -284,6 +329,31 @@ def spawn_agent(
             "source_repo_path": parent_repo,
             },
         )
+        # ── Evidence: WORKER_STARTED ──
+        if evidence_store is not None:
+            from agent.session.run_evidence import (
+                EvidenceEntry, EvidenceKind, EvidenceStatus,
+                idempotency_key_for_worker,
+            )
+            import uuid as _uuid_mod
+            evidence_store.record(EvidenceEntry(
+                evidence_id=f"ev_{_uuid_mod.uuid4().hex[:12]}",
+                idempotency_key=idempotency_key_for_worker(
+                    "start", child.id, child.generation,
+                ),
+                root_run_id="",  # auto-filled by store
+                session_id=child.id,
+                producer_session_id=child.id,
+                kind=EvidenceKind.WORKER_STARTED,
+                status=EvidenceStatus.STARTED,
+                tool_name=child_agent_type,
+                metadata={
+                    "required": bool((child_metadata or {}).get("required", True)),
+                    "delegation_task_id": str(
+                        (child_metadata or {}).get("delegation_task_id", "")
+                    ),
+                },
+            ))
     except Exception:
         # Release governor lease on session creation failure (lease is
         # idempotent — _execute_child_session's finally is a safety net).
@@ -344,18 +414,46 @@ def spawn_agent(
     # Connect agent-scoped MCP servers (CC-aligned: inline mcpServers)
     _agent_mcp_tools = []
     if self._mcp_integration is not None and not is_fork:
-        _agent_mcp_tools = self._mcp_integration.connect_agent_servers(definition)
+        _agent_mcp_tools = self._mcp_integration.connect_agent_servers(
+            definition, evidence_store=evidence_store,
+            session_id=child.id,
+        )
 
-    execute = lambda: self._execute_child_session(
-        parent=parent, child=child, request=request,
-        definition=definition, parent_definition=parent_definition,
-        contract=child_contract, cancellation_token=child_cancellation,
-        parent_policy=parent_policy, repo_path=_repo,
-        child_agent_type=child_agent_type, spawn_context=spawn_context,
-        gov_lease=gov_lease,
-        budget_reservation=budget_reservation,
-        budget_event_request=budget_event_request,
+    if evidence_store is not None:
+        evidence_store.retain()
+    child_evidence_scope = (
+        evidence_scope.fork()
+        if evidence_scope is not None
+        and callable(getattr(evidence_scope, "fork", None))
+        else evidence_scope
     )
+
+    def execute():
+        try:
+            return self._execute_child_session(
+                parent=parent, child=child, request=request,
+                definition=definition, parent_definition=parent_definition,
+                contract=child_contract, cancellation_token=child_cancellation,
+                parent_policy=parent_policy, repo_path=_repo,
+                child_agent_type=child_agent_type, spawn_context=spawn_context,
+                gov_lease=gov_lease,
+                budget_reservation=budget_reservation,
+                budget_event_request=budget_event_request,
+                mode_policy=mode_policy,
+                evidence_store=evidence_store,
+                evidence_scope=child_evidence_scope,
+            )
+        finally:
+            if (
+                evidence_scope is not None
+                and child_evidence_scope is not evidence_scope
+                and callable(
+                    getattr(evidence_scope, "merge_consumed_child", None)
+                )
+            ):
+                evidence_scope.merge_consumed_child(child_evidence_scope)
+            if evidence_store is not None:
+                evidence_store.release()
     _need_mcp_cleanup = bool(_agent_mcp_tools) and self._mcp_integration is not None
     cleanup = None
     if _need_mcp_cleanup:
@@ -367,19 +465,32 @@ def spawn_agent(
         finally:
             if cleanup is not None:
                 cleanup()
-    return self._start_background_execution(
-        parent=parent, child=child, agent_name=definition.name,
-        execute=execute, cleanup=cleanup,
-    )
+    try:
+        return self._start_background_execution(
+            parent=parent, child=child, agent_name=definition.name,
+            execute=execute, cleanup=cleanup,
+        )
+    except Exception:
+        # The worker closure owns the lease only after the background thread
+        # has been accepted. A scheduling failure must not leak it.
+        if evidence_store is not None:
+            evidence_store.release()
+        if cleanup is not None:
+            cleanup()
+        raise
 
 
 def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                            definition, parent_definition, contract, cancellation_token,
                            parent_policy, repo_path, child_agent_type, spawn_context,
                            persisted_messages=None, gov_lease=None,
-                           budget_reservation=None, budget_event_request=None):
+                           budget_reservation=None, budget_event_request=None,
+                           mode_policy=None, evidence_store=None,
+                           evidence_scope=None):
     child_result = None
     child_error = ""
+    if evidence_store is not None:
+        self._active_evidence_stores[child.id] = evidence_store
     def _persist(msgs):
         for m in msgs:
             self._store.append_message(child.id, m)
@@ -388,6 +499,7 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
         if request.agent_kind is AgentKind.FORK:
             inherited_registry = self._build_registry_for_session(
                 parent_definition, child,
+                mode_policy=mode_policy,
             ).with_phase_policy(parent_policy)
             if request.context_origin is ContextOrigin.PARENT_SNAPSHOT:
                 if spawn_context is None:
@@ -440,6 +552,9 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
             persisted_messages=persisted_messages,
             session_record=child, session_runtime=self,
             parent_pipeline_state=_inherited_state,
+            evidence_store=evidence_store,
+            evidence_scope=evidence_scope,
+            mode_policy=mode_policy,
         )
         if budget_reservation is not None:
             from dataclasses import replace
@@ -447,6 +562,50 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
             budget_reservation.settle(child_result.tokens_used)
             child_result = replace(child_result, budget_settled=True)
         self._store.set_agent_result(child.id, child_result)
+        # ── Evidence: WORKER_COMPLETED/FAILED/CANCELLED ──
+        if evidence_store is not None:
+            from agent.session.run_evidence import (
+                EvidenceEntry, EvidenceKind, EvidenceStatus,
+                idempotency_key_for_worker,
+            )
+            import uuid as _uuid_mod
+            _worker_status = EvidenceStatus.SUCCEEDED
+            if hasattr(child_result, 'status'):
+                if child_result.status == AgentRunStatus.COMPLETED:
+                    _worker_status = EvidenceStatus.SUCCEEDED
+                elif child_result.status == AgentRunStatus.CANCELLED:
+                    _worker_status = EvidenceStatus.CANCELLED
+                elif child_result.status == AgentRunStatus.PARTIAL:
+                    _worker_status = EvidenceStatus.FAILED
+                else:
+                    _worker_status = EvidenceStatus.FAILED
+            if child_result is not None and hasattr(child_result, 'status') and child_result.status == AgentRunStatus.CANCELLED:
+                _worker_status = EvidenceStatus.CANCELLED
+            _worktree_disposition = getattr(
+                child_result, "worktree_disposition", None,
+            )
+            if _worktree_disposition is WorktreeDisposition.PRESERVED:
+                _worker_status = EvidenceStatus.BLOCKED
+            evidence_store.record(EvidenceEntry(
+                evidence_id=f"ev_{_uuid_mod.uuid4().hex[:12]}",
+                idempotency_key=idempotency_key_for_worker(
+                    "terminal", child.id, child.generation,
+                ),
+                root_run_id="",  # auto-filled by store
+                session_id=child.id,
+                producer_session_id=child.id,
+                kind=EvidenceKind.WORKER_COMPLETED,
+                status=_worker_status,
+                tool_name=child_agent_type,
+                summary=child_result.summary or "",
+                metadata={
+                    "worktree_disposition": (
+                        _worktree_disposition.value
+                        if hasattr(_worktree_disposition, "value")
+                        else str(_worktree_disposition or "")
+                    ),
+                },
+            ))
         if child_result.summary:
             self._store.append_message(
                 child.id,
@@ -457,6 +616,13 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
         child_error = str(exc) or type(exc).__name__
         raise
     finally:
+        self._active_evidence_stores.pop(child.id, None)
+        if evidence_store is not None:
+            from agent.session.runtime import _flush_skill_activations
+            _flush_skill_activations(
+                evidence_store,
+                self._pending_skill_activations.pop(child.id, []),
+            )
         if child_result is not None and child_result.status is ForkStatus.CANCELLED:
             self._store.update_status(
                 child.id, SessionStatus.CANCELLED,

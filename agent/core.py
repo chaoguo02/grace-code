@@ -32,7 +32,6 @@ from xml.etree import ElementTree as ET
 
 from agent.runtime_controller import RecoveryAction, RuntimeController, ToolDecision
 from agent.event_log import EventLog, summarize_run
-from context.evidence import EvidenceLedger
 from context.history import ConversationHistory, ConversationSnapshot
 from context.repo_map import RepoMap
 from context.token_budget import TokenBudget
@@ -740,9 +739,6 @@ class ReActAgent:
         artifact_store_ref = registry.artifact_store_ref
         if artifact_store_ref is not None:
             artifact_store_ref.store = self._artifact_store
-        evidence_ledger_ref = registry.evidence_ledger_ref
-        if evidence_ledger_ref is not None:
-            evidence_ledger_ref.ledger = None
         self._context_manager = ContextManager(ContextManagerConfig(
             request_budget_tokens=self._cfg.request_budget_tokens,
             history_max_messages=self._cfg.history_max_messages,
@@ -904,6 +900,8 @@ class ReActAgent:
         error: str | None = None,
         cache_stats: CacheStats | None = None,
         completion_blocked: int = 0,
+        max_steps_reached: bool = False,
+        budget_exhausted: bool = False,
     ) -> RunResult:
         """Build the final RunResult from the completion context (P1-2).
 
@@ -957,6 +955,8 @@ class ReActAgent:
             cache_stats=cache_stats,
             contract=self._accumulated_plan_contract,
             termination_reason=ctx.tsm.termination_reason,
+            budget_exhausted=budget_exhausted,
+            max_steps_reached=max_steps_reached,
             verification_status=ctx.tsm.verification_status,
             verification_reason=ctx.tsm.verification_reason,
             workspace_delta=_workspace_delta,
@@ -1155,6 +1155,15 @@ class ReActAgent:
             _live_spawn_context = provider_phase.spawn_context
             _streaming_executor = provider_phase.streaming_executor
 
+            # An empty TOOL_CALL is a malformed spelling of FINISH from some
+            # providers. Normalize it before terminal dispatch so it cannot
+            # bypass the one CompletionGuard/evidence path.
+            if (
+                action.action_type is ActionType.TOOL_CALL
+                and not action.tool_calls
+            ):
+                action = replace(action, action_type=ActionType.FINISH)
+
             if action.is_terminal():
                 terminal = self._handle_terminal_action(
                     action=action,
@@ -1293,6 +1302,7 @@ class ReActAgent:
             total_tokens_used=total_tokens,
             patch=_git_state.current_diff or None,
             cache_stats=cumulative_cache,
+            max_steps_reached=True,
         )
 
     def _initialize_run(
@@ -1316,10 +1326,7 @@ class ReActAgent:
         self._accessed_files = set()
         self._feedback_injected_files = set()
         self._explicit_memory_write_this_run = False
-        self._evidence_ledger = EvidenceLedger()
-        evidence_ref = self._full_registry.evidence_ledger_ref
-        if evidence_ref is not None:
-            evidence_ref.ledger = self._evidence_ledger
+        self._evidence_store = getattr(self._cfg, "evidence_store", None)
         self._accumulated_structured_findings = []
         self._accumulated_plan_contract = None
 
@@ -1426,6 +1433,9 @@ class ReActAgent:
             phase_policy=policy.execution,
             delegation_effects=frozenset(delegation_effects),
             run_id=str(task.metadata.get("run_id", "") or ""),
+            mode_policy=getattr(self._cfg, "mode_policy", None),
+            evidence_store=getattr(self._cfg, "evidence_store", None),
+            evidence_scope=getattr(self._cfg, "evidence_scope", None),
         )
         self._registry = self._registry.with_run_context(base_run_context)
 
@@ -2040,40 +2050,8 @@ class ReActAgent:
             ))
             return None
 
-        is_empty_tool_call = action.action_type is ActionType.TOOL_CALL
-        detail = (
-            "LLM returned empty tool_calls — finishing"
-            if is_empty_tool_call
-            else f"unknown action_type={action.action_type}"
-        )
-        if is_empty_tool_call:
-            logger.info(
-                "LLM returned TOOL_CALL with no tool_calls at step %d — finishing",
-                step,
-            )
-        else:
-            logger.warning(
-                "Unknown action_type=%s at step %d — treating as finish",
-                action.action_type,
-                step,
-            )
-        summary = action.thought or action.message or "Task complete."
-        from agent.session.task_state_machine import TaskState
-        if state_machine.state is not TaskState.COMPLETING:
-            state_machine.transition(TaskState.COMPLETING, detail or "auto-complete")
-        state_machine.complete(
-            VerificationStatus.NOT_APPLICABLE,
-            detail=detail,
-        )
-        log.log_task_complete(steps=step, summary=summary)
-        self._extract_success_memories(task, log, summary)
-        return self._build_run_result(
-            ctx=finish_context,
-            status=RunStatus.SUCCESS,
-            summary=summary,
-            steps_taken=step,
-            total_tokens_used=total_tokens,
-            cache_stats=cache_stats,
+        raise RuntimeError(
+            f"Unsupported non-terminal action: {action.action_type}"
         )
 
     def _handle_terminal_action(
@@ -2146,6 +2124,11 @@ class ReActAgent:
                 ctx=completion_context,
                 task_intent=task.intent,
                 git_state=git_state,
+                mode_policy=getattr(self._cfg, "mode_policy", None),
+                evidence_store=getattr(self._cfg, "evidence_store", None),
+                evidence_requirements=getattr(
+                    self._cfg, "evidence_requirements", None,
+                ),
             ),
             block_tracker=block_tracker,
             block_threshold=COMPLETION_BLOCK_THRESHOLD,
@@ -2373,6 +2356,8 @@ class ReActAgent:
             path=analysis.tool_path,
             success=observation.is_success(),
         )
+        # Verification truth is recorded by the Tool evidence projector.
+        # CompletionContext deliberately does not own a second "latest receipt".
         if analysis.delegated_tokens > 0:
             execution_budget.consume(analysis.delegated_tokens)
             record_subagent_tokens = getattr(
@@ -2784,6 +2769,10 @@ class ReActAgent:
             )
         elif evaluation.status is RunStatus.GAVE_UP:
             logger.warning(evaluation.summary)
+        _budget_exhausted = (
+            evaluation.termination_reason is TerminationReason.BUDGET_EXHAUSTED
+            or state_machine.termination_reason is TerminationReason.BUDGET_EXHAUSTED
+        )
         return self._build_run_result(
             ctx=finish_context,
             status=evaluation.status or RunStatus.GAVE_UP,
@@ -2792,6 +2781,7 @@ class ReActAgent:
             total_tokens_used=total_tokens,
             error=evaluation.error or None,
             cache_stats=cache_stats,
+            budget_exhausted=_budget_exhausted,
         )
 
     def _resume_after_completion_block(
@@ -3277,6 +3267,16 @@ class ReActAgent:
             _ltc = self._build_long_term_context()
             if _ltc:
                 msgs.append(LLMMessage(role="user", content=f"[MEMORY RESTORED]\n{_ltc}"))
+        from agent.session.run_evidence import build_evidence_projection
+        evidence_projection = build_evidence_projection(
+            getattr(self._cfg, "evidence_store", None),
+            getattr(self._cfg, "evidence_requirements", None),
+        )
+        if evidence_projection:
+            msgs.append(LLMMessage(
+                role="system",
+                content=evidence_projection,
+            ))
         # Reset feedback-injected tracking so rules fire again post-compaction
         if hasattr(self, "_feedback_injected_files"):
             self._feedback_injected_files.clear()

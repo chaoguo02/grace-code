@@ -164,11 +164,36 @@ class SkillTool(BaseTool):
                 effort=meta.effort,
                 context=meta.context,
             )
+        from agent.session.evidence_requirements import (
+            compile_skill_tool_calls,
+        )
+        compiled_calls = (
+            compile_skill_tool_calls(meta.evidence_contract, arguments)
+            if meta is not None else []
+        )
 
         return ToolResult(
             success=True,
             output=f"[Skill: {skill_name}]\n\n{rendered}",
-            metadata={"skill_modifier": modifier},
+            metadata={
+                "skill_modifier": modifier,
+                "evidence": {
+                    "skill_name": skill_name,
+                    "skill_fingerprint": _skill_fingerprint(meta),
+                    "mcp_dependencies": sorted(meta.mcp_servers) if meta.mcp_servers else [],
+                    "arguments_digest": _sha256(arguments or ""),
+                    "required_tool_calls": [
+                        {
+                            "tool": requirement.tool,
+                            "arguments_match": dict(
+                                requirement.arguments_match
+                            ),
+                            "minimum_count": requirement.minimum_count,
+                        }
+                        for requirement in compiled_calls
+                    ],
+                },
+            },
         )
 
     def with_run_context(self, context: Any) -> "SkillTool":
@@ -178,3 +203,17 @@ class SkillTool(BaseTool):
         if runtime is not None:
             bound._runtime = runtime
         return bound
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _skill_fingerprint(meta) -> str:
+    """Compatibility alias for the single fingerprint implementation."""
+    from skills.activation import skill_fingerprint
+    return skill_fingerprint(meta)
+
+
+def _sha256(data: str) -> str:
+    import hashlib
+    return hashlib.sha256(data.encode("utf-8", errors="replace")).hexdigest()

@@ -208,6 +208,10 @@ class RunResult:
     error: str | None = None
     cache_stats: Any = None
     termination_reason: TerminationReason = TerminationReason.NONE
+    budget_exhausted: bool = False
+    """True when token budget was exhausted before task completion."""
+    max_steps_reached: bool = False
+    """True when the step limit was reached before task completion."""
     verification_status: VerificationStatus = VerificationStatus.NOT_APPLICABLE
     verification_reason: VerificationReason = VerificationReason.NONE
     verification_checks: tuple[VerificationCheck, ...] = ()

@@ -103,6 +103,9 @@ class ToolResult:
                 "retry": self.tool_error.retry.value,
                 "alternative": self.tool_error.alternative,
             }
+        evidence_ref = self.metadata.get("evidence_ref")
+        if isinstance(evidence_ref, dict):
+            metadata["evidence_ref"] = dict(evidence_ref)
         return Observation(
             status=ObservationStatus.SUCCESS if self.success else ObservationStatus.ERROR,
             output=self.output,
@@ -603,7 +606,6 @@ class ToolRegistry:
         capability_registry: Any = None,
         *,
         artifact_store_ref: Any = None,
-        evidence_ledger_ref: Any = None,
         skill_registry: Any = None,
         skill_buffer: Any = None,
         mcp_integration: Any = None,
@@ -619,7 +621,6 @@ class ToolRegistry:
         self._hook_dispatcher = hook_dispatcher
         self._capability_registry = capability_registry
         self._artifact_store_ref = artifact_store_ref
-        self._evidence_ledger_ref = evidence_ledger_ref
         self._skill_registry = skill_registry
         self._skill_buffer = skill_buffer
         self._mcp_integration = mcp_integration
@@ -679,10 +680,6 @@ class ToolRegistry:
     @property
     def artifact_store_ref(self) -> Any:
         return self._artifact_store_ref
-
-    @property
-    def evidence_ledger_ref(self) -> Any:
-        return self._evidence_ledger_ref
 
     @property
     def skill_registry(self) -> Any:
@@ -764,6 +761,17 @@ class ToolRegistry:
             return ToolConcurrency.SERIAL
         return self._tools[canonical].concurrency_mode(params)
 
+    def _get_evidence_recorder(self, store: Any) -> Any:
+        """Get or create the cached ToolEvidenceRecorder for *store*."""
+        cached = getattr(self, "_evidence_recorder", None)
+        if cached is not None and cached._store is store:
+            return cached
+        from agent.session.tool_evidence_recorder import ToolEvidenceRecorder
+        _scope = getattr(self, "_evidence_scope", None)
+        recorder = ToolEvidenceRecorder(store, scope=_scope)
+        self._evidence_recorder = recorder
+        return recorder
+
     def execute_tool(
         self,
         name: str,
@@ -794,6 +802,12 @@ class ToolRegistry:
         tool = self._tools[canonical]
         from core.tool_execution import ToolExecutionPipeline
 
+        # ── Evidence recorder (cached per-store) ──
+        _evidence_recorder = None
+        _evidence_store = getattr(self, "_evidence_store", None)
+        if _evidence_store is not None:
+            _evidence_recorder = self._get_evidence_recorder(_evidence_store)
+
         pipeline = ToolExecutionPipeline(
             permission_pipeline=self._permission_pipeline,
             hook_dispatcher=self._hook_dispatcher,
@@ -804,6 +818,7 @@ class ToolRegistry:
             root_session_resolver=getattr(
                 self, "_root_session_resolver", None
             ),
+            evidence_recorder=_evidence_recorder,
         )
         result = pipeline.execute(
             tool,
@@ -848,7 +863,6 @@ class ToolRegistry:
             hook_dispatcher=self._hook_dispatcher,
             capability_registry=self._capability_registry,
             artifact_store_ref=self._artifact_store_ref,
-            evidence_ledger_ref=self._evidence_ledger_ref,
             skill_registry=self._skill_registry,
             skill_buffer=self._skill_buffer,
             mcp_integration=self._mcp_integration,
@@ -957,7 +971,6 @@ class ToolRegistry:
             hook_dispatcher=self._hook_dispatcher,
             capability_registry=self._capability_registry,
             artifact_store_ref=self._artifact_store_ref,
-            evidence_ledger_ref=self._evidence_ledger_ref,
             skill_registry=self._skill_registry,
             skill_buffer=self._skill_buffer,
             mcp_integration=self._mcp_integration,
@@ -978,6 +991,10 @@ class ToolRegistry:
         bound._tools = {}
         bound._tool_aliases = {}
         bound._timing_stats = {}
+        # Carry evidence_store and scope from RunContext
+        bound._evidence_store = getattr(context, "evidence_store", None)
+        bound._evidence_scope = getattr(context, "evidence_scope", None)
+        bound._evidence_recorder = None  # lazily created by _get_evidence_recorder()
         for tool in self._tools.values():
             bound.register(
                 tool.with_run_context(context)

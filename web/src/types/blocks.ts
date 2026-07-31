@@ -9,7 +9,7 @@
  * Stable across streaming → DB transition, survives remount.
  */
 
-import type { RunVerification, RunWorkspaceDelta } from "./events";
+import type { EvidenceRef, RunVerification, RunWorkspaceDelta } from "./events";
 
 // ── Block types ──────────────────────────────────────────────────────────
 
@@ -50,6 +50,7 @@ export interface ToolUseBlock {
 
   // ── Anchor targets (P2) ──
   anchorTargets?: string[]; // file paths this tool touched, for ref-backlinks
+  evidence?: EvidenceRef;
 }
 
 export type ContentBlock = TextBlock | ThoughtBlock | ToolUseBlock;
@@ -197,10 +198,21 @@ export interface StreamingTurn {
 }
 
 export interface RunOutcome {
-  status: "completed" | "failed" | "cancelled";
+  status:
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | "partial"
+    | "gave_up"
+    | "blocked";
   terminationReason?: string;
   verification?: RunVerification;
   workspaceDelta?: RunWorkspaceDelta;
+  evidenceSummary?: {
+    total: number;
+    by_kind: Record<string, number>;
+    failed: number;
+  };
   error?: string;
   runId?: string;
 }

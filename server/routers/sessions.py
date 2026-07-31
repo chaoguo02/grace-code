@@ -662,8 +662,11 @@ def create_sessions_router(get_service: Any) -> APIRouter:
                 prompt=execution_prompt,
                 display_prompt=body.prompt,
                 agent_name=effective_agent,
+                product_mode=body.product_mode or "",
                 intent=body.intent,
                 run_context=_ctx,
+                skill_name=body.skill_name or "",
+                skill_arguments=body.skill_arguments,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
@@ -673,6 +676,31 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             "run_id": _run_id,
             "turn_id": _turn_id,
             "turn_index": _turn_index,
+        }
+
+    @router.get("/{session_id}/runs/{run_id}/evidence")
+    async def get_run_evidence(
+        session_id: str,
+        run_id: str,
+        service=Depends(get_service),
+    ) -> dict[str, object]:
+        """Return the persisted, sanitized evidence projection for one run."""
+        _assert_valid_session_id(session_id)
+        storage = getattr(service, "_storage", None)
+        if storage is not None:
+            run = storage.get_run(run_id)
+            if run is None or str(run.get("session_id", "")) != session_id:
+                raise HTTPException(status_code=404, detail="Run not found")
+        from agent.session.run_evidence import EvidenceEntry
+        rows = [
+            EvidenceEntry.from_dict(row).to_dict()
+            for row in service._runtime._store.list_evidence(run_id)
+        ]
+        return {
+            "run_id": run_id,
+            "session_id": session_id,
+            "schema_version": 1,
+            "evidence": rows,
         }
 
     # ── POST /api/sessions/{session_id}/cancel ───────────────────────────
@@ -870,6 +898,10 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         for sid in body.session_ids:
             if _runtime is not None:
                 _runtime.cleanup_session(sid)
+                storage = getattr(service, "_storage", None)
+                if storage is not None:
+                    for run in storage.list_runs(sid, limit=10_000):
+                        _runtime._store.delete_run_evidence(str(run["id"]))
         if hasattr(service, "_event_bus") and service._event_bus is not None:
             for sid in body.session_ids:
                 _fire_and_forget_cleanup(
@@ -906,6 +938,10 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         _runtime = getattr(service, '_runtime', None)
         if _runtime is not None:
             _runtime.cleanup_session(session_id)
+            storage = getattr(service, "_storage", None)
+            if storage is not None:
+                for run in storage.list_runs(session_id, limit=10_000):
+                    _runtime._store.delete_run_evidence(str(run["id"]))
 
         # Clean up plan file
         if hasattr(service, 'remove_plan_file'):

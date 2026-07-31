@@ -282,4 +282,23 @@ class FileEditTool(BaseTool):
                 f"replaced {old_lines} lines with {new_lines} lines{delta_str}. "
                 f"File now has {total_lines} lines total."
             ),
+            metadata={
+                "evidence": {
+                    "path": str(path),
+                    "content_hash": _sha256_file(path),
+                },
+            },
         )
+
+
+def _sha256_hex(data: str) -> str:
+    import hashlib
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""

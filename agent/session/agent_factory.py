@@ -83,6 +83,7 @@ class AgentFactory:
         session=None,
         circuit_breaker=None,
         runtime=None,
+        mode_policy=None,
         repo_path: str | None = None,
         mcp_tool_names: frozenset[str] = frozenset(),
         session_memory_tracker=None,
@@ -170,6 +171,7 @@ class AgentFactory:
                 agent_registry=agent_registry,
                 circuit_breaker=circuit_breaker,
                 runtime=runtime,
+                mode_policy=mode_policy,
                 mcp_tool_names=mcp_tool_names,
             )
         else:
@@ -191,6 +193,7 @@ class AgentFactory:
         # ── 3. Build agent config ──
         agent_cfg = AgentFactory._build_agent_config(
             spec, root_agent_config, circuit_breaker,
+            mode_policy=mode_policy,
         )
 
         # ── 3.5. Create TaskStateMachine — the Runtime's central authority ──
@@ -219,10 +222,12 @@ class AgentFactory:
         spec: "AgentDefinition",
         root_cfg: "AgentConfig",
         circuit_breaker=None,
+        mode_policy=None,
     ) -> "AgentConfig":
         """Build per-agent AgentConfig from root + spec."""
         cfg = copy.copy(root_cfg)
         cfg.circuit_breaker = circuit_breaker
+        cfg.mode_policy = mode_policy
         if spec.effort:
             cfg.effort = spec.effort
         if spec.mode != SessionMode.PRIMARY:

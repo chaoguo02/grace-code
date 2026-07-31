@@ -191,6 +191,49 @@ class SessionStore:
                     completed_at TEXT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS run_evidence (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    evidence_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    root_run_id TEXT NOT NULL,
+                    root_session_id TEXT DEFAULT '',
+                    session_id TEXT NOT NULL,
+                    producer_session_id TEXT NOT NULL,
+                    turn_id TEXT DEFAULT '',
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    sequence INTEGER NOT NULL DEFAULT 0,
+                    tool_name TEXT DEFAULT '',
+                    call_id TEXT DEFAULT '',
+                    invocation_id TEXT DEFAULT '',
+                    parameters_digest TEXT DEFAULT '',
+                    result_digest TEXT DEFAULT '',
+                    source_fingerprint TEXT DEFAULT '',
+                    cached INTEGER DEFAULT 0,
+                    cache_key TEXT DEFAULT '',
+                    path TEXT DEFAULT '',
+                    artifact_id TEXT DEFAULT '',
+                    depends_on_json TEXT DEFAULT '[]',
+                    parent_evidence_id TEXT DEFAULT '',
+                    summary TEXT DEFAULT '',
+                    metadata_json TEXT DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(root_run_id, idempotency_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_run_evidence_root
+                    ON run_evidence(root_run_id, sequence);
+                CREATE INDEX IF NOT EXISTS idx_run_evidence_kind
+                    ON run_evidence(root_run_id, kind, status);
+                CREATE INDEX IF NOT EXISTS idx_run_evidence_call
+                    ON run_evidence(root_run_id, call_id);
+                CREATE INDEX IF NOT EXISTS idx_run_evidence_path
+                    ON run_evidence(root_run_id, path);
+                CREATE INDEX IF NOT EXISTS idx_run_evidence_producer
+                    ON run_evidence(root_run_id, producer_session_id);
+
                 CREATE INDEX IF NOT EXISTS idx_sessions_parent_id
                     ON sessions(parent_id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_root_id
@@ -222,6 +265,46 @@ class SessionStore:
                 conn.execute(
                     "ALTER TABLE session_messages "
                     "ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''"
+                )
+            evidence_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(run_evidence)")
+            }
+            for name, declaration in {
+                "root_session_id": "TEXT DEFAULT ''",
+                "turn_id": "TEXT DEFAULT ''",
+                "schema_version": "INTEGER NOT NULL DEFAULT 1",
+                "sequence": "INTEGER NOT NULL DEFAULT 0",
+            }.items():
+                if name not in evidence_columns:
+                    conn.execute(
+                        f"ALTER TABLE run_evidence ADD COLUMN {name} {declaration}"
+                    )
+            conn.execute(
+                """
+                UPDATE run_evidence
+                SET sequence = (
+                    SELECT COUNT(*)
+                    FROM run_evidence AS prior
+                    WHERE prior.root_run_id = run_evidence.root_run_id
+                      AND prior.id <= run_evidence.id
+                )
+                WHERE sequence IS NULL OR sequence <= 0
+                """
+            )
+            # Existing Phase-2 databases created this index before `sequence`
+            # existed. Rebuild it once when its actual column set is stale.
+            root_index_columns = [
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA index_info(idx_run_evidence_root)"
+                )
+            ]
+            if root_index_columns != ["root_run_id", "sequence"]:
+                conn.execute("DROP INDEX IF EXISTS idx_run_evidence_root")
+                conn.execute(
+                    "CREATE INDEX idx_run_evidence_root "
+                    "ON run_evidence(root_run_id, sequence)"
                 )
             contract_columns = {
                 "agent_kind": "TEXT NOT NULL DEFAULT 'primary'",
@@ -1660,6 +1743,117 @@ class SessionStore:
             "started_at": row["started_at"],
             "completed_at": row["completed_at"],
         }
+
+    # ── Evidence persistence ────────────────────────────────────────────
+
+    def create_evidence(
+        self, entry: "EvidenceEntry",
+    ) -> "EvidenceEntry":
+        """Atomically insert-or-get the canonical evidence row.
+
+        Sequence allocation and idempotency are owned by SQLite so concurrent
+        producers cannot create divergent in-memory/database evidence IDs.
+        """
+        import json as _json
+        from agent.session.run_evidence import EvidenceEntry
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT * FROM run_evidence
+                WHERE root_run_id = ? AND idempotency_key = ?
+                """,
+                (entry.root_run_id, entry.idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                conn.commit()
+                return EvidenceEntry.from_dict(dict(existing))
+
+            next_sequence = int(conn.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) + 1
+                FROM run_evidence WHERE root_run_id = ?
+                """,
+                (entry.root_run_id,),
+            ).fetchone()[0])
+            conn.execute(
+                """
+                INSERT INTO run_evidence (
+                    evidence_id, idempotency_key, root_run_id, root_session_id,
+                    session_id, producer_session_id, turn_id, kind, status, sequence,
+                    schema_version,
+                    tool_name, call_id, invocation_id,
+                    parameters_digest, result_digest, source_fingerprint,
+                    cached, cache_key, path, artifact_id,
+                    depends_on_json, parent_evidence_id,
+                    summary, metadata_json
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    entry.evidence_id, entry.idempotency_key,
+                    entry.root_run_id, entry.root_session_id,
+                    entry.session_id, entry.producer_session_id, entry.turn_id,
+                    entry.kind.value, entry.status.value, next_sequence,
+                    entry.schema_version,
+                    entry.tool_name, entry.call_id, entry.invocation_id,
+                    entry.parameters_digest, entry.result_digest,
+                    entry.source_fingerprint,
+                    int(entry.cached), entry.cache_key,
+                    entry.path, entry.artifact_id,
+                    _json.dumps(list(entry.depends_on), ensure_ascii=True),
+                    entry.parent_evidence_id,
+                    entry.summary,
+                    _json.dumps(entry.metadata, ensure_ascii=True, default=str),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM run_evidence
+                WHERE root_run_id = ? AND idempotency_key = ?
+                """,
+                (entry.root_run_id, entry.idempotency_key),
+            ).fetchone()
+            conn.commit()
+        if row is None:
+            raise RuntimeError("evidence insert committed without a canonical row")
+        return EvidenceEntry.from_dict(dict(row))
+
+    def list_evidence(
+        self, root_run_id: str, *, kind: str | None = None,
+    ) -> list[dict[str, object]]:
+        """List evidence entries for a root run, optionally filtered by kind."""
+        with self._connect() as conn:
+            if kind:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM run_evidence
+                    WHERE root_run_id = ? AND kind = ?
+                    ORDER BY sequence, id
+                    """,
+                    (root_run_id, kind),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM run_evidence
+                    WHERE root_run_id = ?
+                    ORDER BY sequence, id
+                    """,
+                    (root_run_id,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_run_evidence(self, root_run_id: str) -> None:
+        """Delete all evidence for a root run (cascaded on session delete)."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM run_evidence WHERE root_run_id = ?",
+                (root_run_id,),
+            )
 
     def list_agent_notifications(
         self, parent_session_id: str,

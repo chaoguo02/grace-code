@@ -187,11 +187,33 @@ class PytestTool(BaseTool):
             else ToolOutcome.NONE
         )
 
+        # ── Structured verification receipt ──
+        from agent.session.verification_receipt import VerificationReceipt
+        receipt = (
+            VerificationReceipt.passed_test(
+                command=f"pytest {test_path}{' ' + extra_args if extra_args else ''}",
+                exit_code=run_result.returncode,
+                affected_files=(),
+            )
+            if success
+            else VerificationReceipt.failed_test(
+                command=f"pytest {test_path}{' ' + extra_args if extra_args else ''}",
+                exit_code=run_result.returncode,
+                reason=meaning,
+            )
+        )
+        if run_result.returncode == 5:
+            receipt = VerificationReceipt.unavailable(
+                command=f"pytest {test_path}",
+                reason="No tests collected",
+            )
+
         return ToolResult(
             success=success,
             output=output,
             error=error,
             outcome=outcome,
+            metadata={"verification_receipt": receipt.to_dict()},
         )
 
 

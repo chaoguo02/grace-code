@@ -33,8 +33,27 @@ def attach_delegation_tools(
     agent_registry,
     runtime,
     circuit_breaker=None,
+    mode_policy=None,
 ) -> "ToolRegistry":
-    """Attach session-bound delegation controls when declared and in depth."""
+    """Attach session-bound delegation controls gated by ModeExecutionPolicy.
+
+    Tool set per mode (from design doc Section 6.2):
+
+        Plan:
+          Agent (foreground only) + control tools
+
+        Build:
+          Agent (foreground only) + control tools + worktree tools
+
+        Multi-Agent:
+          Agent + AgentBatch + control tools + worktree tools
+
+        Worker:
+          none — this function is NOT called for workers.
+
+    Agent Team tools (ProposeAgentTeam) are NOT part of any three-mode pool,
+    regardless of the TEAM_ENABLED env var.
+    """
     configured_depth = min(
         SubagentSafetyLimits.from_environment().max_spawn_depth,
         session.agent_depth.MAX_SUBAGENT_DEPTH,
@@ -51,13 +70,6 @@ def attach_delegation_tools(
         )
         return registry
 
-    logger.info(
-        "attach_delegation_tools: agent=%s delegatable=%s has_agent_in_registry=%s",
-        spec.name,
-        [c.name for c in delegatable_children],
-        "Agent" in registry,
-    )
-
     from agent.session.models import DelegationScope, WorkspaceMode
     from agent.session.task_tool import AgentTool
     from core.base import ToolEffect
@@ -67,32 +79,46 @@ def attach_delegation_tools(
         if spec.effective_delegation_scope is DelegationScope.READ_ONLY
         else ToolEffect.DELEGATE_WRITE
     )
-    # Idempotent: scoped subagent registries may inherit these from parent
+
+    # ── Derive delegation policy flags ──
+    _is_multi_agent = False
+    _batch_allowed = False
+    if mode_policy is not None:
+        _is_multi_agent = mode_policy.product_mode == "multi-agent"
+        _batch_allowed = mode_policy.agent_batch_allowed
+    else:
+        raise RuntimeError(
+            "attach_delegation_tools requires mode_policy. "
+            "Production paths must pass a ModeExecutionPolicy. "
+            "Tests should create one explicitly with "
+            "ModeExecutionPolicy.for_run(product_mode=..., primary_agent=...)."
+        )
+
+    # ── Agent tool (all modes that delegate) ──
     if "Agent" not in registry:
-        registry.register(AgentTool(
+        _agent_tool = AgentTool(
             runtime, session.id,
             caller_agent_name=spec.name,
             circuit_breaker=circuit_breaker,
-        ))
-    from agent.session.agent_batch_tool import AgentBatchTool
-    if "AgentBatch" not in registry:
+        )
+        # Serial modes: restrict schema to foreground only (Step 7)
+        if mode_policy is not None and not _is_multi_agent:
+            _agent_tool._restrict_to_foreground = True
+        registry.register(_agent_tool)
+
+    # ── AgentBatch — Multi-Agent only ──
+    if _batch_allowed and "AgentBatch" not in registry:
+        from agent.session.agent_batch_tool import AgentBatchTool
         registry.register(AgentBatchTool(
             runtime,
             session.id,
             caller_agent_name=spec.name,
         ))
-    if session.parent_id is None:
-        from agent.team.feature_flags import TeamFeatureConfig
-        if (
-            TeamFeatureConfig.from_environment().enabled
-            and "ProposeAgentTeam" not in registry
-        ):
-            from agent.session.agent_team_tool import ProposeAgentTeamTool
-            registry.register(ProposeAgentTeamTool(
-                runtime,
-                session.id,
-                caller_agent_name=spec.name,
-            ))
+
+    # ── Agent Team tools — NOT in three-mode pool ──
+    # ProposeAgentTeam is explicitly excluded regardless of TEAM_ENABLED.
+
+    # ── Child control tools (all modes that delegate) ──
     from agent.session.agent_control_tool import (
         AgentControlTool,
         CancelAgentTool,
@@ -101,29 +127,26 @@ def attach_delegation_tools(
     )
     if "SendMessage" not in registry:
         registry.register(SendMessageTool(
-            runtime,
-            session.id,
+            runtime, session.id,
             delegation_effect=delegation_effect,
         ))
     if "WaitForAgent" not in registry:
         registry.register(WaitForAgentTool(
-            runtime,
-            session.id,
+            runtime, session.id,
             delegation_effect=delegation_effect,
         ))
     if "CancelAgent" not in registry:
         registry.register(CancelAgentTool(
-            runtime,
-            session.id,
+            runtime, session.id,
             delegation_effect=delegation_effect,
         ))
     if "agent_control" not in registry:
         registry.register(AgentControlTool(
-            runtime,
-            session.id,
+            runtime, session.id,
             delegation_effect=delegation_effect,
         ))
 
+    # ── Worktree tools (Build + Multi-Agent) ──
     if any(
         child.workspace_mode is WorkspaceMode.WORKTREE
         for child in delegatable_children
@@ -149,6 +172,7 @@ def build_registry_for_session(
     agent_registry,
     circuit_breaker=None,
     runtime=None,
+    mode_policy=None,
     mcp_tool_names: frozenset[str] = frozenset(),
     permission_mode_override: str = "",
 ) -> "ToolRegistry":
@@ -190,6 +214,7 @@ def build_registry_for_session(
         agent_registry=agent_registry,
         runtime=runtime,
         circuit_breaker=circuit_breaker,
+        mode_policy=mode_policy,
     )
     if (
         runtime is not None

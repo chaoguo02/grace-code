@@ -95,6 +95,39 @@ export interface WsObservationEvent extends EventEnvelope {
   duration_ms?: number;
   token_estimate?: number;
   child_session_id?: string;
+  evidence?: EvidenceRef;
+}
+
+export interface EvidenceRef {
+  evidence_id: string;
+  kind: string;
+  status: string;
+  schema_version: number;
+  cached?: boolean;
+  source_fingerprint?: string;
+  related_evidence_ids?: string[];
+}
+
+export interface RunEvidenceRecord {
+  evidence_id: string;
+  root_run_id: string;
+  session_id: string;
+  producer_session_id: string;
+  kind: string;
+  status: string;
+  sequence: number;
+  tool_name?: string;
+  path?: string;
+  cached?: boolean;
+  source_fingerprint?: string;
+  depends_on?: string[];
+  summary?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface WsEvidenceRecordEvent extends EventEnvelope {
+  type: "evidence_record";
+  evidence: RunEvidenceRecord;
 }
 
 // ── Subagent ────────────────────────────────────────────────────────────
@@ -421,7 +454,13 @@ export interface WsRunTerminalEvent extends EventEnvelope {
   run_id: string;
   turn_id: string;
   turn_index: number;
-  status: "completed" | "failed" | "cancelled";
+  status:
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | "partial"
+    | "gave_up"
+    | "blocked";
   summary: string;
   steps_taken: number;
   total_tokens: number;
@@ -431,6 +470,11 @@ export interface WsRunTerminalEvent extends EventEnvelope {
   verification_reason?: string;
   verification?: RunVerification;
   workspace_delta?: RunWorkspaceDelta;
+  evidence_summary?: {
+    total: number;
+    by_kind: Record<string, number>;
+    failed: number;
+  };
   timestamp?: string;
 }
 
@@ -443,6 +487,7 @@ export type WsMessage =
   | WsReflectionEvent
   | WsToolCallEvent
   | WsObservationEvent
+  | WsEvidenceRecordEvent
   | WsSubagentStartEvent
   | WsSubagentStopEvent
   | WsDelegationEvent

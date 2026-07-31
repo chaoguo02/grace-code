@@ -1,6 +1,10 @@
 ---
 name: city-weather
 description: Query deterministic city weather through the weather-mock MCP server and summarize current conditions, forecasts, comparisons, and travel advice. Use when the user asks for weather in one or more cities, a multi-day city forecast, a city-weather comparison, or an end-to-end Skill-to-MCP workflow test.
+evidence:
+  required-tool-calls:
+    - tool: mcp:weather_mock:weather_get_current
+      foreach-argument: city
 ---
 
 # City Weather

@@ -314,6 +314,10 @@ class FileReadTool(BaseTool):
                 return ToolResult(
                     success=True,
                     cached=True,
+                    metadata={"evidence": {
+                        "observed_path": normalized,
+                        "content_hash": _sha256_file(path),
+                    }},
                     output=(
                         f"{cached}\n\n"
                         f"[CACHED] File unchanged since last read — using cached content."
@@ -372,6 +376,10 @@ class FileReadTool(BaseTool):
             success=True,
             output=output,
             outcome=ToolOutcome.PARTIAL if is_partial else ToolOutcome.NONE,
+            metadata={"evidence": {
+                "observed_path": normalized,
+                "content_hash": _sha256_file(path),
+            }},
         )
 
 
@@ -641,4 +649,23 @@ class FileWriteTool(BaseTool):
             success=True,
             output=f"Written {line_count} lines to {path}",
             modified_files=[str(target_path)],
+            metadata={
+                "evidence": {
+                    "path": str(target_path),
+                    "content_hash": _sha256_file(target_path),
+                },
+            },
         )
+
+
+def _sha256_hex(data: str) -> str:
+    import hashlib
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""

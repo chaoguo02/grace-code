@@ -107,7 +107,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
             hook_dispatcher=base.hook_dispatcher,
             capability_registry=base.capability_registry,
             artifact_store_ref=base.artifact_store_ref,
-            evidence_ledger_ref=base.evidence_ledger_ref,
             skill_registry=base.skill_registry,
             skill_buffer=base.skill_buffer,
             mcp_integration=base.mcp_integration,
@@ -122,7 +121,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
         self._modifier_owner = modifier_owner
         self._skill_runtime_overrides: dict[str, str] = {}
         self._artifact_store_ref = base.artifact_store_ref
-        self._evidence_ledger_ref = base.evidence_ledger_ref
         for name, tool in base._tools.items():
             if self._is_tool_visible(name):
                 self._tools[name] = tool
@@ -251,8 +249,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
             return False
         if metadata.dependency == ToolDependency.ARTIFACT_STORE:
             return self._artifact_store_ref is not None and self._artifact_store_ref.store is not None
-        if metadata.dependency == ToolDependency.EVIDENCE_LEDGER:
-            return self._evidence_ledger_ref is not None and self._evidence_ledger_ref.ledger is not None
         return True
 
     def _is_tool_visible(self, name: str) -> bool:
@@ -329,6 +325,18 @@ class PolicyAwareToolRegistry(ToolRegistry):
         start = time.perf_counter()
         violation = self._check_tool_call(name, params)
         if violation:
+            # ── Evidence: record blocked call (reuses cached Recorder) ──
+            _store = getattr(self._base, "_evidence_store", None)
+            if _store is not None:
+                _recorder = self._base._get_evidence_recorder(_store)
+                _sid = getattr(self._base, "_session_id", "")
+                _recorder.record_blocked(
+                    tool_name=name, params=params, reason=violation,
+                    invocation_id=invocation_id, session_id=_sid,
+                    tool=self._base._tools.get(
+                        self._base.resolve_name(name) or name,
+                    ),
+                )
             result = ToolResult(success=False, output="", error=violation, outcome=ToolOutcome.BLOCKED)
             self._record_timing(name, start, result)
             return result
@@ -351,6 +359,21 @@ class PolicyAwareToolRegistry(ToolRegistry):
             return
 
         self.activate_mcp_servers(modifier.mcp_servers)
+
+        # ── Evidence: MCP_TOOLS_EXPOSED for skill-activated deferred MCP ──
+        _store = getattr(self._base, "_evidence_store", None)
+        if _store is not None and modifier.mcp_servers:
+            from agent.session.run_evidence import EvidenceEntry, EvidenceKind, EvidenceStatus
+            _sid = str(getattr(self._base, "_session_id", "") or "")
+            for _srv in modifier.mcp_servers:
+                _store.record(EvidenceEntry(
+                    evidence_id=f"ev_mcp_expose_{_srv}_{_sid}"[:64],
+                    idempotency_key=f"mcp-expose:{_sid}:{_srv}:skill",
+                    root_run_id="", session_id=_sid, producer_session_id=_sid,
+                    kind=EvidenceKind.MCP_TOOLS_EXPOSED,
+                    status=EvidenceStatus.SUCCEEDED,
+                    tool_name=f"mcp:{_srv}",
+                ))
 
         owner = self._modifier_owner or self
         targets = (self,) if owner is self else (self, owner)

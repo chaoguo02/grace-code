@@ -175,12 +175,29 @@ class RunContext:
     delegation_effects: "frozenset[ToolEffect] | None" = None
     spawn_context: AgentSpawnContext | None = None
     run_id: str = ""
+    mode_policy: "ModeExecutionPolicy | None" = None
+    """Per-run execution contract. None ONLY in legacy/test paths
+    that have not been migrated. Production paths MUST set this."""
+    evidence_store: Any = None
+    """RunEvidenceStore — per-root-run evidence aggregator.
+    Set by SessionRuntime.run_session()."""
+    evidence_scope: Any = None
+    """EvidenceScope — artifact dependency boundary.
+    Set by SessionRuntime.run_session()."""
 
     def __post_init__(self) -> None:
         if self.delegation_width < 1:
             raise ValueError("delegation_width must be positive")
         if self.delegation_step_limit is not None and self.delegation_step_limit < 1:
             raise ValueError("delegation_step_limit must be positive when provided")
+        # Validate mode_policy when set
+        if self.mode_policy is not None:
+            from agent.session.mode_execution_policy import ModeExecutionPolicy
+            if not isinstance(self.mode_policy, ModeExecutionPolicy):
+                raise TypeError(
+                    f"mode_policy must be ModeExecutionPolicy, "
+                    f"got {type(self.mode_policy).__name__}"
+                )
 
     @property
     def delegation_token_limit(self) -> int:
@@ -189,3 +206,20 @@ class RunContext:
             int(self.budget.token_remaining * 0.65)
             // self.delegation_width
         )
+
+    @property
+    def effective_mode_policy(self) -> "ModeExecutionPolicy":
+        """Return the mode policy, failing if it was never set.
+
+        Production paths MUST set mode_policy. This property makes
+        the requirement explicit and fails fast with a clear message
+        rather than silently producing wrong behavior.
+        """
+        if self.mode_policy is None:
+            raise RuntimeError(
+                "RunContext.mode_policy is None — production paths MUST "
+                "set a ModeExecutionPolicy for every run. If you are in a "
+                "test, create one explicitly with "
+                "ModeExecutionPolicy.for_run(product_mode=..., primary_agent=...)"
+            )
+        return self.mode_policy

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { getSessionDiffs } from "../api/diffs";
-import { getTimeline } from "../api/sessions";
+import { getRunEvidence, getTimeline } from "../api/sessions";
 import { getSessionStats } from "../api/stats";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { useSessionStore } from "../stores/sessionStore";
@@ -10,7 +10,11 @@ import type {
   TurnTimeline,
   WsMessage,
 } from "../types";
-import type { RunVerification, RunWorkspaceDelta } from "../types/events";
+import type {
+  RunEvidenceRecord,
+  RunVerification,
+  RunWorkspaceDelta,
+} from "../types/events";
 import type { SessionDiff, SessionStats } from "../types/stats";
 import type { NavigationTarget, ViewName } from "../navigation";
 import { SessionRequiredState } from "./SessionRequiredState";
@@ -155,12 +159,17 @@ export function RunInspector({
     );
     return event ? `${event.type}:${event.run_id || ""}:${event.sequence || 0}` : "";
   });
+  const liveEvidenceCount = useChatStore((state) => {
+    if (!activeId) return 0;
+    return Object.keys(selectSessionUi(state, activeId).evidenceById).length;
+  });
 
   const [state, setState] = useState<InspectorState>({ phase: "idle" });
   const [timeline, setTimeline] = useState<TimelineResponse | null>(null);
   const [stats, setStats] = useState<SessionStats | null>(null);
   const [diffs, setDiffs] = useState<SessionDiff[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
+  const [evidence, setEvidence] = useState<RunEvidenceRecord[]>([]);
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
@@ -222,6 +231,37 @@ export function RunInspector({
       : runs.find((run) => run.run_id === selectedRunId) || runs[0] || null,
     [requestedRunId, runs, selectedRunId],
   );
+
+  useEffect(() => {
+    if (!activeId || !selectedRun?.run_id) {
+      setEvidence([]);
+      return;
+    }
+    const controller = new AbortController();
+    getRunEvidence(activeId, selectedRun.run_id, controller.signal)
+      .then((result) => setEvidence(result.evidence))
+      .catch(() => {
+        if (!controller.signal.aborted) setEvidence([]);
+      });
+    return () => controller.abort();
+  }, [activeId, selectedRun?.run_id, liveEventKey]);
+
+  useEffect(() => {
+    if (!activeId || !selectedRun?.run_id || liveEvidenceCount === 0) return;
+    const live = Object.values(
+      selectSessionUi(useChatStore.getState(), activeId).evidenceById,
+    ).filter((entry) => entry.root_run_id === selectedRun.run_id);
+    if (!live.length) return;
+    setEvidence((persisted) => {
+      const merged = new Map(
+        persisted.map((entry) => [entry.evidence_id, entry]),
+      );
+      for (const entry of live) merged.set(entry.evidence_id, entry);
+      return Array.from(merged.values()).sort(
+        (left, right) => left.sequence - right.sequence,
+      );
+    });
+  }, [activeId, selectedRun?.run_id, liveEvidenceCount]);
 
   const model = useMemo(() => {
     if (!selectedRun) return null;
@@ -413,9 +453,43 @@ export function RunInspector({
               value={model.approvals}
               hint="Human control points"
             />
+            <RunMetric
+              label="Evidence"
+              value={evidence.length}
+              hint={`${evidence.filter((item) => item.status !== "succeeded").length} non-success`}
+            />
           </div>
 
           <div className="run-inspector-primary-grid">
+            <article className="run-inspector-card execution">
+              <div className="run-inspector-card-heading">
+                <div>
+                  <span>Evidence chain</span>
+                  <h2>Persisted runtime facts</h2>
+                </div>
+                <span className="run-inspector-badge">{evidence.length} records</span>
+              </div>
+              <div className="run-stage-flow">
+                {evidence.length === 0 && (
+                  <div className="run-stage">
+                    <strong>No evidence recorded</strong>
+                    <span>This run did not produce evidence-chain records.</span>
+                  </div>
+                )}
+                {evidence.slice(-12).map((entry) => (
+                  <div
+                    className={`run-stage ${entry.status === "succeeded" ? "complete" : ""}`}
+                    key={entry.evidence_id}
+                  >
+                    <i>{entry.sequence}</i>
+                    <strong>{titleCase(entry.kind)}</strong>
+                    <span>
+                      {entry.path || entry.tool_name || entry.summary || entry.evidence_id}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </article>
             <article className="run-inspector-card execution">
               <div className="run-inspector-card-heading">
                 <div>

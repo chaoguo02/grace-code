@@ -180,6 +180,12 @@ class ChatRequest(BaseModel):
         max_length=4000,
         description="Arguments passed to the selected Skill.",
     )
+    product_mode: str | None = Field(
+        default=None,
+        description="Explicit product mode: 'plan', 'build', or 'multi-agent'. "
+        "When set, the Runtime creates a ModeExecutionPolicy from this mode. "
+        "When None, derived from agent_name for backward compatibility.",
+    )
 
 
 class ChatResponse(BaseModel):

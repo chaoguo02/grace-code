@@ -131,6 +131,11 @@ class AgentBatchTool(BaseTool):
                     "type": "string",
                     "enum": ["current", "worktree"],
                 },
+                "acceptance": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Task-level acceptance criteria.",
+                },
             },
             "required": ["id", "goal", "prompt"],
         }
@@ -138,9 +143,15 @@ class AgentBatchTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "schema_version": {"type": "integer", "default": 1},
                 "description": {"type": "string"},
                 "reason_code": {"type": "string"},
                 "explanation": {"type": "string"},
+                "acceptance": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Run-level acceptance criteria.",
+                },
                 "topology": {
                     "type": "string",
                     "enum": ["fan_out_fan_in", "chain"],
@@ -571,6 +582,9 @@ class AgentBatchTool(BaseTool):
                 ),
                 parent_max_steps=run_context.delegation_step_limit,
                 cancellation_token=run_context.cancellation,
+                mode_policy=getattr(run_context, "mode_policy", None),
+                evidence_store=getattr(run_context, "evidence_store", None),
+                evidence_scope=getattr(run_context, "evidence_scope", None),
                 parent_policy=run_context.phase_policy.with_allowed_effects(
                     run_context.delegation_effects
                 ),
@@ -579,6 +593,7 @@ class AgentBatchTool(BaseTool):
                     "delegation_run_id": run_id,
                     "delegation_task_id": store_task_id,
                     "purpose": task.purpose,
+                    "required": task.required,
                     "expected_files": list(task.expected_files),
                     "write_files": list(task.write_files),
                 },

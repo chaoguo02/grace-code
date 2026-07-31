@@ -148,6 +148,9 @@ def run_child_agent(
     session_record: "SessionRecord | None" = None,
     session_runtime: "SessionRuntime | None" = None,
     parent_pipeline_state: dict | None = None,
+    evidence_store: Any = None,
+    evidence_scope: Any = None,
+    mode_policy: Any = None,
 ) -> AgentRunResult:
     """Run a typed child request while preserving its context-origin contract."""
     definition = source_definition
@@ -260,6 +263,36 @@ def run_child_agent(
     cfg.max_steps = contract.max_steps
     cfg.budget_tokens = contract.budget_tokens
     cfg.cancellation_token = cancellation_token
+    cfg.evidence_store = evidence_store
+    cfg.mode_policy = mode_policy
+    from agent.session.run_evidence import (
+        RequiredToolCall,
+        RunEvidenceRequirements,
+    )
+    _child_required_calls = tuple(
+        RequiredToolCall(
+            tool=str(tool_name),
+            minimum_count=max(1, int(minimum)),
+            producer_session_id=agent_id,
+        )
+        for tool_name, minimum in contract.require_deliverables.items()
+    )
+    cfg.evidence_requirements = RunEvidenceRequirements(
+        required_tool_calls=_child_required_calls,
+        verification_requirement=str(
+            getattr(mode_policy, "verification_requirement", "not_required")
+        ),
+        require_started_workers_succeed=False,
+        producer_session_id=agent_id,
+    )
+    if evidence_scope is not None and callable(
+        getattr(evidence_scope, "set_required_tool_calls", None)
+    ):
+        evidence_scope.set_required_tool_calls((
+            *tuple(getattr(evidence_scope, "required_tool_calls", ()) or ()),
+            *_child_required_calls,
+        ))
+    cfg.evidence_scope = evidence_scope
     # Inherit stream setting from root config (True for Web mode).
     # Callbacks stay None — parent-specific callbacks don't apply to child.
     cfg.stream_callback = None

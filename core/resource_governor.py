@@ -203,6 +203,9 @@ class ResourceGovernor:
             kind: 0 for kind in ResourceKind
         }
         self._root_reserved: dict[str, dict[ResourceKind, int]] = {}
+        # Per-run capacity — set by ModeExecutionPolicy for serial modes
+        self._run_limits: dict[str, dict[ResourceKind, int]] = {}
+        self._run_reserved: dict[str, dict[ResourceKind, int]] = {}
         self._leases: dict[str, ResourceLease] = {}
         self._queue: list[_QueuedRequest] = []
         self._queued_by_id: dict[str, _QueuedRequest] = {}
@@ -497,6 +500,29 @@ class ResourceGovernor:
                 active_leases=len(self._leases),
             )
 
+    # ── Per-run capacity (ModeExecutionPolicy integration) ──────────────
+
+    def set_limit_for_run(
+        self, run_id: str, kind: ResourceKind, limit: int,
+    ) -> None:
+        """Set a per-run capacity limit for one resource kind.
+
+        When *limit* is 0, the limit is removed.  Used by serial modes
+        (Build, Plan) to enforce ``max_in_flight_workers == 1``.
+        """
+        with self._condition:
+            if limit <= 0:
+                self._run_limits.pop(run_id, None)
+                return
+            run_limits = self._run_limits.setdefault(run_id, {})
+            run_limits[kind] = max(0, limit)
+
+    def remove_limit_for_run(self, run_id: str) -> None:
+        """Remove all per-run limits when a Run terminates."""
+        with self._condition:
+            self._run_limits.pop(run_id, None)
+            self._run_reserved.pop(run_id, None)
+
     def shutdown(self) -> None:
         events: list[dict[str, Any]] = []
         with self._condition:
@@ -595,6 +621,13 @@ class ResourceGovernor:
                 )
                 root_map = self._root_reserved.get(lease.root_session_id, {})
                 root_map[kind] = max(0, root_map.get(kind, 0) - reserved)
+                # Per-run tracking
+                _req = lease.request
+                if _req is not None:
+                    _rid = getattr(_req, "run_id", "") or ""
+                    if _rid:
+                        run_map = self._run_reserved.get(_rid, {})
+                        run_map[kind] = max(0, run_map.get(kind, 0) - reserved)
                 if kind not in _RENEWABLE_KINDS:
                     self._consumed[kind] = (
                         self._consumed.get(kind, 0)
@@ -630,9 +663,18 @@ class ResourceGovernor:
             request.root_session_id,
             {kind: 0 for kind in ResourceKind},
         )
+        # Per-run tracking
+        run_id = getattr(request, "run_id", "") or ""
+        run_map: dict[ResourceKind, int] = {}
+        if run_id and run_id in self._run_limits:
+            run_map = self._run_reserved.setdefault(
+                run_id, {kind: 0 for kind in ResourceKind},
+            )
         for kind, amount in request.resources.items():
             self._reserved[kind] = self._reserved.get(kind, 0) + amount
             root_map[kind] = root_map.get(kind, 0) + amount
+            if run_map:
+                run_map[kind] = run_map.get(kind, 0) + amount
         self._leases[lease.lease_id] = lease
         self._last_granted_root_id = request.root_session_id
         return lease
@@ -757,10 +799,14 @@ class ResourceGovernor:
         self, request: ResourceRequest
     ) -> dict[ResourceKind, bool]:
         root_map = self._root_reserved.get(request.root_session_id, {})
+        run_id = getattr(request, "run_id", "") or ""
+        run_limits = self._run_limits.get(run_id, {}) if run_id else {}
+        run_map = self._run_reserved.get(run_id, {}) if run_id else {}
         result: dict[ResourceKind, bool] = {}
         for kind, amount in request.resources.items():
             limit = self._limits.get(kind, 0)
             root_limit = self._root_limits.get(kind, 0)
+            run_limit = run_limits.get(kind, 0)
             consumed = (
                 self._consumed.get(kind, 0)
                 if kind not in _RENEWABLE_KINDS
@@ -772,6 +818,9 @@ class ResourceGovernor:
             ) or (
                 root_limit > 0
                 and root_map.get(kind, 0) + amount > root_limit
+            ) or (
+                run_limit > 0
+                and run_map.get(kind, 0) + amount > run_limit
             )
         return result
 

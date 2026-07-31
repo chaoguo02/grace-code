@@ -96,6 +96,19 @@ function InlineToolBlock({ block }: { block: ToolUseBlock }) {
             → Retried → {block.retrySucceeded ? "✓" : "✗"}
           </span>
         )}
+        {block.evidence?.cached && (
+          <span className="inline-tool-evidence-badge" title="Result served from a validated cache entry">
+            cached
+          </span>
+        )}
+        {block.evidence && (
+          <span
+            className="inline-tool-evidence-badge"
+            title={`${block.evidence.kind} · ${block.evidence.evidence_id}${block.evidence.source_fingerprint ? ` · ${block.evidence.source_fingerprint}` : ""}`}
+          >
+            evidence {1 + (block.evidence.related_evidence_ids?.length || 0)}
+          </span>
+        )}
         <span className="inline-tool-chevron">{expanded ? "▲" : "▼"}</span>
       </button>
 

@@ -6,6 +6,7 @@ import type {
   WsRunTerminalEvent,
   WsAssistantTextStartEvent, WsAssistantTextDeltaEvent, WsAssistantTextEndEvent,
   WsAssistantTextAbortedEvent,
+  RunEvidenceRecord,
 } from "../types/events";
 import type { ContentBlock, RunOutcome, StreamingTurn } from "../types/blocks";
 import type { DelegationRuns } from "../types/delegation";
@@ -76,6 +77,8 @@ export interface SessionUiState {
   delegationRuns: DelegationRuns;
   /** Phase 4: live resource governance state (from snapshot). */
   resourceGovernance: Record<string, unknown> | null;
+  /** Canonical evidence projection keyed by durable evidence id. */
+  evidenceById: Record<string, RunEvidenceRecord>;
   worktreeStates: Record<string, string>;
   /** Per-session draft text — survives tab switches. */
   draft: string;
@@ -162,6 +165,7 @@ export function createEmptySessionUiState(): SessionUiState {
     backgroundAgents: {},
     delegationRuns: {},
     resourceGovernance: null,
+    evidenceById: {},
     worktreeStates: {},
     draft: "",
     streamingThought: "",
@@ -271,6 +275,7 @@ export function applyWsToBlocks(
           b.output = ev.output;
           b.error = ev.error;
           b.outputSize = (ev.output || "").length;
+          b.evidence = ev.evidence;
           break;
         }
       }
@@ -382,6 +387,7 @@ function runOutcomeFromTerminal(re: WsRunTerminalEvent): RunOutcome {
     terminationReason: re.termination_reason,
     verification,
     workspaceDelta: re.workspace_delta,
+    evidenceSummary: re.evidence_summary,
     error: re.error,
     runId: re.run_id,
   };
@@ -805,6 +811,17 @@ export const useChatStore = create<ChatState>((set, get) => {
               || prev.resourceGovernance
             : prev.resourceGovernance,
         }));
+      }
+
+      if (ev.type === "evidence_record") {
+        patchSession(sid, (prev) => ({
+          ...prev,
+          evidenceById: {
+            ...prev.evidenceById,
+            [ev.evidence.evidence_id]: ev.evidence,
+          },
+        }));
+        return;
       }
 
       // ── ContentBlock streaming: mutate activeTurn.assistantResponse ──
@@ -1320,6 +1337,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           agentNameForUiMode(currentMode),
           clientRequestId,
           skill,
+          currentMode,
         );
 
         // ── Bind server turn_id / run_id to the optimistic activeTurn ──
@@ -1491,6 +1509,10 @@ export const useChatStore = create<ChatState>((set, get) => {
             asstBlocks,
             turn.assistant_message?.content || "",
           );
+          const terminalEvent = turn.trace_events.find(
+            (event): event is WsRunTerminalEvent =>
+              event.type === "run_terminal",
+          );
 
           const localId = `turn_${sessionId}_db_${turn.turn_id.slice(0, 8)}`;
           return {
@@ -1517,18 +1539,22 @@ export const useChatStore = create<ChatState>((set, get) => {
               completedAt: turn.meta.completed_at ? new Date(turn.meta.completed_at).getTime() : undefined,
               eventSeq: 0,
               hasGap: false,
-              outcome: {
-                status: (
-                  turn.meta.status === "failed" || turn.meta.status === "cancelled"
-                    ? turn.meta.status
-                    : "completed"
-                ),
-                terminationReason: turn.meta.termination_reason,
-                verification: turn.meta.verification,
-                workspaceDelta: turn.meta.workspace_delta,
-                error: turn.meta.error,
-                runId: turn.run_id || "",
-              },
+              outcome: terminalEvent
+                ? runOutcomeFromTerminal(terminalEvent)
+                : {
+                    status: (
+                      [
+                        "failed", "cancelled", "partial", "gave_up", "blocked",
+                      ].includes(turn.meta.status)
+                        ? turn.meta.status as RunOutcome["status"]
+                        : "completed"
+                    ),
+                    terminationReason: turn.meta.termination_reason,
+                    verification: turn.meta.verification,
+                    workspaceDelta: turn.meta.workspace_delta,
+                    error: turn.meta.error,
+                    runId: turn.run_id || "",
+                  },
             },
           };
         });

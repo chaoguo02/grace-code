@@ -1,35 +1,39 @@
-"""Evidence retrieval tools for phased analysis."""
+"""Evidence retrieval tools for phased analysis.
+
+These tools read from the RunEvidenceStore attached to the current
+RunContext.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
-from context.evidence import EvidenceLedger
 from tools.artifact_tool import ArtifactStoreRef
 from core.base import (
     BaseTool, ToolDependency, ToolEffect, ToolMetadata, ToolResult,
 )
 
 
-@dataclass
-class EvidenceLedgerRef:
-    """Mutable reference used to bind tools to the active agent evidence ledger."""
-
-    ledger: EvidenceLedger | None = None
-
-
 class EvidenceListTool(BaseTool):
     metadata = ToolMetadata(
         effects=frozenset({ToolEffect.READ_AGENT_STATE}),
-        dependency=ToolDependency.EVIDENCE_LEDGER,
     )
 
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
         return True
 
-    def __init__(self, ledger_ref: EvidenceLedgerRef) -> None:
-        self._ledger_ref = ledger_ref
+    def __init__(self) -> None:
+        self._store = None
+
+    def bind_store(self, store: Any) -> None:
+        self._store = store
+
+    def with_run_context(self, context: Any) -> "EvidenceListTool":
+        from copy import copy
+        bound = copy(self)
+        bound._store = getattr(context, "evidence_store", None)
+        return bound
 
     @property
     def name(self) -> str:
@@ -50,49 +54,51 @@ class EvidenceListTool(BaseTool):
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        ledger = self._ledger_ref.ledger
-        if ledger is None:
-            return ToolResult(success=True, output="No evidence ledger is attached.")
+        store = self._store
+        if store is None:
+            return ToolResult(success=True, output="No evidence store is attached to this run.")
         phase = str(params.get("phase", "")).strip()
         limit = max(1, int(params.get("limit", 10) or 10))
-        records = ledger.records
+        entries = store.snapshot()
         if phase:
-            records = [record for record in records if record.phase == phase]
-        records = records[:limit]
-        if not records:
+            entries = [
+                e for e in entries
+                if e.metadata.get("phase") == phase
+            ]
+        entries = entries[:limit]
+        if not entries:
             return ToolResult(success=True, output="No evidence captured yet.")
 
         lines = ["Evidence records:"]
-        for record in records:
-            location = record.path or "(no path)"
-            if record.range_text:
-                location = f"{location} {record.range_text}"
+        for entry in entries:
+            location = entry.path or "(no path)"
             lines.append(
-                f"- {record.evidence_id} | phase={record.phase} | tool={record.tool_name} | {location} | artifact={record.artifact_id or '(none)'}"
+                f"- {entry.evidence_id} | kind={entry.kind.value} | "
+                f"tool={entry.tool_name} | {location} | "
+                f"artifact={entry.artifact_id or '(none)'}"
             )
-        summaries = ledger.phase_summaries
-        if phase:
-            summaries = [summary for summary in summaries if summary.phase == phase]
-        if summaries:
-            lines.append("Phase summaries:")
-            for summary in summaries[: max(1, min(limit, 5))]:
-                lines.append(
-                    f"- {summary.phase} | evidence={len(summary.evidence_ids)} | claims={len(summary.claims)} | recommended_reads={len(summary.recommended_verification_reads)}"
-                )
         return ToolResult(success=True, output="\n".join(lines))
 
 
 class EvidenceGetTool(BaseTool):
     metadata = ToolMetadata(
         effects=frozenset({ToolEffect.READ_AGENT_STATE}),
-        dependency=ToolDependency.EVIDENCE_LEDGER,
     )
 
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
         return True
 
-    def __init__(self, ledger_ref: EvidenceLedgerRef) -> None:
-        self._ledger_ref = ledger_ref
+    def __init__(self) -> None:
+        self._store = None
+
+    def bind_store(self, store: Any) -> None:
+        self._store = store
+
+    def with_run_context(self, context: Any) -> "EvidenceGetTool":
+        from copy import copy
+        bound = copy(self)
+        bound._store = getattr(context, "evidence_store", None)
+        return bound
 
     @property
     def name(self) -> str:
@@ -100,7 +106,7 @@ class EvidenceGetTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Get one evidence record or phase summary by id from the current run."
+        return "Get one evidence record by id from the current run."
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
@@ -108,28 +114,25 @@ class EvidenceGetTool(BaseTool):
             "type": "object",
             "properties": {
                 "evidence_id": {"type": "string", "description": "Evidence id such as ev_ab12cd34."},
-                "phase": {"type": "string", "description": "Phase summary name such as inspect or verify."},
             },
+            "required": ["evidence_id"],
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        ledger = self._ledger_ref.ledger
-        if ledger is None:
-            return ToolResult(success=False, output="", error="No evidence ledger is attached.")
+        store = self._store
+        if store is None:
+            return ToolResult(success=False, output="", error="No evidence store is attached.")
 
         evidence_id = str(params.get("evidence_id", "")).strip()
-        phase = str(params.get("phase", "")).strip()
-        if evidence_id:
-            for record in ledger.records:
-                if record.evidence_id == evidence_id:
-                    return ToolResult(success=True, output=record.reference_text())
+        entry = store.get_by_id(evidence_id)
+        if entry is None:
             return ToolResult(success=False, output="", error=f"Evidence not found: {evidence_id}")
-        if phase:
-            summary = ledger.phase_summary_for(phase)
-            if summary is None:
-                return ToolResult(success=False, output="", error=f"Phase summary not found: {phase}")
-            return ToolResult(success=True, output=summary.prompt_text())
-        return ToolResult(success=False, output="", error="evidence_id or phase is required")
+        return ToolResult(success=True, output=(
+            f"[Evidence {entry.evidence_id}]\n"
+            f"kind={entry.kind.value} status={entry.status.value}\n"
+            f"tool={entry.tool_name} path={entry.path}\n"
+            f"summary: {entry.summary}"
+        ))
 
 
 class ArtifactSearchTool(BaseTool):

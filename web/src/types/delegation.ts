@@ -49,6 +49,8 @@ export interface TaskState {
   tokensUsed?: number;
   durationMs?: number;
   updatedAt?: string;
+  schemaVersion?: number;
+  acceptance?: string[];
   // Phase 4: resource governance fields
   resourceRequested?: Record<string, number>;
   resourceGranted?: Record<string, number>;

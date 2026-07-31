@@ -127,6 +127,13 @@ class ChatRequest:
     display_prompt: str = ""
     """User-visible prompt persisted to history when execution prompt differs."""
     agent_name: str = "build"
+    skill_name: str = ""
+    """User-invocable Skill name from the request body."""
+    skill_arguments: str = ""
+    """Raw structured Skill arguments from the request body."""
+    product_mode: str = ""
+    """Explicit product mode: 'plan', 'build', or 'multi-agent'.
+    When empty, derived from agent_name as fallback for legacy callers."""
     intent: TaskIntent | None = None
     permission_mode: str = "acceptEdits"
     repo_path: str = "."
@@ -442,6 +449,9 @@ class ChatPipeline:
             agent_name=request.agent_name,
             task_description=self._render_prepared_prompt(prepared),
             intent=request.intent,
+            product_mode=request.product_mode,
+            request_skill=request.skill_name,
+            skill_arguments=request.skill_arguments,
             messages=(
                 [LLMMessage(role="user", content=request.display_prompt)]
                 if request.display_prompt

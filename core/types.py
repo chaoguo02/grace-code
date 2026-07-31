@@ -178,7 +178,6 @@ class PathAccess(str, Enum):
 class ToolDependency(str, Enum):
     NONE = "none"
     ARTIFACT_STORE = "artifact_store"
-    EVIDENCE_LEDGER = "evidence_ledger"
 
 
 class ToolRole(str, Enum):

@@ -49,6 +49,13 @@ describe("applyWsToBlocks", () => {
       output: "75",
       status: "success",
       step: 1,
+      evidence: {
+        evidence_id: "ev-call-1",
+        kind: "tool_call_completed",
+        status: "succeeded",
+        cached: true,
+        related_evidence_ids: ["ev-cache-1"],
+      },
     } as WsMessage);
     apply({
       type: "assistant_text_start",
@@ -76,6 +83,13 @@ describe("applyWsToBlocks", () => {
       name: "Bash",
       status: "success",
       output: "75",
+      evidence: {
+        evidence_id: "ev-call-1",
+        kind: "tool_call_completed",
+        status: "succeeded",
+        cached: true,
+        related_evidence_ids: ["ev-cache-1"],
+      },
     });
     expect(blocks[2]).toMatchObject({
       type: "text",

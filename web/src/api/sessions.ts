@@ -7,6 +7,7 @@ import type {
   WsMessage,
   TimelineResponse,
 } from "../types";
+import type { RunEvidenceRecord } from "../types/events";
 
 export function listSessions(limit = 50): Promise<SessionSummary[]> {
   return apiGet(`/api/sessions?limit=${limit}`);
@@ -56,6 +57,21 @@ export function getTimeline(
   );
 }
 
+export function getRunEvidence(
+  sessionId: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<{
+  run_id: string;
+  schema_version: number;
+  evidence: RunEvidenceRecord[];
+}> {
+  return apiGet(
+    `/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/evidence`,
+    signal,
+  );
+}
+
 export function createSession(
   agentName: string,
   repoPath: string,
@@ -75,11 +91,13 @@ export function chat(
   agentName?: string,
   idempotencyKey?: string,
   skill?: { name: string; arguments?: string },
+  productMode?: string,
 ): Promise<Record<string, unknown>> {
   const body: Record<string, unknown> = { prompt };
   if (intent) body.intent = intent;
   if (agentName) body.agent_name = agentName;
   if (idempotencyKey) body.idempotency_key = idempotencyKey;
+  if (productMode) body.product_mode = productMode;
   if (skill) {
     body.skill_name = skill.name;
     body.skill_arguments = skill.arguments || "";

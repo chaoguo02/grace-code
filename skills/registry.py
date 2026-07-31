@@ -20,7 +20,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +97,7 @@ class SkillMetadata:
     allowed_tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
     mcp_servers: frozenset[str] = frozenset()
+    evidence_contract: dict[str, object] = field(default_factory=dict)
     hooks: tuple[dict, ...] = ()
     source: str = "project"
     trusted: bool = True
@@ -483,6 +484,10 @@ class SkillRegistry:
             allowed_tools=_parse_tool_set(fm_dict.get("allowed-tools", [])),
             disallowed_tools=_parse_tool_set(fm_dict.get("disallowed-tools", [])),
             mcp_servers=self._load_mcp_dependencies(skill_file.parent),
+            evidence_contract=(
+                dict(fm_dict.get("evidence", {}))
+                if isinstance(fm_dict.get("evidence"), dict) else {}
+            ),
             hooks=hooks,
             source=source.name,
             trusted=source.trusted,

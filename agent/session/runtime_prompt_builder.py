@@ -23,6 +23,7 @@ def build_runtime_messages(
     agent_registry=None,
     project_dir: str | None = None,
     skill_registry=None,
+    on_skill_preload: Any = None,
 ) -> list["LLMMessage"]:
     """Build runtime-injected messages for a session.
 
@@ -43,6 +44,7 @@ def build_runtime_messages(
             spec.skills,
             project_dir,
             skill_registry=skill_registry,
+            on_skill_preload=on_skill_preload,
         )
         if skill_contents:
             messages.append(LLMMessage(
@@ -183,6 +185,7 @@ def _load_skills(
     project_dir: str | None,
     *,
     skill_registry=None,
+    on_skill_preload: Any = None,
 ) -> list[str]:
     """Load SKILL.md content for preloading into agent context."""
     from pathlib import Path
@@ -195,6 +198,24 @@ def _load_skills(
             )
             if rendered:
                 contents.append(f"=== {skill_name} ===\n{rendered}")
+                # ── Evidence: record preload activation ──
+                if on_skill_preload is not None:
+                    try:
+                        meta = skill_registry.get_skill_meta(skill_name)
+                        fingerprint = ""
+                        mcp_deps: list[str] = []
+                        if meta is not None:
+                            from skills.activation import skill_fingerprint
+                            fingerprint = skill_fingerprint(meta)
+                            mcp_deps = sorted(meta.mcp_servers) if meta.mcp_servers else []
+                        on_skill_preload(
+                            skill_name,
+                            source="preload",
+                            fingerprint=fingerprint,
+                            mcp_dependencies=mcp_deps,
+                        )
+                    except Exception:
+                        pass
             else:
                 import logging
                 logging.getLogger(__name__).warning(

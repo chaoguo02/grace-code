@@ -12,6 +12,9 @@ const STATUS_LABELS: Record<RunOutcome["status"], string> = {
   completed: "Completed",
   failed: "Failed",
   cancelled: "Cancelled",
+  partial: "Partial",
+  gave_up: "Gave up",
+  blocked: "Blocked",
 };
 
 function verificationLabel(outcome: RunOutcome): string {
@@ -42,6 +45,7 @@ export function RunOutcomeBar({
     outcome.terminationReason && outcome.terminationReason !== "none" ||
     verification?.checks?.length ||
     changedFiles.length ||
+    outcome.evidenceSummary?.total ||
     outcome.runId,
   );
 
@@ -64,6 +68,12 @@ export function RunOutcomeBar({
           <>
             <span className="run-outcome-separator">·</span>
             <span>{changedFiles.length} file{changedFiles.length === 1 ? "" : "s"} changed</span>
+          </>
+        )}
+        {(outcome.evidenceSummary?.total || 0) > 0 && (
+          <>
+            <span className="run-outcome-separator">·</span>
+            <span>{outcome.evidenceSummary?.total} evidence</span>
           </>
         )}
         {steps > 0 && <span className="run-outcome-metric">{steps} steps</span>}
@@ -101,6 +111,17 @@ export function RunOutcomeBar({
             <div>
               <strong>Changed files</strong>
               <span className="run-outcome-paths">{changedFiles.join("\n")}</span>
+            </div>
+          )}
+          {(outcome.evidenceSummary?.total || 0) > 0 && (
+            <div>
+              <strong>Evidence</strong>
+              <span>
+                {outcome.evidenceSummary?.total} records
+                {outcome.evidenceSummary?.failed
+                  ? ` · ${outcome.evidenceSummary.failed} failed`
+                  : ""}
+              </span>
             </div>
           )}
           {outcome.runId && <div><strong>Run ID</strong><span>{outcome.runId}</span></div>}

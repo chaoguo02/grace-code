@@ -38,9 +38,10 @@ class ToolExecutionPipeline:
         hook_dispatcher: Any = None,
         capability_registry: Any = None,
         session_id: str = "",
-        budget: Any = None,  # ExecutionBudget only EXHAUSTED gates calls
+        budget: Any = None,
         resource_governor: Any = None,
         root_session_resolver: Any = None,
+        evidence_recorder: Any = None,
     ) -> None:
         self._permission_pipeline = permission_pipeline
         self._hook_dispatcher = hook_dispatcher
@@ -49,6 +50,7 @@ class ToolExecutionPipeline:
         self._budget = budget
         self._resource_governor = resource_governor
         self._root_session_resolver = root_session_resolver
+        self._evidence_recorder = evidence_recorder
 
     def execute(
         self,
@@ -82,6 +84,17 @@ class ToolExecutionPipeline:
 
         logical_id = invocation_id or f"tool_{uuid.uuid4().hex}"
         policy = tool.retry_policy(params)
+
+        # ── Evidence: record tool call started ──
+        if self._evidence_recorder is not None:
+            self._evidence_recorder.record_started(
+                tool_name=tool.name,
+                params=params,
+                invocation_id=logical_id,
+                tool=tool,
+                session_id=self._session_id,
+            )
+
         attempts: list[dict[str, Any]] = []
         delay_ms = policy.base_delay_ms
         result: ToolResult | None = None
@@ -155,6 +168,16 @@ class ToolExecutionPipeline:
             "retry_mode": policy.mode.value,
             "attempts": attempts,
         }
+        # ── Evidence: record tool call completed ──
+        if self._evidence_recorder is not None:
+            self._evidence_recorder.record_completed(
+                tool_name=tool.name,
+                params=params,
+                result=result,
+                invocation_id=logical_id,
+                tool=tool,
+                session_id=self._session_id,
+            )
         return result
 
     def _execute_once(

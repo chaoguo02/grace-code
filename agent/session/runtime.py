@@ -47,6 +47,7 @@ from agent.session.session_store import SessionStore
 from agent.session.run_context import (
     AgentSpawnContext, CancellationToken,
 )
+from agent.session.mode_execution_policy import ModeExecutionPolicy
 from context.history import ConversationHistory
 from hooks.events import HookContext, HookEvent, SessionStartSource
 from hooks.protocol import DispatchResult
@@ -171,6 +172,17 @@ class SessionRuntime:
         self._text_delta_callbacks: dict[str, object] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
         self._backend_store: dict[str, "LLMBackend"] = {}
+        # Pre-run Skill activations are isolated by session.  Once a run owns
+        # its Store, activations are recorded directly instead of passing
+        # through shared mutable "current run" state.
+        self._pending_skill_activations: dict[str, list[dict[str, object]]] = {}
+        self._active_evidence_stores: dict[str, object] = {}
+        self._active_evidence_requirements: dict[str, object] = {}
+        from agent.session.run_evidence import EvidenceStoreManager
+        self._evidence_stores = EvidenceStoreManager(
+            persist_fn=self._store.create_evidence,
+            list_fn=self._store.list_evidence,
+        )
         # Shared read cache — survives tool registry rebuilds across turns.
         # Without this, PolicyAwareToolRegistry.copy() + scoped() may give
         # Read and Edit tools different _read_cache instances, causing
@@ -1571,7 +1583,15 @@ class SessionRuntime:
 
         # Derive authority from tools physically visible to this parent rather
         # than from the requested child name or task prose.
-        parent_registry = self._build_registry_for_session(parent_definition, parent)
+        _exp_mode = _derive_product_mode(parent_definition.name)
+        _exp_policy = ModeExecutionPolicy.for_run(
+            product_mode=_exp_mode,
+            primary_agent=parent_definition.name,
+            governor=self._governor,
+        )
+        parent_registry = self._build_registry_for_session(
+            parent_definition, parent, mode_policy=_exp_policy,
+        )
         allowed_effects = {ToolEffect.PRODUCE_DELIVERABLE}
         for tool_name in parent_registry.tool_names:
             metadata = parent_registry.metadata_for(tool_name)
@@ -1626,6 +1646,9 @@ class SessionRuntime:
         agent_name: str,
         task_description: str,
         intent: TaskIntent | str | None = None,
+        product_mode: str = "",
+        request_skill: str = "",
+        skill_arguments: str = "",
         messages: list[LLMMessage] | None = None,
         max_steps_override: int | None = None,        # deprecated: use contract
         budget_tokens_override: int | None = None,    # deprecated: use contract
@@ -1688,6 +1711,7 @@ class SessionRuntime:
             except Exception:
                 logger.debug("Run lifecycle transition skipped", exc_info=True)
 
+        _evidence_store = None
         try:
             # ── Session memory tracker ──
             session_memory_tracker = None
@@ -1707,6 +1731,81 @@ class SessionRuntime:
             # so all Read/Edit/Write/View tools in the run get the same cache.
             _inject_shared_read_cache(self._base_registry, self._read_cache)
 
+            # ── ModeExecutionPolicy — per-Run immutable execution contract ──
+            _resolved_product_mode = product_mode or _derive_product_mode(
+                _effective_agent,
+            )
+            _mode_policy = ModeExecutionPolicy.for_run(
+                product_mode=_resolved_product_mode,
+                primary_agent=_effective_agent,
+                governor=self._governor,
+            )
+
+            # ── RunEvidenceStore — one namespace per REAL top-level run ──
+            import uuid as _run_uuid
+            _root_run_id = str(
+                getattr(_run_ctx, "run_id", "") or f"local-{_run_uuid.uuid4()}"
+            )
+            _root_session_id = session.root_id or session.id
+            _evidence_store = self._evidence_stores.acquire(
+                _root_run_id,
+                root_session_id=_root_session_id,
+                turn_id=str(getattr(_run_ctx, "turn_id", "") or ""),
+                default_session_id=session_id,
+            )
+            self._active_evidence_stores[session_id] = _evidence_store
+
+            # ── Flush pending skill activations into evidence ──
+            _pending_activations = self._pending_skill_activations.pop(
+                session_id, [],
+            )
+            _flush_skill_activations(_evidence_store, _pending_activations)
+            if self._mcp_integration is not None:
+                self._mcp_integration.record_run_exposure(
+                    _evidence_store, session_id,
+                )
+
+            # ── RunEvidenceRequirements — built from trusted sources only ──
+            from agent.session.evidence_requirements import (
+                RunEvidenceRequirementsFactory,
+            )
+            # Skill metadata for MCP dep resolution
+            _skill_meta = None
+            _skill_args = skill_arguments
+            if request_skill and self._base_registry.skill_registry is not None:
+                try:
+                    _skill_meta_raw = self._base_registry.skill_registry.get_skill_meta(
+                        request_skill,
+                    )
+                    if _skill_meta_raw is not None:
+                        _skill_meta = {
+                            "name": getattr(_skill_meta_raw, "name", request_skill),
+                            "mcp_dependencies": sorted(
+                                getattr(_skill_meta_raw, "mcp_servers", frozenset())
+                            ),
+                            "argument_names": tuple(
+                                getattr(_skill_meta_raw, "arguments", ())
+                            ),
+                            "evidence_contract": dict(
+                                getattr(_skill_meta_raw, "evidence_contract", {})
+                                or {}
+                            ),
+                            "source": getattr(_skill_meta_raw, "source", ""),
+                        }
+                except Exception:
+                    pass
+            # Plan contract from previous Plan run (persisted in session metadata)
+            _plan_contract = (session.metadata or {}).get("plan_contract")
+            _evidence_requirements = RunEvidenceRequirementsFactory.for_run(
+                request_skill=request_skill or None,
+                skill_arguments=_skill_args,
+                skill_metadata=_skill_meta,
+                plan_contract=_plan_contract if isinstance(_plan_contract, dict) else None,
+                delegation_plan=None,
+                mode_policy=_mode_policy,
+            )
+            self._active_evidence_requirements[_root_run_id] = _evidence_requirements
+
             from agent.session.agent_factory import AgentFactory
             _effective_backend = self.get_backend_for_session(session_id)
             _assembly = AgentFactory.create(
@@ -1719,12 +1818,34 @@ class SessionRuntime:
                 session=session,
                 circuit_breaker=self._circuit_breaker,
                 runtime=self,
+                mode_policy=_mode_policy,
                 mcp_tool_names=self._mcp_tool_names_for_spec(
                     self._agent_registry.get(_effective_agent)
                 ),
                 session_memory_tracker=session_memory_tracker,
             )
             spec = _assembly.spec
+            if spec.completion_requires:
+                from agent.session.run_evidence import RequiredToolCall
+                _definition_calls = tuple(
+                    RequiredToolCall(
+                        tool=str(tool_name),
+                        minimum_count=max(1, int(minimum)),
+                        producer_session_id=session_id,
+                    )
+                    for tool_name, minimum
+                    in spec.completion_requires.items()
+                )
+                _evidence_requirements = replace(
+                    _evidence_requirements,
+                    required_tool_calls=(
+                        *_evidence_requirements.required_tool_calls,
+                        *_definition_calls,
+                    ),
+                )
+                self._active_evidence_requirements[
+                    _root_run_id
+                ] = _evidence_requirements
             if self._memory_context is not None and hasattr(self._memory_context, "set_session_context"):
                 self._memory_context.set_session_context(
                     session_id=session_id,
@@ -1741,6 +1862,13 @@ class SessionRuntime:
             _eff_contract = contract if contract is not None else _assembly.contract
             agent = _assembly.agent
             agent_cfg = _assembly.agent_cfg
+            agent_cfg.evidence_store = _evidence_store
+            agent_cfg.evidence_requirements = _evidence_requirements
+            # ── EvidenceScope: artifact dependency boundary ──
+            from agent.session.evidence_scope import EvidenceScope
+            agent_cfg.evidence_scope = EvidenceScope(
+                required_tool_calls=_evidence_requirements.required_tool_calls,
+            )
             if effort_override:
                 agent_cfg.effort = effort_override
             if skill_modifier is not None:
@@ -1782,6 +1910,7 @@ class SessionRuntime:
                     session_id=session_id,
                     circuit_breaker=agent_cfg.circuit_breaker,
                     approved_prompts=tuple(allowed_prompts or ()),
+                    write_allowed=_mode_policy.write_allowed,
                 ),
             )
 
@@ -1869,7 +1998,21 @@ class SessionRuntime:
                     )
 
             history = ConversationHistory(max_messages=agent_cfg.history_max_messages)
-            injected_messages = self._build_runtime_messages(spec, task_description)
+            injected_messages = self._build_runtime_messages(
+                spec, task_description, session_id=session_id,
+            )
+            # Preloaded skills are discovered while building runtime messages.
+            # record_skill_activation() writes them directly to the active Store.
+
+            # ── Evidence summary for compaction-aware context ──
+            from agent.session.run_evidence import build_evidence_projection
+            _evidence_summary = build_evidence_projection(
+                _evidence_store, _evidence_requirements,
+            )
+            if _evidence_summary:
+                injected_messages.append(
+                    LLMMessage(role="system", content=_evidence_summary),
+                )
 
             # Session context: injected as a Runtime message so the model
             # sees it but it is NOT persisted to DB (filtered by the
@@ -2045,12 +2188,37 @@ class SessionRuntime:
                         # ── Run lifecycle: CANCELLED ──
                         self._finalize_run(_run_ctx, result, "cancelled",
                                           error=result.error or result.summary)
+                    elif result.status is RunStatus.MAX_STEPS:
+                        self._store.set_summary(
+                            session_id, result.summary,
+                            status=SessionStatus.PARTIAL,
+                        )
+                        self._finalize_run(_run_ctx, result, "partial")
+                    elif result.status is RunStatus.GAVE_UP:
+                        self._store.update_status(
+                            session_id, SessionStatus.FAILED,
+                            error=result.error or result.summary,
+                        )
+                        if result.summary:
+                            self._store.set_summary(
+                                session_id, result.summary,
+                                status=SessionStatus.FAILED,
+                            )
+                        self._finalize_run(_run_ctx, result, "gave_up",
+                                          error=result.error or result.summary)
+                    elif result.status is RunStatus.BLOCKED:
+                        self._store.update_status(
+                            session_id, SessionStatus.FAILED,
+                            error=result.error or result.summary,
+                        )
+                        if result.summary:
+                            self._store.set_summary(
+                                session_id, result.summary,
+                                status=SessionStatus.FAILED,
+                            )
+                        self._finalize_run(_run_ctx, result, "blocked",
+                                          error=result.error or result.summary)
                     elif result.is_success():
-                        # ── Transition session from RUNNING back to a stable state ──
-                        # The frontend ChatView syncs isRunning from session.status;
-                        # if we leave it as RUNNING, refreshActive() will re-set
-                        # isRunning=true forever.  COMPLETED is the backward-compat
-                        # value — future work can introduce SessionStatus.ACTIVE.
                         self._store.set_summary(
                             session_id, result.summary, status=SessionStatus.COMPLETED,
                         )
@@ -2064,7 +2232,7 @@ class SessionRuntime:
                                 )
                             except Exception:
                                 pass
-                        # ── Run lifecycle: COMPLETED (transaction: messages + run + run_terminal) ──
+                        # ── Run lifecycle: COMPLETED ──
                         self._finalize_run(_run_ctx, result, "completed")
                     else:
                         self._store.update_status(
@@ -2099,6 +2267,13 @@ class SessionRuntime:
                     session_id[:8],
                 )
             self._cancellation_tokens.pop(session_key, None)
+            self._active_evidence_stores.pop(session_id, None)
+            if _evidence_store is not None:
+                self._active_evidence_requirements.pop(
+                    _evidence_store.root_run_id, None,
+                )
+            if _evidence_store is not None:
+                self._evidence_stores.finish(_evidence_store.root_run_id)
 
     # ── Run lifecycle helper ───────────────────────────────────────────────
 
@@ -2157,6 +2332,56 @@ class SessionRuntime:
             import uuid as _uuid_mod
             from datetime import datetime as _dt, timezone as _tz
 
+            _evidence_manager = getattr(self, "_evidence_stores", None)
+            _requirements_by_run = getattr(
+                self, "_active_evidence_requirements", {},
+            )
+            _terminal_store = (
+                _evidence_manager.get(_run_id)
+                if _evidence_manager is not None else None
+            )
+            _requirements = _requirements_by_run.get(_run_id)
+            if _terminal_store is not None and _requirements is not None:
+                from agent.session.run_evidence import (
+                    EvidenceEntry,
+                    EvidenceKind,
+                    EvidenceStatus,
+                )
+                _evaluation = (
+                    _terminal_store.last_evaluation
+                    or _terminal_store.evaluate(_requirements)
+                )
+                _terminal_store.record(EvidenceEntry(
+                    evidence_id=f"ev_completion_{_run_id}",
+                    idempotency_key=f"completion-evaluated:{_run_id}",
+                    root_run_id=_run_id,
+                    session_id=_session_id,
+                    producer_session_id=_session_id,
+                    kind=EvidenceKind.COMPLETION_EVALUATED,
+                    status=(
+                        EvidenceStatus.SUCCEEDED
+                        if _evaluation.satisfied else EvidenceStatus.FAILED
+                    ),
+                    summary=(
+                        "requirements satisfied"
+                        if _evaluation.satisfied
+                        else "completion requirements not satisfied"
+                    ),
+                    depends_on=_evaluation.satisfied_evidence_ids,
+                    metadata={
+                        "satisfied": _evaluation.satisfied,
+                        "total_required": _evaluation.total_required,
+                        "total_satisfied": _evaluation.total_satisfied,
+                        "satisfied_by": {
+                            key: list(value)
+                            for key, value
+                            in _evaluation.satisfied_by.items()
+                        },
+                        "missing": [asdict(item) for item in _evaluation.missing],
+                        "failed": [asdict(item) for item in _evaluation.failed],
+                    },
+                ))
+
             # 1. CAS update — best-effort transition from 'running'
             _updated = self._store.update_run(
                 _run_id,
@@ -2205,6 +2430,9 @@ class SessionRuntime:
                     } | {
                         "patch_available": bool(_workspace_delta.get("patch")),
                     }) if _workspace_delta else {},
+                    "evidence_summary": _build_terminal_evidence_summary(
+                        _terminal_store,
+                    ),
                     "timestamp": _dt.now(_tz.utc).isoformat(),
                     "event_id": str(_uuid_mod.uuid4()),
                 }
@@ -2419,20 +2647,30 @@ class SessionRuntime:
             agent_type=child_agent_type,
         ))
         persisted_messages = self._store.list_messages(child.id)
-        execute = lambda: self._execute_child_session(
-            parent=parent,
-            child=resumed,
-            request=request,
-            definition=definition,
-            parent_definition=parent_definition,
-            contract=contract,
-            cancellation_token=child_cancellation,
-            parent_policy=effective_policy,
-            repo_path=self._require_project_scope(parent.repo_path),
-            child_agent_type=child_agent_type,
-            spawn_context=None,
-            persisted_messages=persisted_messages,
-        )
+        _resume_evidence_store = self._active_evidence_stores.get(parent.id)
+        if _resume_evidence_store is not None:
+            _resume_evidence_store.retain()
+
+        def execute():
+            try:
+                return self._execute_child_session(
+                    parent=parent,
+                    child=resumed,
+                    request=request,
+                    definition=definition,
+                    parent_definition=parent_definition,
+                    contract=contract,
+                    cancellation_token=child_cancellation,
+                    parent_policy=effective_policy,
+                    repo_path=self._require_project_scope(parent.repo_path),
+                    child_agent_type=child_agent_type,
+                    spawn_context=None,
+                    persisted_messages=persisted_messages,
+                    evidence_store=_resume_evidence_store,
+                )
+            finally:
+                if _resume_evidence_store is not None:
+                    _resume_evidence_store.release()
         handle = self._start_background_execution(
             parent=parent,
             child=resumed,
@@ -2719,6 +2957,8 @@ class SessionRuntime:
 
     def _build_registry_for_session(
         self, spec: AgentDefinition, session,
+        *,
+        mode_policy=None,
     ) -> ToolRegistry:
         """委托给 registry_builder。"""
         from agent.session.registry_builder import build_registry_for_session
@@ -2729,6 +2969,7 @@ class SessionRuntime:
             agent_registry=self._agent_registry,
             circuit_breaker=self._circuit_breaker,
             runtime=self,
+            mode_policy=mode_policy,
             mcp_tool_names=self._mcp_tool_names_for_spec(spec),
             permission_mode_override=override,
         )
@@ -2874,6 +3115,28 @@ class SessionRuntime:
     def pop_pending_effort(self, session_id: str) -> str | None:
         return getattr(self, '_pending_effort', {}).pop(session_id, None)
 
+    def record_skill_activation(
+        self, skill_name: str, *, source: str = "", fingerprint: str = "",
+        mcp_dependencies: list[str] | None = None, session_id: str = "",
+    ) -> None:
+        """Record a Skill activation in the owning run or its session queue."""
+        if not session_id:
+            raise ValueError("session_id is required for Skill evidence")
+        activation = {
+            "skill_name": skill_name,
+            "source": source,
+            "fingerprint": fingerprint,
+            "mcp_dependencies": mcp_dependencies or [],
+            "session_id": session_id,
+        }
+        active_store = self._active_evidence_stores.get(session_id)
+        if active_store is not None:
+            _flush_skill_activations(active_store, [activation])
+            return
+        self._pending_skill_activations.setdefault(session_id, []).append(
+            activation,
+        )
+
     def set_pending_skill_modifier(self, session_id: str, modifier: Any) -> None:
         if not hasattr(self, "_pending_skill_modifiers"):
             self._pending_skill_modifiers: dict[str, Any] = {}
@@ -2955,15 +3218,26 @@ class SessionRuntime:
             cfg.token_callback = None
         return cfg
 
-    def _build_runtime_messages(self, spec: AgentDefinition, task_description: str) -> list[LLMMessage]:
+    def _build_runtime_messages(
+        self, spec: AgentDefinition, task_description: str, *,
+        session_id: str = "",
+    ) -> list[LLMMessage]:
         """委托给 runtime_prompt_builder。"""
         from agent.session.runtime_prompt_builder import build_runtime_messages
         skill_registry = self._base_registry.skill_registry
+        _on_preload = (
+            lambda skill_name, source, fingerprint, mcp_dependencies:
+                self.record_skill_activation(
+                    skill_name, source=source, fingerprint=fingerprint,
+                    mcp_dependencies=mcp_dependencies, session_id=session_id,
+                )
+        ) if session_id else None
         return build_runtime_messages(
             spec, task_description,
             agent_registry=self._agent_registry,
             project_dir=self._agent_registry.project_dir if self._agent_registry else None,
             skill_registry=skill_registry,
+            on_skill_preload=_on_preload,
         )
 
 
@@ -2992,3 +3266,59 @@ def memory_freshness_text(name: str, store) -> str:
         return f"{age_days} days ago — verify against current code"
     except Exception:
         return ""
+
+
+# ── Product mode derivation (legacy fallback) ─────────────────────────────
+
+
+def _derive_product_mode(agent_name: str) -> str:
+    """Derive product_mode from agent_name for backward compatibility."""
+    _map = {
+        "plan": "plan",
+        "build": "build",
+        "orchestrator": "multi-agent",
+    }
+    return _map.get(agent_name, "build")
+
+
+def _build_terminal_evidence_summary(store) -> dict[str, object]:
+    if store is None:
+        return {"total": 0, "by_kind": {}, "failed": 0}
+    entries = store.snapshot()
+    by_kind: dict[str, int] = {}
+    failed = 0
+    for entry in entries:
+        by_kind[entry.kind.value] = by_kind.get(entry.kind.value, 0) + 1
+        if entry.status.value in {"failed", "blocked", "cancelled"}:
+            failed += 1
+    return {
+        "total": len(entries),
+        "by_kind": by_kind,
+        "failed": failed,
+    }
+
+
+def _flush_skill_activations(store, activations: list[dict[str, object]]) -> None:
+    """Record pending skill activations as SKILL_LOADED evidence."""
+    if not activations:
+        return
+    from agent.session.run_evidence import (
+        EvidenceEntry, EvidenceKind, EvidenceStatus,
+    )
+    for activation in activations:
+        skill_name = str(activation.get("skill_name", ""))
+        fingerprint = str(activation.get("fingerprint", ""))
+        source = str(activation.get("source", ""))
+        session_id = str(activation.get("session_id", ""))
+        store.record(EvidenceEntry(
+            evidence_id=f"ev_skill_{skill_name}_{source}"[:40],
+            idempotency_key=f"skill-load:{session_id}:{skill_name}:{fingerprint}:{source}",
+            root_run_id="",
+            session_id=session_id,
+            producer_session_id=session_id,
+            kind=EvidenceKind.SKILL_LOADED,
+            status=EvidenceStatus.SUCCEEDED,
+            tool_name=f"skill:{skill_name}",
+            source_fingerprint=fingerprint,
+            metadata={"source": source, "mcp_dependencies": list(activation.get("mcp_dependencies", []))},
+        ))

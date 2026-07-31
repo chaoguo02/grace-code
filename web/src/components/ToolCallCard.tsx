@@ -45,7 +45,19 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
   const [expanded, setExpanded] = useState(false);
   const paramsStr = formatJson(params, expanded ? Number.MAX_SAFE_INTEGER : 220);
   const summary = summarizeTarget(params);
-  const obs = observation as { output?: string; error?: string; status?: string; tool_name?: string } | null;
+  const obs = observation as {
+    output?: string;
+    error?: string;
+    status?: string;
+    tool_name?: string;
+    evidence?: {
+      evidence_id: string;
+      kind: string;
+      cached?: boolean;
+      source_fingerprint?: string;
+      related_evidence_ids?: string[];
+    };
+  } | null;
   const observationPreview = (obs?.output || obs?.error || "").replace(/\s+/g, " ").slice(0, 280);
 
   return (
@@ -70,6 +82,15 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
           <span className="timeline-card-subtitle">{summary}</span>
         </div>
         {id && <span className="tc-id" title={id}>{id.slice(0, 8)}</span>}
+        {obs?.evidence?.cached && <span className="tc-id">cached</span>}
+        {obs?.evidence && (
+          <span
+            className="tc-id"
+            title={`${obs.evidence.kind} · ${obs.evidence.evidence_id}${obs.evidence.source_fingerprint ? ` · ${obs.evidence.source_fingerprint}` : ""}`}
+          >
+            evidence {1 + (obs.evidence.related_evidence_ids?.length || 0)}
+          </span>
+        )}
         <button
           type="button"
           className="trace-expand-btn tc-expand-btn"
@@ -107,4 +128,3 @@ export function ToolCallCard({ name, params, id, step, observation, className }:
     </div>
   );
 }
-

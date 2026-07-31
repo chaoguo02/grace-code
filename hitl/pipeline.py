@@ -153,6 +153,10 @@ class PermissionSessionConfig:
     circuit_breaker: Any = None
     approved_prompts: tuple[dict[str, str], ...] = ()
     """CC-aligned: prompts approved during plan exit, carried to build session."""
+    write_allowed: bool = True
+    """When False, all write-effect tools are denied by the pipeline.
+    Set by Plan mode (write_allowed=False). This is the security boundary —
+    registry hiding and prompts are only UX hints."""
 
 
 @dataclass(frozen=True)
@@ -231,6 +235,8 @@ class PermissionPipeline:
         # CC-aligned prompt-based permissions: model-declared prompts approved during
         # plan exit, auto-allowed in the subsequent build session.
         self._approved_prompts: list[dict[str, str]] = []
+        self._write_allowed: bool = True
+        """When False, all write-effect tools are denied."""
 
         for r in (rules or []):
             if r.tier is PermissionRuleTier.DENY:
@@ -284,6 +290,31 @@ class PermissionPipeline:
             if config.approved_prompts:
                 for item in config.approved_prompts:
                     self.add_approved_prompts([item])
+            # ── Plan mode write gate ──
+            self._write_allowed = config.write_allowed
+            if not config.write_allowed:
+                # When writes are not allowed, add a catch-all deny rule
+                # for write-effect tools. This is the security boundary.
+                self._add_write_deny_rule()
+
+    def _add_write_deny_rule(self) -> None:
+        """Add catch-all rules denying write tools when write_allowed=False."""
+        from hitl.permission_rule import PermissionRule, PermissionRuleTier
+        write_tool_names = {
+            "Write", "Edit", "Bash", "git_add", "git_commit",
+            "git_push", "pytest",
+        }
+        for tool_name in write_tool_names:
+            rule = PermissionRule(
+                raw=f"{tool_name} deny",
+                tool_name=tool_name.lower(),
+                pattern=None,
+                tier=PermissionRuleTier.DENY,
+                source="plan_policy",
+            )
+            if rule not in self._deny_rules:
+                self._deny_rules.append(rule)
+        self._sort_rule_lists()
 
     def attach_hook_dispatcher(self, dispatcher: Any) -> None:
         """Attach the lifecycle dispatcher without exposing mutable fields."""

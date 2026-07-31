@@ -223,6 +223,7 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
             step=payload.get("step", 0), id=_tc_id,
             tool_call_id=_tc_id,  # explicit tool_call_id for frontend matching
             diff=_obs_meta.get("diff", ""),
+            evidence=_obs_meta.get("evidence_ref"),
             child_session_id=child_id, timestamp=ts).to_dict()]
 
     if ev_type == "reflection":

@@ -26,6 +26,7 @@ def test_temp_project_orchestrator_session_exposes_agent_batch_schema(
     from agent.session.models import SessionMode
     from agent.session.registry_builder import build_registry_for_session
     from agent.session.session_store import SessionStore
+    from agent.session.mode_execution_policy import ModeExecutionPolicy
     from core.base import ToolRegistry
 
     project = tmp_path / "fixture"
@@ -40,11 +41,16 @@ def test_temp_project_orchestrator_session_exposes_agent_batch_schema(
     agent_registry = AgentRegistryV2(project_dir=project)
     spec = agent_registry.get("orchestrator")
 
+    mode_policy = ModeExecutionPolicy.for_run(
+        product_mode="multi-agent",
+        primary_agent="orchestrator",
+    )
     effective_registry = build_registry_for_session(
         spec,
         session,
         base_registry=ToolRegistry(),
         agent_registry=agent_registry,
+        mode_policy=mode_policy,
         runtime=__import__("types").SimpleNamespace(
             agent_registry=agent_registry,
         ),

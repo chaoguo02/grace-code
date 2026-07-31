@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from context.token_budget import estimate_tokens
 
@@ -132,12 +132,18 @@ class PhaseSummary:
 
 
 class EvidenceLedger:
-    """In-memory evidence ledger for a single agent run."""
+    """In-memory evidence ledger for a single agent run.
+
+    When ``_store`` is set (RunEvidenceStore), ``add_observation()``
+    delegates to the store.  Existing read methods continue to work
+    against ``_records`` for backward compatibility.
+    """
 
     def __init__(self, summary_chars: int = 700) -> None:
         self._records: list[EvidenceRecord] = []
         self._phase_summaries: dict[str, PhaseSummary] = {}
         self._summary_chars = summary_chars
+        self._store: Any = None  # RunEvidenceStore, set by agent/core.py
 
     @property
     def records(self) -> list[EvidenceRecord]:
@@ -166,6 +172,22 @@ class EvidenceLedger:
         artifact_id: str = "",
         key_evidence: bool = False,
     ) -> EvidenceRecord:
+        # ── Delegate to RunEvidenceStore when available ──
+        if self._store is not None:
+            store_entry = self._store.record_analysis_observation(
+                phase=phase, tool_name=tool_name, output=output,
+                path=path, range_text=range_text, artifact_id=artifact_id,
+                key_evidence=key_evidence,
+            )
+            return EvidenceRecord(
+                evidence_id=store_entry.evidence_id,
+                phase=phase, tool_name=tool_name, path=path,
+                range_text=range_text, summary=store_entry.summary,
+                artifact_id=artifact_id,
+                token_count=estimate_tokens(output or ""),
+                key_evidence=key_evidence,
+            )
+        # ── Legacy in-memory path ──
         token_count = estimate_tokens(output or "")
         summary = self._summarize_output(output)
         evidence_id = self._make_evidence_id(phase, tool_name, path, range_text, summary)

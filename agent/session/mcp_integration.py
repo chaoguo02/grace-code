@@ -158,7 +158,13 @@ class MCPToolIntegration:
             registry.unregister(name)
         registry.register_many(pool)
 
-    def connect_agent_servers(self, spec) -> list[str]:
+    def connect_agent_servers(
+        self,
+        spec,
+        *,
+        evidence_store: Any = None,
+        session_id: str = "",
+    ) -> list[str]:
         """Connect MCP servers declared in an agent's mcpServers frontmatter.
         Returns list of newly registered tool names.
         CC-aligned: inline definitions connect when agent starts.
@@ -185,9 +191,88 @@ class MCPToolIntegration:
                                 new_tools.append(tool.name)
                                 logger.info("Connected agent-scoped MCP server '%s' (tool: %s)", name, tool.name)
                             self._apply_loading_mode()
+                            # ── Evidence: MCP_CONNECTED + MCP_TOOLS_EXPOSED ──
+                            if evidence_store is not None:
+                                self._record_mcp_connected(
+                                    evidence_store, session_id, name, server_config,
+                                )
+                                for tool in runtime_tools:
+                                    self._record_mcp_exposed(
+                                        evidence_store, session_id, name, tool.name,
+                                    )
                         except Exception as exc:
                             logger.warning("Failed to connect agent-scoped MCP server '%s': %s", name, exc)
         return new_tools
+
+    def record_run_exposure(self, store: Any, session_id: str) -> None:
+        """Project already-connected MCP tools into one run's evidence."""
+        for server_name, tool_names in sorted(self.server_tools.items()):
+            for tool_name in sorted(tool_names):
+                self._record_mcp_exposed(
+                    store, session_id, server_name, tool_name,
+                )
+
+    def _record_mcp_connected(
+        self,
+        store: Any,
+        session_id: str,
+        server_name: str,
+        server_config: Any,
+    ) -> None:
+        """Record MCP_CONNECTED evidence."""
+        from agent.session.run_evidence import EvidenceEntry, EvidenceKind, EvidenceStatus
+        import uuid as _u
+        fingerprint = self._runtime_server_fingerprint(
+            server_name, server_config,
+        )
+        store.record(EvidenceEntry(
+            evidence_id=f"ev_{_u.uuid4().hex[:12]}",
+            idempotency_key=f"mcp-connect:{server_name}:{fingerprint}",
+            root_run_id="",
+            session_id=session_id,
+            producer_session_id=session_id,
+            kind=EvidenceKind.MCP_CONNECTED,
+            status=EvidenceStatus.SUCCEEDED,
+            tool_name=f"mcp:{server_name}",
+            source_fingerprint=fingerprint,
+        ))
+
+    def _record_mcp_exposed(
+        self,
+        store: Any,
+        session_id: str,
+        server_name: str,
+        tool_name: str,
+    ) -> None:
+        """Record MCP_TOOLS_EXPOSED evidence."""
+        from agent.session.run_evidence import EvidenceEntry, EvidenceKind, EvidenceStatus
+        import uuid as _u
+        fingerprint = self._runtime_server_fingerprint(server_name, None)
+        store.record(EvidenceEntry(
+            evidence_id=f"ev_{_u.uuid4().hex[:12]}",
+            idempotency_key=(
+                f"mcp-expose:{server_name}:{tool_name}:{fingerprint}"
+            ),
+            root_run_id="",
+            session_id=session_id,
+            producer_session_id=session_id,
+            kind=EvidenceKind.MCP_TOOLS_EXPOSED,
+            status=EvidenceStatus.SUCCEEDED,
+            tool_name=f"mcp:{server_name}",
+            source_fingerprint=fingerprint,
+            metadata={"exposed_tool": tool_name},
+        ))
+
+    def _runtime_server_fingerprint(
+        self, server_name: str, server_config: Any,
+    ) -> str:
+        """Use the MCP watchdog's negotiated fingerprint as the authority."""
+        if self._manager is not None:
+            bridge = self._manager.bridges.get(server_name)
+            fingerprint = str(getattr(bridge, "fingerprint", "") or "")
+            if fingerprint:
+                return fingerprint
+        return _mcp_fingerprint(server_name, server_config)
 
     def disconnect_agent_servers(self, spec) -> None:
         """Disconnect agent-scoped MCP servers when agent finishes."""
@@ -373,3 +458,15 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if isinstance(item, str)]
+
+
+def _mcp_fingerprint(server_name: str, server_config: Any) -> str:
+    """Generate a stable server fingerprint for evidence tracking."""
+    import hashlib
+    parts = [server_name]
+    if server_config is not None:
+        parts.append(getattr(server_config, "transport", ""))
+        parts.append(getattr(server_config, "command", "") or "")
+        parts.append(getattr(server_config, "url", "") or "")
+    seed = "|".join(parts)
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]

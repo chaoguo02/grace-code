@@ -78,6 +78,13 @@ class AgentConfig:
     llm_metrics_callback: object | None = None
     memory_event_callback: object | None = None
     """Callback for memory_written runtime events."""
+    mode_policy: object | None = None
+    """ModeExecutionPolicy — per-Run immutable execution contract.
+    Set by SessionRuntime.run_session() and consumed by _initialize_run()
+    when creating the RunContext for tool execution."""
+    evidence_store: object | None = None
+    """RunEvidenceStore — per-root-run evidence aggregator.
+    Set by SessionRuntime.run_session()."""
     """Hook-based LLM observability callback (P2-18).
     If set, invoked with a ``RetryMetrics`` dataclass after each LLM
     invocation.  Zero-overhead when None.  Set by AgentService when

@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import logging
 import os as _os
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from dataclasses import dataclass, field, replace
+from typing import Any, TYPE_CHECKING, Protocol
 
 from agent.task import TaskIntent
 
@@ -56,11 +56,9 @@ class CompletionContext:
 
     files_read: set[str] = field(default_factory=set)
     files_written: set[str] = field(default_factory=set)
-    produced_deliverables: set[str] = field(default_factory=set)
     had_any_read: bool = False
     had_any_write: bool = False
     total_tool_calls: int = 0  # diagnostic only, never used for decisions
-
     def record_tool_result(
         self,
         tool_name: str,
@@ -83,8 +81,6 @@ class CompletionContext:
             self.had_any_write = True
             if path:
                 self.files_written.add(path)
-        if ToolEffect.PRODUCE_DELIVERABLE in metadata.effects:
-            self.produced_deliverables.add(tool_name)
 
 
 # ---------------------------------------------------------------------------
@@ -180,15 +176,15 @@ class TaskCompletionGuard:
         ctx: CompletionContext,
         task_intent: TaskIntent | str = TaskIntent.EDIT,
         git_state: GitStateLike | None = None,
-        completion_requires: dict[str, int] | None = None,
         verify_callback: "Callable[[], CompletionCheckResult] | None" = None,
+        mode_policy: Any = None,
+        evidence_requirements: Any = None,
+        evidence_store: Any = None,
         **kwargs,  # absorb deprecated params silently
     ) -> CompletionCheckResult:
         """Run all completion validation checks against FACTS, not counters.
 
         The only question for edit tasks: does git diff show the expected changes?
-        For subagents with completion_requires: did files get written?
-
         An optional verify_callback runs LAST — it can override all built-in checks.
         """
         # ── Built-in checks ──
@@ -255,20 +251,63 @@ class TaskCompletionGuard:
                             reason="Agent files missing from workspace diff",
                         )
 
-        # ── Required deliverables (subagent contracts, not counters) ──
-        if completion_requires:
-            for tool_name, min_count in completion_requires.items():
-                _actual = ctx.produced_deliverables.get(tool_name, 0) if isinstance(ctx.produced_deliverables, dict) else (
-                    1 if tool_name in ctx.produced_deliverables else 0
+        # ── Evidence requirements gate ──
+        if evidence_store is not None and evidence_requirements is not None:
+            effective_requirements = evidence_requirements
+            verification_requirement = getattr(
+                evidence_requirements,
+                "verification_requirement",
+                "not_required",
+            )
+            if verification_requirement == "required_if_workspace_changed":
+                has_workspace_changes = (
+                    (
+                        git_state is not None
+                        and git_state.is_git_repo
+                        and git_state.has_changes
+                    )
+                    or bool(ctx.had_any_write)
                 )
-                if _actual < min_count:
+                effective_requirements = replace(
+                    evidence_requirements,
+                    verification_requirement=(
+                        "required" if has_workspace_changes else "not_required"
+                    ),
+                )
+            if (
+                not effective_requirements.is_empty
+                or evidence_store.count > 0
+            ):
+                evaluation = evidence_store.evaluate(effective_requirements)
+                if not evaluation.satisfied:
+                    missing = [
+                        f"{item.tool or item.code}({item.code})"
+                        for item in evaluation.missing
+                    ]
+                    failures = [
+                        f"{item.kind}:{item.reason}"
+                        for item in evaluation.failed
+                    ]
+                    retryable = all(
+                        item.retryable
+                        for item in (*evaluation.missing, *evaluation.failed)
+                    )
+                    if not retryable:
+                        return CompletionCheckResult.abort(
+                            reason="required_evidence_not_satisfied",
+                            detail="; ".join((*missing, *failures)),
+                        )
                     return CompletionCheckResult.retry(
                         feedback=(
-                            f"[SYSTEM] Cannot finish yet — you must call "
-                            f"'{tool_name}' at least {min_count} time(s) "
-                            f"(called {_actual} time(s)) before finishing."
+                            "[RUNTIME BLOCK] Required evidence is not satisfied: "
+                            f"{'; '.join((*missing, *failures))}. "
+                            "Complete or repeat the required operations before finishing."
                         ),
-                        reason=f"Required deliverable '{tool_name}' count {_actual} < {min_count}",
+                        reason=(
+                            "required_evidence_not_satisfied: "
+                            f"{len(evaluation.missing)} missing, "
+                            f"{len(evaluation.failed)} failed"
+                        ),
                     )
 
         # ── Per-task verify callback (highest priority) ──

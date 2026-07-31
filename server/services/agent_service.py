@@ -549,6 +549,21 @@ class AgentService:
 
             self._runtime._publish_run_terminal = _on_run_terminal
 
+            def _on_evidence_record(entry) -> None:
+                from server.events import WsEvidenceRecord
+                _eb.publish_typed(
+                    entry.root_session_id or entry.session_id,
+                    WsEvidenceRecord(
+                        run_id=entry.root_run_id,
+                        turn_id=entry.turn_id,
+                        evidence=entry.to_dict(),
+                    ),
+                )
+
+            self._runtime._evidence_stores.set_event_callback(
+                _on_evidence_record,
+            )
+
             def _on_memory_written(session_id, memory, source):
                 from server.events import WsMemoryWritten
                 if not session_id:
@@ -906,10 +921,13 @@ class AgentService:
         session_id: str,
         prompt: str,
         agent_name: str = "build",
+        product_mode: str = "",
         intent: str | None = None,
         display_prompt: str = "",
         allowed_prompts: list[dict[str, str]] | None = None,
         run_context: Any = None,
+        skill_name: str = "",
+        skill_arguments: str = "",
     ) -> None:
         """Execute chat asynchronously in a background thread.
 
@@ -988,6 +1006,9 @@ class AgentService:
             prompt=prompt,
             display_prompt=display_prompt,
             agent_name=agent_name,
+            skill_name=skill_name,
+            skill_arguments=skill_arguments,
+            product_mode=product_mode,
             intent=resolved_intent,
             permission_mode=_effective_perm,
             repo_path=self.repo_path,
@@ -1028,7 +1049,20 @@ class AgentService:
         if not rendered:
             raise ValueError(f"Skill has no executable instructions: {normalized}")
         if session_id:
+            from skills.activation import SkillActivationService
             from skills.tool import SkillContextModifier
+            # ── Evidence: record pending skill activation ──
+            activation = SkillActivationService(skill_registry).activate(
+                normalized, source="http_request", session_id=session_id,
+            )
+            if activation is not None:
+                self._runtime.record_skill_activation(
+                    activation.skill_name,
+                    source=activation.source,
+                    fingerprint=activation.fingerprint,
+                    mcp_dependencies=list(activation.mcp_dependencies),
+                    session_id=activation.session_id,
+                )
             if meta.model:
                 self._runtime.set_pending_model(session_id, meta.model)
             if meta.effort:

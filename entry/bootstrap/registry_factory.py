@@ -62,7 +62,7 @@ def build_registry(
     from tools.test_tool import PytestTool
     from tools.web_tool import WebSearchTool, WebFetchTool
     from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
-    from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
+    from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceListTool
     from tools.submit_analysis_tool import SubmitAnalysisTool
     from tools.plan_mode_tool import EnterPlanModeTool, ExitPlanModeTool
     from tools.worktree_session_tool import EnterWorktreeTool, ExitWorktreeTool
@@ -93,7 +93,6 @@ def build_registry(
 
     web_cfg = cfg.tools.web
     artifact_store_ref = ArtifactStoreRef()
-    evidence_ledger_ref = EvidenceLedgerRef()
 
     _global_read_cache = FileReadCache()
 
@@ -106,7 +105,6 @@ def build_registry(
     registry = ToolRegistry(
         permission_pipeline=pipeline,
         artifact_store_ref=artifact_store_ref,
-        evidence_ledger_ref=evidence_ledger_ref,
         skill_registry=skill_registry,
         skill_buffer=skill_buffer,
     )
@@ -139,8 +137,8 @@ def build_registry(
         ArtifactListTool(artifact_store_ref),
         ArtifactReadTool(artifact_store_ref),
         ArtifactSearchTool(artifact_store_ref),
-        EvidenceListTool(evidence_ledger_ref),
-        EvidenceGetTool(evidence_ledger_ref),
+        EvidenceListTool(),
+        EvidenceGetTool(),
         SubmitAnalysisTool(),
         EnterPlanModeTool(),
         ExitPlanModeTool(),

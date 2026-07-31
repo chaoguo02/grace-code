@@ -20,6 +20,11 @@ describe("RunOutcomeBar", () => {
             changed_files: ["agent/task.py", "web/src/types/events.ts"],
             patch_available: true,
           },
+          evidenceSummary: {
+            total: 7,
+            by_kind: { tool_call_completed: 3 },
+            failed: 0,
+          },
           runId: "run-1",
         }}
         steps={3}
@@ -29,6 +34,7 @@ describe("RunOutcomeBar", () => {
 
     expect(html).toContain("Validation not run");
     expect(html).toContain("2 files changed");
+    expect(html).toContain("7 evidence");
     expect(html).toContain("aria-expanded=\"false\"");
     expect(html).not.toContain("Code changes were made but NOT independently verified");
   });
