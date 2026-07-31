@@ -58,6 +58,55 @@ def _legacy_description_fallback(content: str, name: str) -> str:
     desc = " ".join(body_lines[:3])[:100].strip()
     return desc if desc else f"(no description — {name})"
 
+
+def _validate_skill_description(meta: "SkillMetadata", source_id: str) -> None:
+    """Phase 1 #12: validate description at registration time.
+
+    Marks non-compliant skills as degraded with a WARNING log.
+    Degraded skills remain in the registry but are annotated.
+    """
+    from context.token_budget import estimate_tokens
+    desc = meta.description
+    if not desc or not desc.strip():
+        logger.warning(
+            "Skill %s from %s has empty description — degraded",
+            meta.name, source_id,
+        )
+        meta.description = f"(description unavailable — {meta.name})"
+        return
+    tokens = estimate_tokens(desc)
+    if tokens > 2000:
+        logger.warning(
+            "Skill %s description exceeds 2000 tokens (%d) — degraded",
+            meta.name, tokens,
+        )
+        meta.description = meta.description[:800] + "..."
+        return
+
+
+def _sanitize_untrusted_content(content: str, provenance: str) -> str:
+    """Phase 1 #10: strip system-prompt injection patterns from untrusted skills.
+
+    Conservative: false positives are acceptable, false negatives are not.
+    Builtin skills (trusted) bypass sanitization.
+    """
+    import re as _re
+    _INJECTION_PATTERNS = (
+        r"(?i)(ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|directives?|prompts?))",
+        r"(?i)(you\s+are\s+now\s+(a\s+)?(different|new|another)\s+(model|assistant|agent))",
+        r"(?i)(disregard\s+(all\s+)?(previous|prior|earlier)\s+(instructions?|context))",
+        r"(?i)(override\s+(system\s+)?(prompt|instructions?|rules?|behavior))",
+    )
+    sanitized = content
+    for pattern in _INJECTION_PATTERNS:
+        if _re.search(pattern, sanitized):
+            sanitized = _re.sub(pattern, "[content sanitized — untrusted source]", sanitized)
+            logger.warning(
+                "Sanitized injection pattern in untrusted skill from %s: %s",
+                provenance, pattern,
+            )
+    return sanitized
+
 @dataclass
 class SkillMetadata:
     """技能元数据 — aligned with Claude Code Skill frontmatter reference.
@@ -522,7 +571,7 @@ class SkillRegistry:
         else:
             hooks = ()
 
-        return SkillMetadata(
+        meta = SkillMetadata(
             name=dir_name,
             display_name=str(fm_dict.get("name", dir_name)),
             description=str(fm_dict.get("description", "")),
@@ -549,6 +598,9 @@ class SkillRegistry:
             file_path=str(skill_file),
             _frontmatter=fm_dict,
         )
+        # Phase 1 #12: description validation
+        _validate_skill_description(meta, str(skill_file))
+        return meta
 
     @staticmethod
     def _load_mcp_dependencies(skill_dir: Path) -> frozenset[str]:

@@ -156,10 +156,13 @@ def _load_skills(
                         pass
             else:
                 import logging
-                logging.getLogger(__name__).warning(
-                    "Skill %r not found or empty",
+                # Phase 1 #4: preload failure → ERROR + runtime notice
+                _err_msg = f"(skill \"{skill_name}\" failed to load — file missing or malformed)"
+                logging.getLogger(__name__).error(
+                    "Skill %r not found or empty — runtime notice appended",
                     skill_name,
                 )
+                contents.append(_err_msg)
         return contents
 
     search_dirs: list[Path] = []
