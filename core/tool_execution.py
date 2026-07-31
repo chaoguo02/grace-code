@@ -86,6 +86,31 @@ class ToolExecutionPipeline:
         # Phase 2 #6: Store cancellation token for _run_with_cancellation
         self._cancellation = cancellation_token
 
+        import uuid as _uuid_mod
+        logical_id = invocation_id or f"tool_{_uuid_mod.uuid4().hex}"
+
+        # Phase 3 #7: TraceScope propagation — wrap entire execution in trace context
+        from observability.trace_context import current as _current_trace
+        _parent_trace = _current_trace()
+        _exec_trace = _parent_trace.child(
+            span_id=f"tool:{tool.name}",
+            invocation_id=logical_id,
+        )
+        from observability.trace_context import set_current as _set_trace
+        with _set_trace(_exec_trace):
+            return self._execute_inner(tool, params, thought, logical_id)
+
+    def _execute_inner(
+        self,
+        tool: "BaseTool",
+        params: dict[str, Any],
+        thought: str,
+        logical_id: str,
+    ) -> "ToolResult":
+        """Inner execution path — called within TraceScope context."""
+        from core.base import ToolResult
+        from core.types import RetryMode
+
         validation_error = self._validate_params(tool, params)
         if validation_error is not None:
             return validation_error
@@ -104,7 +129,6 @@ class ToolExecutionPipeline:
                     detail=getattr(budget_status, "inject_message", "") or "Budget exhausted",
                 )
 
-        logical_id = invocation_id or f"tool_{uuid.uuid4().hex}"
         policy = tool.retry_policy(params)
 
         # ── Evidence: record tool call started ──

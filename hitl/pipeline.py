@@ -176,6 +176,7 @@ class PipelineStats:
     prompted: int = 0
     hook_decided: int = 0
     total_wait_ms: float = 0.0
+    layer_blocks: dict[str, int] = field(default_factory=dict)
     _lock: RLock = field(default_factory=RLock, repr=False, compare=False)
 
     def record(self, result: PermissionResult) -> None:
@@ -185,6 +186,8 @@ class PipelineStats:
                 self.allowed += 1
             else:
                 self.denied += 1
+                ln = result.layer.value if hasattr(result.layer, "value") else str(result.layer)
+                self.layer_blocks[ln] = self.layer_blocks.get(ln, 0) + 1
             if result.layer is PermissionLayer.INTERACTIVE:
                 self.prompted += 1
             elif result.layer is PermissionLayer.PRE_TOOL_HOOK:

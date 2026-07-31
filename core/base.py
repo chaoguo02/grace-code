@@ -64,6 +64,19 @@ class ToolResult:
     """
     工具执行的原始结果，由各 Tool.execute() 返回。
     core.py 把它转换为 Observation 后写入 EventLog。
+
+    **Field categorization** (Phase 3 #8):
+
+    | Category | Fields | Consumer |
+    |----------|--------|----------|
+    | **Output payload** | ``output``, ``error``, ``tool_error`` | Observation rendering → model context |
+    | **Action evidence** | ``modified_files``, ``outcome``, ``attachments`` | CompletionGuard, evidence chain |
+    | **Runtime metadata** | ``success``, ``duration_ms``, ``cached``, ``subagent_tokens_used``, ``structured_findings``, ``metadata``, ``data``, ``invocation_id``, ``attempt_count``, ``eventual_success`` | Agent loop internals, budget, memory |
+
+    Output payload fields are rendered to the model. Action evidence
+    fields drive completion evaluation and evidence recording. Runtime
+    metadata fields are consumed by the agent loop and never sent to
+    the LLM directly.
     """
     success: bool
     output: str                         # 工具的文本输出，已做截断处理
