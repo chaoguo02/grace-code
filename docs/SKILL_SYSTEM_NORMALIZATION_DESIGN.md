@@ -10,10 +10,52 @@ full rendering pipeline.  But one critical bug and several isolation gaps exist.
 ## 2. Core Principles
 
 ### 2.1 Normalization, Not Refactoring
-### 2.2 DDR-First Development
-### 2.3 Vertical Integration
-### 2.4 Fail-Closed Defaults
-### 2.5 明确不做
+
+Skills are discovered, parsed, loaded, and activated through four distinct
+paths (tool call, HTTP request, CLI slash, preload).  All four paths
+already work correctly in the common case.  The gaps are in edge-case
+error handling (fork crash, missing-dependency silence, legacy-format
+description gaps), not in architectural redesign.
+
+### 2.2 Skills are On-Demand Instruction Injection
+
+Skills inject instructional content into the model context — they are
+NOT permanent tool modifiers.  A skill's allowed_tools/disallowed_tools
+are active only while the skill's `SkillContextModifier` is applied to
+the `PolicyAwareToolRegistry`.  When the modifier is deactivated (at
+end of run), the registry returns to its base policy.  This principle
+governs: why `context="fork"` spawns a subagent (#1), why preload
+injection is a distinct path from tool-call activation, and why
+model/effort overrides are scoped to the skill's active duration.
+
+### 2.3 LLM Semantic Matching, Not Keyword Triggers
+
+CC's skills are matched by the LLM based on `description` and
+`when_to_use` — not by regex-based path triggers.  The `triggers` field
+was explicitly removed from the frontmatter reference (#7 docstring note).
+`paths` in `SkillMetadata` is informational for the model, not a
+mechanical activation gate.  This principle governs: why we don't
+auto-activate skills on file path match, and why the description is the
+primary discovery mechanism.
+
+### 2.4 Four Activation Paths, One Evidence Contract
+
+All four activation paths (tool call, HTTP request, CLI slash, preload)
+produce identical evidence — `SKILL_LOADED` entries with consistent
+fingerprint and MCP dependency metadata.  This guarantees traceability
+regardless of how the skill was activated.  Governs: why preload
+failures must surface errors (#4) and why MCP dependencies must be
+validated at load time (#3).
+
+### 2.5 Untrusted Skills Have Restricted Capabilities
+
+Skills from MCP sources (`trusted=False`) have inline commands (`!cmd`)
+blocked before execution.  The block is absolute — no configuration
+can override it.  This principle governs: why untrusted skill audit
+logging matters (#6) — the block is a security event that must be
+observable.
+
+### 2.6 明确不做
 
 | Anti-requirement | Reason |
 |-----------------|--------|
@@ -21,6 +63,7 @@ full rendering pipeline.  But one critical bug and several isolation gaps exist.
 | Skill dependency graph | CC has no skill-to-skill dependency — orthogonal concern |
 | skills-lock.json implementation | File format exists but no code reads it — reserved for future external tooling |
 | Auto-generated skill descriptions | CC proves hand-written is superior |
+| Triggers field revival | Explicitly removed per CC frontmatter reference — description is the matching mechanism |
 
 ## 3. Gap Analysis Summary
 
@@ -42,6 +85,8 @@ full rendering pipeline.  But one critical bug and several isolation gaps exist.
 ### 4.0 Phase 0: Critical Bug Fix
 
 #### #1: Fork-via-SkillMetadata AttributeError
+
+**CC Principle**: Skills are On-Demand Instruction Injection (#2.2) — `context="fork"` spawns a subagent, so `SkillMetadata` must satisfy the spawn protocol.
 
 **Problem**: `entry/chat.py:397-402` passes `SkillMetadata` as `definition=meta`
 to `AgentSpawnRequest.named()`.  `AgentSpawnRequest.__post_init__` checks
@@ -86,6 +131,8 @@ but only imports it inside `TYPE_CHECKING` block (line 10).
 
 #### #3: MCP Dependency Validation at Skill Load
 
+**CC Principle**: Four Activation Paths, One Evidence Contract (#2.4) — MCP dependency mismatches must be traceable to the skill activation event.
+
 **Problem**: `_load_mcp_dependencies()` reads server names from
 `agents/openai.yaml` but never validates that those servers exist in
 the session's MCP configuration.  The mismatch is only discovered at
@@ -100,6 +147,8 @@ the model receives the MCP annotation and can reason about availability.
 
 #### #4: Missing Skill in Preload — Surface Error
 
+**CC Principle**: Four Activation Paths, One Evidence Contract (#2.4) — preload failures must produce observable errors.
+
 **Problem**: `runtime_prompt_builder.py:157-162` logs a WARNING and silently
 omits the skill when `load_and_render()` returns `None`.  The agent
 silently starts with a missing skill.
@@ -113,6 +162,8 @@ runtime notice message appended after the `[PRELOADED SKILLS]` block.
 
 #### #5: Legacy Commands Description Default
 
+**CC Principle**: LLM Semantic Matching (#2.3) — descriptions are the primary discovery mechanism; legacy commands without descriptions are invisible to the model.
+
 **Problem**: Legacy commands (flat `.md` files with no frontmatter) get
 `description=""` — they appear in the skills listing with no description
 for LLM matching.
@@ -122,6 +173,8 @@ the file body as the description.  This matches CC's behavior where
 legacy commands get a best-effort description from content.
 
 #### #6: Untrusted MCP Skill Audit Log
+
+**CC Principle**: Untrusted Skills Have Restricted Capabilities (#2.5) — security events must be observable.
 
 **Problem**: Untrusted MCP skills have all inline commands replaced with
 `"[blocked: untrusted skill inline command]"` before execution
