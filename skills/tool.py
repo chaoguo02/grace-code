@@ -267,12 +267,26 @@ class SkillActivationTool(BaseTool):
         return False  # skill activation modifies agent state
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        """Delegate to SkillTool's internal execution logic."""
+        """Delegate to SkillTool's internal execution logic.
+
+        Phase 2: Always returns a TURN-scoped SkillContextModifier in metadata,
+        even on failure — so the after_tool_use hook can always pop the modifier.
+        """
+        modifier = SkillContextModifier(
+            allowed_tools=self._meta.allowed_tools,
+            disallowed_tools=self._meta.disallowed_tools,
+            mcp_servers=self._meta.mcp_servers,
+            model=self._meta.model,
+            effort=self._meta.effort,
+            context=self._meta.context,
+            scope="turn",
+        )
         if self._skill_registry is None:
             return ToolResult(
                 success=False,
                 output="",
                 error="Skill registry not available for activation",
+                metadata={"skill_modifier": modifier},
             )
         rendered = self._skill_registry.load_and_render(
             self._meta.name,
@@ -283,21 +297,12 @@ class SkillActivationTool(BaseTool):
                 success=False,
                 output="",
                 error=f"Skill '{self._meta.name}' failed to load",
+                metadata={"skill_modifier": modifier},
             )
         return ToolResult(
             success=True,
             output=f"[Skill: {self._meta.name}]\n\n{rendered}",
-            metadata={
-                "skill_modifier": SkillContextModifier(
-                    allowed_tools=self._meta.allowed_tools,
-                    disallowed_tools=self._meta.disallowed_tools,
-                    mcp_servers=self._meta.mcp_servers,
-                    model=self._meta.model,
-                    effort=self._meta.effort,
-                    context=self._meta.context,
-                    scope="turn",
-                ),
-            },
+            metadata={"skill_modifier": modifier},
         )
 
     # ── Schema visibility ──────────────────────────────────────────

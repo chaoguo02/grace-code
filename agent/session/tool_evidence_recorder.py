@@ -25,6 +25,23 @@ _SECRET_KEY = re.compile(
 _MAX_METADATA_JSON = 16_000
 
 
+def _tool_source_for(tool: Any) -> str:
+    """Extract canonical tool source for evidence metadata (Phase 2 Step 2.X).
+
+    Returns one of: "system" (native), "mcp" (MCP transport), "project" (skill).
+    Defaults to "system" when tool or metadata is unavailable.
+    """
+    if tool is None:
+        return "system"
+    source = getattr(getattr(tool, "metadata", None), "source", "")
+    if source:
+        return source
+    # Fallback: MCP tools are identifiable by their mcp_props attribute
+    if getattr(tool, "mcp_props", None) is not None:
+        return "mcp"
+    return "system"
+
+
 class ToolEvidenceRecorder:
     """Projects one logical Tool invocation into typed run evidence."""
 
@@ -187,6 +204,7 @@ class ToolEvidenceRecorder:
         metadata = {
             "arguments": arguments,
             "result": _safe_result_metadata(result),
+            "tool_source": _tool_source_for(tool),  # Phase 2 Step 2.X
         }
         return self._store.record(EvidenceEntry(
             evidence_id=f"ev_{uuid.uuid4().hex[:16]}",

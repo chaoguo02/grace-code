@@ -22,7 +22,7 @@
 - [x] 3.2 Hook Migration Guide: draft with `isinstance` filter + `tool_name` examples
 - [x] 3.3 TURN cleanup exception safety: `deactivate_turn_scoped_modifier()` must pop even when tool fails
 - [x] 3.4 Collision logging: WARNING format with conflicting name, source, priority, rejected detail
-- [ ] 3.5 Evidence `tool_source` injection: `ToolEvidenceRecorder` reads `tool.metadata.source`
+- [x] 3.5 Evidence `tool_source` injection: `ToolEvidenceRecorder` reads `tool.metadata.source`
 
 ## 4. Test & Verification Baseline
 
@@ -42,5 +42,5 @@
 
 - [ ] 6.1 Dual-Stack `_turn_modifiers` / `_run_modifiers` data structures are in Phase 1 (not deferred to Phase 3)
 - [ ] 6.2 `__legacy_skill_loader` has zero production code-path dependencies (audit before Phase 1 ships)
-- [ ] 6.3 `TURN` modifier fault injection test: `SkillActivationTool.execute()` raises → `after_tool_use` still pops
+- [x] 6.3 `TURN` modifier fault injection test: `SkillActivationTool.execute()` raises → `after_tool_use` still pops
 - [ ] 6.4 Evidence `tool_source` literals (`"system"` / `"mcp"` / `"project"`) defined in single module (core/types.py)
