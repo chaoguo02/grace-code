@@ -70,6 +70,10 @@ class WebSearchTool(BaseTool):
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
         return True
 
+    @property
+    def parallel_safe(self) -> bool:
+        return True
+
     def __init__(self, max_results: int = DEFAULT_SEARCH_MAX_RESULTS) -> None:
         self._max_results = max_results
 
@@ -220,6 +224,10 @@ class WebFetchTool(BaseTool):
     """
 
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
+    @property
+    def parallel_safe(self) -> bool:
         return True
 
     def __init__(

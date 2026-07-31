@@ -363,6 +363,9 @@ class ShellTool(BaseTool):
             success=run_result.success,
             output=output,
             error=getattr(run_result, "error", None) or None,
+            metadata={
+                "exit_code": str(getattr(run_result, "returncode", 0) or 0),
+            },
         )
 
 

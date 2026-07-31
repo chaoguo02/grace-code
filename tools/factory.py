@@ -51,6 +51,7 @@ class BuiltTool(BaseTool):
         self._risk = risk or (lambda _params: RiskLevel.MEDIUM)
         self._close = close
         self._supports_cancellation = False
+        self._parallel_safe = False
         self.mcp_props = mcp_props
         self.is_mcp = mcp_props is not None
         self._always_load = False
@@ -87,6 +88,10 @@ class BuiltTool(BaseTool):
     @property
     def supports_cancellation(self) -> bool:
         return self._supports_cancellation
+
+    @property
+    def parallel_safe(self) -> bool:
+        return self._parallel_safe
 
     def is_enabled(self) -> bool:
         return bool(self._is_enabled())
@@ -141,6 +146,7 @@ def build_tool(
     close: Callable[[float], None] | None = None,
     mcp_props: Any = None,
     supports_cancellation: bool = False,
+    parallel_safe: bool = False,
 ) -> BaseTool:
     """Build or validate one canonical tool with fail-closed defaults."""
     if tool is not None:
@@ -168,6 +174,7 @@ def build_tool(
         mcp_props=mcp_props,
     )
     tool_obj._supports_cancellation = supports_cancellation
+    tool_obj._parallel_safe = parallel_safe
     return tool_obj
 
 

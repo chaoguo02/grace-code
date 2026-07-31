@@ -375,8 +375,36 @@ class BaseTool(ABC):
         return None
 
     def concurrency_mode(self, params: dict[str, Any]) -> ToolConcurrency:
-        """Declare whether this specific call may run beside sibling calls."""
+        """Declare whether this specific call may run beside sibling calls.
+
+        Default derives from ``parallel_safe``:
+        - ``parallel_safe=True`` → ``PARALLEL_SAFE``
+        - ``parallel_safe=False`` → ``SERIAL``
+
+        Input-aware tools (Bash: ``ls`` vs ``rm``, TaskTool: fork vs
+        non-fork) override this method and inspect *params* directly.
+        The override always takes precedence over the static property.
+        """
+        if self.parallel_safe:
+            return ToolConcurrency.PARALLEL_SAFE
         return ToolConcurrency.SERIAL
+
+    @property
+    def parallel_safe(self) -> bool:
+        """Whether this tool can run concurrently with OTHER tools.
+
+        Default: ``False`` (fail-closed — serial execution is always safe).
+        Tools that operate on disjoint resources MUST override to ``True``.
+
+        SEPARATE from ``isReadOnly()``.  A tool can be:
+        - read-only + parallel-safe   (Read: independent files)
+        - read-only + NOT parallel-safe (rate-limited API)
+        - write + NOT parallel-safe    (most tools, default)
+
+        This declaration feeds ``concurrency_mode()`` which the
+        ``StreamingToolExecutor`` consumes for admission control.
+        """
+        return False
 
     def retry_policy(self, params: dict[str, Any]) -> RetryPolicy:
         """Resolve the retry contract for this concrete call.

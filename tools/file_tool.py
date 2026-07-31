@@ -247,6 +247,10 @@ class FileReadTool(BaseTool):
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
         return True
 
+    @property
+    def parallel_safe(self) -> bool:
+        return True
+
     def __init__(
         self,
         read_cache: FileReadCache | None = None,
@@ -255,7 +259,7 @@ class FileReadTool(BaseTool):
         self._read_cache = read_cache or FileReadCache()
         self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
-    aliases = ("file_read", "read_file")  # backward-compatible + Claude Code naming
+    aliases = ("file_read", "read_file")
 
     @property
     def name(self) -> str:
@@ -403,6 +407,10 @@ class FileViewTool(BaseTool):
     """
 
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
+    @property
+    def parallel_safe(self) -> bool:
         return True
 
     def __init__(

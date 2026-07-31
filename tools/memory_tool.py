@@ -71,6 +71,10 @@ class MemoryReadTool(BaseTool):
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
         return True
 
+    @property
+    def parallel_safe(self) -> bool:
+        return True
+
     def __init__(self, store: "MemoryStore") -> None:
         self._store = store
 
@@ -280,6 +284,10 @@ class MemoryListTool(BaseTool):
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
         return True
 
+    @property
+    def parallel_safe(self) -> bool:
+        return True
+
     def __init__(self, store: "MemoryStore") -> None:
         self._store = store
 
@@ -482,6 +490,10 @@ class MemorySearchTool(BaseTool):
     """
 
     def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return True
+
+    @property
+    def parallel_safe(self) -> bool:
         return True
 
     def __init__(self, external_store: "ExternalMemoryStore | None" = None) -> None:

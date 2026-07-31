@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from agent.result_compression import compress_tool_result
 from core.base import ToolRole
 
 if TYPE_CHECKING:
@@ -101,13 +102,12 @@ def build_tool_result_content(
 
     parts: list[str] = []
     if observation.output:
-        output = observation.output
         if (
             observation.tool_name not in exempt_tools
             and artifact_store is not None
         ):
             output, was_stored = artifact_store.maybe_store(
-                observation.tool_name, output
+                observation.tool_name, observation.output
             )
             if was_stored:
                 logger.debug(
@@ -115,9 +115,9 @@ def build_tool_result_content(
                     observation.tool_name,
                     artifact_store.total_tokens_stored,
                 )
+            parts.append(output)
         else:
-            output = truncate_output(output)
-        parts.append(output)
+            parts.append(compress_tool_result(observation))
     if observation.error and not observation.is_success():
         parts.append(f"Error: {observation.error}")
     attachment_text = render_hook_attachments(observation)
@@ -148,15 +148,14 @@ def format_observations_for_history(
             ))
             continue
         if obs.output:
-            output = obs.output
             if (
                 obs.tool_name not in exempt_tools
                 and artifact_store is not None
             ):
-                output, _ = artifact_store.maybe_store(obs.tool_name, output)
+                output, _ = artifact_store.maybe_store(obs.tool_name, obs.output)
+                lines.append(output)
             else:
-                output = truncate_output(output)
-            lines.append(output)
+                lines.append(compress_tool_result(obs))
         if obs.error and not obs.is_success():
             lines.append(f"Error: {obs.error}")
         attachment_text = render_hook_attachments(obs)
