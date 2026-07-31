@@ -354,15 +354,15 @@ subsequent discoveries.
 
 ### Phase 2
 
-- [ ] `_sse_responses` dict removed from SseMCPBridge
-- [ ] SSE notification handling unchanged (`list_changed` still works)
-- [ ] WsMCPBridge._rpc_call acquires asyncio.Lock
-- [ ] Sequential WsMCPBridge calls (call A -> await -> call B -> await) complete successfully after lock integration
-- [ ] Concurrent WsMCPBridge calls raise clear error
-- [ ] SyncMCPToolManager thread changed to daemon=True
-- [ ] Process exit no longer blocked by unclosed MCP manager
-- [ ] #13: `_last_tool_counts` dict tracks successful discovery tool counts
-- [ ] #13: WARNING logged when server declares tools capability but returns 0 tools (and prior count > 0)
+- [x] `_sse_responses` dict removed from SseMCPBridge
+- [x] SSE notification handling unchanged (`list_changed` still works)
+- [x] WsMCPBridge._rpc_call acquires asyncio.Lock
+- [x] Sequential WsMCPBridge calls (call A -> await -> call B -> await) complete successfully after lock integration
+- [x] Concurrent WsMCPBridge calls raise clear error
+- [x] SyncMCPToolManager thread changed to daemon=True
+- [x] Process exit no longer blocked by unclosed MCP manager
+- [x] #13: `_last_tool_counts` dict tracks successful discovery tool counts
+- [x] #13: WARNING logged when server declares tools capability but returns 0 tools (and prior count > 0)
 
 ### Phase 3
 
