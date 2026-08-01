@@ -263,8 +263,6 @@ class DelegationIntegrationCoordinator:
         run = self._store.get_delegation_run(run_id)
         if run is None or str(run["parent_session_id"]) != parent_session_id:
             raise ValueError("Delegation run is outside the parent session")
-        if bool(run.get("is_team")):
-            raise ValueError("Agent Team runs use the team review workflow")
         return run
 
     def _effective_tasks(self, run_id: str) -> list[dict[str, object]]:

@@ -470,38 +470,18 @@ class AgentService:
         # ── HookDispatcher with memory consolidation STOP hook ──
         # Must be created BEFORE SessionRuntime (passed via constructor).
         self._hook_dispatcher = None
-        if self._memory_store is not None:
-            try:
-                from hooks import HookDispatcher, HookEvent, HookRegistry, InternalHook
+        try:
+            from entry.bootstrap.hook_bootstrap import init_hook_dispatcher
 
-                _hook_registry = HookRegistry()
-                _settings_path = Path(self.repo_path) / ".grace" / "settings.json"
-                _hook_registry.load_from_settings(_settings_path)
-
-                _store_ref = self._memory_store
-                _log_dir_ref = self._log_dir
-                _backend_ref = self._backend
-                _repo_ref = Path(self.repo_path)
-
-                def _on_session_stop(ctx):
-                    from memory.consolidation import record_session_end, run_consolidation
-                    try:
-                        _store_dir = getattr(_store_ref, 'store_dir', None)
-                        if _store_dir:
-                            record_session_end(_store_dir)
-                        run_consolidation(
-                            _store_ref, log_dir=_log_dir_ref, backend=_backend_ref,
-                            async_run=True, workspace_root=_repo_ref,
-                        )
-                        _store_ref.prune_expired()
-                    except Exception as exc:
-                        logger.debug("Consolidation hook skipped: %s", exc)
-
-                _hook_registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))
-                self._hook_dispatcher = HookDispatcher(_hook_registry, cwd=str(_repo_ref.resolve()))
-                logger.info("HookDispatcher initialized with memory consolidation STOP hook")
-            except Exception:
-                logger.warning("Failed to initialize HookDispatcher", exc_info=True)
+            self._hook_dispatcher = init_hook_dispatcher(
+                Path(self.repo_path),
+                memory_store=self._memory_store,
+                log_dir=self._log_dir,
+                backend=self._backend,
+            )
+            logger.info("HookDispatcher initialized")
+        except Exception:
+            logger.warning("Failed to initialize HookDispatcher", exc_info=True)
 
         self._runtime = SessionRuntime(
             store=self._store,
@@ -1367,7 +1347,9 @@ class AgentService:
         run had its session incorrectly marked CANCELLED.
         """
         # Wake any pending approval first so the agent loop can exit quickly
-        broker = self._runtime.ensure_approval_broker(session_id)
+        # Cancellation must not create a broker as a side effect.  Wake only
+        # an approval that is already pending for this session.
+        broker = self._runtime.get_approval_broker(session_id)
         if broker is not None:
             broker.cancel_pending()
 
@@ -1383,7 +1365,13 @@ class AgentService:
                     expect_status="running",
                 )
                 # P0_3: check CAS result before touching session state
-                run_cas_ok = rows_updated > 0 if isinstance(rows_updated, int) else bool(rows_updated)
+                # Older Storage adapters returned None after a successful
+                # update; current adapters return an affected-row count.
+                run_cas_ok = (
+                    True if rows_updated is None
+                    else rows_updated > 0 if isinstance(rows_updated, int)
+                    else bool(rows_updated)
+                )
             except Exception:
                 logger.debug("Run cancel CAS failed", exc_info=True)
 

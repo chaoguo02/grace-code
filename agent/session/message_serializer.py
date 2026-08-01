@@ -69,6 +69,24 @@ def content_from_json(content_json: str | None, fallback_text: str = "") -> str 
         return fallback_text
 
 
+def collapse_plain_text_content(content):
+    """Return a string for the canonical one-text-block representation.
+
+    Storage remains lossless for genuinely structured/multimodal content,
+    while legacy text-only API and context consumers keep their historical
+    string contract.
+    """
+    if (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+    ):
+        return content[0]["text"]
+    return content
+
+
 def content_to_text(content) -> str:
     """Extract a plain-text summary from content (for FTS and old clients)."""
     if content is None:

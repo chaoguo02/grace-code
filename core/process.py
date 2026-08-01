@@ -91,6 +91,11 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 capture_output=True, timeout=5,
             )
+            # taskkill can return a non-zero code without raising (notably in
+            # restricted test/service environments).  Always verify and kill
+            # the direct child as a final fallback so communicate() unblocks.
+            if proc.poll() is None:
+                proc.kill()
         except Exception:
             try:
                 proc.kill()

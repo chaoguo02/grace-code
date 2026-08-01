@@ -1,20 +1,10 @@
-"""
-hooks/dispatcher.py
-
-Central hook dispatcher: event → match → execute → decide.
-
-Flow:
-1. Event fires (tool call, session start, etc.)
-2. Registry finds matching hooks (internal + external)
-3. Internal hooks run first (in-process, cheap)
-4. External hooks run via Runtime (stdin JSON, stdout parsed)
-5. Exit code determines outcome (0=allow, 2=block for blockable events)
-"""
+"""Synchronous policy-hook dispatcher with explicit authority contracts."""
 
 from __future__ import annotations
 
 import logging
-import time as _time
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,29 +12,35 @@ from hooks.events import BLOCKABLE_EVENTS, HookContext, HookEvent
 from hooks.executor import execute_hook
 from hooks.protocol import (
     DispatchResult,
-    ExitCode,
     HookAttachment,
     HookAttachmentKind,
     HookControl,
+    HookOutput,
+    HookResult,
 )
-from hooks.registry import HookRegistry
+from hooks.registry import (
+    ExternalHookConfig,
+    HookDataAuthority,
+    HookDecisionAuthority,
+    HookFailurePolicy,
+    HookRegistry,
+    HookScheduling,
+    InternalHook,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class HookDispatcher:
-    """
-    Synchronous hook dispatcher.
-
-    Fires internal hooks (Python callables) first, then external hooks
-    (Runtime-managed commands). Short-circuits on block for blockable events.
-    """
+    """Dispatch hooks deterministically and aggregate every awaited result."""
 
     def __init__(
         self,
         registry: HookRegistry,
         cwd: str | None = None,
         runtime: Any = None,
+        *,
+        total_timeout: float = 30.0,
     ) -> None:
         self._registry = registry
         self._cwd = str(Path(cwd or Path.cwd()).resolve())
@@ -53,35 +49,27 @@ class HookDispatcher:
 
             runtime = LocalRuntime(workspace_root=self._cwd)
         self._runtime = runtime
+        self._total_timeout = max(0.1, float(total_timeout))
 
     def dispatch(self, event: HookEvent, context: HookContext) -> DispatchResult:
-        """
-        Dispatch an event to all matching hooks.
-
-        For blockable events (PreToolUse, UserPromptSubmit): exits 2 → block.
-        For non-blockable events: exit codes are logged but don't block.
-        """
         return self._dispatch(event, context)
 
     def dispatch_stop(self, context: HookContext) -> DispatchResult:
-        """Compatibility entrypoint; blockability belongs to HookEvent."""
         return self.dispatch(HookEvent.STOP, context)
 
-    def clone_registry(self) -> "HookRegistry":
-        """Return a deep copy of the internal registry.
-
-        Use this when creating a per-session dispatcher that starts with
-        the same hooks as the global dispatcher but can be independently
-        extended with agent-scoped hooks.
-        """
+    def clone_registry(self) -> HookRegistry:
         return self._registry.clone()
 
-    def derive(self, registry: "HookRegistry") -> "HookDispatcher":
-        """Create a dispatcher sharing this Runtime and working directory."""
+    def register_internal(self, event: HookEvent, hook: InternalHook) -> None:
+        """Register a lifecycle hook through the dispatcher boundary."""
+        self._registry.register_internal(event, hook)
+
+    def derive(self, registry: HookRegistry) -> "HookDispatcher":
         return HookDispatcher(
             registry=registry,
             cwd=self._cwd,
             runtime=self._runtime,
+            total_timeout=self._total_timeout,
         )
 
     def _dispatch(
@@ -91,98 +79,215 @@ class HookDispatcher:
     ) -> DispatchResult:
         if context.event is not event:
             raise ValueError("Hook context event does not match dispatch event")
-        matcher_subject = context.matcher_subject
-        tool_input = context.tool_input
+
         is_blockable = event in BLOCKABLE_EVENTS
-        collected_warnings: list[str] = []
-
-        # Phase 1: Internal hooks (cheap, in-process)
-        internal_hooks = self._registry.find_internal(
-            event, matcher_subject, tool_input,
+        agent_id = context.agent_id or context.session_id
+        internal = self._registry.find_internal(
+            event, context.matcher_subject, context.tool_input,
         )
-        for hook in internal_hooks:
-            try:
-                hook.callback(context)
-            except Exception as exc:
-                warning = f"Internal hook failed for {event.value}: {exc}"
-                logger.warning(warning)
-                if is_blockable:
-                    return DispatchResult(
-                        control=HookControl.BLOCK,
-                        reason=warning,
-                        warnings=[warning],
-                    )
-                collected_warnings.append(warning)
-
-        # Phase 2: External hooks (Runtime-managed process), scoped by agent_id
-        agent_id = getattr(context, "agent_id", "") or getattr(context, "session_id", "")
-        external_hooks = self._registry.find_external(
-            event, matcher_subject, tool_input, agent_id=agent_id,
+        external = self._registry.find_external(
+            event,
+            context.matcher_subject,
+            context.tool_input,
+            agent_id=agent_id,
         )
-        if not external_hooks:
-            return DispatchResult(
-                warnings=collected_warnings or None,
-            )
+        hooks: list[tuple[int, int, str, InternalHook | ExternalHookConfig]] = []
+        sequence = 0
+        for hook in internal:
+            hooks.append((hook.priority, sequence, "internal", hook))
+            sequence += 1
+        for hook in external:
+            hooks.append((hook.priority, sequence, "external", hook))
+            sequence += 1
+        hooks.sort(key=lambda item: (item[0], item[1]))
 
-        collected_context: list[str] = []
+        warnings: list[str] = []
+        contexts: list[str] = []
         attachments: list[HookAttachment] = []
         updated_input: dict[str, Any] | None = None
-        _hook_start = _time.time()
-        _MAX_TOTAL = 30.0  # total hook execution budget (P2-19)
+        updated_output: dict[str, Any] | str | None = None
+        approved = False
+        deadline = time.monotonic() + self._total_timeout
 
-        for hook_config in external_hooks:
-            _elapsed = _time.time() - _hook_start
-            if _elapsed > _MAX_TOTAL:
-                logger.warning(
-                    "Hook total time cap (%.0fs) exceeded — skipping remaining %d hooks",
-                    _MAX_TOTAL, len(external_hooks),
+        for _, _, kind, hook in hooks:
+            source = self._source(kind, hook)
+            if hook.scheduling is HookScheduling.DETACHED:
+                self._launch_detached(kind, hook, context, source)
+                continue
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = (
+                    f"Hook dispatch deadline exceeded before {source} "
+                    f"for {event.value}"
                 )
-                break
-            result = execute_hook(
-                command=hook_config.command,
-                context=context,
-                timeout=hook_config.timeout,
-                cwd=self._cwd,
-                runtime=self._runtime,
-            )
-
-            # Exit 2 = block (only for blockable events or dispatch_stop)
-            if result.control is HookControl.BLOCK and is_blockable:
-                reason = ""
-                if result.parsed and result.parsed.reason:
-                    reason = result.parsed.reason
-                return DispatchResult(
-                    control=HookControl.BLOCK,
-                    reason=reason or result.stderr or result.stdout or "Blocked by hook",
+                blocked = self._handle_failure(
+                    hook, failure, is_blockable, warnings,
                 )
+                if blocked is not None:
+                    return blocked
+                continue
 
-            # Exit 0 with explicit approve decision
-            if result.control is HookControl.APPROVE:
-                return DispatchResult(control=HookControl.APPROVE)
+            try:
+                result = self._execute_awaited(
+                    kind, hook, context, remaining,
+                )
+            except Exception as exc:
+                failure = f"Hook {source} failed for {event.value}: {exc}"
+                blocked = self._handle_failure(
+                    hook, failure, is_blockable, warnings,
+                )
+                if blocked is not None:
+                    return blocked
+                continue
 
-            # Collect CC-aligned: updatedInput + additionalContext
-            if result.parsed and result.parsed.updated_input:
-                updated_input = {**(updated_input or {}), **result.parsed.updated_input}
-            if result.context:
-                collected_context.append(result.context)
-                attachments.append(HookAttachment(
-                    kind=HookAttachmentKind.CONTEXT,
-                    text=result.context,
-                    source=hook_config.command,
-                ))
-
-            # CC-aligned: non-blocking error (exit != 0,2) → warning, don't block
             if result.control is HookControl.NON_BLOCKING_ERROR:
-                warning = (
-                    f"Hook {hook_config.command} warned: "
+                failure = (
+                    f"Hook {source} failed for {event.value}: "
                     f"{result.stderr or 'exit ' + str(result.exit_code)}"
                 )
-                collected_warnings.append(warning)
-                logger.warning(warning)
+                blocked = self._handle_failure(
+                    hook, failure, is_blockable, warnings,
+                )
+                if blocked is not None:
+                    return blocked
+                continue
+
+            if (
+                result.control is HookControl.BLOCK
+                and hook.decision_authority is HookDecisionAuthority.POLICY
+                and is_blockable
+            ):
+                reason = (
+                    result.parsed.reason
+                    if result.parsed and result.parsed.reason
+                    else result.stderr or result.stdout or f"Blocked by {source}"
+                )
+                return DispatchResult(
+                    control=HookControl.BLOCK,
+                    reason=reason,
+                    warnings=warnings or None,
+                )
+            if (
+                result.control is HookControl.APPROVE
+                and hook.decision_authority is HookDecisionAuthority.POLICY
+            ):
+                approved = True
+
+            if hook.data_authority is HookDataAuthority.TRANSFORM:
+                parsed = result.parsed
+                if parsed and parsed.updated_input is not None:
+                    updated_input = {
+                        **(updated_input or {}),
+                        **parsed.updated_input,
+                    }
+                if parsed and parsed.updated_output is not None:
+                    updated_output = parsed.updated_output
+                if result.context:
+                    contexts.append(result.context)
+                    attachments.append(HookAttachment(
+                        kind=HookAttachmentKind.CONTEXT,
+                        text=result.context,
+                        source=source,
+                    ))
 
         return DispatchResult(
-            additional_context="\n".join(collected_context) if collected_context else "",
+            control=HookControl.APPROVE if approved else HookControl.CONTINUE,
+            additional_context="\n".join(contexts),
             attachments=tuple(attachments),
             updated_input=updated_input,
-            warnings=collected_warnings if collected_warnings else None,
+            updated_output=updated_output,
+            warnings=warnings or None,
         )
+
+    def _execute_awaited(
+        self,
+        kind: str,
+        hook: InternalHook | ExternalHookConfig,
+        context: HookContext,
+        remaining: float,
+    ) -> HookResult:
+        if kind == "internal":
+            assert isinstance(hook, InternalHook)
+            return self._normalize_internal(hook.callback(context))
+        assert isinstance(hook, ExternalHookConfig)
+        return execute_hook(
+            command=hook.command,
+            context=context,
+            timeout=max(0.1, min(float(hook.timeout), remaining)),
+            cwd=self._cwd,
+            runtime=self._runtime,
+        )
+
+    @staticmethod
+    def _normalize_internal(value: Any) -> HookResult:
+        if value is None:
+            return HookResult(exit_code=0)
+        if isinstance(value, HookResult):
+            return value
+        if isinstance(value, HookOutput):
+            return HookResult(exit_code=0, parsed=value)
+        if isinstance(value, dict):
+            return HookResult(exit_code=0, parsed=HookOutput.from_dict(value))
+        raise TypeError(
+            "Internal hook must return None, dict, HookOutput, or HookResult"
+        )
+
+    def _launch_detached(
+        self,
+        kind: str,
+        hook: InternalHook | ExternalHookConfig,
+        context: HookContext,
+        source: str,
+    ) -> None:
+        def run() -> None:
+            try:
+                self._execute_awaited(
+                    kind, hook, context, self._total_timeout,
+                )
+            except Exception:
+                logger.warning("Detached hook %s failed", source, exc_info=True)
+
+        threading.Thread(
+            target=run,
+            name=f"grace-hook-{source}"[:80],
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _source(
+        kind: str,
+        hook: InternalHook | ExternalHookConfig,
+    ) -> str:
+        if hook.hook_id:
+            return hook.hook_id
+        if kind == "external":
+            assert isinstance(hook, ExternalHookConfig)
+            return hook.command
+        assert isinstance(hook, InternalHook)
+        return getattr(hook.callback, "__name__", "internal-hook")
+
+    @staticmethod
+    def _handle_failure(
+        hook: InternalHook | ExternalHookConfig,
+        message: str,
+        is_blockable: bool,
+        warnings: list[str],
+    ) -> DispatchResult | None:
+        fail_closed = (
+            hook.failure_policy is HookFailurePolicy.FAIL_CLOSED
+            or (
+                hook.failure_policy is HookFailurePolicy.EVENT_DEFAULT
+                and is_blockable
+            )
+        )
+        logger.warning(message)
+        if fail_closed:
+            return DispatchResult(
+                control=HookControl.BLOCK,
+                reason=message,
+                warnings=[*warnings, message],
+            )
+        if hook.failure_policy is not HookFailurePolicy.FAIL_OPEN:
+            warnings.append(message)
+        return None

@@ -835,11 +835,14 @@ class SessionStore:
                     for tc in json.loads(raw_tool_calls)
                 ]
             # P0_4: restore from content_json if available, fall back to content text
-            from agent.session.message_serializer import content_from_json
-            restored_content = content_from_json(
+            from agent.session.message_serializer import (
+                collapse_plain_text_content,
+                content_from_json,
+            )
+            restored_content = collapse_plain_text_content(content_from_json(
                 row["content_json"] if "content_json" in row.keys() else None,
                 fallback_text=row["content"] or "",
-            )
+            ))
             # P0_4: restore correct message kind
             if _kind_str:
                 try:

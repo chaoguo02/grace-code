@@ -745,6 +745,11 @@ class ReActAgent:
             compact_history=self._cfg.compact_history,
             enable_caching=False,  # updated per-request in _build_messages
         ))
+        # Both context assemblers read this cache before lazily rebuilding it.
+        # Keep an explicit empty value so lightweight/test Agent construction
+        # follows the same invariant as a fully prepared production run.
+        self._repo_map_cache = ""
+        self._repo_map_cache_key: str | None = None
         self._session_context: str | None = None  # set by ChatSession per round
 
     @property
@@ -1321,8 +1326,8 @@ class ReActAgent:
         """Assemble run-scoped resources before entering the transition loop."""
         self._active_policy = policy
         if getattr(self, "_repo_map_cache_key", None) != task.repo_path:
-            if hasattr(self, "_repo_map_cache"):
-                del self._repo_map_cache
+            self._repo_map_cache = ""
+            self._repo_map_cache_v2 = ""
             self._repo_map_cache_key = task.repo_path
         if self._memory_context:
             self._memory_context.set_task_context(task.description)
@@ -2921,23 +2926,7 @@ class ReActAgent:
                     f"{result.reason}\n"
                     "Continue working until the check passes."
                 )
-        # P6: Legacy _goal_stop_hook — scheduled for migration to STOP hook.
-        # Currently the HookDispatcher STOP event only checks BLOCK control.
-        # Once STOP hook supports messages/additional_context output, this
-        # attribute-based callback can be replaced by a registered STOP hook.
-        # Tracked in RUNTIME_HOOKS_EVENTBUS_REDESIGN.md P6.
-
-        goal_hook = getattr(self, "_goal_stop_hook", None)
-        if goal_hook is None:
-            return None
-        try:
-            goal_messages = goal_hook(messages)
-        except Exception as exc:
-            logger.debug("Goal stop hook failed: %s", exc)
-            return None
-        if not goal_messages:
-            return None
-        return str(goal_messages[0].get("content", ""))
+        return None
 
     def _dispatch_post_response(
         self, history: ConversationHistory, step: int,
@@ -3313,7 +3302,7 @@ class ReActAgent:
             system = self._require_prompt_renderer().sub_agent_system(schemas)
         else:
             repo_path = getattr(self, "_current_repo_path", ".")
-            repo_map_text = self._repo_map_cache or ""
+            repo_map_text = getattr(self, "_repo_map_cache", "") or ""
             system = self._require_prompt_renderer().system_core(
                 repo_path, schemas, repo_map_text,
             )

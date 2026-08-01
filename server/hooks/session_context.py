@@ -28,8 +28,10 @@ class SessionContextInjector:
     def __init__(self, repo_path: str = ".") -> None:
         self._repo_path = Path(repo_path).resolve()
 
-    def on_session_start(self, ctx: object) -> dict | None:
+    def on_session_start(self, ctx: object):
         """Return additional context to inject, or None."""
+        from hooks.protocol import HookOutput
+
         context_parts: list[str] = []
 
         # Project instructions (CLAUDE.md)
@@ -44,4 +46,6 @@ class SessionContextInjector:
         if not context_parts:
             return None
 
-        return {"additional_context": "\n\n".join(context_parts)}
+        return HookOutput(
+            additional_context="\n\n".join(context_parts),
+        )

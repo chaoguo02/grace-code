@@ -1,3 +1,4 @@
+
 """Multi-agent control-plane inspection and explicit user actions."""
 
 from __future__ import annotations
@@ -11,11 +12,11 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 def _http_status_for(exc: Exception, not_found_hint: bool = False) -> int:
     """Map domain exceptions to HTTP status codes.
 
-    - PermissionError → 403 Forbidden
-    - TypeError → 422 Unprocessable Entity (bad input shape)
-    - ValueError with a "not found" / "unknown" message → 404
-    - ValueError (other) → 422 Unprocessable Entity
-    - RuntimeError → 409 Conflict (runtime state)
+    - PermissionError 鈫?403 Forbidden
+    - TypeError 鈫?422 Unprocessable Entity (bad input shape)
+    - ValueError with a "not found" / "unknown" message 鈫?404
+    - ValueError (other) 鈫?422 Unprocessable Entity
+    - RuntimeError 鈫?409 Conflict (runtime state)
     """
     if isinstance(exc, PermissionError):
         return 403
@@ -129,168 +130,6 @@ def create_multi_agent_router(get_service: Any) -> APIRouter:
                 service._multi_agent_service.verify_run,
                 session_id,
                 run_id,
-            )
-        except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(
-                status_code=_http_status_for(exc), detail=str(exc),
-            ) from exc
-
-    @router.post("/{session_id}/team/propose")
-    async def propose_team(
-        session_id: str,
-        body: dict = Body(...),
-        service=Depends(get_service),
-    ) -> dict:
-        try:
-            return service._runtime.propose_agent_team(
-                session_id=session_id,
-                members=list(body.get("members", [])),
-                tasks=list(body.get("tasks", [])),
-            )
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=_http_status_for(exc), detail=str(exc),
-            ) from exc
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    @router.post("/{session_id}/team/approve")
-    async def approve_team(
-        session_id: str,
-        service=Depends(get_service),
-    ) -> dict:
-        try:
-            return service._runtime.approve_agent_team(session_id=session_id)
-        except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(
-                status_code=_http_status_for(exc), detail=str(exc),
-            ) from exc
-
-    @router.post("/{session_id}/team/reject")
-    async def reject_team(
-        session_id: str,
-        service=Depends(get_service),
-    ) -> dict:
-        try:
-            return service._runtime.reject_agent_team(session_id=session_id)
-        except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(
-                status_code=_http_status_for(exc), detail=str(exc),
-            ) from exc
-
-    @router.post("/{session_id}/team/message")
-    async def team_message(
-        session_id: str,
-        body: dict = Body(...),
-        service=Depends(get_service),
-    ) -> dict:
-        try:
-            return service._runtime.send_team_message(
-                session_id=session_id,
-                sender_id=str(body.get("sender_id", "")),
-                recipient_id=str(body.get("recipient_id", "")),
-                body=str(body.get("body", "")),
-            )
-        except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(
-                status_code=_http_status_for(exc), detail=str(exc),
-            ) from exc
-
-    @router.post("/{session_id}/team/shutdown")
-    async def shutdown_team(
-        session_id: str,
-        body: dict = Body(default={}),
-        service=Depends(get_service),
-    ) -> dict:
-        try:
-            return service._runtime.shutdown_agent_team(
-                session_id=session_id,
-                cancel=bool(body.get("cancel", False)),
-            )
-        except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(
-                status_code=_http_status_for(exc), detail=str(exc),
-            ) from exc
-
-    @router.post("/{session_id}/team/tasks/{task_id}/claim")
-    async def claim_team_task(
-        session_id: str,
-        task_id: str,
-        body: dict = Body(...),
-        service=Depends(get_service),
-    ) -> dict:
-        try:
-            return service._runtime.claim_team_task(
-                session_id=session_id,
-                task_id=task_id,
-                member_id=str(body.get("member_id", "")),
-            )
-        except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(
-                status_code=_http_status_for(exc), detail=str(exc),
-            ) from exc
-
-    @router.post("/{session_id}/team/tasks/{task_id}/complete")
-    async def complete_team_task(
-        session_id: str,
-        task_id: str,
-        body: dict = Body(...),
-        service=Depends(get_service),
-    ) -> dict:
-        try:
-            return service._runtime.complete_team_task(
-                session_id=session_id,
-                task_id=task_id,
-                member_id=str(body.get("member_id", "")),
-                lease_token=str(body.get("lease_token", "")),
-                summary=str(body.get("summary", "")),
-                failed=bool(body.get("failed", False)),
-            )
-        except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(
-                status_code=_http_status_for(exc), detail=str(exc),
-            ) from exc
-
-    @router.post("/{session_id}/team/tasks/{task_id}/execute")
-    async def execute_team_task(
-        session_id: str,
-        task_id: str,
-        body: dict = Body(...),
-        service=Depends(get_service),
-    ) -> dict:
-        try:
-            result = await asyncio.to_thread(
-                service._runtime.execute_team_task,
-                session_id=session_id,
-                task_id=task_id,
-                member_id=str(body.get("member_id", "")),
-                lease_token=str(body.get("lease_token", "")),
-            )
-            return {
-                "task_id": task_id,
-                "child_session_id": result.session_id,
-                "status": result.status.value,
-                "summary": result.summary,
-                "tokens_used": result.tokens_used,
-            }
-        except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
-            raise HTTPException(
-                status_code=_http_status_for(exc), detail=str(exc),
-            ) from exc
-
-    @router.post("/{session_id}/team/tasks/{task_id}/resolve")
-    async def resolve_team_task(
-        session_id: str,
-        task_id: str,
-        body: dict = Body(...),
-        service=Depends(get_service),
-    ) -> dict:
-        try:
-            return service._runtime.resolve_team_task_review(
-                session_id=session_id,
-                task_id=task_id,
-                accepted=bool(body.get("accepted", False)),
-                summary=str(body.get("summary", "")),
             )
         except (TypeError, ValueError, RuntimeError, PermissionError) as exc:
             raise HTTPException(

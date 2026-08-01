@@ -32,7 +32,7 @@ from app.storage.protocol import StorageBackend
 logger = logging.getLogger(__name__)
 
 _LEGACY_UNVERIFIED_PREFIX = re.compile(
-    r"^\[UNVERIFIED — (?:no test environment available|"
+    r"^\[UNVERIFIED\s+[-—–―〞]\s+(?:no test environment available|"
     r"project has no Git fact source|tests ran but failed|"
     r"test/validation did not run or was unavailable)\. "
     r"Code changes were made but NOT independently verified\.\]\r?\n\r?\n",
@@ -64,7 +64,9 @@ def _serialize_message(msg: LLMMessage) -> dict[str, Any]:
             }
             for tc in msg.tool_calls
         ]
-    content = msg.content
+    from agent.session.message_serializer import collapse_plain_text_content
+
+    content = collapse_plain_text_content(msg.content)
     if msg.role == "assistant" and isinstance(content, str):
         # Compatibility for answers persisted before verification metadata
         # was separated from assistant prose.

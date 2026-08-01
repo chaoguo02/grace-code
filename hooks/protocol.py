@@ -57,6 +57,7 @@ class HookOutput:
     reason: str | None = None
     additional_context: str | None = None
     updated_input: dict[str, Any] | None = None
+    updated_output: dict[str, Any] | str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "HookOutput":
@@ -70,6 +71,10 @@ class HookOutput:
             reason=data.get("reason"),
             additional_context=data.get("additional_context") or data.get("additionalContext"),
             updated_input=data.get("updated_input") or data.get("updatedInput"),
+            updated_output=(
+                data["updated_output"] if "updated_output" in data
+                else data.get("updatedOutput")
+            ),
         )
 
 
@@ -121,6 +126,7 @@ class DispatchResult:
     additional_context: str = ""
     attachments: tuple[HookAttachment, ...] = ()
     updated_input: dict[str, Any] | None = None
+    updated_output: dict[str, Any] | str | None = None
     warnings: list[str] = None  # type: ignore[assignment]
     """CC-aligned: non-blocking error messages accumulated during dispatch."""
 

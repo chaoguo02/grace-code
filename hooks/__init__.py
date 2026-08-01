@@ -11,9 +11,19 @@ Core components:
 from hooks.events import (
     BLOCKABLE_EVENTS, HookContext, HookEvent, SessionStartSource,
 )
-from hooks.protocol import DispatchResult, ExitCode, HookOutput, HookResult
+from hooks.protocol import (
+    DispatchResult, ExitCode, HookDecision, HookOutput, HookResult,
+)
 from hooks.matcher import HookMatcher
-from hooks.registry import ExternalHookConfig, HookRegistry, InternalHook
+from hooks.registry import (
+    ExternalHookConfig,
+    HookDataAuthority,
+    HookDecisionAuthority,
+    HookFailurePolicy,
+    HookRegistry,
+    HookScheduling,
+    InternalHook,
+)
 from hooks.dispatcher import HookDispatcher
 
 __all__ = [
@@ -23,11 +33,16 @@ __all__ = [
     "BLOCKABLE_EVENTS",
     "ExitCode",
     "HookOutput",
+    "HookDecision",
     "HookResult",
     "DispatchResult",
     "HookMatcher",
     "ExternalHookConfig",
     "InternalHook",
+    "HookScheduling",
+    "HookDecisionAuthority",
+    "HookDataAuthority",
+    "HookFailurePolicy",
     "HookRegistry",
     "HookDispatcher",
 ]

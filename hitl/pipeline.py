@@ -666,17 +666,8 @@ class PermissionPipeline:
                     self._stats.record(result)
                     return self._apply_tool_check(result, tool, params)
 
-        # Step 6: canUseTool Callback
-        if hook_proposal.approved and not force_interactive:
-            result = PermissionResult(
-                decision=PermissionDecision.ALLOW,
-                layer=PermissionLayer.PRE_TOOL_HOOK,
-                reason="Hook waived interactive approval",
-                updated_params=dict(hook_updates) or None,
-            )
-            self._stats.record(result)
-            return self._apply_tool_check(result, tool, params)
-
+        # Step 6: canUseTool Callback. Hook approval is advisory here: only
+        # explicit permission policy or a human decision may waive HITL.
         result = self._layer6_callback(
             tool_name, params, thought,
             force_interactive=force_interactive,
@@ -1137,14 +1128,6 @@ class PermissionPipeline:
                     layer=PermissionLayer.INTERACTIVE,
                     reason=hook_result.reason or "Permission request blocked by hook",
                 )
-            if hook_result.control is HookControl.APPROVE:
-                return PermissionResult(
-                    decision=PermissionDecision.ALLOW,
-                    layer=PermissionLayer.INTERACTIVE,
-                    reason="Permission request approved by hook",
-                    updated_params=hook_result.updated_input,
-                )
-
         # Path 2: Web headless callback (blocks on threading.Event internally)
         if self._web_confirm_callback is not None:
             t0 = time.time()

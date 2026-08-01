@@ -51,8 +51,6 @@ def attach_delegation_tools(
         Worker:
           none — this function is NOT called for workers.
 
-    Agent Team tools (ProposeAgentTeam) are NOT part of any three-mode pool,
-    regardless of the TEAM_ENABLED env var.
     """
     configured_depth = min(
         SubagentSafetyLimits.from_environment().max_spawn_depth,
@@ -114,9 +112,6 @@ def attach_delegation_tools(
             session.id,
             caller_agent_name=spec.name,
         ))
-
-    # ── Agent Team tools — NOT in three-mode pool ──
-    # ProposeAgentTeam is explicitly excluded regardless of TEAM_ENABLED.
 
     # ── Child control tools (all modes that delegate) ──
     from agent.session.agent_control_tool import (
@@ -216,15 +211,6 @@ def build_registry_for_session(
         circuit_breaker=circuit_breaker,
         mode_policy=mode_policy,
     )
-    if (
-        runtime is not None
-        and session.metadata.get("team_id")
-        and session.metadata.get("team_member_id")
-        and "TeamCoordinate" not in registry
-    ):
-        from agent.session.team_coordination_tool import TeamCoordinateTool
-        registry.register(TeamCoordinateTool(runtime, session.id))
-
     # Tag registry with session_id for per-session intercept dedup
     registry = registry.with_session_id(session.id)
 

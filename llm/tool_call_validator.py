@@ -94,6 +94,17 @@ def validate_tool_calls(
             result = validator.safe_parse(params)
             if not result.valid:
                 feedback = validator.format_errors_for_llm(result.errors)
+                legacy_paths = [
+                    "params" + "".join(
+                        f"[{part}]" if part.isdigit() else f".{part}"
+                        for part in error.path.strip("/").split("/")
+                        if part
+                    )
+                    for error in result.errors
+                    if error.path and error.path != "/"
+                ]
+                if legacy_paths:
+                    feedback += "\n  Parameter paths: " + ", ".join(legacy_paths)
                 return _invalid_params(name, feedback)
 
     # ── Check 3: Duplicate detection ──

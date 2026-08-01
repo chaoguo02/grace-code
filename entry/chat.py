@@ -79,6 +79,41 @@ class ChatSession:
         self._memory_context = memory_context
         self._hook_dispatcher = hook_dispatcher
 
+        from core.goal import GoalStore, goal_stop_hook
+        from core.state_paths import ProjectStatePaths
+
+        self.goal_store = GoalStore(ProjectStatePaths.for_project(repo_path).goals)
+        self.goal_store.restore()
+        if self._hook_dispatcher is not None:
+            from hooks import (
+                HookDecision,
+                HookEvent,
+                HookOutput,
+                InternalHook,
+            )
+
+            def _goal_policy_hook(ctx):
+                messages = goal_stop_hook(
+                    self.goal_store,
+                    list(ctx.messages or []),
+                    backend_factory=self._create_goal_judge_backend,
+                )
+                if not messages:
+                    return None
+                return HookOutput(
+                    decision=HookDecision.BLOCK,
+                    reason=str(messages[0].get("content", "")),
+                )
+
+            self._hook_dispatcher.register_internal(
+                HookEvent.STOP,
+                InternalHook(
+                    callback=_goal_policy_hook,
+                    hook_id="goal-completion-policy",
+                    priority=20,
+                ),
+            )
+
         self._backend = backend
         self._registry = registry
         self._agent_registry = AgentRegistryV2(project_dir=repo_path)
@@ -128,12 +163,6 @@ class ChatSession:
         # SessionState — 结构化任务追踪
         from context.session import SessionState
         self._session_state = SessionState()
-
-        # Goal Stop Hook
-        from core.goal import GoalStore
-        from core.state_paths import ProjectStatePaths
-        self.goal_store = GoalStore(ProjectStatePaths.for_project(repo_path).goals)
-        self.goal_store.restore()
 
         # 跨 session 上下文恢复
         self._inject_session_summary()
@@ -463,16 +492,6 @@ class ChatSession:
             steps_taken=result.steps_taken,
             tokens_spent=result.total_tokens,
             elapsed_seconds=elapsed,
-        )
-
-    # ── Goal Stop Hook ────────────────────────────────────────────────
-
-    def _goal_stop_hook(self, messages: list[dict]):
-        from core.goal import goal_stop_hook
-        return goal_stop_hook(
-            messages=messages,
-            goal_store=self.goal_store,
-            repo_path=self.repo_path,
         )
 
     def print_stats(self) -> None:

@@ -1094,9 +1094,8 @@ final. After integration, inspect git status and diff, then run the relevant tes
 build in the parent workspace. Wait for required workers, validate their evidence,
 and return one concise synthesis of changes, verification, and remaining issues.
 
-Do not create or bind an Agent Team. Agent Team is a separate, explicitly enabled
-workflow. Do not bypass the permission pipeline or lower approval requirements for
-high-risk operations.""",
+Do not bypass the permission pipeline or lower approval requirements for high-risk
+operations.""",
         permission_mode="default",
     ),
     "plan": AgentDefinition(

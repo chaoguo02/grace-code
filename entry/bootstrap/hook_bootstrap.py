@@ -24,6 +24,19 @@ def init_hook_dispatcher(
     settings_path = repo_path / ".grace" / "settings.json"
     registry.load_from_settings(settings_path)
 
+    from server.hooks.session_context import SessionContextInjector
+
+    registry.register_internal(
+        HookEvent.SESSION_START,
+        InternalHook(
+            callback=SessionContextInjector(
+                repo_path=str(repo_path),
+            ).on_session_start,
+            hook_id="session-context-injector",
+            priority=50,
+        ),
+    )
+
     if memory_store is not None:
         def _on_session_stop(ctx):
             from memory.consolidation import record_session_end, run_consolidation

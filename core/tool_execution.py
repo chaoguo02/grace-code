@@ -423,3 +423,15 @@ class ToolExecutionPipeline:
                 *result.attachments,
                 *dispatch_result.attachments,
             )
+        transformed = dispatch_result.updated_output
+        if isinstance(transformed, str):
+            result.output = transformed
+        elif isinstance(transformed, dict):
+            output = transformed.get("output")
+            if isinstance(output, str):
+                result.output = output
+            metadata = transformed.get("metadata")
+            if isinstance(metadata, dict):
+                result.metadata = {**result.metadata, **metadata}
+            if "data" in transformed:
+                result.data = transformed["data"]

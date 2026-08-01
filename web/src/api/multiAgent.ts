@@ -1,8 +1,8 @@
+
 import { apiGet, apiPost } from "./client";
 import type {
   AgentBudgetProjection,
   AgentRoutingProjection,
-  AgentTeamProjection,
   DelegationRunProjection,
   DelegationTaskProjection,
   MultiAgentSnapshot,
@@ -116,59 +116,6 @@ function delegationTask(value: unknown): DelegationTaskProjection {
   };
 }
 
-function team(value: unknown): AgentTeamProjection | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const item = object(value);
-  const members = Array.isArray(item.members)
-    ? item.members.map((value) => {
-      const member = object(value);
-      return {
-        id: string(member.id),
-        role: string(member.role),
-        state: string(member.state, "unknown"),
-      };
-    })
-    : [];
-  const taskBoard = Array.isArray(item.task_board)
-    ? item.task_board.map((value) => {
-      const task = object(value);
-      return {
-        id: string(task.id),
-        goal: string(task.goal) || string(task.title),
-        dependencies: Array.isArray(task.dependencies)
-          ? task.dependencies.map((entry) => String(entry))
-          : [],
-        status: string(task.status, "unknown"),
-        assignee_id: string(task.assignee_id),
-        result_summary: string(task.result_summary),
-      };
-    })
-    : [];
-  const mailbox = object(item.mailbox);
-  return {
-    id: string(item.id) || undefined,
-    enabled: boolean(item.enabled),
-    available: boolean(item.available) || boolean(item.enabled),
-    active: boolean(item.active),
-    state: string(item.state, boolean(item.active) ? "active" : "inactive"),
-    approval_required: boolean(item.approval_required),
-    arbitrary_agent_message_bus: boolean(item.arbitrary_agent_message_bus),
-    shared_task_board: boolean(item.shared_task_board) || boolean(item.task_board),
-    direct_messaging: boolean(item.direct_messaging) || boolean(item.mailbox)
-      || boolean(item.arbitrary_agent_message_bus),
-    reason: string(item.reason) || undefined,
-    recovery_note: string(item.recovery_note) || undefined,
-    members,
-    task_board: taskBoard,
-    mailbox: {
-      pending: number(mailbox.pending) ?? 0,
-      persisted: typeof mailbox.persisted === "boolean"
-        ? mailbox.persisted
-        : undefined,
-    },
-  };
-}
-
 export function normalizeMultiAgentSnapshot(value: MultiAgentSnapshot): MultiAgentSnapshot {
   const raw = value as MultiAgentSnapshot & JsonObject;
   const rawRuns = raw.delegation_runs ?? raw.runs;
@@ -181,7 +128,6 @@ export function normalizeMultiAgentSnapshot(value: MultiAgentSnapshot): MultiAge
     delegation_runs: Array.isArray(rawRuns) ? rawRuns.map(delegationRun) : [],
     delegation_tasks: Array.isArray(rawTasks) ? rawTasks.map(delegationTask) : [],
     limits: budget(raw.limits ?? raw.budget),
-    team: team(raw.team ?? raw.team_capability),
     resource,
   };
 }
@@ -209,78 +155,6 @@ export function getAgentDefinitions(signal?: AbortSignal): Promise<AgentDefiniti
     "/api/multi-agent/catalog/definitions",
     signal,
   ).then((value) => value.definitions);
-}
-
-export function proposeAgentTeam(
-  sessionId: string,
-  body: {
-    members: Array<{ id: string; role: string }>;
-    tasks: Array<{
-      id: string;
-      goal: string;
-      dependencies?: string[];
-      agent?: string;
-      purpose?: string;
-      required?: boolean;
-    }>;
-  },
-) {
-  return apiPost<Record<string, unknown>>(
-    `/api/multi-agent/${encodeURIComponent(sessionId)}/team/propose`,
-    body,
-  );
-}
-
-export function approveAgentTeam(sessionId: string) {
-  return apiPost<Record<string, unknown>>(
-    `/api/multi-agent/${encodeURIComponent(sessionId)}/team/approve`,
-  );
-}
-
-export function rejectAgentTeam(sessionId: string) {
-  return apiPost<Record<string, unknown>>(
-    `/api/multi-agent/${encodeURIComponent(sessionId)}/team/reject`,
-  );
-}
-
-export function shutdownAgentTeam(sessionId: string, cancel = false) {
-  return apiPost<Record<string, unknown>>(
-    `/api/multi-agent/${encodeURIComponent(sessionId)}/team/shutdown`,
-    { cancel },
-  );
-}
-
-export function sendAgentTeamMessage(
-  sessionId: string,
-  body: { sender_id: string; recipient_id: string; body: string },
-) {
-  return apiPost<Record<string, unknown>>(
-    `/api/multi-agent/${encodeURIComponent(sessionId)}/team/message`,
-    body,
-  );
-}
-
-export function claimAgentTeamTask(
-  sessionId: string,
-  taskId: string,
-  memberId: string,
-) {
-  return apiPost<{ lease_token: string }>(
-    `/api/multi-agent/${encodeURIComponent(sessionId)}/team/tasks/${encodeURIComponent(taskId)}/claim`,
-    { member_id: memberId },
-  );
-}
-
-export function executeAgentTeamTask(
-  sessionId: string,
-  taskId: string,
-  memberId: string,
-  leaseToken: string,
-) {
-  return apiPost<Record<string, unknown>>(
-    `/api/multi-agent/${encodeURIComponent(sessionId)}/team/tasks/${encodeURIComponent(taskId)}/execute`,
-    { member_id: memberId, lease_token: leaseToken },
-  );
 }
 
 export function cancelDelegationTask(

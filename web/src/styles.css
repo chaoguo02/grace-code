@@ -9981,8 +9981,6 @@ footer.composer { margin-top: 0; padding-top: 0; }
 .agent-routing-layout dt, .agent-routing-layout dd { margin: 0; font-size: 7px; }
 .agent-routing-layout dt { color: var(--text-muted); text-transform: uppercase; }
 .agent-routing-layout dd { color: var(--text); font-weight: 700; }
-.agent-team-capability { padding: 4px 7px; border-radius: 999px; background: var(--bg-soft); color: var(--text-muted) !important; text-transform: uppercase; }
-.agent-team-capability.active { background: var(--success-soft); color: var(--success) !important; }
 .agent-control-grid { display: grid; grid-template-columns: 1.25fr .75fr; gap: 13px; max-width: 1280px; margin: 0 auto 13px; }
 .agent-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
 .agent-section-heading h2, .agent-node-inspector h2, .agent-consistency h2 { margin: 0; color: var(--text); font-size: 12px; }
@@ -10472,86 +10470,12 @@ footer.composer { margin-top: 0; padding-top: 0; }
   }
 }
 
-.agent-team-board {
-  display: grid;
-  gap: 14px;
-}
-
-.agent-team-explanation {
-  margin: 0;
-  color: var(--text-muted);
-}
-
-.agent-team-approval,
-.agent-team-shutdown {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg-soft);
-}
-
-.agent-team-approval > div {
-  display: grid;
-  gap: 3px;
-  margin-right: auto;
-}
-
-.agent-team-approval span,
-.agent-team-shutdown span {
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.agent-team-members,
-.agent-team-tasks {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 10px;
-}
-
-.agent-team-members article,
-.agent-team-tasks article {
-  display: grid;
-  gap: 5px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--panel);
-}
-
-.agent-team-members span,
-.agent-team-members small,
-.agent-team-tasks span {
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.agent-team-tasks article {
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-}
-
-.agent-team-tasks article > div {
-  display: grid;
-  gap: 4px;
-}
-
-.agent-team-tasks p {
-  margin: 3px 0 0;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
 .agent-task-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
 }
 
-.agent-team-board button,
 .agent-task-actions button {
   min-height: 32px;
   padding: 0 12px;
@@ -10562,33 +10486,15 @@ footer.composer { margin-top: 0; padding-top: 0; }
   cursor: pointer;
 }
 
-.agent-team-board button.secondary,
 .agent-task-actions button.secondary {
   color: var(--text);
   border-color: var(--border);
   background: var(--panel);
 }
 
-.agent-team-board button:disabled,
 .agent-task-actions button:disabled {
   cursor: wait;
   opacity: 0.55;
-}
-
-@media (max-width: 720px) {
-  .agent-team-approval,
-  .agent-team-shutdown {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .agent-team-approval > div {
-    margin-right: 0;
-  }
-
-  .agent-team-tasks article {
-    grid-template-columns: 1fr;
-  }
 }
 
 /* ── Multi-agent delegation run ─────────────────────────────────────── */

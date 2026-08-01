@@ -1,3 +1,4 @@
+
 """Persisted multi-agent scheduling and consistency projection."""
 
 from __future__ import annotations
@@ -372,7 +373,6 @@ class MultiAgentService:
                 "max_concurrent": feature.max_concurrent,
             },
             "observability": observability,
-            "team": self._team_projection(root_id),
             "nodes": nodes,
             "edges": [
                 {
@@ -444,9 +444,6 @@ class MultiAgentService:
             "disclosure": {
                 "source": (
                     "persisted_sessions_notifications_and_delegation_tasks"
-                ),
-                "arbitrary_agent_message_bus": bool(
-                    self._team_projection(root_id).get("active")
                 ),
                 "scheduler_simulation_performed": False,
                 "parallelism_is_interval_projection": True,
@@ -561,110 +558,6 @@ class MultiAgentService:
                     result["governor_mode"] = governor.mode
                     result["governor_queue_depth"] = governor.queue_depth
         return result
-
-    def _team_projection(self, root_id: str) -> dict[str, Any]:
-        from agent.team.feature_flags import TeamFeatureConfig
-
-        config = TeamFeatureConfig.from_environment()
-        runtime = getattr(self._service, "_runtime", None)
-        teams = getattr(runtime, "_teams", {})
-        proposals = getattr(runtime, "_team_proposals", {})
-        team = teams.get(root_id) if isinstance(teams, dict) else None
-        if team is None:
-            persisted = [
-                run for run in self._list_delegation_runs(root_id)
-                if bool(run.get("is_team"))
-            ]
-            if persisted:
-                latest = persisted[-1]
-                board = self._list_delegation_tasks(str(latest["id"]))
-                return {
-                    "id": latest["id"],
-                    "available": config.enabled,
-                    "enabled": config.enabled,
-                    "active": False,
-                    "state": "recovery_required",
-                    "approval_required": False,
-                    "direct_messaging": False,
-                    "shared_task_board": True,
-                    "task_board": board,
-                    "mailbox": {"pending": 0, "persisted": False},
-                    "members": [],
-                    "recovery_note": (
-                        "The durable task board was restored, but live teammate "
-                        "mailboxes require an explicit new activation."
-                    ),
-                }
-            return {
-                "available": config.enabled,
-                "enabled": config.enabled,
-                "active": False,
-                "approval_required": False,
-                "proposal_requires_approval": config.require_user_approval,
-                "direct_messaging": False,
-                "shared_task_board": False,
-                "task_board": [],
-                "mailbox": {"pending": 0},
-                "members": [],
-            }
-        members = [
-            {
-                "id": member.id,
-                "role": member.role,
-                "state": _value(member.state),
-            }
-            for member in team.members
-        ]
-        board = [
-            {
-                "id": task.id,
-                "goal": task.goal,
-                "dependencies": list(task.dependencies),
-                "status": _value(task.state),
-                "assignee_id": task.assignee_id,
-                "result_summary": task.result_summary,
-            }
-            for task in team.task_board.list()
-        ]
-        state = str(_value(team.state))
-        pending = sum(
-            team.mailbox.pending_count(member.id) for member in team.members
-        )
-        proposal = (
-            proposals.get(root_id)
-            if isinstance(proposals, dict) else None
-        )
-        if proposal and state == "awaiting_approval":
-            members.extend({
-                "id": str(item.get("id", "")),
-                "role": str(item.get("role", "")),
-                "state": "proposed",
-            } for item in proposal.get("members", []))
-            board = [{
-                "id": str(item.get("id", "")),
-                "goal": str(item.get("goal", "")),
-                "dependencies": [
-                    str(value)
-                    for value in item.get("dependencies", [])
-                ],
-                "status": "proposed",
-                "assignee_id": "",
-                "result_summary": "",
-            } for item in proposal.get("tasks", [])]
-        return {
-            "id": team.team_id,
-            "available": True,
-            "enabled": True,
-            "active": state == "active",
-            "state": state,
-            "approval_required": state == "awaiting_approval",
-            "direct_messaging": state == "active",
-            "arbitrary_agent_message_bus": state == "active",
-            "shared_task_board": True,
-            "task_board": board,
-            "mailbox": {"pending": pending},
-            "members": members,
-        }
 
     def _node(self, record: Any, selected_id: str) -> dict[str, Any]:
         result = record.agent_result
