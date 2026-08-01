@@ -624,7 +624,7 @@ class ChatPipeline:
                     _run_id = getattr(_rc, "run_id", "") if _rc else ""
                     if _run_id:
                         try:
-                            self._runtime._store.update_run(
+                            self._runtime.update_run(
                                 _run_id,
                                 status="failed",
                                 error=str(exc),

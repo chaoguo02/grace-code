@@ -497,8 +497,9 @@ class AgentService:
             governor=self._resource_governor,
         )
         # Mark as Web mode — child agents use this to create web callbacks
-        self._runtime._is_web_mode = True
-        self._runtime._stats_recorder = self._stats_recorder
+        # R4: inject web mode + stats recorder via Runtime public API
+        self._runtime.set_web_mode(True)
+        self._runtime.set_stats_recorder(self._stats_recorder)
 
         # Wire hook_dispatcher into registry for PreToolUse/PostToolUse hooks
         if self._hook_dispatcher is not None:
@@ -545,7 +546,7 @@ class AgentService:
                         event_id=event.get("event_id", ""),
                     ))
 
-            self._runtime._publish_run_terminal = _on_run_terminal
+            self._runtime.set_publish_run_terminal(_on_run_terminal)
 
             def _on_evidence_record(entry) -> None:
                 from server.events import WsEvidenceRecord
@@ -558,9 +559,7 @@ class AgentService:
                     ),
                 )
 
-            self._runtime._evidence_stores.set_event_callback(
-                _on_evidence_record,
-            )
+            self._runtime.set_evidence_event_callback(_on_evidence_record)
 
             def _on_memory_written(session_id, memory, source):
                 from server.events import WsMemoryWritten
@@ -572,7 +571,7 @@ class AgentService:
                     source=source,
                     confidence=float(getattr(memory.metadata, "confidence", 0.0)),
                 ))
-            self._runtime._memory_event_callback = _on_memory_written
+            self._runtime.set_memory_event_callback(_on_memory_written)
 
         # ── Plan revision storage (SQLite-backed) ───────────────────────
         from server.services.plan_revision_service import PlanRevisionService

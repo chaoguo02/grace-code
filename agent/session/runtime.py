@@ -2533,6 +2533,28 @@ class SessionRuntime:
         with self._active_sessions_lock:
             return self._approval_brokers.get(session_id)
 
+    # ── R4: IoC ports — replace direct _ field writes from server layer ──
+
+    def set_web_mode(self, enabled: bool) -> None:
+        self._is_web_mode = enabled
+
+    def set_stats_recorder(self, recorder: object | None) -> None:
+        self._stats_recorder = recorder
+
+    def set_publish_run_terminal(self, callback: object | None) -> None:
+        self._publish_run_terminal = callback
+
+    def set_evidence_event_callback(self, callback: object | None) -> None:
+        if hasattr(self, "_evidence_stores") and self._evidence_stores is not None:
+            self._evidence_stores.set_event_callback(callback)
+
+    def set_memory_event_callback(self, callback: object | None) -> None:
+        self._memory_event_callback = callback
+
+    def update_run(self, run_id: str, **kwargs) -> object:
+        """Public accessor for SessionStore.update_run()."""
+        return self._store.update_run(run_id, **kwargs)
+
     def set_web_confirm_callback(
         self, session_id: str, callback: "WebConfirmCallback",
     ) -> None:
