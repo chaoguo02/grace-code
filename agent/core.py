@@ -2921,9 +2921,11 @@ class ReActAgent:
                     f"{result.reason}\n"
                     "Continue working until the check passes."
                 )
-        # Legacy _goal_stop_hook — NOT HookDispatcher-based.
-        # This is a separate callback set externally (entry/chat.py).
-        # Only runs when the HookDispatcher-based STOP hook didn't block.
+        # P6: Legacy _goal_stop_hook — scheduled for migration to STOP hook.
+        # Currently the HookDispatcher STOP event only checks BLOCK control.
+        # Once STOP hook supports messages/additional_context output, this
+        # attribute-based callback can be replaced by a registered STOP hook.
+        # Tracked in RUNTIME_HOOKS_EVENTBUS_REDESIGN.md P6.
 
         goal_hook = getattr(self, "_goal_stop_hook", None)
         if goal_hook is None:
