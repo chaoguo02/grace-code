@@ -414,13 +414,12 @@ class AgentService:
             if self._event_bus is not None:
                 session_id = str(event.get("session_id", ""))
                 if session_id:
-                    self._event_bus.publish_raw(
-                        session_id,
-                        {
-                            "type": event.get("type"),
-                            "payload": event,
-                        },
-                    )
+                    from server.events import WsResourceGovernance
+                    self._event_bus.publish_typed(session_id, WsResourceGovernance(
+                        event_type=str(event.get("type", "")),
+                        payload=dict(event),
+                        session_id=session_id,
+                    ))
 
         self._resource_governor.on_event(_on_resource_event)
         if self._resource_governor.mode == "observe":
@@ -1154,10 +1153,11 @@ class AgentService:
                 msgs = self.session_service.get_messages(session_id)
                 if not msgs:
                     if self._event_bus is not None:
-                        self._event_bus.publish_raw(session_id, {
-                            "type": "status", "status": "compacted",
-                            "message": "No messages to compact",
-                        })
+                        from server.events import WsCompactStatus
+                        self._event_bus.publish_typed(session_id, WsCompactStatus(
+                            status="compacted", message="No messages to compact",
+                            session_id=session_id,
+                        ))
                     return
 
                 # Run compaction via runtime
@@ -1204,20 +1204,21 @@ class AgentService:
                     pass
 
                 if self._event_bus is not None:
-                    self._event_bus.publish_raw(session_id, {
-                        "type": "status",
-                        "status": "compacted",
-                        "compaction": result,
-                        "message": f"Compressed {len(msgs)} → {len(compacted)} messages",
-                    })
+                    from server.events import WsCompactStatus
+                    self._event_bus.publish_typed(session_id, WsCompactStatus(
+                        status="compacted",
+                        message=f"Compressed {len(msgs)} → {len(compacted)} messages",
+                        session_id=session_id,
+                    ))
             except Exception as exc:
                 logger.exception("Compact failed for session %s", session_id)
                 if self._event_bus is not None:
-                    self._event_bus.publish_raw(session_id, {
-                        "type": "status",
-                        "status": "failed",
-                        "error": str(exc),
-                    })
+                    from server.events import WsCompactStatus
+                    self._event_bus.publish_typed(session_id, WsCompactStatus(
+                        status="failed",
+                        error=str(exc),
+                        session_id=session_id,
+                    ))
 
         import threading
         thread = threading.Thread(target=_compact, daemon=True)

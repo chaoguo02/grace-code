@@ -287,6 +287,7 @@ class EventBus:
         self._publish_lock = threading.Lock()
         self._repo_path = repo_path
         self._queue_max_size = max(0, int(queue_max_size))
+        self._accepting = True  # P3: set False on shutdown, events rejected
         # P3: typed — set by agent_service, None until injected
         self.recorder: object | None = None   # StatsRecorder
         self.trace_store: object | None = None  # StorageBackend
@@ -459,9 +460,32 @@ class EventBus:
                 "Use a typed dataclass from server.events instead."
             )
         try:
+            if not self._accepting:
+                logger.warning("EventBus.publish_typed rejected: bus is shut down")
+                return
             self._publish_msg(session_id, event.to_dict(), source="typed", run_context=run_context)
         except Exception:
             logger.exception("EventBus.publish_typed failed")
+
+    # ── Shutdown (P3) ──────────────────────────────────────────────────
+
+    async def drain(self, timeout_s: float = 5.0) -> int:
+        """Wait for queued events to be delivered. Returns undelivered count."""
+        remaining = 0
+        async with self._lock:
+            for sub in list(self._sessions.values()):
+                remaining += sub.queue.qsize()
+        if remaining > 0:
+            await asyncio.sleep(min(timeout_s, 5.0))
+            remaining = 0
+            async with self._lock:
+                for sub in list(self._sessions.values()):
+                    remaining += sub.queue.qsize()
+        return remaining
+
+    def shutdown(self) -> None:
+        """Stop accepting new events.  drain() should be called first."""
+        self._accepting = False
 
     # ── Subscriber management ──────────────────────────────────────────────
 
