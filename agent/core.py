@@ -1263,6 +1263,13 @@ class ReActAgent:
                 if tool_turn.result is not None:
                     return tool_turn.result
                 if tool_turn.continue_loop:
+                    # P1-1: capture checkpoint at turn boundary
+                    self._capture_turn_checkpoint(
+                        session_id=getattr(self, "_session_id", ""),
+                        generation=getattr(self, "_generation", 0),
+                        turn_number=step,
+                        tool_batch=tool_batch,
+                    )
                     continue
 
             else:
@@ -3119,13 +3126,27 @@ class ReActAgent:
         组装发给 LLM 的完整 messages，含 token 裁剪。
 
         委托 ContextManager 执行实际组装。保留此方法签名以兼容现有调用。
+
+        P0_1: CC-Native ContextWindowManager is the DEFAULT.
+        Opt-out: GRACE_USE_LEGACY_CONTEXT=1 → old three-path divergence.
         """
+        import os as _os
+        if _os.environ.get("GRACE_USE_LEGACY_CONTEXT") != "1":
+            return self._build_messages_v2(
+                history=history,
+                token_budget=token_budget,
+                repo_map=repo_map,
+                consumed_tokens=consumed_tokens,
+                max_context_window=max_context_window,
+                step=step,
+            )
         schemas = self._registry.get_schemas()
         effective_request_budget = token_budget.compute_plan(
             consumed_tokens=consumed_tokens,
             max_context_window=max_context_window,
         ).total
 
+        # ── DEPRECATED paths (P0_1): only reached when GRACE_USE_LEGACY_CONTEXT=1 ──
         if self._inherited_context is not None:
             ctx = self._context_manager.build_inherited_messages(
                 self._inherited_context, history,
@@ -3221,6 +3242,119 @@ class ReActAgent:
             )
 
         return ctx.messages
+
+    def _build_messages_v2(
+        self,
+        history: ConversationHistory,
+        token_budget: TokenBudget,
+        repo_map: RepoMap,
+        consumed_tokens: int = 0,
+        max_context_window: int | None = None,
+        *,
+        step: int = 1,
+    ) -> list[LLMMessage]:
+        """CC-Native context assembly — single entry point via ContextWindowManager.
+
+        Replaces the three-path divergence (main / sub-agent / inherited)
+        with ONE call to ContextWindowManager.build_context().
+        """
+        from context.counters import CharEstimator
+        from context.planner import TokenPlanner
+        from context.compaction_v2 import MicroCompactor
+        from context.trimmer import DeterministicTrimmer
+        from context.manager_v2 import (
+            ContextWindowManager,
+            ContextWindowManagerConfig,
+            TaskContext,
+        )
+        from llm.base import LLMMessage
+
+        window = max_context_window or self._backend.max_context_window
+
+        # ── Build the v2 manager (lightweight, per-call acceptable) ──
+        estimator = CharEstimator(model_window=window)
+        planner = TokenPlanner()
+        mgr = ContextWindowManager(
+            estimator=estimator,
+            planner=planner,
+            compaction_chain=[MicroCompactor()],
+            trimmer=DeterministicTrimmer(preserve_last_n_pairs=3),
+            config=ContextWindowManagerConfig(
+                auto_compact_threshold=0.80,
+                max_consecutive_api_failures=3,
+            ),
+        )
+
+        # ── Determine task context for sub-agent / inherited paths ──
+        task_ctx: TaskContext | None = None
+
+        if self._inherited_context is not None:
+            # Inherited context: extract task from the snapshot metadata
+            snapshot = self._inherited_context
+            task_ctx = TaskContext(
+                task=getattr(snapshot, 'task_description', '') or 'Continue work',
+                agent_type=getattr(self._cfg, 'agent_type', 'general'),
+                context_provenance="fork",
+                parent_run_id=getattr(self, '_run_id', None),
+            )
+        elif self._cfg.is_subagent:
+            task_ctx = TaskContext(
+                task=getattr(self, '_current_task_description', '') or 'Execute task',
+                agent_type=getattr(self._cfg, 'agent_type', 'general'),
+                context_provenance="fork",
+                parent_run_id=getattr(self, '_run_id', None),
+            )
+
+        # ── Build system content ──
+        schemas = self._registry.get_schemas()
+        if task_ctx is not None:
+            system = self._require_prompt_renderer().sub_agent_system(schemas)
+        else:
+            repo_path = getattr(self, "_current_repo_path", ".")
+            repo_map_text = self._repo_map_cache or ""
+            system = self._require_prompt_renderer().system_core(
+                repo_path, schemas, repo_map_text,
+            )
+            _instructions = self._load_project_instructions(repo_path)
+            if _instructions:
+                system = system.rstrip() + "\n\n## Project Instructions\n" + _instructions
+            # Repo map
+            if not hasattr(self, "_repo_map_cache_v2"):
+                plan = planner.plan(model_window=window, consumed_tokens=consumed_tokens)
+                self._repo_map_cache_v2 = repo_map.build(budget=plan.repo_map)
+            repo_map_text = self._repo_map_cache_v2 or ""
+
+        # ── Single entry point ──
+        history_dicts = history.to_dicts()
+        memory = self._build_long_term_context() or ""
+        anchor = self._build_task_anchor() or ""
+
+        assembly = mgr.build_context(
+            system_content=system,
+            history=history_dicts,
+            memory_context=memory,
+            task_anchor=anchor,
+            repo_map_text=repo_map_text if task_ctx is None else "",
+            consumed_tokens=consumed_tokens,
+            task_context=task_ctx,
+        )
+
+        # ── Convert to LLMMessage list ──
+        result: list[LLMMessage] = []
+        for m in assembly.messages:
+            result.append(LLMMessage(
+                role=m.get("role", "user"),
+                content=m.get("content", ""),
+            ))
+
+        logger.debug(
+            "V2 context: %d msgs, %d tokens, compact=%s, trim=%s",
+            len(result),
+            assembly.estimated_tokens,
+            assembly.compaction_applied,
+            assembly.fallback_trim_applied,
+        )
+        return result
 
     def _apply_collapse_projection(self, history: ConversationHistory) -> ConversationHistory:
         """Apply CollapseStore read-time projection, or return history unchanged."""
@@ -3321,6 +3455,42 @@ class ReActAgent:
         """判断当前 backend 是否为 Anthropic（支持 prompt cache）。"""
         backend_type = type(self._backend).__name__
         return "anthropic" in backend_type.lower()
+
+    def _capture_turn_checkpoint(
+        self,
+        session_id: str,
+        generation: int,
+        turn_number: int,
+        tool_batch: Any,
+    ) -> None:
+        """P1-1: Capture checkpoint at turn boundary for crash recovery."""
+        if not session_id:
+            return
+        try:
+            from agent.session.checkpoint import CheckpointManager
+            db_path = getattr(self, "_db_path", None) or getattr(
+                getattr(self, "_cfg", None), "checkpoint_db_path", None,
+            )
+            if db_path is None:
+                return
+            mgr = CheckpointManager(db_path)
+            # Collect tool results from this batch
+            results: dict[str, Any] = {}
+            pending: list[str] = []
+            if tool_batch is not None:
+                for obs in getattr(tool_batch, "observations", []) or []:
+                    inv_id = getattr(obs, "invocation_id", "")
+                    if inv_id:
+                        results[inv_id] = getattr(obs, "result", None)
+            mgr.capture(
+                session_id=session_id,
+                generation=generation,
+                turn_number=turn_number,
+                pending_tool_ids=pending,
+                tool_results=results,
+            )
+        except Exception:
+            logger.debug("Checkpoint capture skipped", exc_info=True)
 
     def _build_long_term_context(self) -> str | None:
         """委托给 memory/injection_service.py。可被 _invalidate_ltc() 强制刷新。"""

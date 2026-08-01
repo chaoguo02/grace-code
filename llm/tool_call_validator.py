@@ -81,16 +81,20 @@ def validate_tool_calls(
                     offending_tool=name,
                 )
 
-    # ── Check 2b: Parameter type validation (P2-40) ──
+    # ── Check 2b: Parameter validation (P1-2: jsonschema) ──
         if not isinstance(params, dict):
             return _invalid_params(
                 name,
                 "parameters must be an object",
             )
         root_schema = schema.parameters if hasattr(schema, "parameters") else {}
-        error = _validate_json_value(params, root_schema, path="params")
-        if error:
-            return _invalid_params(name, error)
+        if root_schema:
+            from core.schema_validator import SchemaValidator
+            validator = SchemaValidator(root_schema)
+            result = validator.safe_parse(params)
+            if not result.valid:
+                feedback = validator.format_errors_for_llm(result.errors)
+                return _invalid_params(name, feedback)
 
     # ── Check 3: Duplicate detection ──
     if len(tool_calls) > 1:

@@ -279,6 +279,33 @@ class SyncMCPToolManager:
             timeout=bridge.config.timeout_seconds,
         )
 
+    # ── Prompts (P0_2) ─────────────────────────────────────────────────
+
+    def list_prompts(self, server_name: str) -> list[dict[str, Any]]:
+        """List available prompts from a connected MCP server."""
+        bridge = self._bridges.get(server_name)
+        if bridge is None or not bridge.is_connected:
+            raise ConnectionError(f"MCP server '{server_name}' is not connected")
+        return self._run_coro(
+            bridge.list_prompts(),
+            timeout=bridge.config.timeout_seconds,
+        )
+
+    def get_prompt(
+        self,
+        server_name: str,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Retrieve a specific prompt from a connected MCP server."""
+        bridge = self._bridges.get(server_name)
+        if bridge is None or not bridge.is_connected:
+            raise ConnectionError(f"MCP server '{server_name}' is not connected")
+        return self._run_coro(
+            bridge.get_prompt(name, arguments=arguments),
+            timeout=bridge.config.timeout_seconds,
+        )
+
     def close_server(self, server_name: str) -> None:
         """Close one connected server and remove its tool registrations."""
         bridge = self._bridges.pop(server_name, None)

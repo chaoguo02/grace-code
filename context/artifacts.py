@@ -41,7 +41,8 @@ class Artifact:
     full_content: str
     summary: str
     token_count: int
-    char_count: int
+    char_count: int          # length of full_content (may be capped)
+    original_length: int     # length of the original output (before capping)
     line_count: int
     created_at: float = field(default_factory=time.time)
 
@@ -199,13 +200,23 @@ class ArtifactStore:
         return sum(a.token_count for a in self._store.values())
 
     def _create_artifact(self, tool_name: str, output: str, token_count: int) -> Artifact:
-        """从原始输出创建 Artifact，生成摘要。"""
+        """从原始输出创建 Artifact，生成摘要。
+
+        P0_1: Hash the FULL content (not just first 1000 chars) to prevent
+        ID collisions.  Use streaming update for large outputs.
+        """
         lines = output.splitlines()
         line_count = len(lines)
+        original_len = len(output)
 
         summary = self._build_summary(lines, tool_name, token_count, line_count)
 
-        content_hash = hashlib.sha256(output[:1000].encode(errors="replace")).hexdigest()[:8]
+        # P0_1: full-content hash via streaming update (avoids O(N) memory copy)
+        h = hashlib.sha256()
+        chunk_size = 64 * 1024  # 64 KB chunks
+        for i in range(0, original_len, chunk_size):
+            h.update(output[i:i + chunk_size].encode(errors="replace"))
+        content_hash = h.hexdigest()[:12]  # 12 hex chars = 48 bits
         artifact_id = f"art_{content_hash}"
 
         # Cap per-artifact content at 1 MB to prevent OOM from single large output
@@ -217,6 +228,7 @@ class ArtifactStore:
             summary=summary,
             token_count=token_count,
             char_count=len(capped_output),
+            original_length=original_len,
             line_count=line_count,
         )
 
@@ -252,13 +264,44 @@ class ArtifactStore:
         return "\n".join(parts)
 
     def _add(self, artifact: Artifact) -> None:
-        """添加 artifact，执行 LRU 淘汰（数量 + 内存双重限制）。"""
+        """添加 artifact，执行 LRU 淘汰（数量 + 内存双重限制）。
+
+        P0_1: Detect ID collisions.  If an artifact with the same ID but
+        different content already exists, log a warning and append a
+        disambiguation suffix instead of silently overwriting.
+        """
         content_len = len(artifact.full_content)
         if artifact.artifact_id in self._store:
-            self._total_bytes -= len(self._store[artifact.artifact_id].full_content)
-            self._store.move_to_end(artifact.artifact_id)
-            self._store[artifact.artifact_id] = artifact
-            self._total_bytes += content_len
+            existing = self._store[artifact.artifact_id]
+            # P0_1: collision detection — same ID, different content
+            if existing.full_content != artifact.full_content:
+                logger.warning(
+                    "Artifact ID collision: %s (existing=%d chars, new=%d chars). "
+                    "Appending disambiguation suffix.",
+                    artifact.artifact_id, len(existing.full_content), content_len,
+                )
+                # Append a short disambiguation hash
+                disambig = hashlib.sha256(
+                    artifact.full_content[:256].encode(errors="replace")
+                ).hexdigest()[:6]
+                artifact = Artifact(
+                    artifact_id=f"{artifact.artifact_id}_{disambig}",
+                    tool_name=artifact.tool_name,
+                    full_content=artifact.full_content,
+                    summary=artifact.summary,
+                    token_count=artifact.token_count,
+                    char_count=artifact.char_count,
+                    original_length=artifact.original_length,
+                    line_count=artifact.line_count,
+                )
+                self._store[artifact.artifact_id] = artifact
+                self._total_bytes += content_len
+            else:
+                # Same content — just update LRU position
+                self._total_bytes -= len(existing.full_content)
+                self._store.move_to_end(artifact.artifact_id)
+                self._store[artifact.artifact_id] = artifact
+                self._total_bytes += content_len
         else:
             self._store[artifact.artifact_id] = artifact
             self._total_bytes += content_len

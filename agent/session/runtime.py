@@ -1755,6 +1755,12 @@ class SessionRuntime:
             )
             self._active_evidence_stores[session_id] = _evidence_store
 
+            # ── Wire WS event callback for live evidence streaming ──
+            if self._event_callback is not None:
+                _evidence_store._event_callback = lambda entry: (
+                    self._publish_evidence_event(entry, session_id)
+                )
+
             # ── Flush pending skill activations into evidence ──
             _pending_activations = self._pending_skill_activations.pop(
                 session_id, [],
@@ -3114,6 +3120,21 @@ class SessionRuntime:
 
     def pop_pending_effort(self, session_id: str) -> str | None:
         return getattr(self, '_pending_effort', {}).pop(session_id, None)
+
+    def _publish_evidence_event(self, entry: Any, session_id: str) -> None:
+        """Publish an EvidenceEntry as a WS event through the EventBus."""
+        if self._event_callback is None:
+            return
+        try:
+            from agent.task import Event, EventType
+            self._event_callback(Event(
+                event_type=EventType("evidence_record"),
+                task_id=session_id,
+                session_id=session_id,
+                payload={"evidence": entry.to_dict()},
+            ))
+        except Exception:
+            pass
 
     def record_skill_activation(
         self, skill_name: str, *, source: str = "", fingerprint: str = "",

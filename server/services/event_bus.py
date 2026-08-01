@@ -249,6 +249,22 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
         values.setdefault("event_id", getattr(event, "event_id", ""))
         return [WsDelegationEvent(type=ev_type, **values).to_dict()]
 
+    if ev_type == "evidence_record":
+        _evidence = payload.get("evidence", {})
+        return [{
+            "type": "evidence_record",
+            "evidence_id": _evidence.get("evidence_id", ""),
+            "kind": _evidence.get("kind", ""),
+            "status": _evidence.get("status", ""),
+            "tool_name": _evidence.get("tool_name", ""),
+            "path": _evidence.get("path", ""),
+            "cached": _evidence.get("cached", False),
+            "source_fingerprint": _evidence.get("source_fingerprint", ""),
+            "depends_on": _evidence.get("depends_on", []),
+            "session_id": _evidence.get("session_id", ""),
+            "timestamp": ts,
+        }]
+
     # Fallback: send raw event as-is
     return [{"type": ev_type, "payload": payload, "timestamp": ts}]
 

@@ -124,6 +124,85 @@ class StructuredContext:
             for layer in self._sorted_layers()
         ]
 
+    def render_with_budget(
+        self,
+        estimator: object | None = None,
+        *,
+        enable_caching: bool = False,
+    ) -> "str | list[dict[str, Any]]":
+        """Build system content, enforcing per-layer max_tokens.
+
+        P0_1: ContextLayer.max_tokens was previously dead code (declared
+        but never enforced).  This method trims each layer whose
+        max_tokens > 0 before assembly.
+
+        Trimming preserves the first N tokens of the content and appends
+        a truncation marker.
+        """
+        trimmed_layers: list[ContextLayer] = []
+        for layer in self._sorted_layers():
+            if layer.is_empty:
+                continue
+            if layer.max_tokens > 0:
+                trimmed = self._trim_to_tokens(layer.content, layer.max_tokens, estimator)
+                trimmed_layers.append(ContextLayer(
+                    name=layer.name,
+                    priority=layer.priority,
+                    content=trimmed,
+                    cacheable=layer.cacheable,
+                    max_tokens=layer.max_tokens,
+                ))
+            else:
+                trimmed_layers.append(layer)
+
+        # Rebuild with trimmed layers
+        stable_parts = []
+        dynamic_parts = []
+        for layer in trimmed_layers:
+            if layer.cacheable:
+                stable_parts.append(layer.content)
+            else:
+                dynamic_parts.append(layer.content)
+
+        if not enable_caching:
+            parts = [p for p in (stable_parts + dynamic_parts) if p]
+            return "\n\n".join(parts)
+
+        blocks = []
+        if stable_parts:
+            blocks.append({
+                "type": "text",
+                "text": "\n\n".join(stable_parts),
+                "cache_control": {"type": "ephemeral"},
+            })
+        if dynamic_parts:
+            blocks.append({"type": "text", "text": "\n\n".join(dynamic_parts)})
+        return blocks if blocks else ""
+
+    @staticmethod
+    def _trim_to_tokens(
+        text: str,
+        max_tokens: int,
+        estimator: object | None = None,
+    ) -> str:
+        """Trim *text* to fit within *max_tokens*.
+
+        Uses the estimator if provided; otherwise char/4 heuristic.
+        Returns the original text if it already fits.
+        """
+        if estimator is not None and hasattr(estimator, "estimate"):
+            current = estimator.estimate(text)
+        else:
+            current = max(1, len(text) // 4)
+
+        if current <= max_tokens:
+            return text
+
+        # Conservative: keep enough chars for max_tokens
+        keep_chars = max(100, max_tokens * 4)
+        trimmed = text[:keep_chars]
+        return trimmed + "\n\n[Content trimmed to fit token budget]"
+
     def _sorted_layers(self) -> list[ContextLayer]:
         """按优先级排序（稳定的在前）。"""
         return sorted(self.layers, key=lambda l: (l.priority, l.name))

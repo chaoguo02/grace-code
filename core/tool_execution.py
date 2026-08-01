@@ -59,8 +59,13 @@ class ToolExecutionPipeline:
         *,
         thought: str = "",
         invocation_id: str = "",
+        cancel_token: object | None = None,  # CancellationHandle | None
     ) -> "ToolResult":
-        """Validate and execute one logical call, including safe retries."""
+        """Validate and execute one logical call, including safe retries.
+
+        P0_3 Batch 2: *cancel_token* propagates to ResourceGovernor so
+        queued tools are released immediately on cancellation.
+        """
         from core.base import ToolResult
         from core.types import RetryMode
 
@@ -139,6 +144,7 @@ class ToolExecutionPipeline:
                     call.params,
                     invocation_id=logical_id,
                     attempt=attempt,
+                    cancel_token=cancel_token,
                 )
             except Exception as exc:
                 result = ToolResult.from_error(
@@ -187,9 +193,18 @@ class ToolExecutionPipeline:
         *,
         invocation_id: str,
         attempt: int,
+        cancel_token: object | None = None,
     ) -> "ToolResult":
-        """Execute one attempt under the shared external-work capacity."""
+        """Execute one attempt under the shared external-work capacity.
+
+        P0_3 Batch 2: cancel_token forwarded to ResourceGovernor.
+        P0_3 Batch 4: execution_timeout enforcement — on timeout, side-effect
+            is marked UNKNOWN (not FAILED — we don't know if it succeeded).
+        """
         from core.types import ToolEffect
+
+        # P0_3: per-tool execution timeout
+        tool_timeout = getattr(tool, "execution_timeout", None)
 
         governed_effects = {
             ToolEffect.EXECUTE,
@@ -225,6 +240,9 @@ class ToolExecutionPipeline:
             getattr(self._resource_governor, "_config", None), "queue", None
         )
         timeout_s = float(getattr(queue_cfg, "timeout_seconds", 120.0))
+        # P0_3: per-tool execution_timeout overrides queue default
+        if tool_timeout is not None and tool_timeout > 0:
+            timeout_s = min(timeout_s, float(tool_timeout))
         admission = self._resource_governor.admit_wait(ResourceRequest(
             request_id=f"{invocation_id}:attempt-{attempt}",
             root_session_id=root_session_id or "unscoped",
@@ -232,6 +250,7 @@ class ToolExecutionPipeline:
             run_id=invocation_id,
             resources={ResourceKind.TOOL_SLOT: 1},
             timeout_s=timeout_s,
+            cancel_token=cancel_token,
         ))
         if (
             admission.outcome is not AdmissionOutcome.GRANTED

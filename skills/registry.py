@@ -43,6 +43,50 @@ class SkillSource:
     legacy_commands: bool = False
 
 
+# ── P2: Type-safe YAML frontmatter parsing helpers ──
+
+_VALID_EFFORT_VALUES = frozenset({"", "low", "medium", "high", "xhigh", "max"})
+_VALID_CONTEXT_VALUES = frozenset({"", "fork"})
+
+
+def _parse_bool(value: Any, *, default: bool = False) -> bool:
+    """Parse a YAML frontmatter boolean value safely.
+
+    Unlike bool("false"), this correctly handles string representations.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off", ""):
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _parse_effort(value: Any) -> str:
+    """Parse and validate the 'effort' field."""
+    s = str(value).strip().lower() if value else ""
+    if s not in _VALID_EFFORT_VALUES:
+        if s:
+            logger.warning("Invalid effort value '%s' — must be one of %s. Using default.", s, sorted(_VALID_EFFORT_VALUES))
+        return ""
+    return s
+
+
+def _parse_context(value: Any) -> str:
+    """Parse and validate the 'context' field."""
+    s = str(value).strip().lower() if value else ""
+    if s not in _VALID_CONTEXT_VALUES:
+        if s:
+            logger.warning("Invalid context value '%s' — must be one of %s. Using default.", s, sorted(_VALID_CONTEXT_VALUES))
+        return ""
+    return s
+
+
 @dataclass
 class SkillMetadata:
     """技能元数据 — aligned with Claude Code Skill frontmatter reference.
@@ -467,17 +511,37 @@ class SkillRegistry:
         else:
             hooks = ()
 
+        # P2: Strong-type validation for boolean and enum fields
+        _disable_model = _parse_bool(fm_dict.get("disable-model-invocation"), default=False)
+        _user_invocable = _parse_bool(fm_dict.get("user-invocable"), default=True)
+        _effort = _parse_effort(fm_dict.get("effort", ""))
+        _context = _parse_context(fm_dict.get("context", ""))
+
+        # Warn on unknown frontmatter fields
+        _known_fields = {
+            "name", "description", "when_to_use", "disable-model-invocation",
+            "user-invocable", "model", "effort", "context", "agent",
+            "allowed-tools", "disallowed-tools", "paths", "arguments",
+            "evidence", "hooks",
+        }
+        for _key in fm_dict:
+            if _key not in _known_fields:
+                logger.warning(
+                    "Unknown frontmatter field '%s' in %s — will be ignored",
+                    _key, skill_file,
+                )
+
         return SkillMetadata(
             name=dir_name,
             display_name=str(fm_dict.get("name", dir_name)),
             description=str(fm_dict.get("description", "")),
             when_to_use=str(fm_dict.get("when_to_use", "")),
             dir_path=str(skill_file.parent),
-            disable_model_invocation=bool(fm_dict.get("disable-model-invocation", False)),
-            user_invocable=bool(fm_dict.get("user-invocable", True)),
+            disable_model_invocation=_disable_model,
+            user_invocable=_user_invocable,
             model=str(fm_dict.get("model", "")),
-            effort=str(fm_dict.get("effort", "")),
-            context=str(fm_dict.get("context", "")),
+            effort=_effort,
+            context=_context,
             agent=str(fm_dict.get("agent", "")),
             paths=paths,
             arguments=named_args,
@@ -665,19 +729,44 @@ class SkillRegistry:
 
     @staticmethod
     def _run_skill_command(cmd: str, *, cwd: str, runtime: Any = None) -> str:
-        """Execute a skill inline command via Runtime (CC-aligned safety).
+        """Execute a skill inline command via safe Runtime.execute().
 
-        Without a Runtime, execution is refused — this prevents Skill content
-        from bypassing the PermissionPipeline, Hooks, and workspace boundaries.
+        P0: Uses runtime.execute() (argv mode, shell=False) instead of
+        runtime.exec() (shell=True).  This prevents shell injection via
+        inline command markers.
+
+        Without a Runtime, execution is refused.
+        Commands are blocked for untrusted skills (allow_execution=False).
         """
         if runtime is not None:
+            # P0: Validate workspace boundary
+            ws_root = getattr(runtime, "_workspace_root", None)
+            if ws_root is not None:
+                import os as _os
+                try:
+                    from pathlib import Path as _Path
+                    _Path(cwd).resolve().relative_to(_Path(str(ws_root)).resolve())
+                except (ValueError, OSError):
+                    logger.warning(
+                        "Skill inline command blocked (cwd outside workspace): %s", cmd[:80],
+                    )
+                    return "[blocked: cwd outside workspace boundary]"
+
             try:
-                result = runtime.exec(cmd, cwd=cwd, timeout=30)
+                # P0: Use execute() (argv-safe) not exec() (shell=True)
+                # Split command into executable + args for argv mode
+                import shlex as _shlex
+                parts = _shlex.split(cmd)
+                if not parts:
+                    return ""
+                exe = parts[0]
+                exe_args = parts[1:] if len(parts) > 1 else []
+                result = runtime.execute(exe, args=exe_args, cwd=cwd, timeout=30)
                 return (result.stdout or "").strip()
             except Exception as exc:
                 logger.warning("Skill command failed via Runtime: %s", exc)
                 return "[command failed: %s]" % exc
-        # No Runtime available — refuse to execute (CC-aligned safe fallback)
+        # No Runtime available -- refuse to execute (CC-aligned safe fallback)
         logger.warning("Skill inline command blocked (no Runtime): %s", cmd[:80])
         return "[blocked: skill inline command requires Runtime]"
 
@@ -837,23 +926,36 @@ class SkillRegistry:
             # Fallback: split on whitespace
             return arguments.split()
 
-    def format_for_prompt(self, *, llm_invocable_only: bool = True) -> str:
+    def format_for_prompt(
+        self, *,
+        llm_invocable_only: bool = True,
+        active_file_paths: list[str] | None = None,
+    ) -> str:
         """
         Format skill list for system prompt injection.
 
         Aligned with Claude Code frontmatter:
         - Skills with disable_model_invocation=true are hidden from LLM listing.
-          The user can still invoke them via /name, but the LLM won't auto-load.
         - user-invocable=false skills are still listed (LLM can auto-load them).
         - when_to_use is appended to description for semantic matching.
+
+        P1: active_file_paths enables path-based skill discovery.
+        Skills whose path patterns match active files get a [RELEVANT] tag.
 
         Args:
             llm_invocable_only: if True (default), exclude skills that set
                                disable-model-invocation: true.
+            active_file_paths: optional list of currently active/modified files.
         """
         entries = self.list_skill_entries()
         if not entries:
             return ""
+
+        # P1: path-matched skills for active files
+        relevant_names: set[str] = set()
+        if active_file_paths:
+            matched = self.discover_for_paths(active_file_paths)
+            relevant_names = {m.name for m in matched}
 
         user_skills = [
             (name, meta)
@@ -886,6 +988,9 @@ class SkillRegistry:
                     desc += f" (Use when: {meta.when_to_use})"
                 if meta.paths:
                     desc += f" (Path scope: {', '.join(meta.paths)})"
+                # P1: mark skills relevant to active files
+                if name in relevant_names:
+                    desc = f"[RELEVANT to current files] {desc}"
                 lines.append(f"- **{name}**: {desc}")
 
         return "\n".join(lines)

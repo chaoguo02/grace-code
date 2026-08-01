@@ -178,6 +178,15 @@ class StreamingToolExecutor:
         # CC-aligned: event-driven wake signal for collect() instead of polling.
         # Set whenever a tool completes or is cancelled.
         self._wake = threading.Event()
+        # Optional: process registry for active cancellation (P0_3 Batch 1).
+        # When set, _cancel_executing() will kill tracked subprocesses.
+        self._process_registry: object | None = None  # ProcessRegistry | None
+        # Optional: CancellationHandle for pipeline propagation (P0_3 Batch 2).
+        self._cancellation_handle: object | None = None
+        # Track active futures so _cancel_executing can .cancel() them.
+        self._active_futures: dict[str, object] = {}  # invocation_id → Future
+        # P2: observation cursor — prevents duplicate injection
+        self._last_observed_count: int = 0
 
     # ── Queue management ─────────────────────────────────────────────────
 
@@ -336,11 +345,16 @@ class StreamingToolExecutor:
                 tc.name,
                 tc.params or {},
                 invocation_id=tc.id or "",
+                cancel_token=getattr(self, "_cancellation_handle", None),
             )
+            # P0_3 CAS: only transition to COMPLETED if not already CANCELLED.
+            # A concurrent _cancel_executing() may have set CANCELLED while
+            # the tool was executing.  Reject completed → cancelled overwrite.
             with self._lock:
-                tracked.result = result
-                tracked.status = TrackedStatus.COMPLETED
-                tracked.finished_at = time.monotonic()
+                if tracked.status != TrackedStatus.CANCELLED:
+                    tracked.result = result
+                    tracked.status = TrackedStatus.COMPLETED
+                    tracked.finished_at = time.monotonic()
                 self._wake.set()
             # CC: Bash error → cancel sibling parallel tools
             if (
@@ -358,9 +372,11 @@ class StreamingToolExecutor:
             self.process_queue()
         except Exception as exc:
             with self._lock:
-                tracked.error = str(exc)
-                tracked.status = TrackedStatus.COMPLETED
-                tracked.finished_at = time.monotonic()
+                # CAS: error can override EXECUTING, but NOT CANCELLED
+                if tracked.status != TrackedStatus.CANCELLED:
+                    tracked.error = str(exc)
+                    tracked.status = TrackedStatus.COMPLETED
+                    tracked.finished_at = time.monotonic()
                 self._wake.set()
             self.process_queue()
 
@@ -411,13 +427,18 @@ class StreamingToolExecutor:
     ) -> list[Any]:
         """Collect results and convert to observations in input order.
 
-        Returns only newly yielded results (skips those already yielded by
-        get_completed_results() during mid-stream collection).
+        P2: Returns only NEW results since the last call (cursor-based).
+        Prevents duplicate observation injection on repeated calls.
         """
         new_results = self.collect()
         observations = []
+        yielded_count = 0
         for t in self._tracked:
             if t.status != TrackedStatus.YIELDED:
+                continue
+            yielded_count += 1
+            # P2: skip already-observed results
+            if yielded_count <= self._last_observed_count:
                 continue
             if t.result is not None:
                 observations.append(build_observation(t.tool_call, t.result))
@@ -426,9 +447,25 @@ class StreamingToolExecutor:
                     ToolErrorType.INTERNAL, detail=t.error or "Tool error",
                 )
                 observations.append(build_observation(t.tool_call, fake_result))
+        self._last_observed_count = yielded_count
         return observations
 
-    # ── Cancellation ─────────────────────────────────────────────────────
+    def set_process_registry(self, registry: object) -> None:
+        """Attach a ProcessRegistry for active cancellation (P0_3 Batch 1).
+
+        When set, _cancel_executing() will kill subprocesses tracked
+        by the registry in addition to updating status fields.
+        """
+        self._process_registry = registry
+
+    def set_cancellation_handle(self, handle: object) -> None:
+        """Attach a CancellationHandle for pipeline propagation (P0_3 Batch 2).
+
+        When set, _execute_one() forwards it to ToolRegistry.execute_tool()
+        → ToolExecutionPipeline → ResourceGovernor, so queued tools are
+        released immediately on cancellation.
+        """
+        self._cancellation_handle = handle
 
     def abort_all(self, reason: str = "Executor aborted") -> None:
         """Abort all queued and executing tools."""
@@ -443,12 +480,38 @@ class StreamingToolExecutor:
                     t.error = reason
 
     def _cancel_executing(self, reason: str) -> None:
+        """Cancel all EXECUTING tools + kill their subprocesses.
+
+        P0_3 Batch 1: when _process_registry is attached, actively kills
+        the subprocesses tracked for each cancelled invocation.  Also
+        attempts future.cancel() on active worker futures.
+        """
         with self._lock:
             for t in self._tracked:
                 if t.status == TrackedStatus.EXECUTING:
                     t.status = TrackedStatus.CANCELLED
                     t.error = reason
             self._wake.set()
+
+        # P0_3: kill registered subprocesses for cancelled invocations
+        registry = self._process_registry
+        if registry is not None:
+            for t in self._tracked:
+                if t.status == TrackedStatus.CANCELLED and t.tool_call.id:
+                    try:
+                        registry.kill_one(t.tool_call.id, escalate=True)
+                    except Exception:
+                        pass
+
+        # P0_3: cancel active ThreadPoolExecutor futures
+        for t in self._tracked:
+            if t.status == TrackedStatus.CANCELLED:
+                fut = self._active_futures.pop(t.tool_call.id or "", None)
+                if fut is not None:
+                    try:
+                        fut.cancel()
+                    except Exception:
+                        pass
 
     def _cancel_all(self, reason: str) -> None:
         with self._lock:

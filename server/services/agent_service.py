@@ -1359,6 +1359,11 @@ class AgentService:
         CAS-updates the run to 'cancelled' and signals the cancellation
         token.  The agent loop will stop at the next safe point and the
         finally block will broadcast run_terminal { status: "cancelled" }.
+
+        P0_3 Batch 1: CAS result is now checked.  If the CAS fails (run
+        already completed/failed/cancelled), the session status is NOT
+        overwritten.  This prevents the state-split bug where a completed
+        run had its session incorrectly marked CANCELLED.
         """
         # Wake any pending approval first so the agent loop can exit quickly
         broker = self._runtime.get_approval_broker(session_id)
@@ -1367,22 +1372,30 @@ class AgentService:
 
         # CAS-update the active run → cancelled
         active_run = self._storage.get_active_run(session_id)
+        run_cas_ok = False
         if active_run is not None:
             try:
-                self._storage.update_run(
+                rows_updated = self._storage.update_run(
                     active_run["id"],
                     status="cancelled",
                     error=detail or "User cancelled",
                     expect_status="running",
                 )
-                from agent.session.models import SessionStatus
+                # P0_3: check CAS result before touching session state
+                run_cas_ok = rows_updated > 0 if isinstance(rows_updated, int) else bool(rows_updated)
+            except Exception:
+                logger.debug("Run cancel CAS failed", exc_info=True)
+
+        if run_cas_ok:
+            from agent.session.models import SessionStatus
+            try:
                 self._storage.update_status(
                     session_id,
                     SessionStatus.CANCELLED,
                     error=detail or "User cancelled",
                 )
             except Exception:
-                logger.debug("Run cancel CAS failed", exc_info=True)
+                logger.debug("Session status update after CAS failed", exc_info=True)
 
         cancelled = self._runtime.cancel_session(session_id, detail=detail)
         if cancelled and getattr(self, "_event_bus", None) is not None:

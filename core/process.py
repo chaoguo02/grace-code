@@ -33,6 +33,8 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
+import time as _time
 import logging
 import uuid
 from abc import ABC, abstractmethod
@@ -49,6 +51,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 跨平台进程树杀灭
 # ---------------------------------------------------------------------------
+
+def _start_cancel_watcher(
+    proc_getter, cancel_token: object,
+) -> threading.Thread:
+    """Start a daemon thread that kills *proc_getter()* when cancel_token fires.
+
+    P0_3: CC-aligned background watcher — polls cancel_token every 0.1s.
+    When cancelled, calls kill_process_tree on the current process.
+    """
+    def _watch() -> None:
+        while True:
+            token = cancel_token
+            if token is not None and getattr(token, "is_cancelled", False):
+                proc = proc_getter()
+                if proc is not None and proc.returncode is None:
+                    kill_process_tree(proc)
+                return
+            _time.sleep(0.1)
+
+    t = threading.Thread(target=_watch, daemon=True, name="cancel-watcher")
+    t.start()
+    return t
+
 
 def kill_process_tree(proc: subprocess.Popen) -> None:
     """
@@ -239,6 +264,7 @@ class Runtime(ABC):
         cwd: str | None = None,
         timeout: int = 30,
         stdin_data: str | None = None,
+        cancel_token: object | None = None,
     ) -> RunResult:
         """
         执行 shell 命令，返回 RunResult。
@@ -257,11 +283,15 @@ class Runtime(ABC):
 
     def execute(self, command: str, args: list[str] | None = None,
                 cwd: str | None = None, timeout: int = 30,
-                env: dict[str, str] | None = None) -> RunResult:
+                env: dict[str, str] | None = None,
+                cancel_token: object | None = None) -> RunResult:
         """Execute a command with physically isolated parameters.
 
         Each parameter is passed as a separate list item to subprocess.Popen
         with shell=False. The model CANNOT inject shell metacharacters.
+
+        P0_3: *cancel_token* (CancellationHandle) — cancelling it kills
+        the running process via the background watcher thread.
 
         Default implementation delegates to exec() for backward compat.
         Subclasses should override with shell=False implementation.
@@ -269,7 +299,7 @@ class Runtime(ABC):
         import shlex
         parts = [command] + (args or [])
         cmd_str = " ".join(shlex.quote(p) for p in parts)
-        return self.exec(cmd_str, cwd=cwd, timeout=timeout)
+        return self.exec(cmd_str, cwd=cwd, timeout=timeout, cancel_token=cancel_token)
 
     def resolve_executable(self, kind: Any) -> str | None:
         """Return a Runtime-owned absolute executable path, if declared."""
@@ -434,11 +464,18 @@ class LocalRuntime(Runtime):
         cwd: str | None = None,
         timeout: int = 30,
         stdin_data: str | None = None,
+        cancel_token: object | None = None,
     ) -> RunResult:
         # Normalize LLM-generated commands for current OS/shell
         cmd = CommandNormalizer.normalize(cmd)
 
         proc: subprocess.Popen | None = None
+        _watcher: threading.Thread | None = None
+        if cancel_token is not None:
+            _watcher = _start_cancel_watcher(
+                lambda: proc, cancel_token,
+            )
+
         try:
             popen_kwargs: dict[str, Any] = {
                 "args": cmd,
@@ -536,14 +573,20 @@ class LocalRuntime(Runtime):
         cwd: str | None = None,
         timeout: int = 30,
         env: dict[str, str] | None = None,
+        cancel_token: object | None = None,
     ) -> RunResult:
         """Execute a command with physically isolated parameters (shell=False).
 
         Each argument is a separate list element. The shell never parses
         the command string, so shell metacharacters in args are inert.
+
+        P0_3: cancel_token (CancellationHandle) — cancelling kills the process.
         """
         cmd_list = [command] + (args or [])
         proc: subprocess.Popen | None = None
+        _watcher: threading.Thread | None = None
+        if cancel_token is not None:
+            _watcher = _start_cancel_watcher(lambda: proc, cancel_token)
         try:
             popen_kwargs: dict[str, Any] = {
                 "args": cmd_list,

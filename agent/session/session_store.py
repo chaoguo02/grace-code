@@ -34,6 +34,9 @@ class SessionStore:
         self._db_path = str(Path(db_path))
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        # P0_4: run schema migrations after base tables are created
+        from agent.session.message_serializer import SchemaMigrator
+        SchemaMigrator(self._db_path).ensure_latest()
 
     @property
     def db_path(self) -> str:
@@ -614,7 +617,10 @@ class SessionStore:
     # ── Context budget: tool output cap ───────────────────────────────────
     _MAX_TOOL_OUTPUT_CHARS: int = 2_000
     _MAX_INTERMEDIATE_ASSISTANT_CHARS: int = 500
-    _CONTEXT_TOKEN_BUDGET: int = 8_000
+    # P2: Legacy budget — ContextWindowManager (v2 default) handles actual
+    # trimming.  This ceiling is now a generous safety net, not the primary
+    # budget.  Set high enough to avoid conflicting with the v2 manager.
+    _CONTEXT_TOKEN_BUDGET: int = 200_000
 
     def append_message(self, session_id: str, message: LLMMessage) -> None:
         """Persist a message — full content, no truncation.
@@ -635,21 +641,34 @@ class SessionStore:
                 ensure_ascii=True,
             )
             tool_name = ",".join(tc.name for tc in message.tool_calls)
-        content = str(message.content)
+        from agent.session.message_serializer import (
+            content_to_json, content_to_text, infer_message_kind,
+        )
+        content_json_str = content_to_json(message.content)
+        content_text = content_to_text(message.content)
+        content_legacy = str(message.content)
+        _kind = infer_message_kind(
+            message.role,
+            getattr(message, "tool_call_id", None),
+            getattr(message, "tool_calls", None),
+        )
         _turn_id = getattr(message, "turn_id", "") or ""
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO session_messages (
-                    session_id, role, content, tool_call_id, tool_name,
+                    session_id, role, content, content_json, message_kind,
+                    tool_call_id, tool_name,
                     tool_calls_json, turn_id, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     message.role,
-                    content,
+                    content_legacy,
+                    content_json_str,
+                    _kind.value,
                     message.tool_call_id,
                     tool_name,
                     tool_calls_json,
@@ -789,7 +808,8 @@ class SessionStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, session_id, role, content, tool_call_id, tool_name,
+                SELECT id, session_id, role, content, content_json, message_kind,
+                       tool_call_id, tool_name,
                        tool_calls_json, turn_id, created_at
                 FROM session_messages
                 WHERE session_id = ?
@@ -799,9 +819,14 @@ class SessionStore:
             ).fetchall()
         result: list[LLMMessage] = []
         for row in rows:
-            content = row["content"] or ""
-            if any(content.startswith(p) for p in self._RUNTIME_PREFIXES):
-                continue  # skip Runtime-injected prompt engineering
+            # P0_4: filter by message_kind (precise) first; fall back to prefix (legacy)
+            _kind_str = row["message_kind"] if "message_kind" in row.keys() else None
+            if _kind_str and _kind_str in ("system", "runtime_notice", "plan_context"):
+                continue
+            if not _kind_str:
+                content = row["content"] or ""
+                if any(content.startswith(p) for p in self._RUNTIME_PREFIXES):
+                    continue
             tool_calls = None
             raw_tool_calls = row["tool_calls_json"]
             if raw_tool_calls:
@@ -809,12 +834,27 @@ class SessionStore:
                     ToolCall(name=tc["name"], params=tc["params"], id=tc.get("id"))
                     for tc in json.loads(raw_tool_calls)
                 ]
+            # P0_4: restore from content_json if available, fall back to content text
+            from agent.session.message_serializer import content_from_json
+            restored_content = content_from_json(
+                row["content_json"] if "content_json" in row.keys() else None,
+                fallback_text=row["content"] or "",
+            )
+            # P0_4: restore correct message kind
+            if _kind_str:
+                try:
+                    restored_kind = MessageKind(_kind_str)
+                except ValueError:
+                    restored_kind = MessageKind.USER if row["role"] == "user" else MessageKind.ASSISTANT
+            else:
+                restored_kind = MessageKind.USER if row["role"] == "user" else MessageKind.ASSISTANT
+
             result.append(LLMMessage(
                 role=row["role"],
-                content=row["content"],
+                content=restored_content,
                 tool_call_id=row["tool_call_id"],
                 tool_calls=tool_calls,
-                kind=MessageKind.USER if row["role"] == "user" else MessageKind.ASSISTANT,
+                kind=restored_kind,
                 created_at=row["created_at"],
             ))
             # Attach DB id for incremental reload (subagent S4: live steering)

@@ -127,18 +127,23 @@ def _launch_fact(config: MCPServerConfig) -> dict[str, Any]:
 def create_mcp_bridge(config: MCPServerConfig) -> "MCPToolBridge":
     """Factory: return the correct bridge implementation for the transport type.
 
-    Multi-transport dispatch (MCP-E1, MCP-01):
-      - stdio → MCPToolBridge (local subprocess via MCP SDK)
-      - http  → HttpMCPBridge (JSON-RPC 2.0 over HTTP POST)
-      - sse   → HttpMCPBridge (SSE placeholder — HTTP bridge with SSE notes)
-      - ws    → HttpMCPBridge (WebSocket placeholder — HTTP bridge with WS notes)
+    P0_2: Streamable HTTP migration.
+      - stdio      -> MCPToolBridge (SDK stdio_client)
+      - http       -> StreamableHttpBridge (SDK streamable_http_client)
+      - sse        -> ValueError -- ambiguous; use 'http' for streamable
+      - ws         -> WsMCPBridge (non-standard, isolated)
     """
     if config.type == "stdio":
         return MCPToolBridge(config)
     if config.type == "http":
-        return HttpMCPBridge(config)
-    if config.type == "sse":
-        return SseMCPBridge(config)
+        # P0_2: map 'http' to streamable -- SDK handles the protocol
+        return StreamableHttpBridge(config)
+    if config.type in ("sse", "sse-legacy"):
+        raise ValueError(
+            "Transport 'sse' is ambiguous and deprecated. "
+            "Use 'http' for MCP 2025-06-18 Streamable HTTP (SDK), "
+            "or 'sse-legacy' for the deprecated HTTP+SSE (2024-11-05) pattern."
+        )
     if config.type == "ws":
         return WsMCPBridge(config)
     raise ValueError(f"Unsupported MCP transport type: {config.type!r}")
@@ -405,17 +410,33 @@ class MCPToolBridge:
             return []
 
     async def read_resource(self, uri: str) -> dict[str, Any]:
-        """Read a specific MCP resource by URI (resources/read)."""
+        """Read a specific MCP resource by URI (resources/read).
+
+        P0_2: Preserve blob (base64), mimeType, and annotations.
+        """
+        import base64 as _base64
         self._require_session()
         try:
             result = await self._session.read_resource(uri)
             contents: list[dict[str, Any]] = []
             for c in getattr(result, "contents", []) or []:
-                contents.append({
+                entry: dict[str, Any] = {
                     "uri": str(getattr(c, "uri", uri)),
                     "mimeType": str(getattr(c, "mimeType", "")),
-                    "text": str(getattr(c, "text", "")),
-                })
+                }
+                text = getattr(c, "text", None)
+                blob = getattr(c, "blob", None)
+                if text is not None:
+                    entry["text"] = str(text)
+                if blob is not None:
+                    try:
+                        entry["blob"] = _base64.b64encode(blob).decode("ascii")
+                    except Exception:
+                        entry["blob"] = None
+                annotations = getattr(c, "annotations", None)
+                if annotations is not None:
+                    entry["annotations"] = dict(annotations) if hasattr(annotations, "__iter__") else str(annotations)
+                contents.append(entry)
             return {"contents": contents}
         except Exception as exc:
             _logger = __import__("logging").getLogger(__name__)
@@ -465,7 +486,7 @@ class MCPToolBridge:
             raise RuntimeError("MCPToolBridge is not connected")
 
     async def _terminate_process(self) -> None:
-        """Best-effort terminate → wait → kill for SDK-owned subprocesses."""
+        """Best-effort terminate -> wait -> kill for SDK-owned subprocesses."""
         candidates = [
             self._transport_cm,
             getattr(self._transport_cm, "_process", None),
@@ -550,19 +571,218 @@ class MCPToolBridge:
 
 
 # ---------------------------------------------------------------------------
-# HTTP Bridge — JSON-RPC 2.0 over HTTP POST (MCP-01)
+# Streamable HTTP Bridge -- SDK-driven, spec-compliant (P0_2)
+# ---------------------------------------------------------------------------
+
+class StreamableHttpBridge(MCPToolBridge):
+    """MCP Streamable HTTP transport -- uses official SDK streamable_http_client.
+
+    Aligns with MCP 2025-06-18 Streamable HTTP spec.
+    SDK handles: Mcp-Session-Id header, MCP-Protocol-Version negotiation,
+    notifications/initialized, SSE stream reading, JSON-RPC id matching.
+
+    This class only manages: transport lifecycle (owner task), fingerprint,
+    connection state -- same responsibilities as the stdio MCPToolBridge.
+    """
+
+    @property
+    def transport_type(self) -> str:
+        return "streamable"
+
+    def __init__(self, config: MCPServerConfig) -> None:
+        super().__init__(config)
+        self._get_session_id: Any = None
+
+    async def connect(self) -> list[MCPToolInfo]:
+        if self._connected:
+            return self.tools
+        if not HAS_MCP:
+            raise MCPNotInstalledError(
+                "Install the optional 'mcp' dependency to use MCP Streamable HTTP bridge"
+            )
+        if self._owner_task is not None and not self._owner_task.done():
+            await asyncio.wait_for(self._ready_future, timeout=self.config.timeout_seconds or 30)
+            return self._ready_future.result() if self._ready_future else []
+
+        self._close_requested = asyncio.Event()
+        self._ready_future = asyncio.Future()
+        self._owner_task = asyncio.ensure_future(self._run_owned_session())
+        return await asyncio.wait_for(
+            self._ready_future,
+            timeout=self.config.timeout_seconds or 30,
+        )
+
+    async def _run_owned_session(self) -> None:
+        """Owner task: enter SDK context managers, initialize, discover tools.
+
+        Same pattern as MCPToolBridge._run_owned_session but uses
+        streamable_http_client instead of stdio_client.
+        """
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        url = self.config.url
+        if not url:
+            raise ValueError("MCPServerConfig.url is required for streamable transport")
+
+        try:
+            transport_cm = streamable_http_client(
+                url=url,
+                terminate_on_close=True,
+            )
+            read_stream, write_stream, get_session_id = await transport_cm.__aenter__()
+            self._transport_cm = transport_cm
+            self._get_session_id = get_session_id
+
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await session_cm.__aenter__()
+            self._session_cm = session_cm
+            self._session = session
+
+            # SDK handles: initialize -> initialized notification -> negotiate version
+            init_result = await session.initialize()
+
+            # Compute fingerprints
+            self._fingerprint = _make_fingerprint(
+                getattr(init_result, "protocolVersion", "unknown"),
+                str(getattr(init_result, "serverInfo", {})),
+                url,
+            )
+            self._launch_fingerprint = _launch_fingerprint(self.config)
+
+            # Discover tools
+            tools = await self.discover_tools()
+
+            # Register for tool change notifications
+            try:
+                if hasattr(session, "list_tools"):
+                    self._connected = True
+                    self._ready_future.set_result(tools)
+            except Exception:
+                self._connected = True
+                self._ready_future.set_result(tools)
+
+            # Wait until close is requested
+            await self._close_requested.wait()
+
+        except Exception as exc:
+            if self._ready_future is not None and not self._ready_future.done():
+                self._ready_future.set_exception(exc)
+            raise
+        finally:
+            self._connected = False
+            await self._close_contexts()
+
+    async def discover_tools(self) -> list[MCPToolInfo]:
+        if self._session is None:
+            return []
+        result = await self._session.list_tools()
+        tools: list[MCPToolInfo] = []
+        for t in result.tools:
+            tools.append(MCPToolInfo(
+                server_name=self.config.name,
+                name=t.name,
+                description=getattr(t, "description", "") or "",
+                input_schema=getattr(t, "inputSchema", {}) or {},
+            ))
+        self._tools = tools
+        return tools
+
+    async def call_tool(self, tool_name: str, arguments: dict) -> MCPCallResult:
+        if self._session is None:
+            raise MCPToolCallError(tool_name, "Session not connected")
+        try:
+            coro = self._session.call_tool(tool_name, arguments)
+            result = await asyncio.wait_for(coro, timeout=self.config.timeout_seconds or 30)
+            content = getattr(result, "content", []) or []
+            is_error = getattr(result, "isError", False)
+            text_parts = [
+                (c.text if hasattr(c, "text") else str(c))
+                for c in content
+            ]
+            return MCPCallResult(
+                content=text_parts,
+                is_error=is_error,
+            )
+        except asyncio.TimeoutError:
+            raise MCPToolCallError(tool_name, "Tool call timed out")
+        except Exception as exc:
+            self._connected = False
+            raise MCPToolCallError(tool_name, str(exc)) from exc
+
+    async def list_resources(self) -> list[dict]:
+        if self._session is None:
+            return []
+        try:
+            result = await self._session.list_resources()
+            resources: list[dict] = []
+            for r in getattr(result, "resources", []) or []:
+                resources.append({
+                    "uri": getattr(r, "uri", ""),
+                    "name": getattr(r, "name", ""),
+                    "description": getattr(r, "description", None),
+                    "mimeType": getattr(r, "mimeType", None),
+                })
+            return resources
+        except Exception:
+            return []
+
+    async def read_resource(self, uri: str) -> dict:
+        if self._session is None:
+            return {}
+        try:
+            result = await self._session.read_resource(uri)
+            contents = getattr(result, "contents", []) or []
+            text_parts = [
+                (c.text if hasattr(c, "text") else str(c))
+                for c in contents
+            ]
+            return {"uri": uri, "text": "\n".join(text_parts)}
+        except Exception:
+            return {}
+
+    async def list_prompts(self) -> list[dict]:
+        if self._session is None:
+            return []
+        try:
+            result = await self._session.list_prompts()
+            prompts: list[dict] = []
+            for p in getattr(result, "prompts", []) or []:
+                prompts.append({
+                    "name": getattr(p, "name", ""),
+                    "description": getattr(p, "description", None),
+                })
+            return prompts
+        except Exception:
+            return []
+
+    async def get_prompt(self, name: str, arguments: dict | None = None) -> dict:
+        if self._session is None:
+            return {}
+        try:
+            result = await self._session.get_prompt(name, arguments=arguments or {})
+            msgs = getattr(result, "messages", []) or []
+            return {
+                "name": name,
+                "messages": [{"role": getattr(m, "role", ""), "content": str(getattr(m, "content", ""))} for m in msgs],
+            }
+        except Exception:
+            return {}
+
+
+# ---------------------------------------------------------------------------
+# HTTP Bridge -- DEPRECATED (P0_2). Use StreamableHttpBridge (SDK-driven).
+# Scheduled for removal in next release cycle.
 # ---------------------------------------------------------------------------
 
 class HttpMCPBridge(MCPToolBridge):
-    """HTTP MCP transport — JSON-RPC 2.0 POST to <url>/mcp.
+    """DEPRECATED: Use StreamableHttpBridge instead.
 
-    Implements the MCP HTTP transport spec:
-      1. POST initialize → get sessionId
-      2. POST tools/list → discover tools
-      3. POST tools/call → invoke tool
+    This self-implemented JSON-RPC over HTTP is replaced by the MCP SDK's
+    streamable_http_client.  It is unreachable through the transport factory
+    (create_mcp_bridge routes 'http' -> StreamableHttpBridge).
 
-    Uses httpx for async HTTP. Custom headers (e.g. Authorization: Bearer)
-    are passed through from the server config.
+    Kept temporarily for reference and WsMCPBridge's inherited utilities.
     """
 
     JSONRPC_VERSION = "2.0"
@@ -712,11 +932,11 @@ class HttpMCPBridge(MCPToolBridge):
 
 
 # ---------------------------------------------------------------------------
-# SSE Bridge — Server-Sent Events (MCP-02)
+# SSE Bridge -- Server-Sent Events (MCP-02)
 # ---------------------------------------------------------------------------
 
 class SseMCPBridge(HttpMCPBridge):
-    """MCP SSE transport — Server-Sent Events for server→client, POST for client→server.
+    """MCP SSE transport - Server-Sent Events for server->client, POST for client->server.
 
     The SSE transport uses a streaming GET connection to receive JSON-RPC
     notifications and responses, while sending requests via HTTP POST.
@@ -772,10 +992,10 @@ class SseMCPBridge(HttpMCPBridge):
                             rpc_id = msg.get("id")
                             method = msg.get("method", "")
                             if method:
-                                # MCP notification — dispatch to registered handlers
+                                # MCP notification -- dispatch to registered handlers
                                 await self._dispatch_notification(method, msg)
                             elif rpc_id is not None:
-                                # JSON-RPC response via SSE — route to pending request
+                                # JSON-RPC response via SSE -- route to pending request
                                 await self._route_sse_response(rpc_id, msg)
                             else:
                                 _logger.debug("SSE message with no method or id: %s", data_str[:100])
@@ -824,16 +1044,39 @@ class SseMCPBridge(HttpMCPBridge):
 # WebSocket Bridge (MCP-03)
 # ---------------------------------------------------------------------------
 
-class WsMCPBridge(HttpMCPBridge):
-    """MCP WebSocket transport — persistent bidirectional connection.
+class WsMCPBridge(MCPToolBridge):
+    """MCP WebSocket transport -- persistent bidirectional connection.
 
-    Requires the 'websockets' package. JSON-RPC messages flow
-    bidirectionally over a single WebSocket connection.
+    Non-standard MCP transport.  Requires the 'websockets' package.
+    JSON-RPC messages flow bidirectionally over a single WebSocket.
+
+    P0_2: Inherits directly from MCPToolBridge.  Self-contained JSON-RPC
+    implementation (no dependency on deprecated HttpMCPBridge).
     """
+
+    JSONRPC_VERSION = "2.0"
 
     def __init__(self, config: MCPServerConfig) -> None:
         super().__init__(config)
+        self._tools: list[MCPToolInfo] = []
         self._ws: Any = None  # websockets.WebSocketClientProtocol
+        self._next_id = 0
+        self._id_lock = asyncio.Lock()
+        # P0_2: single-reader + id dispatch for concurrent safety
+        self._pending: dict[int, asyncio.Future] = {}
+        self._reader_task: asyncio.Task | None = None
+
+    @property
+    def transport_type(self) -> str:
+        return "ws-custom"
+
+    def _dispatch_notification(self, method: str, params: dict[str, Any]) -> None:
+        """Handle server-to-client notifications over WebSocket."""
+        if method == "notifications/tools/list_changed":
+            if self._on_tools_changed is not None:
+                self._on_tools_changed(self.config.name)
+        elif method.startswith("notifications/"):
+            pass  # Reserved for future notification types
 
     async def connect(self) -> list[MCPToolInfo]:
         if self._connected:
@@ -860,6 +1103,9 @@ class WsMCPBridge(HttpMCPBridge):
                 f"MCP WebSocket connection to '{self.config.name}' failed: {exc}"
             ) from exc
 
+        # P0_2: start single background reader before any RPC calls
+        self._reader_task = asyncio.ensure_future(self._read_loop())
+
         try:
             await self._initialize()
             self._tools = await self.discover_tools()
@@ -870,6 +1116,19 @@ class WsMCPBridge(HttpMCPBridge):
             raise
 
     async def close(self) -> None:
+        # Cancel reader task
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._reader_task = None
+        # Resolve all pending futures with error
+        for _fut in self._pending.values():
+            if not _fut.done():
+                _fut.set_exception(RuntimeError("WebSocket connection closed"))
+        self._pending.clear()
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -877,6 +1136,36 @@ class WsMCPBridge(HttpMCPBridge):
                 pass
             self._ws = None
         self._connected = False
+
+    async def _read_loop(self) -> None:
+        """Single background reader -- dispatches responses by id, notifications by method."""
+        import json as _json
+        while self._ws is not None:
+            try:
+                raw = await self._ws.recv()
+            except Exception:
+                break
+            try:
+                data: dict[str, Any] = _json.loads(raw)
+            except Exception:
+                continue
+
+            msg_id = data.get("id")
+            msg_method = data.get("method")
+
+            if msg_id is not None and not msg_method:
+                # JSON-RPC response -- route to pending future
+                fut = self._pending.pop(msg_id, None)
+                if fut is not None and not fut.done():
+                    if "error" in data:
+                        fut.set_exception(MCPToolCallError(
+                            str(data["error"].get("message", "RPC error")),
+                        ))
+                    else:
+                        fut.set_result(data.get("result", {}))
+            elif msg_method:
+                # Notification -- dispatch to handler
+                self._dispatch_notification(msg_method, data.get("params", {}))
 
     async def _rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if self._ws is None:
@@ -891,17 +1180,17 @@ class WsMCPBridge(HttpMCPBridge):
             "method": method,
             "params": params,
         }
+        fut: asyncio.Future = asyncio.Future()
+        self._pending[request_id] = fut
         try:
             await asyncio.wait_for(
                 self._ws.send(_json.dumps(body)),
                 timeout=self.config.timeout_seconds,
             )
-            raw = await asyncio.wait_for(
-                self._ws.recv(),
-                timeout=self.config.timeout_seconds,
-            )
-            data: dict[str, Any] = _json.loads(raw)
+            result = await asyncio.wait_for(fut, timeout=self.config.timeout_seconds)
+            return result
         except asyncio.TimeoutError as exc:
+            self._pending.pop(request_id, None)
             raise MCPToolCallError(
                 f"MCP WS call '{method}' to '{self.config.name}' timed out"
             ) from exc
@@ -909,9 +1198,57 @@ class WsMCPBridge(HttpMCPBridge):
             raise MCPToolCallError(
                 f"MCP WS request to '{self.config.name}' failed: {exc}"
             ) from exc
-        if "error" in data:
-            err = data["error"]
-            raise MCPToolCallError(
-                f"MCP JSON-RPC error {err.get('code', '')}: {err.get('message', str(err))}"
+
+    # ── JSON-RPC methods (self-contained, not inherited) ──────────────
+
+    async def _initialize(self) -> None:
+        result = await self._rpc_call("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "grace-code", "version": "1.0"},
+        })
+        self._session_id = result.get("sessionId")
+
+    async def discover_tools(self) -> list[MCPToolInfo]:
+        result = await self._rpc_call("tools/list", {})
+        tools: list[MCPToolInfo] = []
+        for tool in result.get("tools") or []:
+            tools.append(MCPToolInfo(
+                server_name=self.config.name,
+                name=str(tool.get("name", "")),
+                description=str(tool.get("description", "") or f"MCP tool"),
+                input_schema=tool.get("inputSchema") or {"type": "object", "properties": {}},
+            ))
+        return tools
+
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> MCPCallResult:
+        try:
+            result = await asyncio.wait_for(
+                self._rpc_call("tools/call", {"name": tool_name, "arguments": arguments}),
+                timeout=self.config.timeout_seconds,
             )
-        return data.get("result", {})
+        except asyncio.TimeoutError as exc:
+            raise MCPToolCallError(f"MCP WS tool '{tool_name}' timed out") from exc
+        except Exception as exc:
+            self._connected = False
+            raise MCPToolCallError(f"MCP WS transport failure: {exc}") from exc
+        return MCPCallResult(
+            content=list(result.get("content", []) or []),
+            is_error=bool(result.get("isError", False)),
+        )
+
+    async def list_resources(self) -> list[dict]:
+        try:
+            result = await self._rpc_call("resources/list", {})
+            return list(result.get("resources", []) or [])
+        except Exception:
+            return []
+
+    async def read_resource(self, uri: str) -> dict:
+        try:
+            result = await self._rpc_call("resources/read", {"uri": uri})
+            contents = result.get("contents", []) or []
+            text = "\n".join(c.get("text", "") for c in contents if c.get("text"))
+            return {"uri": uri, "text": text}
+        except Exception:
+            return {}
