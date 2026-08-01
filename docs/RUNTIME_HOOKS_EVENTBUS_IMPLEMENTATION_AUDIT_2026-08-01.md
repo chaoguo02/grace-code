@@ -61,3 +61,6 @@ EventBus 与 Runtime Ports 尚未达到设计稿终态，应作为下一轮 R3-R
 ## 下一轮建议
 
 只推进 R3（EventBus Outbox）作为独立批次，完成崩溃恢复和幂等测试后再进入 R4。不要在同一批次同时重写 Runtime Ports，以免事件可靠性与依赖反转两类故障相互掩盖。
+
+详细执行步骤、接口契约、回滚点与机器验收标准见
+`docs/R3_R4_RUNTIME_EVENTBUS_EXECUTION_PLAN.md`。

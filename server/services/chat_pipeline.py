@@ -612,18 +612,14 @@ class ChatPipeline:
                     # If run_context is available, use its run_id/turn_id so the frontend
                     # can deduplicate by run_id and properly archive the optimistic turn.
                     _rc = request.run_context
-                    _terminal = {
-                        "type": "run_terminal",
-                        "run_id": getattr(_rc, "run_id", "") if _rc else "",
-                        "turn_id": getattr(_rc, "turn_id", "") if _rc else "",
-                        "turn_index": getattr(_rc, "turn_index", 0) if _rc else 0,
-                        "status": "failed",
-                        "summary": "",
-                        "steps_taken": 0,
-                        "total_tokens": 0,
-                        "error": str(exc),
-                    }
-                    self._event_bus.publish_raw(request.session_id, _terminal)
+                    from server.events import WsRunTerminal
+                    self._event_bus.publish_typed(request.session_id, WsRunTerminal(
+                        run_id=getattr(_rc, "run_id", "") if _rc else "",
+                        turn_id=getattr(_rc, "turn_id", "") if _rc else "",
+                        turn_index=getattr(_rc, "turn_index", 0) if _rc else 0,
+                        status="failed", error=str(exc),
+                        session_id=request.session_id,
+                    ))
                     # Also CAS-update the Run record so DB reflects the failure
                     _run_id = getattr(_rc, "run_id", "") if _rc else ""
                     if _run_id:

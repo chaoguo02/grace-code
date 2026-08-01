@@ -517,14 +517,33 @@ class AgentService:
 
             # ── Run lifecycle callback: run_started / run_terminal ──
             def _on_run_terminal(session_id: str, event: dict) -> None:
-                """Publish run_started / run_terminal via EventBus.
-
-                Both go through publish_raw → _publish_msg → persist
-                (insert_trace_event, gets sequence) → WS broadcast.
-                Same code path as all other events — no skip_persist.
-                """
-                if _eb is not None:
-                    _eb.publish_raw(session_id, event)
+                """Publish run_started / run_terminal via EventBus — R3 typed."""
+                if _eb is None:
+                    return
+                from server.events import WsRunStarted, WsRunTerminal
+                ev_type = event.get("type", "")
+                if ev_type == "run_started":
+                    _eb.publish_typed(session_id, WsRunStarted(
+                        run_id=event.get("run_id", ""),
+                        turn_id=event.get("turn_id", ""),
+                        turn_index=event.get("turn_index", 0),
+                        timestamp=event.get("timestamp", ""),
+                        session_id=session_id,
+                        event_id=event.get("event_id", ""),
+                    ))
+                else:
+                    _eb.publish_typed(session_id, WsRunTerminal(
+                        run_id=event.get("run_id", ""),
+                        turn_id=event.get("turn_id", ""),
+                        turn_index=event.get("turn_index", 0),
+                        status=event.get("status", ""),
+                        summary=event.get("summary", ""),
+                        steps_taken=event.get("steps_taken", 0),
+                        total_tokens=event.get("total_tokens", 0),
+                        error=event.get("error", ""),
+                        session_id=session_id,
+                        event_id=event.get("event_id", ""),
+                    ))
 
             self._runtime._publish_run_terminal = _on_run_terminal
 
