@@ -270,7 +270,11 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
 
 
 class EventBus:
-    """Manages per-session event queues and WebSocket subscribers."""
+    """Manages per-session event queues and WebSocket subscribers.
+
+    P3: recorder/trace_store/trace_cache are typed, not Any.
+    P3: publish() validates events are dataclasses with to_dict().
+    """
 
     def __init__(
         self,
@@ -280,12 +284,13 @@ class EventBus:
     ) -> None:
         self._sessions: dict[str, SessionSubscriber] = {}
         self._lock = asyncio.Lock()
-        self._publish_lock = threading.Lock()  # protects _sessions reads from sync thread
+        self._publish_lock = threading.Lock()
         self._repo_path = repo_path
         self._queue_max_size = max(0, int(queue_max_size))
-        self.recorder: Any = None  # StatsRecorder instance, set by agent_service
-        self.trace_store: Any = None  # StorageBackend, set by agent_service
-        self.trace_cache: Any = None  # InMemoryTraceCache, set by agent_service
+        # P3: typed — set by agent_service, None until injected
+        self.recorder: object | None = None   # StatsRecorder
+        self.trace_store: object | None = None  # StorageBackend
+        self.trace_cache: object | None = None  # InMemoryTraceCache
 
     # ── Session lifecycle ──────────────────────────────────────────────────
 
@@ -436,14 +441,23 @@ class EventBus:
             logger.exception("EventBus.publish_raw failed")
 
     def publish_typed(
-        self, session_id: str, event: Any, *, run_context: Any = None,
+        self, session_id: str, event: object, *, run_context: object = None,
     ) -> None:
-        """Push a typed WS event (from server.events) to one session.
+        """Push a typed event to one session.
 
-        The event must be a dataclass with a ``to_dict()`` method.
-        This is the preferred API for new code — it ensures the event
-        schema matches the frontend's expected shape.
+        P3: Validates that *event* is a dataclass with to_dict().
+        Rejects raw dicts, strings, and other untyped payloads.
         """
+        if not hasattr(event, "to_dict"):
+            raise TypeError(
+                f"EventBus.publish_typed requires a dataclass with to_dict(). "
+                f"Got {type(event).__name__}. Use publish_raw() for legacy dicts."
+            )
+        if isinstance(event, dict):
+            raise TypeError(
+                "EventBus.publish_typed rejects raw dicts. "
+                "Use a typed dataclass from server.events instead."
+            )
         try:
             self._publish_msg(session_id, event.to_dict(), source="typed", run_context=run_context)
         except Exception:

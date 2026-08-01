@@ -915,6 +915,24 @@ class SessionRuntime:
             )
         return {"team_id": team.team_id, "state": team.state.value}
 
+    # ── P2: Public API for external callers ──────────────────────────
+
+    def get_approval_broker(self, session_id: str):
+        """Public accessor for session-scoped approval broker."""
+        return self._approval_brokers.get(session_id)
+
+    def cancel_all_sessions(self, reason: str = "shutdown") -> int:
+        """Cancel all active sessions.  Returns count of cancelled sessions."""
+        count = 0
+        for (session_id, gen) in list(self._cancellation_tokens.keys()):
+            if self.cancel_session(session_id, detail=reason):
+                count += 1
+        return count
+
+    def get_active_sessions(self) -> list[str]:
+        """Return list of active session IDs."""
+        return list(self._active_sessions)
+
     def cancel_session(self, session_id: str, detail: str = "") -> bool:
         """Cancel one active session; hierarchical tokens propagate to descendants."""
         session = self._store.get_session(session_id)
@@ -3042,8 +3060,8 @@ class SessionRuntime:
 
     # ── Headless Web Approval (CC control_request/control_response equivalent) ─
 
-    def _ensure_approval_broker(self, session_id: str) -> "ApprovalBroker":
-        """Get or create the per-session ApprovalBroker.
+    def ensure_approval_broker(self, session_id: str) -> "ApprovalBroker":
+        """Get or create the per-session ApprovalBroker. (P2: public API)
 
         One broker per session.  The agent thread blocks on
         ``broker.wait_for_decision()``; the HTTP handler resolves via

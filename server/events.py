@@ -1,17 +1,85 @@
 """
-server/events.py — typed WS event dataclasses.
+server/events.py — typed event dataclasses.
 
-Single source of truth for all WebSocket message shapes.
-Replace the ad-hoc dict construction in _translate_event()
-with these structured types.
+Two categories:
+  1. DomainEvent (internal lifecycle facts) — published to EventBus
+  2. Ws* (WebSocket message shapes) — published to frontend via EventBus
 
-The frontend mirrors these types in web/src/types/events.ts.
+Single source of truth for all event shapes.
+The frontend mirrors Ws* types in web/src/types/events.ts.
+
+P1: All events are typed dataclasses — no ad-hoc dicts.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Any, Literal
+
+
+# ── DomainEvent base (P1) ──────────────────────────────────────────────
+
+class SessionStatus(StrEnum):
+    STARTED = "started"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+class RunStatus(StrEnum):
+    STARTED = "started"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class DomainEvent:
+    """Base for internal lifecycle events.  Immutable, serializable."""
+    session_id: str = ""
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+@dataclass(frozen=True)
+class SessionStarted(DomainEvent):
+    status: str = SessionStatus.STARTED.value
+
+@dataclass(frozen=True)
+class SessionCompleted(DomainEvent):
+    status: str = SessionStatus.COMPLETED.value
+    steps_taken: int = 0
+
+@dataclass(frozen=True)
+class SessionCancelled(DomainEvent):
+    status: str = SessionStatus.CANCELLED.value
+    reason: str = ""
+
+@dataclass(frozen=True)
+class RunStarted(DomainEvent):
+    run_id: str = ""
+
+@dataclass(frozen=True)
+class RunCompleted(DomainEvent):
+    run_id: str = ""
+    steps_taken: int = 0
+    tokens_used: int = 0
+
+@dataclass(frozen=True)
+class RunCancelled(DomainEvent):
+    run_id: str = ""
+    reason: str = ""
+
+@dataclass(frozen=True)
+class ToolExecuted(DomainEvent):
+    run_id: str = ""
+    tool_name: str = ""
+    invocation_id: str = ""
+    success: bool = True
+    duration_ms: float = 0.0
 
 
 def _to_dict(obj) -> dict:
@@ -547,6 +615,37 @@ class WsMemoryWritten:
         return _to_dict(self)
 
 
+# ── Compact + Resource events (P1: replacing publish_raw) ──────────────
+
+@dataclass
+class WsCompactStatus:
+    """Context compaction progress."""
+    type: Literal["compact_status"] = "compact_status"
+    status: str = ""          # "compacting" | "compacted" | "failed"
+    tokens_before: int = 0
+    tokens_after: int = 0
+    message: str = ""
+    error: str = ""
+    timestamp: str = ""
+    session_id: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+@dataclass
+class WsResourceGovernance:
+    """Resource governance event (capacity timeout, cancellation, etc.)."""
+    type: Literal["resource_governance"] = "resource_governance"
+    event_type: str = ""      # "capacity_timeout" | "cancelled" | "throttled"
+    payload: dict = field(default_factory=dict)
+    session_id: str = ""
+    timestamp: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
 # ── Discriminated union ───────────────────────────────────────────────
 
 WsEvent = (
@@ -556,4 +655,5 @@ WsEvent = (
     | WsWorktreeResolved | WsMemoryRecall | WsMemoryWritten
     | WsAssistantTextStart | WsAssistantTextDelta | WsAssistantTextEnd | WsAssistantTextAborted
     | WsRunStarted | WsRunTerminal
+    | WsCompactStatus | WsResourceGovernance
 )

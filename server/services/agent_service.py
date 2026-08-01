@@ -753,7 +753,7 @@ class AgentService:
             HTTP POST → broker.resolve(request_id, decision)
             Event.set() → Agent thread continues
         """
-        broker = self._runtime._ensure_approval_broker(session_id)
+        broker = self._runtime.ensure_approval_broker(session_id)
         event_bus = self._event_bus
         from server.services.approval_broker import ApprovalRequest
 
@@ -1366,7 +1366,7 @@ class AgentService:
         run had its session incorrectly marked CANCELLED.
         """
         # Wake any pending approval first so the agent loop can exit quickly
-        broker = self._runtime.get_approval_broker(session_id)
+        broker = self._runtime.ensure_approval_broker(session_id)
         if broker is not None:
             broker.cancel_pending()
 
@@ -1444,12 +1444,9 @@ class AgentService:
         if self._resource_governor is not None:
             self._resource_governor.shutdown()
 
-        # 2. Cancel running sessions
+        # 2. Cancel running sessions (P2: uses public API)
         if self._runtime is not None:
-            for (session_id, gen) in list(self._runtime._cancellation_tokens.keys()):
-                self._runtime.cancel_session(
-                    session_id, detail="Server shutting down",
-                )
+            self._runtime.cancel_all_sessions(reason="Server shutting down")
 
         # 3. Close LLM backend streams
         if hasattr(self._backend, "close"):
