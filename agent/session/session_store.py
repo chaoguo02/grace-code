@@ -2189,6 +2189,80 @@ class SessionStore:
                 "Failed to transactional_finalize_run %s", run_id)
             return None
 
+    def transactional_finalize_run_v2(
+        self,
+        run_id: str,
+        session_id: str,
+        *,
+        status: str = "completed",
+        summary: str = "",
+        steps_taken: int = 0,
+        total_tokens: int = 0,
+        error: str = "",
+        expect_status: str = "running",
+    ) -> bool:
+        """R3.3: CAS-update Run + INSERT outbox event in ONE transaction.
+
+        Returns True if CAS succeeded and outbox was written.
+        The trace projection will pick up the outbox event separately.
+        """
+        import os as _os
+        if _os.environ.get("GRACE_OUTBOX_TERMINAL_EVENTS") != "1":
+            # Fallback to legacy path
+            result = self.transactional_finalize_run(
+                run_id=run_id,
+                terminal_event={"type": f"run_{status}", "status": status},
+                session_id=session_id,
+                summary=summary, steps_taken=steps_taken,
+                total_tokens=total_tokens, error=error,
+                expect_status=expect_status,
+            )
+            return result is not None
+
+        from server.services.event_outbox import OutboxStore
+        import json as _json
+        import uuid as _uuid
+
+        event_id = str(_uuid.uuid4())
+        event_type = f"run.{status}"
+        payload = _json.dumps({
+            "status": status, "summary": summary,
+            "steps_taken": steps_taken, "total_tokens": total_tokens,
+            "error": error,
+        }, ensure_ascii=False)
+
+        try:
+            outbox = OutboxStore(self._db_path)
+            with self._connect() as conn:
+                outbox.ensure_tables(conn)
+                conn.execute("BEGIN IMMEDIATE")
+
+                cur = conn.execute(
+                    """UPDATE runs SET status = ?, summary = ?, steps_taken = ?,
+                       total_tokens = ?, error = ?, completed_at = ?,
+                       updated_at = ?
+                       WHERE id = ? AND status = ?""",
+                    (status, summary, steps_taken, total_tokens, error,
+                     _utc_now(), _utc_now(), run_id, expect_status),
+                )
+                if cur.rowcount != 1:
+                    conn.execute("ROLLBACK")
+                    return False
+
+                outbox.append_event(
+                    conn, event_id, event_type, session_id,
+                    run_id, 1, payload,
+                )
+
+                conn.execute("COMMIT")
+                return True
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Failed to transactional_finalize_run_v2 %s", run_id)
+            return False
+            return None
+
     def update_metadata(
         self, session_id: str, extra: dict[str, Any]
     ) -> None:
