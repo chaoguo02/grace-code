@@ -199,19 +199,22 @@ class AgentService:
             )
 
         # Durable lifecycle chain: transaction -> outbox -> trace -> live WS.
-        from server.services.event_outbox import OutboxRelay, OutboxStore
-        from server.projections.projection_runner import ProjectionRunner
-        from server.projections.trace_projection import TraceProjection
+        # N0: When NATIVE mode owns the pipeline, the legacy relay must NOT
+        # compete for the same outbox table.
+        if os.environ.get("GRACE_RUNTIME_MODE") != "NATIVE":
+            from server.services.event_outbox import OutboxRelay, OutboxStore
+            from server.projections.projection_runner import ProjectionRunner
+            from server.projections.trace_projection import TraceProjection
 
-        self._outbox_store = OutboxStore(db_path)
-        self._outbox_store.install()
-        self._projection_runner = ProjectionRunner(
-            TraceProjection(db_path),
-            self._event_bus.publish_live if self._event_bus is not None else None,
-        )
-        self._outbox_relay = OutboxRelay(
-            self._outbox_store, self._projection_runner.deliver,
-        )
+            self._outbox_store = OutboxStore(db_path)
+            self._outbox_store.install()
+            self._projection_runner = ProjectionRunner(
+                TraceProjection(db_path),
+                self._event_bus.publish_live if self._event_bus is not None else None,
+            )
+            self._outbox_relay = OutboxRelay(
+                self._outbox_store, self._projection_runner.deliver,
+            )
 
         # ── SessionService ─────────────────────────────────────────────
         from server.services.session_service import SessionService

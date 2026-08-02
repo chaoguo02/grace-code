@@ -65,11 +65,29 @@ class TestRunFacts:
 
 class TestEnvelope:
 
+    @staticmethod
+    def _event_type_for(payload) -> str:
+        """Map payload class to its registered event type name."""
+        from application.events.run_facts import (
+            RunSubmittedV1, RunStartedV1, RunCompletedV1, RunFailedV1,
+            RunCancelledV1, RunBlockedV1, RunGaveUpV1,
+        )
+        _map = {
+            RunSubmittedV1: "run.submitted.v1",
+            RunStartedV1: "run.started.v1",
+            RunCompletedV1: "run.completed.v1",
+            RunFailedV1: "run.failed.v1",
+            RunCancelledV1: "run.cancelled.v1",
+            RunBlockedV1: "run.blocked.v1",
+            RunGaveUpV1: "run.gave_up.v1",
+        }
+        return _map.get(type(payload), "run.submitted.v1")
+
     def _envelope(self, payload):
         sid = SessionId("s1")
         return EventEnvelope(
             event_id=EventId.generate(),
-            event_type=EventTypeName("run.submitted.v1"),
+            event_type=EventTypeName(self._event_type_for(payload)),
             schema_version=SchemaVersion(1),
             occurred_at=datetime.now(timezone.utc),
             source=EventSource(process_id="test", component="runtime"),
@@ -113,3 +131,23 @@ class TestEnvelope:
         env = self._envelope(submitted("r1"))
         with pytest.raises(Exception):
             env.event_type = EventTypeName("other.v1")  # type: ignore
+
+    def test_typed_round_trip_preserves_payload_class(self):
+        """R0: decode(encode(envelope)) must preserve the exact payload type.
+
+        MUST FAIL on current code: SchemaRegistry has no decode method.
+        """
+        from application.events.schema_registry import SchemaRegistry
+        from application.events.run_facts import RunCompletedV1
+
+        registry = SchemaRegistry()
+        env = self._envelope(completed("r1", steps_taken=5, tokens_used=100))
+
+        js = env.canonical_json()
+        # R0: registry must be able to decode JSON back to typed EventEnvelope
+        decoded = registry.decode(js)
+        assert decoded.event_id == env.event_id
+        assert decoded.event_type == env.event_type
+        assert type(decoded.payload) is RunCompletedV1, (
+            f"R0 FAIL: payload type lost. Expected RunCompletedV1, got {type(decoded.payload).__name__}"
+        )

@@ -155,7 +155,8 @@ class SqliteOutboxStore:
     def dead_letter(self, event_id: str, worker_id: str, error: str) -> bool:
         with self._connect() as conn:
             c = conn.execute(
-                "UPDATE event_outbox SET status='dead_letter', last_error=? "
+                "UPDATE event_outbox SET status='dead_letter', "
+                "attempts=attempts+1, last_error=? "
                 "WHERE event_id=? AND claimed_by=?",
                 (error[:500], event_id, worker_id),
             )

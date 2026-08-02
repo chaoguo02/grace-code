@@ -21,18 +21,44 @@ from runtime_core.runtime import AgentRuntime
 
 
 class FakeUoW:
-    """Fake UoW — records appended facts in memory."""
+    """Fake UoW — records appended facts and state mutations in memory."""
     def __init__(self):
         self.facts: list = []
+        self.runs: list[dict] = []
+        self.messages: list[dict] = []
+        self.generations: dict[str, int] = {}
 
-    def execute(self, fn) -> None:
+    def execute(self, fn):
         tx = FakeTransaction(self)
-        fn(tx)
+        return fn(tx)
 
 
 class FakeTransaction:
     def __init__(self, uow: FakeUoW):
         self._uow = uow
+
+    def increment_generation(self, session_id) -> int:
+        sid = str(session_id)
+        current = self._uow.generations.get(sid, 0)
+        new_val = current + 1
+        self._uow.generations[sid] = new_val
+        return new_val
+
+    def create_run(self, *, run_id, session_id, turn_id, turn_index,
+                   idempotency_key: str = "", prompt: str = "") -> None:
+        self._uow.runs.append({
+            "run_id": str(run_id), "session_id": str(session_id),
+            "turn_id": turn_id, "turn_index": turn_index,
+            "idempotency_key": idempotency_key, "prompt": prompt,
+            "status": "queued",
+        })
+
+    def insert_message(self, *, session_id, role: str, content: str,
+                       turn_id: str) -> None:
+        self._uow.messages.append({
+            "session_id": str(session_id), "role": role,
+            "content": content, "turn_id": turn_id,
+        })
 
     def append_fact(self, envelope) -> None:
         self._uow.facts.append(envelope)
@@ -40,7 +66,7 @@ class FakeTransaction:
 
 class TestRunCoordinator:
 
-    def test_submit_creates_fact(self):
+    def test_submit_creates_fact_and_state(self):
         uow = FakeUoW()
         rt = AgentRuntime(RuntimePorts())
         coord = RunCoordinator(rt, uow)
@@ -48,8 +74,25 @@ class TestRunCoordinator:
         cmd = SubmitRun(session_id=SessionId("s1"), prompt="test")
         envelope = coord.submit(cmd)
 
+        # Fact must be appended
         assert len(uow.facts) == 1
         assert str(envelope.event_type) == "run.submitted.v1"
+
+        # State mutations must occur in same transaction
+        assert len(uow.runs) == 1
+        assert uow.runs[0]["session_id"] == "s1"
+        assert uow.runs[0]["prompt"] == "test"
+        assert uow.runs[0]["status"] == "queued"
+
+        assert len(uow.messages) == 1
+        assert uow.messages[0]["role"] == "user"
+        assert uow.messages[0]["content"] == "test"
+
+        assert uow.generations.get("s1", 0) >= 1
+
+        # Envelope payload must carry real metadata
+        assert envelope.payload.turn_index >= 1
+        assert envelope.payload.turn_id  # must be non-empty
 
     def test_finalize_persists_terminal_fact(self):
         uow = FakeUoW()

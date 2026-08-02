@@ -1,24 +1,27 @@
 """
-P11: Hook Dispatcher — awaited gate, total deadline, deny-overrides.
+CC-aligned HookDispatcher — match, execute, merge.
 
-Aggregates results from multiple hooks.  Deny always wins.
-Only supports awaited gate (no background hooks in P11).
+Precedence: deny > defer > ask > allow (CC four-way permission model).
+Deny short-circuits immediately.  Defer passes to next hook.
+Transform results are merged from all hooks.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import time
+from dataclasses import dataclass, field
 
 from hook_core.decisions import (
-    HookDecision, StopDecision, PreToolUseDecision, PostToolUseDecision,
-    UserPromptSubmitDecision,
-    PreCompactDecision,
+    PermissionDecision,
+    PreToolUseDecision, PostToolUseDecision, PostToolUseFailureDecision,
+    StopDecision, SessionStartDecision, PreCompactDecision,
+    UserPromptSubmitDecision, ObserveDecision,
 )
+from hook_core.events import BLOCKABLE_EVENTS
 from hook_core.executor import execute_hook, HookExecution
 from hook_core.policies import (
-    HookPolicy, FailurePolicy, DecisionAuthority,
-    PRETOOL_USE, POSTTOOL_USE, USER_PROMPT_SUBMIT, STOP, PRECOMPACT,
+    HookPolicy, FailurePolicy,
+    policy_for, PRETOOL_USE,
 )
 from hook_core.registry import RegistrySnapshot, HookRegistration
 
@@ -27,20 +30,34 @@ class HookDispatchTimeout(RuntimeError):
     """Total dispatch deadline exceeded."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass
 class DispatchResult:
-    results: tuple[HookExecution, ...]
-    total_duration_ms: float
+    """Aggregated result from dispatching an event to matching hooks."""
+
+    results: list[HookExecution] = field(default_factory=list)
+    total_duration_ms: float = 0.0
     blocked: bool = False
     block_reason: str = ""
-    merged_decision: object | None = None  # aggregated typed decision
+    # PreToolUse: final permission after merging all hooks
+    permission: PermissionDecision | None = None
+    # Merged transform data
+    updated_input: dict | None = None
+    additional_context: str = ""
+    replace_output: str | None = None
+    # Warnings from non-blocking failures
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def merged_decision(self) -> object | None:
+        """Return the final typed decision for backward compatibility."""
+        results = [r for r in self.results if r.decision is not None]
+        return results[-1].decision if results else None
 
 
 class HookDispatcher:
     """Awaited hook gate — dispatches to matching hooks, merges results.
 
-    Deny always overrides allow.
-    Fail-closed hooks block the operation on failure.
+    Deny always overrides allow.  Defer passes decision to next hook.
     """
 
     TOTAL_DEADLINE_S = 30.0
@@ -50,24 +67,20 @@ class HookDispatcher:
 
     def dispatch(
         self,
-        snapshot: RegistrySnapshot | None,
         event_type: str,
         hook_input: object,
         *,
+        snapshot: RegistrySnapshot | None = None,
         tool_name: str = "",
     ) -> DispatchResult:
-        """Dispatch to matching hooks, merge results.
-
-        For PreToolUse: deny wins over allow over ask.
-        For Stop: block wins over continue.
-        """
+        """Dispatch to matching hooks, merge results."""
         started = time.monotonic()
+        policy = policy_for(event_type)
         hooks = self._registry.get_hooks(snapshot, event_type, tool_name)
-        policy = _policy_for(event_type)
+        is_blockable = event_type in {e.value for e in BLOCKABLE_EVENTS}
 
-        results: list[HookExecution] = []
-        blocked = False
-        block_reason = ""
+        result = DispatchResult()
+        permission: PermissionDecision | None = None
 
         for hook in hooks:
             elapsed = time.monotonic() - started
@@ -76,61 +89,120 @@ class HookDispatcher:
                     f"Total dispatch deadline {self.TOTAL_DEADLINE_S}s exceeded"
                 )
 
-            result = execute_hook(hook.name, hook.handler, hook_input, policy)
-            results.append(result)
+            # ── stop_hook_active guard ──────────────────────────────
+            if event_type == "Stop" and getattr(hook_input, "stop_hook_active", False):
+                continue  # never block when already in forced continuation
 
-            # Check if this hook should block
-            if policy.failure_policy == FailurePolicy.FAIL_CLOSED and result.decision is None:
-                blocked = True
-                block_reason = f"Hook '{hook.name}' failed (fail-closed): {result.error}"
-                break
+            # ── Execute ─────────────────────────────────────────────
+            execution = execute_hook(hook.name, hook.handler, hook_input, policy)
+            result.results.append(execution)
 
-            # Check decision-based blocking
-            if event_type == "PreToolUse" and result.decision is not None:
-                d = result.decision
-                if getattr(d, "permission", None) == HookDecision.DENY:
-                    blocked = True
-                    block_reason = getattr(d, "reason", f"Hook '{hook.name}' denied")
-                    break
+            # ── Handle failure ──────────────────────────────────────
+            if execution.decision is None:
+                failure_blocks = _resolve_failure(policy.failure_policy, is_blockable)
+                if failure_blocks:
+                    result.blocked = True
+                    result.block_reason = (
+                        f"Hook '{hook.name}' failed (fail-closed): {execution.error}"
+                    )
+                    return result
+                else:
+                    result.warnings.append(
+                        f"Hook '{hook.name}' failed: {execution.error}"
+                    )
+                    continue
 
-            if event_type == "Stop" and result.decision is not None:
-                d = result.decision
-                if getattr(d, "decision", None) == "block":
-                    blocked = True
-                    block_reason = getattr(d, "reason", f"Hook '{hook.name}' blocked stop")
-                    break
+            decision = execution.decision
 
-        total_ms = (time.monotonic() - started) * 1000
-        merged = _merge_decisions(event_type, results) if results and not blocked else None
+            # ── Process decision by event type ──────────────────────
+            if event_type == "PreToolUse" and isinstance(decision, PreToolUseDecision):
+                perm = decision.permission
+                # Deny → immediate block
+                if perm == PermissionDecision.DENY:
+                    result.blocked = True
+                    result.block_reason = decision.reason or f"Hook '{hook.name}' denied"
+                    result.permission = PermissionDecision.DENY
+                    return result
+                # Track highest-precedence permission
+                permission = _merge_permission(permission, perm)
+                # Merge transforms
+                if decision.updated_input:
+                    result.updated_input = {
+                        **(result.updated_input or {}),
+                        **decision.updated_input,
+                    }
+                if decision.reason and not result.block_reason:
+                    result.block_reason = decision.reason
 
-        return DispatchResult(
-            results=tuple(results),
-            total_duration_ms=total_ms,
-            blocked=blocked,
-            block_reason=block_reason,
-            merged_decision=merged,
-        )
+            elif event_type == "Stop" and isinstance(decision, StopDecision):
+                if decision.decision == "block":
+                    result.blocked = True
+                    result.block_reason = decision.reason or f"Hook '{hook.name}' blocked stop"
+                    return result
+
+            elif event_type in ("PostToolUse", "PostToolUseFailure"):
+                if isinstance(decision, (PostToolUseDecision, PostToolUseFailureDecision)):
+                    if decision.decision == "block":
+                        result.block_reason = decision.reason or result.block_reason
+                    if getattr(decision, "additional_context", ""):
+                        sep = "\n" if result.additional_context else ""
+                        result.additional_context += sep + decision.additional_context
+                    if getattr(decision, "replace_output", None) is not None:
+                        result.replace_output = decision.replace_output
+
+            elif event_type == "UserPromptSubmit" and isinstance(decision, UserPromptSubmitDecision):
+                if decision.block:
+                    result.blocked = True
+                    result.block_reason = decision.reason or f"Hook '{hook.name}' blocked prompt"
+                    return result
+                if decision.updated_input:
+                    result.updated_input = decision.updated_input
+
+            elif event_type == "SessionStart" and isinstance(decision, SessionStartDecision):
+                if decision.additional_context:
+                    sep = "\n" if result.additional_context else ""
+                    result.additional_context += sep + decision.additional_context
+
+            elif event_type == "PreCompact" and isinstance(decision, PreCompactDecision):
+                if decision.block:
+                    result.blocked = True
+                    result.block_reason = decision.reason or f"Hook '{hook.name}' blocked compaction"
+                    return result
+
+        # ── Finalize ────────────────────────────────────────────────
+        result.total_duration_ms = (time.monotonic() - started) * 1000
+        if event_type == "PreToolUse":
+            result.permission = permission or PermissionDecision.ALLOW
+        return result
 
 
-def _policy_for(event_type: str) -> HookPolicy:
-    if event_type == "PreToolUse":
-        return PRETOOL_USE
-    if event_type == "PostToolUse":
-        return POSTTOOL_USE
-    if event_type == "UserPromptSubmit":
-        return USER_PROMPT_SUBMIT
-    if event_type in ("Stop", "SubagentStop"):
-        return STOP
-    if event_type == "PreCompact":
-        return PRECOMPACT
-    return HookPolicy(
-        scheduling="awaited", decision_authority="observe",
-        data_authority="observe", failure_policy="fail_open",
-    )
+def _merge_permission(current: PermissionDecision | None,
+                      incoming: PermissionDecision) -> PermissionDecision | None:
+    """Merge two permission decisions with defer semantics.
+
+    Defer means "I don't decide — pass to the next hook."
+    Otherwise, highest precedence wins: deny > defer > ask > allow.
+    """
+    if current is None:
+        return incoming
+    # Defer passes the decision to subsequent hooks
+    if incoming == PermissionDecision.DEFER:
+        return current
+    if current == PermissionDecision.DEFER:
+        return incoming
+    # Both are concrete decisions — highest precedence wins
+    prec = PermissionDecision.precedence()
+    cur_idx = prec.index(current)
+    inc_idx = prec.index(incoming)
+    return current if cur_idx <= inc_idx else incoming
 
 
-def _merge_decisions(event_type: str, results: list[HookExecution]) -> object | None:
-    for r in results:
-        if r.decision is not None:
-            return r.decision
-    return None
+def _resolve_failure(failure_policy: FailurePolicy, is_blockable: bool) -> bool:
+    """Return True if a hook failure should block the operation."""
+    if failure_policy == FailurePolicy.FAIL_CLOSED:
+        return True
+    if failure_policy == FailurePolicy.EVENT_DEFAULT:
+        return is_blockable
+    if failure_policy == FailurePolicy.FAIL_TURN:
+        return is_blockable
+    return False  # FAIL_OPEN

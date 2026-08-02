@@ -18,7 +18,8 @@ def init_hook_dispatcher(
     backend: Any = None,
 ) -> Any:
     """Create HookDispatcher with memory consolidation hooks."""
-    from hooks import HookDispatcher, HookEvent, HookMatcher, HookRegistry, InternalHook
+    from hooks import HookEvent, HookMatcher, HookRegistry, InternalHook
+    from hook_core.bridge import _create_bridge
 
     registry = HookRegistry()
     settings_path = repo_path / ".grace" / "settings.json"
@@ -50,5 +51,5 @@ def init_hook_dispatcher(
                 pass
         registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))
 
-    dispatcher = HookDispatcher(registry, cwd=str(repo_path.resolve()))
+    dispatcher = _create_bridge(registry, cwd=str(repo_path.resolve()))
     return dispatcher

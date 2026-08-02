@@ -28,4 +28,18 @@ if __name__ == "__main__":
     service.ensure_root_session()
     app = create_app(service)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # P19: Start native event pipeline when GRACE_RUNTIME_MODE=NATIVE
+    _native_shutdown = None
+    if os.environ.get("GRACE_RUNTIME_MODE") == "NATIVE":
+        from composition.runtime_composition import start_native_pipeline
+        db_path = os.path.join(repo, ".grace", "grace.db")
+        if os.path.exists(db_path):
+            _native = start_native_pipeline(db_path)
+            _native_shutdown = _native["shutdown"]
+            print(f"  Native event pipeline started (worker={_native['relay']._worker_id})")
+
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    finally:
+        if _native_shutdown is not None:
+            _native_shutdown()

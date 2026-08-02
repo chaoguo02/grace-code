@@ -1,7 +1,7 @@
 """
-P9: Hook policies — per-event scheduling, decision authority, data authority, failure.
+CC-aligned hook policies — per-event scheduling, decision authority, data authority, failure.
 
-No Any/dict.  Each hook event type has a declared policy.
+Each hook event type has a declared default policy.
 """
 
 from __future__ import annotations
@@ -26,9 +26,10 @@ class DataAuthority(StrEnum):
 
 
 class FailurePolicy(StrEnum):
-    FAIL_CLOSED = "fail_closed"   # Hook error/timeout → block operation
-    FAIL_OPEN = "fail_open"       # Hook error → operation continues
-    FAIL_TURN = "fail_turn"       # Hook error → terminate current turn
+    FAIL_CLOSED = "fail_closed"     # Hook error → block operation
+    FAIL_OPEN = "fail_open"         # Hook error → continue
+    FAIL_TURN = "fail_turn"         # Hook error → terminate turn
+    EVENT_DEFAULT = "event_default" # blockable→FAIL_CLOSED, non-blockable→FAIL_OPEN
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +41,7 @@ class HookPolicy:
     timeout_s: float = 30.0
 
 
-# ── Default policies per hook event ─────────────────────────────────────────
+# ── Per-event default policies ──────────────────────────────────────────────
 
 PRETOOL_USE = HookPolicy(
     scheduling=Scheduling.AWAITED,
@@ -53,6 +54,34 @@ POSTTOOL_USE = HookPolicy(
     scheduling=Scheduling.AWAITED,
     decision_authority=DecisionAuthority.OBSERVE,
     data_authority=DataAuthority.TRANSFORM,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
+POSTTOOL_USE_FAILURE = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.OBSERVE,
+    data_authority=DataAuthority.OBSERVE,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
+POSTTOOL_BATCH = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.BLOCKABLE,
+    data_authority=DataAuthority.OBSERVE,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
+PERMISSION_REQUEST = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.BLOCKABLE,
+    data_authority=DataAuthority.OBSERVE,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
+PERMISSION_DENIED = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.OBSERVE,
+    data_authority=DataAuthority.OBSERVE,
     failure_policy=FailurePolicy.FAIL_OPEN,
 )
 
@@ -71,6 +100,34 @@ STOP = HookPolicy(
     timeout_s=5.0,
 )
 
+STOP_FAILURE = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.OBSERVE,
+    data_authority=DataAuthority.OBSERVE,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
+SESSION_START = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.OBSERVE,
+    data_authority=DataAuthority.TRANSFORM,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
+SESSION_END = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.OBSERVE,
+    data_authority=DataAuthority.OBSERVE,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
+SUBAGENT_START = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.OBSERVE,
+    data_authority=DataAuthority.OBSERVE,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
 SUBAGENT_STOP = HookPolicy(
     scheduling=Scheduling.AWAITED,
     decision_authority=DecisionAuthority.BLOCKABLE,
@@ -78,9 +135,54 @@ SUBAGENT_STOP = HookPolicy(
     failure_policy=FailurePolicy.FAIL_OPEN,
 )
 
-PRECOMPACT = HookPolicy(
+PRE_COMPACT = HookPolicy(
     scheduling=Scheduling.AWAITED,
     decision_authority=DecisionAuthority.BLOCKABLE,
     data_authority=DataAuthority.OBSERVE,
     failure_policy=FailurePolicy.FAIL_OPEN,
 )
+
+POST_COMPACT = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.OBSERVE,
+    data_authority=DataAuthority.OBSERVE,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
+NOTIFICATION = HookPolicy(
+    scheduling=Scheduling.AWAITED,
+    decision_authority=DecisionAuthority.OBSERVE,
+    data_authority=DataAuthority.OBSERVE,
+    failure_policy=FailurePolicy.FAIL_OPEN,
+)
+
+
+def policy_for(event_type: str) -> HookPolicy:
+    """Return the default policy for a hook event type string."""
+    _map: dict[str, HookPolicy] = {
+        "PreToolUse": PRETOOL_USE,
+        "PostToolUse": POSTTOOL_USE,
+        "PostToolUseFailure": POSTTOOL_USE_FAILURE,
+        "PostToolBatch": POSTTOOL_BATCH,
+        "PermissionRequest": PERMISSION_REQUEST,
+        "PermissionDenied": PERMISSION_DENIED,
+        "UserPromptSubmit": USER_PROMPT_SUBMIT,
+        "Stop": STOP,
+        "StopFailure": STOP_FAILURE,
+        "SessionStart": SESSION_START,
+        "SessionEnd": SESSION_END,
+        "SubagentStart": SUBAGENT_START,
+        "SubagentStop": SUBAGENT_STOP,
+        "PreCompact": PRE_COMPACT,
+        "PostCompact": POST_COMPACT,
+        "Notification": NOTIFICATION,
+    }
+    return _map.get(
+        event_type,
+        HookPolicy(
+            scheduling=Scheduling.AWAITED,
+            decision_authority=DecisionAuthority.OBSERVE,
+            data_authority=DataAuthority.OBSERVE,
+            failure_policy=FailurePolicy.FAIL_OPEN,
+        ),
+    )

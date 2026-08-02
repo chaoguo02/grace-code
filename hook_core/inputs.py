@@ -1,8 +1,8 @@
 """
-P9: Hook event-specific input contracts — frozen, no Any/dict.
+CC-aligned hook input contracts — frozen, one class per event.
 
-One input class per hook event.  Each class carries only the fields
-relevant to that event.  No raw dict passthrough.
+Each input class carries only the fields relevant to its event.
+No dict passthrough for decision-critical fields.
 """
 
 from __future__ import annotations
@@ -11,30 +11,62 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# ── PreToolUse ──────────────────────────────────────────────────────────────
+# ── Tool execution ──────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
 class PreToolUseInput:
     tool_name: str
-    tool_input: dict[str, Any]  # JSON-serializable tool params
-    tool_use_id: str = ""
+    tool_input: dict[str, Any]
     session_id: str = ""
+    tool_use_id: str = ""
+    cwd: str = ""
 
-
-# ── PostToolUse ─────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
 class PostToolUseInput:
     tool_name: str
     tool_input: dict[str, Any]
     tool_output: str = ""
-    tool_error: str = ""
-    tool_use_id: str = ""
     session_id: str = ""
+    tool_use_id: str = ""
     success: bool = True
 
 
-# ── UserPromptSubmit ────────────────────────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class PostToolUseFailureInput:
+    tool_name: str
+    tool_input: dict[str, Any]
+    error_message: str = ""
+    error_type: str = ""
+    session_id: str = ""
+    tool_use_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PostToolBatchInput:
+    session_id: str = ""
+    tool_count: int = 0
+
+
+# ── Permissions ─────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class PermissionRequestInput:
+    tool_name: str
+    tool_input: dict[str, Any]
+    required_permissions: frozenset[str] = frozenset()
+    session_id: str = ""
+    agent_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionDeniedInput:
+    tool_name: str
+    tool_input: dict[str, Any]
+    session_id: str = ""
+
+
+# ── User input ──────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
 class UserPromptSubmitInput:
@@ -42,28 +74,77 @@ class UserPromptSubmitInput:
     session_id: str = ""
 
 
-# ── Stop ────────────────────────────────────────────────────────────────────
+# ── Model output ────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
 class StopInput:
     session_id: str = ""
+    stop_hook_active: bool = False
+    last_assistant_message: str = ""
     steps_taken: int = 0
     tokens_used: int = 0
+    agent_id: str = ""
+    agent_type: str = ""
+    messages: list[dict[str, Any]] | None = None
 
 
-# ── SubagentStop ────────────────────────────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class StopFailureInput:
+    session_id: str = ""
+    error_type: str = ""  # "rate_limit" | "overloaded" | "billing_error" | ...
+
+
+# ── Session lifecycle ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class SessionStartInput:
+    session_id: str = ""
+    agent_type: str = ""
+    source: str = ""  # "startup" | "resume" | "clear"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionEndInput:
+    session_id: str = ""
+    reason: str = ""  # "completed" | "cancelled" | "error"
+
+
+# ── Subagents ───────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class SubagentStartInput:
+    session_id: str = ""
+    agent_id: str = ""
+    agent_type: str = ""
+
 
 @dataclass(frozen=True, slots=True)
 class SubagentStopInput:
     session_id: str = ""
+    agent_id: str = ""
     agent_name: str = ""
     steps_taken: int = 0
 
 
-# ── PreCompact ──────────────────────────────────────────────────────────────
+# ── Compaction ──────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
 class PreCompactInput:
     session_id: str = ""
     tokens_before: int = 0
     trigger: str = ""  # "auto" | "manual"
+
+
+@dataclass(frozen=True, slots=True)
+class PostCompactInput:
+    session_id: str = ""
+    tokens_after: int = 0
+
+
+# ── Notifications ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class NotificationInput:
+    session_id: str = ""
+    message: str = ""
+    level: str = ""  # "info" | "warning" | "error"

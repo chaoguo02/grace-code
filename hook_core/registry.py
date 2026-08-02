@@ -1,23 +1,13 @@
 """
-P10: Immutable Hook Registry — copy-on-write revision.
+CC-aligned Hook Registry — copy-on-write, snapshot-based isolation.
 
-Task binding captures a revision snapshot; subsequent registrations
-do not affect already-bound tasks.
+Tasks bind to a RegistrySnapshot; later registrations don't affect them.
 """
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field
 
-from hook_core.decisions import (
-    PreToolUseDecision, PostToolUseDecision, UserPromptSubmitDecision,
-    StopDecision, PreCompactDecision,
-)
-from hook_core.inputs import (
-    PreToolUseInput, PostToolUseInput, UserPromptSubmitInput,
-    StopInput, SubagentStopInput, PreCompactInput,
-)
 from hook_core.matcher import HookSelector
 
 
@@ -32,9 +22,10 @@ class HookNotFoundError(ValueError):
 @dataclass(frozen=True, slots=True)
 class HookRegistration:
     name: str
-    event_type: str  # "PreToolUse" | "PostToolUse" | ...
-    selector: HookSelector
-    handler: object   # callable(input) -> decision
+    event_type: str       # "PreToolUse" | "Stop" | ...
+    handler: object        # callable(input) → decision
+    selector: HookSelector = field(default_factory=HookSelector.all_tools)
+    priority: int = 100
 
 
 @dataclass(frozen=True)
@@ -47,7 +38,7 @@ class RegistrySnapshot:
 class HookRegistry:
     """Copy-on-write hook registry.
 
-    Registration creates a new revision.  Tasks bind to a revision
+    Registration creates a new revision. Tasks bind to a revision
     snapshot and are immune to subsequent registrations.
     """
 
@@ -57,15 +48,18 @@ class HookRegistry:
 
     def register(self, name: str, event_type: str,
                  handler: object,
-                 selector: HookSelector | None = None) -> None:
+                 selector: HookSelector | None = None,
+                 priority: int = 100) -> None:
         if name in self._hooks:
             raise HookAlreadyRegisteredError(
-                f"Hook '{name}' already registered for '{self._hooks[name].event_type}'"
+                f"Hook '{name}' already registered for "
+                f"'{self._hooks[name].event_type}'"
             )
         self._hooks[name] = HookRegistration(
             name=name, event_type=event_type,
-            selector=selector or HookSelector.all_tools(),
             handler=handler,
+            selector=selector or HookSelector.all_tools(),
+            priority=priority,
         )
         self._revision += 1
 
@@ -76,7 +70,7 @@ class HookRegistry:
         self._revision += 1
 
     def snapshot(self) -> RegistrySnapshot:
-        """Capture current revision.  Task binds to this snapshot."""
+        """Capture current revision. Task binds to this snapshot."""
         return RegistrySnapshot(
             revision=self._revision,
             hooks=tuple(self._hooks.values()),
@@ -84,9 +78,9 @@ class HookRegistry:
 
     def get_hooks(self, snapshot: RegistrySnapshot | None,
                   event_type: str, tool_name: str = "") -> list[HookRegistration]:
-        """Get hooks for *event_type* from *snapshot*.
+        """Get hooks for *event_type*, sorted by priority (ascending).
 
-        If snapshot is None, uses the current state.
+        If snapshot is None, uses current state.
         Filters by selector if tool_name is provided.
         """
         hooks = (
@@ -98,6 +92,7 @@ class HookRegistry:
             if h.event_type == event_type
             and (not tool_name or h.selector.selects(tool_name))
         ]
+        matching.sort(key=lambda h: h.priority)
         return matching
 
     @property

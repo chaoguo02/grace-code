@@ -27,6 +27,7 @@ class RunTerminalStatus(StrEnum):
 class RunSubmittedV1:
     run_id: RunId
     turn_index: int = 0
+    turn_id: str = ""
 
     def __post_init__(self) -> None:
         if self.turn_index < 0:
@@ -90,8 +91,10 @@ class RunGaveUpV1:
 
 # ── Factory helpers ─────────────────────────────────────────────────────────
 
-def submitted(run_id: str, turn_index: int = 0) -> RunSubmittedV1:
-    return RunSubmittedV1(run_id=RunId(run_id), turn_index=turn_index)
+def submitted(run_id: str, turn_index: int = 0,
+              turn_id: str = "") -> RunSubmittedV1:
+    return RunSubmittedV1(run_id=RunId(run_id), turn_index=turn_index,
+                          turn_id=turn_id)
 
 def started(run_id: str, turn_index: int = 0) -> RunStartedV1:
     return RunStartedV1(run_id=RunId(run_id), turn_index=turn_index)

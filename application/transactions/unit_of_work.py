@@ -6,7 +6,9 @@ Protocol only.  No SQLite, no server imports.  Eliminates agent→server depende
 
 from __future__ import annotations
 
-from typing import Protocol, Callable
+from typing import Protocol, Callable, TypeVar
+
+T = TypeVar("T")
 
 
 class TransactionError(RuntimeError):
@@ -20,6 +22,26 @@ class SessionTransaction(Protocol):
     commit atomically or roll back together.
     """
 
+    # ── State mutation methods ───────────────────────────────────────────
+
+    def increment_generation(self, session_id) -> int:
+        """Increment session's run_generation, return the NEW turn_index.
+
+        Must be called inside a transaction.  Raises ValueError if session
+        does not exist.
+        """
+        ...
+
+    def create_run(self, *, run_id, session_id, turn_id, turn_index,
+                   idempotency_key: str, prompt: str) -> None:
+        """Insert a row into the runs table with status='queued'."""
+        ...
+
+    def insert_message(self, *, session_id, role: str, content: str,
+                       turn_id: str) -> None:
+        """Insert a row into session_messages."""
+        ...
+
     def append_fact(self, envelope) -> None:
         """Append a durable fact event to the outbox.
 
@@ -27,6 +49,8 @@ class SessionTransaction(Protocol):
         This is NOT a dict passthrough.
         """
         ...
+
+    # ── Transaction control ──────────────────────────────────────────────
 
     def commit(self) -> None:
         """Commit the transaction.  Raises TransactionError on failure."""
@@ -41,14 +65,18 @@ class SessionUnitOfWork(Protocol):
     """Transaction boundary for one session-scoped operation.
 
     Usage:
-        uow.execute(lambda tx: (
+        result = uow.execute(lambda tx: (
+            tx.increment_generation(sid),
+            tx.create_run(...),
+            tx.insert_message(...),
             tx.append_fact(envelope),
-            # ... other state writes via tx methods
         ))
     """
 
-    def execute(self, fn: Callable[[SessionTransaction], None]) -> None:
+    def execute(self, fn: Callable[[SessionTransaction], T]) -> T:
         """Run *fn* in a transaction.  Commit on success, rollback on error.
+
+        Returns whatever *fn* returns.
 
         Raises:
             TransactionError: if commit fails.

@@ -144,47 +144,139 @@ def submit_run_turn(
 
 def _submit_via_coordinator(storage, *, session_id: str, prompt: str,
                             idempotency_key: str = "") -> SubmittedRun:
-    """P19: Route run submission through the new RunCoordinator."""
+    """P19: Route run submission through the new RunCoordinator.
+
+    Pre-checks (idempotency, active-run) execute on a read connection.
+    The happy-path transaction runs through RunCoordinator.submit() which
+    orchestrates: increment_generation → create_run → insert_message →
+    append_fact — all in one SQLite transaction via SqliteOutboxStore.
+    """
     from core.eventing.identifiers import SessionId
     from application.commands.run_commands import SubmitRun
     from application.coordinators.run_coordinator import RunCoordinator
+    from application.events.schema_registry import SchemaRegistry
     from runtime_core.runtime import AgentRuntime
     from runtime_core.ports import RuntimePorts
-    from application.transactions.unit_of_work import SessionUnitOfWork
+    from infrastructure.outbox.sqlite_store import SqliteOutboxStore
 
-    # Build coordinator with the storage-backed UoW
+    key = idempotency_key.strip()
+    db_path = storage._db_path
+
+    # ── Pre-checks (read-only, same semantics as LEGACY path) ──────────
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        if key:
+            existing = conn.execute(
+                """SELECT id, turn_id, turn_index, prompt
+                   FROM runs WHERE session_id = ? AND idempotency_key = ?""",
+                (session_id, key),
+            ).fetchone()
+            if existing is not None:
+                if existing["prompt"] != prompt:
+                    raise IdempotencyConflictError(
+                        "idempotency key reused with different prompt"
+                    )
+                return SubmittedRun(
+                    run_id=existing["id"],
+                    turn_id=existing["turn_id"],
+                    turn_index=int(existing["turn_index"]),
+                    created=False,
+                )
+
+        active = conn.execute(
+            """SELECT id FROM runs
+               WHERE session_id = ? AND status IN ('queued', 'running')
+               LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+        if active is not None:
+            raise RunAlreadyActiveError("RUN_ALREADY_ACTIVE")
+    finally:
+        conn.close()
+
+    # ── Happy path: coordinator in real transaction ────────────────────
+    registry = SchemaRegistry()
+
     class _StorageUoW:
         def execute(self, fn):
-            conn = sqlite3.connect(storage._db_path)
-            conn.row_factory = sqlite3.Row
+            conn2 = sqlite3.connect(db_path)
+            conn2.row_factory = sqlite3.Row
+            outbox = SqliteOutboxStore(db_path, registry)
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                fn(_StorageTx(conn))
-                conn.commit()
+                conn2.execute("BEGIN IMMEDIATE")
+                result = fn(_StorageTx(conn2, outbox))
+                conn2.commit()
+                return result
             except Exception:
-                conn.rollback()
+                conn2.rollback()
                 raise
             finally:
-                conn.close()
+                conn2.close()
 
     class _StorageTx:
-        def __init__(self, conn):
+        __slots__ = ("conn", "_outbox")
+
+        def __init__(self, conn, outbox_store):
             self.conn = conn
+            self._outbox = outbox_store
+
+        @staticmethod
+        def _to_str(value) -> str:
+            return str(value.value) if hasattr(value, 'value') else str(value)
+
+        def increment_generation(self, session_id) -> int:
+            sid = self._to_str(session_id)
+            self.conn.execute(
+                "UPDATE sessions SET run_generation = run_generation + 1 WHERE id = ?",
+                (sid,),
+            )
+            row = self.conn.execute(
+                "SELECT run_generation FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown session: {sid}")
+            return int(row["run_generation"])
+
+        def create_run(self, *, run_id, session_id, turn_id, turn_index,
+                       idempotency_key: str, prompt: str) -> None:
+            now = datetime.now(timezone.utc).isoformat()
+            sid = self._to_str(session_id)
+            rid = self._to_str(run_id)
+            self.conn.execute(
+                """INSERT INTO runs
+                   (id, session_id, turn_id, turn_index, idempotency_key, prompt,
+                    status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                (rid, sid, turn_id, turn_index, idempotency_key, prompt, now, now),
+            )
+
+        def insert_message(self, *, session_id, role: str, content: str,
+                           turn_id: str) -> None:
+            now = datetime.now(timezone.utc).isoformat()
+            sid = self._to_str(session_id)
+            self.conn.execute(
+                """INSERT INTO session_messages
+                   (session_id, role, content, turn_id, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (sid, role, content, turn_id, now),
+            )
+
         def append_fact(self, envelope) -> None:
-            pass  # OutboxStore integration in next iteration
+            self._outbox.append(self.conn, envelope)
 
     uow = _StorageUoW()
     rt = AgentRuntime(RuntimePorts())
     coord = RunCoordinator(rt, uow)
 
     cmd = SubmitRun(session_id=SessionId(session_id), prompt=prompt,
-                    idempotency_key=idempotency_key)
+                    idempotency_key=key)
     envelope = coord.submit(cmd)
 
-    run_id = str(envelope.aggregate_id)
+    payload = envelope.payload
     return SubmittedRun(
-        run_id=run_id,
-        turn_id=str(envelope.event_id),
-        turn_index=0,
+        run_id=str(envelope.aggregate_id),
+        turn_id=payload.turn_id,
+        turn_index=payload.turn_index,
         created=True,
     )

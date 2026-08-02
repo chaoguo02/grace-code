@@ -49,15 +49,35 @@ class RunCoordinator:
         ))
 
     def submit(self, cmd: SubmitRun) -> EventEnvelope:
-        """Submit a new run.  Creates Run + RunSubmitted fact in one UoW."""
+        """Submit a new run.  Creates Run + Message + RunSubmitted fact in one UoW.
+
+        State mutation (increment_generation, create_run, insert_message)
+        and fact append (append_fact) share the same transaction.
+        """
         run_id = RunId(str(uuid.uuid4()))
+        turn_id = str(uuid.uuid4())
         scope = self._scope_factory(cmd.session_id)
-        envelope = _envelope_for(
-            "run.submitted.v1", scope, run_id, 1,
-            submitted(str(run_id)),
-        )
-        self._uow.execute(lambda tx: tx.append_fact(envelope))
-        return envelope
+
+        def _mutate(tx) -> EventEnvelope:
+            turn_index = tx.increment_generation(cmd.session_id)
+            tx.create_run(
+                run_id=run_id, session_id=cmd.session_id,
+                turn_id=turn_id, turn_index=turn_index,
+                idempotency_key=cmd.idempotency_key, prompt=cmd.prompt,
+            )
+            tx.insert_message(
+                session_id=cmd.session_id, role="user",
+                content=cmd.prompt, turn_id=turn_id,
+            )
+            envelope = _envelope_for(
+                "run.submitted.v1", scope, run_id, 1,
+                submitted(str(run_id), turn_index=turn_index,
+                          turn_id=turn_id),
+            )
+            tx.append_fact(envelope)
+            return envelope
+
+        return self._uow.execute(_mutate)
 
     def execute(self, cmd: ExecuteRun) -> RuntimeOutcome:
         """Execute a run via Runtime."""

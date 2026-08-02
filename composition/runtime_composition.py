@@ -25,8 +25,8 @@ class RuntimeComposition:
     def assemble(self) -> dict:
         """Return a dict of assembled components, keyed by role name.
 
-        P19: Wired to run_submission.py via GRACE_RUNTIME_MODE=NATIVE.
-        P20-P22: Multi-agent, Context, Worktree extraction pending.
+        When mode is NATIVE or SHADOW, the returned dict includes a fully
+        wired pipeline: OutboxRelay → ScopedEventBus → Projections.
         """
         components: dict = {"mode": self._mode}
 
@@ -41,27 +41,118 @@ class RuntimeComposition:
             from listeners.projection_runner import ProjectionRunner
             from listeners.ws_gateway import WsGateway
             from listeners.stats_projection import StatsProjection
+            from eventing.scoped_bus import ScopedEventBus
 
             registry = SchemaRegistry()
             outbox = SqliteOutboxStore(self._db_path, registry)
+            bus = ScopedEventBus()
+
+            # ── Projections ──────────────────────────────────────────
             trace = TraceProjection(self._db_path)
             stats = StatsProjection()
-            runner = ProjectionRunner([trace, stats])
             ws_gw = WsGateway()
-            ports = RuntimePorts()
 
+            # Subscribe projections to the bus (GLOBAL scope — they
+            # receive all events; scope filtering is per-session via
+            # the bus's own publish logic which matches envelope.scope).
+            bus.subscribe("run.submitted.v1", trace.on_event, "trace")
+            bus.subscribe("run.started.v1", trace.on_event, "trace")
+            bus.subscribe("run.completed.v1", trace.on_event, "trace")
+            bus.subscribe("run.failed.v1", trace.on_event, "trace")
+            bus.subscribe("run.cancelled.v1", trace.on_event, "trace")
+            bus.subscribe("run.blocked.v1", trace.on_event, "trace")
+            bus.subscribe("run.gave_up.v1", trace.on_event, "trace")
+
+            for et in registry.registered_types:
+                if et.startswith("run."):
+                    bus.subscribe(et, stats.on_event, "stats")
+                    bus.subscribe(et, ws_gw.on_event, "ws_gateway")
+
+            # ── Delivery pipeline ────────────────────────────────────
             def _deliver(record):
-                pass  # P19: envelope reconstruction pending mapper
+                """Decode outbox JSON → typed EventEnvelope → publish to bus.
+
+                Exceptions MUST propagate so the Relay can reschedule/DLQ
+                instead of falsely marking the event as delivered.
+                """
+                envelope = registry.decode(record.payload_json)
+                bus.publish(envelope)
 
             relay = OutboxRelay(outbox, _deliver)
-            runtime = AgentRuntime(ports)
-            coordinator = RunCoordinator(runtime, None)
+            runtime = AgentRuntime(RuntimePorts())
+            coordinator = RunCoordinator(runtime, None)  # UoW injected per-request
 
             for k, v in [
                 ("registry", registry), ("outbox", outbox), ("relay", relay),
-                ("runtime", runtime), ("coordinator", coordinator),
+                ("bus", bus), ("runtime", runtime), ("coordinator", coordinator),
                 ("trace", trace), ("stats", stats), ("ws_gateway", ws_gw),
             ]:
                 components[k] = v
 
         return components
+
+
+def start_native_pipeline(db_path: str) -> dict:
+    """Start the native event pipeline: OutboxRelay → ScopedEventBus → Projections.
+
+    Call this once at server startup when GRACE_RUNTIME_MODE=NATIVE.
+    Returns a dict with {'relay', 'bus', 'shutdown'} — call shutdown() to stop.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    from application.events.schema_registry import SchemaRegistry
+    from infrastructure.outbox.sqlite_store import SqliteOutboxStore
+    from infrastructure.outbox.relay import OutboxRelay
+    from listeners.trace_projection import TraceProjection
+    from listeners.stats_projection import StatsProjection
+    from listeners.ws_gateway import WsGateway
+    from eventing.scoped_bus import ScopedEventBus
+
+    registry = SchemaRegistry()
+    outbox = SqliteOutboxStore(db_path, registry)
+    bus = ScopedEventBus()
+
+    # Install outbox DDL
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    try:
+        SqliteOutboxStore.install(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Projections
+    trace = TraceProjection(db_path)
+    stats = StatsProjection()
+    ws_gw = WsGateway()
+
+    # Subscribe projections to run events
+    for et in registry.registered_types:
+        if et.startswith("run."):
+            bus.subscribe(et, trace.on_event, "trace")
+            bus.subscribe(et, stats.on_event, "stats")
+            bus.subscribe(et, ws_gw.on_event, "ws_gateway")
+
+    # Delivery: decode outbox JSON → typed envelope → publish to bus
+    # Exceptions MUST propagate so Relay reschedules/DLQs instead of false ACK.
+    def _deliver(record):
+        envelope = registry.decode(record.payload_json)
+        sid = envelope.scope.session_id
+        if sid is not None:
+            try:
+                bus.ensure_session(sid)
+            except Exception:
+                pass  # session already ensured is harmless
+        bus.publish(envelope)
+
+    relay = OutboxRelay(outbox, _deliver)
+    relay.start()
+    logger.info("Native event pipeline started (relay=%s)", relay._worker_id)
+
+    def shutdown():
+        relay.stop()
+        logger.info("Native event pipeline stopped")
+
+    return {"relay": relay, "bus": bus, "trace": trace, "stats": stats,
+            "ws_gateway": ws_gw, "shutdown": shutdown}

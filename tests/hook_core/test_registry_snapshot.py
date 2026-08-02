@@ -1,8 +1,8 @@
-"""P10: Hook Registry — acceptance tests.
+"""Hook Registry — acceptance tests.
 
 AC: Registration creates new revision.
 AC: Snapshot is immune to subsequent registrations.
-AC: Matcher compile failure raises MatcherCompileError.
+AC: Matcher uses CC syntax (no regex).
 AC: Duplicate registration raises HookAlreadyRegisteredError.
 """
 
@@ -22,15 +22,34 @@ def _noop(_input) -> None:
 
 class TestMatcher:
 
-    def test_valid_pattern(self):
-        m = HookMatcher(r"^(Write|Edit)$")
-        assert m.matches("Write")
-        assert m.matches("Edit")
+    def test_exact_match(self):
+        m = HookMatcher("Bash")
+        assert m.matches("Bash")
+        assert not m.matches("BashRead")
         assert not m.matches("Read")
 
-    def test_invalid_pattern_rejected(self):
-        with pytest.raises(MatcherCompileError):
-            HookMatcher("[unclosed")
+    def test_pipe_separated(self):
+        m = HookMatcher("Edit|Write|NotebookEdit")
+        assert m.matches("Edit")
+        assert m.matches("Write")
+        assert m.matches("NotebookEdit")
+        assert not m.matches("Read")
+
+    def test_prefix_wildcard(self):
+        m = HookMatcher("mcp__github__*")
+        assert m.matches("mcp__github__search")
+        assert m.matches("mcp__github__push")
+        assert not m.matches("Bash")
+        assert not m.matches("mcp__gitlab__search")
+
+    def test_match_all(self):
+        assert HookMatcher("*").matches("anything")
+        assert HookMatcher("").matches("anything")
+
+    def test_regex_metacharacters_rejected(self):
+        for bad in [".*", "foo.bar", "^Bash$", "[abc]", "foo?", "foo+"]:
+            with pytest.raises(MatcherCompileError, match="regex"):
+                HookMatcher(bad)
 
     def test_selector_all_tools(self):
         sel = HookSelector.all_tools()
@@ -40,6 +59,12 @@ class TestMatcher:
         sel = HookSelector.matching("Bash")
         assert sel.selects("Bash")
         assert not sel.selects("Read")
+
+    def test_selector_multiple(self):
+        sel = HookSelector.matching("Bash", "Read")
+        assert sel.selects("Bash")
+        assert sel.selects("Read")
+        assert not sel.selects("Write")
 
 
 class TestRegistry:
@@ -91,3 +116,11 @@ class TestRegistry:
         assert len(hooks) == 1
         hooks2 = reg.get_hooks(None, "PreToolUse", tool_name="Read")
         assert len(hooks2) == 0
+
+    def test_hooks_sorted_by_priority(self):
+        reg = HookRegistry()
+        reg.register("low", "PreToolUse", _noop, priority=200)
+        reg.register("high", "PreToolUse", _noop, priority=10)
+        hooks = reg.get_hooks(None, "PreToolUse")
+        assert hooks[0].name == "high"
+        assert hooks[1].name == "low"
