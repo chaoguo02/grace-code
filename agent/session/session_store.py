@@ -2233,8 +2233,11 @@ class SessionStore:
 
         try:
             outbox = OutboxStore(self._db_path)
+            # P0-1: ensure_tables uses executescript() which implicitly commits.
+            # MUST be called BEFORE BEGIN IMMEDIATE, outside the transaction.
+            with self._connect() as schema_conn:
+                outbox.ensure_tables(schema_conn)
             with self._connect() as conn:
-                outbox.ensure_tables(conn)
                 conn.execute("BEGIN IMMEDIATE")
 
                 cur = conn.execute(
