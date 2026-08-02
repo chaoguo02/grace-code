@@ -1426,7 +1426,7 @@ class SessionStore:
         report_count: int = 0,
         verification: dict[str, object] | None = None,
     ) -> dict[str, object] | None:
-        """Atomically CAS a delegation terminal state and append its trace.
+        """Atomically CAS a delegation terminal state and append its outbox fact.
 
         A successful call is the only path that creates ``delegation_completed``.
         Concurrent/stale callers lose the CAS and therefore cannot persist or
@@ -1435,6 +1435,10 @@ class SessionStore:
         """
         if status not in {"completed", "partial", "failed", "cancelled"}:
             raise ValueError(f"Invalid delegation terminal status: {status}")
+        from server.services.event_outbox import OutboxStore
+
+        outbox = OutboxStore(self._db_path)
+        outbox.install()
         now = _utc_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1473,40 +1477,26 @@ class SessionStore:
             if cursor.rowcount != 1:
                 conn.execute("ROLLBACK")
                 return None
-            seq_row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM session_trace_events "
-                "WHERE session_id = ?",
-                (str(row["parent_session_id"]),),
-            ).fetchone()
-            sequence = int(seq_row[0]) if seq_row else 1
             event = {
                 "type": "delegation_completed",
                 "session_id": str(row["parent_session_id"]),
                 "run_id": str(row["parent_run_id"]),
                 "delegation_run_id": run_id,
                 "event_id": f"delegation-terminal:{run_id}:{next_version}",
-                "sequence": sequence,
-                "seq": sequence,
                 "timestamp": now,
                 "status": status,
                 "phase": phase,
                 "report_count": report_count,
                 "version": next_version,
             }
-            conn.execute(
-                """
-                INSERT INTO session_trace_events (
-                    session_id, seq, event_type, timestamp, event_json,
-                    source, child_session_id
-                ) VALUES (?, ?, 'delegation_completed', ?, ?,
-                          'delegation_terminal', '')
-                """,
-                (
-                    str(row["parent_session_id"]),
-                    sequence,
-                    now,
-                    json.dumps(event, ensure_ascii=False),
-                ),
+            outbox.append_event(
+                conn,
+                event["event_id"],
+                "delegation.completed",
+                str(row["parent_session_id"]),
+                run_id,
+                next_version,
+                json.dumps(event, ensure_ascii=False),
             )
             conn.execute("COMMIT")
             return event
@@ -2127,69 +2117,7 @@ class SessionStore:
             logging.getLogger(__name__).exception("Failed to update run %s", run_id)
             return False
 
-    def transactional_finalize_run(
-        self,
-        run_id: str,
-        terminal_event: dict,
-        session_id: str,
-        *,
-        summary: str = "",
-        steps_taken: int = 0,
-        total_tokens: int = 0,
-        error: str = "",
-        expect_status: str = "running",
-    ) -> dict | None:
-        """CAS-update Run + insert run_terminal trace in ONE transaction.
-
-        Returns terminal_event dict with ``sequence`` injected,
-        or None if CAS failed.
-        """
-        import json as _json
-        try:
-            with self._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-
-                cur = conn.execute(
-                    """UPDATE runs SET status = ?, summary = ?, steps_taken = ?,
-                       total_tokens = ?, error = ?, completed_at = ?,
-                       updated_at = ?
-                       WHERE id = ? AND status = ?""",
-                    (terminal_event.get("status", "completed"),
-                     summary, steps_taken, total_tokens, error,
-                     _utc_now(), _utc_now(),
-                     run_id, expect_status),
-                )
-                if cur.rowcount != 1:
-                    conn.execute("ROLLBACK")
-                    return None
-
-                row = conn.execute(
-                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM session_trace_events WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                sequence = row[0] if row else 1
-
-                stored = {**terminal_event, "seq": sequence, "sequence": sequence}
-                conn.execute(
-                    """INSERT INTO session_trace_events
-                       (session_id, seq, event_type, timestamp, event_json, source, child_session_id)
-                       VALUES (?, ?, ?, ?, ?, 'run_terminal', ?)""",
-                    (session_id, sequence,
-                     str(terminal_event.get("type") or "run_terminal"),
-                     str(terminal_event.get("timestamp") or ""),
-                     _json.dumps(stored, ensure_ascii=False),
-                     str(terminal_event.get("child_session_id") or "")),
-                )
-
-                conn.execute("COMMIT")
-                return stored
-        except Exception:
-            import logging
-            logging.getLogger(__name__).exception(
-                "Failed to transactional_finalize_run %s", run_id)
-            return None
-
-    def transactional_finalize_run_v2(
+    def finalize_run_with_event(
         self,
         run_id: str,
         session_id: str,
@@ -2199,6 +2127,7 @@ class SessionStore:
         steps_taken: int = 0,
         total_tokens: int = 0,
         error: str = "",
+        event_payload: dict | None = None,
         expect_status: str = "running",
     ) -> bool:
         """R3.3: CAS-update Run + INSERT outbox event in ONE transaction.
@@ -2206,47 +2135,42 @@ class SessionStore:
         Returns True if CAS succeeded and outbox was written.
         The trace projection will pick up the outbox event separately.
         """
-        # S5: Outbox is the default. Legacy path retained for one cycle.
-        import os as _os
-        if _os.environ.get("GRACE_LEGACY_TERMINAL_EVENTS") == "1":
-            result = self.transactional_finalize_run(
-                run_id=run_id,
-                terminal_event={"type": f"run_{status}", "status": status},
-                session_id=session_id,
-                summary=summary, steps_taken=steps_taken,
-                total_tokens=total_tokens, error=error,
-                expect_status=expect_status,
-            )
-            return result is not None
-
         from server.services.event_outbox import OutboxStore
         import json as _json
         import uuid as _uuid
 
         event_id = str(_uuid.uuid4())
         event_type = f"run.{status}"
-        payload = _json.dumps({
+        terminal_payload = {
             "status": status, "summary": summary,
             "steps_taken": steps_taken, "total_tokens": total_tokens,
             "error": error,
-        }, ensure_ascii=False)
+        }
+        terminal_payload.update(event_payload or {})
+        payload = _json.dumps(terminal_payload, ensure_ascii=False)
 
         try:
             outbox = OutboxStore(self._db_path)
-            # P0-1: ensure_tables uses executescript() which implicitly commits.
-            # MUST be called BEFORE BEGIN IMMEDIATE, outside the transaction.
-            with self._connect() as schema_conn:
-                outbox.ensure_tables(schema_conn)
+            outbox.install()
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
 
                 cur = conn.execute(
                     """UPDATE runs SET status = ?, summary = ?, steps_taken = ?,
-                       total_tokens = ?, error = ?, completed_at = ?,
-                       updated_at = ?
+                       total_tokens = ?, error = ?, termination_reason = ?,
+                       verification_status = ?, verification_reason = ?,
+                       verification_checks_json = ?, workspace_delta_json = ?,
+                       completed_at = ?, updated_at = ?
                        WHERE id = ? AND status = ?""",
-                    (status, summary, steps_taken, total_tokens, error,
-                     _utc_now(), _utc_now(), run_id, expect_status),
+                    (
+                        status, summary, steps_taken, total_tokens, error,
+                        terminal_payload.get("termination_reason", "none"),
+                        terminal_payload.get("verification_status", "not_applicable"),
+                        terminal_payload.get("verification_reason", "none"),
+                        _json.dumps(terminal_payload.get("verification", {}).get("checks", []), ensure_ascii=False),
+                        _json.dumps(terminal_payload.get("workspace_delta", {}), ensure_ascii=False),
+                        _utc_now(), _utc_now(), run_id, expect_status,
+                    ),
                 )
                 if cur.rowcount != 1:
                     conn.execute("ROLLBACK")
@@ -2262,9 +2186,49 @@ class SessionStore:
         except Exception:
             import logging
             logging.getLogger(__name__).exception(
-                "Failed to transactional_finalize_run_v2 %s", run_id)
+                "Failed to finalize_run_with_event %s", run_id)
             return False
-            return None
+
+    def start_run_with_event(
+        self,
+        run_id: str,
+        session_id: str,
+        *,
+        turn_id: str = "",
+        turn_index: int = 0,
+    ) -> bool:
+        """CAS queued->running and append run.started atomically."""
+        from server.domain_events import DomainEvent
+        from server.services.event_outbox import OutboxStore
+
+        outbox = OutboxStore(self._db_path)
+        outbox.install()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    "UPDATE runs SET status='running', updated_at=? "
+                    "WHERE id=? AND status='queued'",
+                    (_utc_now(), run_id),
+                )
+                if cur.rowcount != 1:
+                    conn.execute("ROLLBACK")
+                    return False
+                outbox.append(conn, DomainEvent(
+                    event_type="run.started",
+                    session_id=session_id,
+                    aggregate_id=run_id,
+                    aggregate_version=2,
+                    payload={"turn_id": turn_id, "turn_index": turn_index},
+                ))
+                conn.execute("COMMIT")
+                return True
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Failed to start_run_with_event %s", run_id,
+            )
+            return False
 
     def update_metadata(
         self, session_id: str, extra: dict[str, Any]

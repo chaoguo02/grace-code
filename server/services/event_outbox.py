@@ -55,6 +55,11 @@ class OutboxStore:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
 
+    def install(self) -> None:
+        """Install schema outside any business transaction."""
+        with self._connect() as conn:
+            self.ensure_tables(conn)
+
     # ── schema ──────────────────────────────────────────────────────────
 
     @staticmethod
@@ -97,38 +102,49 @@ class OutboxStore:
 
         *event* must be a DomainEvent with to_dict().
         """
-        self.ensure_tables(conn)
         d = event.to_dict()
-        conn.execute(
-            """INSERT OR IGNORE INTO event_outbox
+        self._insert_idempotent(conn, (
+            d["event_id"], d["event_type"], d.get("event_version", 1),
+            d["session_id"], d["aggregate_id"],
+            d.get("aggregate_version", 1),
+            _normalize_json(d.get("payload", {})),
+            d.get("occurred_at", _utc_now()), _utc_now(),
+        ))
+
+    def _insert_idempotent(
+        self, conn: sqlite3.Connection, values: tuple,
+    ) -> None:
+        try:
+            conn.execute(
+                """INSERT INTO event_outbox
                (event_id, event_type, event_version, session_id,
                 aggregate_id, aggregate_version, payload_json,
                 occurred_at, available_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                d["event_id"], d["event_type"], d.get("event_version", 1),
-                d["session_id"], d["aggregate_id"],
-                d.get("aggregate_version", 1),
-                json.dumps(d.get("payload", {}), ensure_ascii=False),
-                d.get("occurred_at", _utc_now()), _utc_now(),
-            ),
-        )
+                values,
+            )
+        except sqlite3.IntegrityError as exc:
+            existing = conn.execute(
+                """SELECT event_type, event_version, session_id, aggregate_id,
+                          aggregate_version, payload_json
+                   FROM event_outbox WHERE event_id=?""",
+                (values[0],),
+            ).fetchone()
+            if existing is not None and tuple(existing) == tuple(values[1:7]):
+                return
+            raise ValueError(
+                f"event_id {values[0]!r} reused with different event data"
+            ) from exc
 
     def append_event(self, conn: sqlite3.Connection, event_id: str,
                      event_type: str, session_id: str, aggregate_id: str,
                      aggregate_version: int, payload_json: str) -> None:
         """Low-level append for callers without DomainEvent objects."""
-        self.ensure_tables(conn)
-        conn.execute(
-            """INSERT OR IGNORE INTO event_outbox
-               (event_id, event_type, event_version, session_id,
-                aggregate_id, aggregate_version, payload_json,
-                occurred_at, available_at)
-               VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)""",
-            (event_id, event_type, session_id, aggregate_id,
-             aggregate_version, payload_json,
-             _utc_now(), _utc_now()),
-        )
+        now = _utc_now()
+        self._insert_idempotent(conn, (
+            event_id, event_type, 1, session_id, aggregate_id,
+            aggregate_version, _normalize_json(payload_json), now, now,
+        ))
 
     # ── claim / deliver ─────────────────────────────────────────────────
 
@@ -138,6 +154,7 @@ class OutboxStore:
         now = _utc_now()
         lease_expiry = _utc_now_offset(-lease_s)
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             # Release expired claims first
             conn.execute(
                 """UPDATE event_outbox SET status='pending',
@@ -198,9 +215,17 @@ class OutboxStore:
             )
             return cursor.rowcount > 0
 
-    def release_expired_claims(self, now: str | None = None) -> int:
-        """Release claims older than lease (60s default). Returns count."""
-        expiry = _utc_now_offset(-60.0)
+    def release_expired_claims(
+        self, now: str | None = None, *, lease_s: float = 60.0,
+    ) -> int:
+        """Release claims older than *lease_s*. Returns count."""
+        if now is None:
+            expiry = _utc_now_offset(-lease_s)
+        else:
+            from datetime import datetime, timedelta
+            expiry = (
+                datetime.fromisoformat(now) - timedelta(seconds=lease_s)
+            ).isoformat()
         with self._connect() as conn:
             cursor = conn.execute(
                 """UPDATE event_outbox SET status='pending',
@@ -230,10 +255,33 @@ class OutboxStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def try_record_projection(
+        conn: sqlite3.Connection, consumer_name: str, event_id: str,
+    ) -> bool:
+        """Insert a receipt in the caller's projection transaction."""
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO event_projection_receipts
+               (consumer_name, event_id, processed_at)
+               VALUES (?, ?, ?)""",
+            (consumer_name, event_id, _utc_now()),
+        )
+        return cursor.rowcount == 1
+
+    def count_undelivered(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) FROM event_outbox
+                   WHERE status IN ('pending', 'claimed')"""
+            ).fetchone()
+            return int(row[0]) if row else 0
+
     # ── internal ────────────────────────────────────────────────────────
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -256,40 +304,58 @@ class OutboxRelay:
         self._task: asyncio.Task | None = None
 
     async def start(self) -> None:
+        if self._running:
+            return
         self._running = True
         self._task = asyncio.ensure_future(self._poll_loop())
 
     async def stop(self, drain_timeout_s: float = 10.0) -> int:
         self._running = False
         if self._task is not None:
-            self._task.cancel()
             try:
-                await self._task
+                # Let an in-flight projection finish and acknowledge its
+                # claim. Cancelling asyncio.to_thread does not stop the worker
+                # thread and can otherwise create a false shutdown gap.
+                await asyncio.wait_for(
+                    asyncio.shield(self._task),
+                    timeout=min(drain_timeout_s, self.POLL_INTERVAL_S + 5.0),
+                )
+            except asyncio.TimeoutError:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
             except asyncio.CancelledError:
                 pass
+            finally:
+                self._task = None
         # Final drain of claimed events
         deadline = time.monotonic() + drain_timeout_s
-        delivered = 0
         while time.monotonic() < deadline:
-            batch = self._store.claim_batch(self._worker_id, limit=50, lease_s=5.0)
+            batch = await asyncio.to_thread(
+                self._store.claim_batch, self._worker_id, 50, 5.0,
+            )
             if not batch:
                 break
             for record in batch:
-                self._deliver_one(record)
-                delivered += 1
-        return delivered
+                await asyncio.to_thread(self._deliver_one, record)
+        return await asyncio.to_thread(self._store.count_undelivered)
 
     async def _poll_loop(self) -> None:
         while self._running:
-            batch = self._store.claim_batch(self._worker_id, limit=20, lease_s=60.0)
+            batch = await asyncio.to_thread(
+                self._store.claim_batch, self._worker_id, 20, 60.0,
+            )
             for record in batch:
-                self._deliver_one(record)
+                await asyncio.to_thread(self._deliver_one, record)
             await asyncio.sleep(self.POLL_INTERVAL_S)
 
     def _deliver_one(self, record: OutboxRecord) -> None:
         try:
-            self._deliver(record.payload)
-            self._store.mark_delivered(record.event_id, self._worker_id)
+            self._deliver(record)
+            if not self._store.mark_delivered(record.event_id, self._worker_id):
+                raise RuntimeError("outbox claim was lost before acknowledgement")
         except Exception as exc:
             new_attempts = record.attempts + 1
             if new_attempts >= self.MAX_ATTEMPTS:
@@ -313,6 +379,13 @@ def _utc_now() -> str:
 def _utc_now_offset(offset_s: float) -> str:
     from datetime import timedelta
     return (datetime.now(timezone.utc) + timedelta(seconds=offset_s)).isoformat()
+
+def _normalize_json(value: object) -> str:
+    if isinstance(value, str):
+        value = json.loads(value)
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
 
 def _row_to_record(row) -> OutboxRecord:
     return OutboxRecord(

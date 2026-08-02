@@ -65,21 +65,16 @@ def test_planner_downgrades_conflicting_writes_and_budget():
     assert low_budget.reason_code == "delegation_budget_insufficient"
 
 
-def test_team_and_nested_require_explicit_gates():
-    team_shape = _shape(
+def test_peer_coordination_uses_parent_mediated_fanout_and_nested_is_gated():
+    peer_shape = _shape(
         WorkItem("a", "Challenge A", "repo"),
         WorkItem("b", "Challenge B", "repo"),
         coordination_need=CoordinationNeed.PEER_TO_PEER,
     )
-    disabled = TopologyPlanner().plan(team_shape)
-    assert disabled.topology is AgentTopology.FAN_OUT_FAN_IN
-    assert disabled.downgraded_from is AgentTopology.TEAM
-    assert disabled.reason_code == "team_feature_disabled"
-
-    approved = TopologyPlanner().plan(
-        team_shape, TopologyPolicy(team_enabled=True, team_approved=True)
-    )
-    assert approved.topology is AgentTopology.TEAM
+    decision = TopologyPlanner().plan(peer_shape)
+    assert decision.topology is AgentTopology.FAN_OUT_FAN_IN
+    assert decision.downgraded_from is None
+    assert decision.reason_code == "independent_work_items"
 
     nested_shape = _shape(
         *(WorkItem(str(i), f"Inspect {i}", "repo") for i in range(5)),
@@ -113,4 +108,3 @@ def test_fanout_is_capped_by_concurrency_and_budget():
     assert decision.topology is AgentTopology.FAN_OUT_FAN_IN
     assert len(decision.work_items) == 2
     assert decision.estimated_budget.max_workers == 2
-

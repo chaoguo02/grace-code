@@ -384,25 +384,7 @@ class EventBus:
         are injected into every translated message as envelope fields.
         """
         try:
-            # S6: _persisted_event protocol — scheduled for outbox migration.
-            # Subagent code passes pre-persisted trace events through this path.
-            # TODO: replace with direct outbox INSERT in subagent CAS transaction.
-            persisted = (getattr(event, "payload", {}) or {}).get("_persisted_event")
             target_session_id = getattr(event, "session_id", None)
-            if isinstance(persisted, dict) and target_session_id:
-                # The run state and terminal trace were committed atomically by
-                # SessionStore. EventBus remains the sole live broadcast path,
-                # but must not persist the terminal event a second time.
-                if self.trace_cache is not None:
-                    try:
-                        self.trace_cache.append(target_session_id, persisted)
-                    except Exception:
-                        logger.debug("Trace cache append failed", exc_info=True)
-                with self._publish_lock:
-                    sub = self._sessions.get(target_session_id)
-                if sub is not None and sub.has_subscribers:
-                    sub.publish(persisted)
-                return
             msgs = _translate_event(event)
             if target_session_id:
                 for msg in msgs:
@@ -417,33 +399,18 @@ class EventBus:
         except Exception:
             logger.exception("EventBus.publish failed")
 
-    def publish_raw(
-        self,
-        session_id: str,
-        msg: dict[str, Any],
-        *,
-        run_context: Any = None,
-        skip_persist: bool = False,
-    ) -> None:
-        """DEPRECATED (R3.5): use publish_typed() instead.  Scheduled for removal."""
-        """Push a pre-formatted WS message to one session's subscribers.
+    def publish_live(self, session_id: str, msg: dict[str, Any]) -> None:
+        """Broadcast a projection of an already durable event.
 
-        When *skip_persist* is True, the message is broadcast directly
-        without inserting into session_trace_events.  Use this when the
-        event has already been persisted (e.g. run_terminal from
-        transactional_finalize_run).
+        This is the only persistence-free EventBus entry point. It is reserved
+        for the Outbox projection pipeline and must never accept business facts.
         """
-        try:
-            if skip_persist:
-                # ── Broadcast only — event already persisted ──
-                with self._publish_lock:
-                    sub = self._sessions.get(session_id)
-                if sub is not None and sub.has_subscribers:
-                    sub.publish(msg)
-            else:
-                self._publish_msg(session_id, msg, source="raw", run_context=run_context)
-        except Exception:
-            logger.exception("EventBus.publish_raw failed")
+        if not self._accepting:
+            return
+        with self._publish_lock:
+            sub = self._sessions.get(session_id)
+        if sub is not None and sub.has_subscribers:
+            sub.publish(dict(msg))
 
     def publish_typed(
         self, session_id: str, event: object, *, run_context: object = None,
@@ -456,7 +423,7 @@ class EventBus:
         if not hasattr(event, "to_dict"):
             raise TypeError(
                 f"EventBus.publish_typed requires a dataclass with to_dict(). "
-                f"Got {type(event).__name__}. Use publish_raw() for legacy dicts."
+                f"Got {type(event).__name__}."
             )
         if isinstance(event, dict):
             raise TypeError(

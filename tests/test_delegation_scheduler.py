@@ -21,6 +21,14 @@ class _Runtime:
         )
         self.executed: list[str] = []
 
+    @property
+    def session_store(self):
+        return self._store
+
+    @property
+    def root_agent_config(self):
+        return self._root_agent_config
+
     def run_explicit_delegation(self, parent_session_id: str, **kwargs):
         del parent_session_id
         task_id = str(kwargs["child_metadata"]["delegation_task_id"])

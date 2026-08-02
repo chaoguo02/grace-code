@@ -198,6 +198,21 @@ class AgentService:
                 len(recovered),
             )
 
+        # Durable lifecycle chain: transaction -> outbox -> trace -> live WS.
+        from server.services.event_outbox import OutboxRelay, OutboxStore
+        from server.projections.projection_runner import ProjectionRunner
+        from server.projections.trace_projection import TraceProjection
+
+        self._outbox_store = OutboxStore(db_path)
+        self._outbox_store.install()
+        self._projection_runner = ProjectionRunner(
+            TraceProjection(db_path),
+            self._event_bus.publish_live if self._event_bus is not None else None,
+        )
+        self._outbox_relay = OutboxRelay(
+            self._outbox_store, self._projection_runner.deliver,
+        )
+
         # ── SessionService ─────────────────────────────────────────────
         from server.services.session_service import SessionService
         self.session_service = SessionService(self._storage)
@@ -466,7 +481,7 @@ class AgentService:
         self._log_dir = str(ProjectStatePaths.for_project(self.repo_path).logs)
 
         # ── 9. SessionRuntime ──
-        from agent.session.runtime import SessionRuntime
+        from agent.session.runtime import RuntimeDependencies, SessionRuntime
 
         # ── HookDispatcher with memory consolidation STOP hook ──
         # Must be created BEFORE SessionRuntime (passed via constructor).
@@ -485,17 +500,22 @@ class AgentService:
             logger.warning("Failed to initialize HookDispatcher", exc_info=True)
 
         self._runtime = SessionRuntime(
-            store=self._store,
-            backend=self._backend,
-            base_registry=self._registry,
-            agent_registry=self._agent_registry,
-            root_agent_config=self._build_agent_cfg(),
-            log_dir=self._log_dir,
-            memory_context=self._memory_context,
-            hook_dispatcher=self._hook_dispatcher,
-            mcp_integration=self._mcp_integration,
-            event_callback=self._event_bus.publish if self._event_bus is not None else None,
-            governor=self._resource_governor,
+            dependencies=RuntimeDependencies(
+                store=self._store,
+                backend=self._backend,
+                base_registry=self._registry,
+                agent_registry=self._agent_registry,
+                root_agent_config=self._build_agent_cfg(),
+                log_dir=self._log_dir,
+                memory_context=self._memory_context,
+                hook_dispatcher=self._hook_dispatcher,
+                mcp_integration=self._mcp_integration,
+                event_callback=(
+                    self._event_bus.publish
+                    if self._event_bus is not None else None
+                ),
+                governor=self._resource_governor,
+            ),
         )
         # Mark as Web mode — child agents use this to create web callbacks
         # R4: inject web mode + stats recorder via Runtime public API
@@ -516,38 +536,6 @@ class AgentService:
                     child_session_id=child_id, action=action, status=status,
                 ))
             self._runtime.set_worktree_completion_callback(_on_worktree_done)
-
-            # ── Run lifecycle callback: run_started / run_terminal ──
-            def _on_run_terminal(session_id: str, event: dict) -> None:
-                """Publish run_started / run_terminal via EventBus — R3 typed."""
-                if _eb is None:
-                    return
-                from server.events import WsRunStarted, WsRunTerminal
-                ev_type = event.get("type", "")
-                if ev_type == "run_started":
-                    _eb.publish_typed(session_id, WsRunStarted(
-                        run_id=event.get("run_id", ""),
-                        turn_id=event.get("turn_id", ""),
-                        turn_index=event.get("turn_index", 0),
-                        timestamp=event.get("timestamp", ""),
-                        session_id=session_id,
-                        event_id=event.get("event_id", ""),
-                    ))
-                else:
-                    _eb.publish_typed(session_id, WsRunTerminal(
-                        run_id=event.get("run_id", ""),
-                        turn_id=event.get("turn_id", ""),
-                        turn_index=event.get("turn_index", 0),
-                        status=event.get("status", ""),
-                        summary=event.get("summary", ""),
-                        steps_taken=event.get("steps_taken", 0),
-                        total_tokens=event.get("total_tokens", 0),
-                        error=event.get("error", ""),
-                        session_id=session_id,
-                        event_id=event.get("event_id", ""),
-                    ))
-
-            self._runtime.set_publish_run_terminal(_on_run_terminal)
 
             def _on_evidence_record(entry) -> None:
                 from server.events import WsEvidenceRecord
@@ -995,6 +983,7 @@ class AgentService:
             loaded_rules=lambda: list(self._loaded_rules),
             accumulate_session_stats=self._accumulate_session_stats,
             compact_session_async=self.compact_session_async,
+            finalize_run=self._store.finalize_run_with_event,
             event_bus=self._event_bus,
             plan_revisions=self._plan_revisions,
         )
@@ -1353,6 +1342,16 @@ class AgentService:
         """
         return self.cancel_run(session_id, detail)
 
+    def list_run_evidence(self, run_id: str) -> list[dict[str, object]]:
+        """Return durable evidence through the application-service boundary."""
+        return self._store.list_evidence(run_id)
+
+    def cleanup_session_resources(self, session_id: str) -> None:
+        """Release runtime state and run-scoped evidence before deletion."""
+        self._runtime.cleanup_session(session_id)
+        for run in self._storage.list_runs(session_id, limit=10_000):
+            self._store.delete_run_evidence(str(run["id"]))
+
     def cancel_run(self, session_id: str, detail: str = "") -> bool:
         """Cancel the currently active run.
 
@@ -1372,16 +1371,29 @@ class AgentService:
         if broker is not None:
             broker.cancel_pending()
 
+        # Active executions own their terminal transition. Signal first and
+        # let Runtime commit run state + outbox fact in its finally block.
+        cancelled = self._runtime.cancel_session(session_id, detail=detail)
+        if cancelled:
+            if getattr(self, "_event_bus", None) is not None:
+                self._event_bus.publish_typed(
+                    session_id,
+                    WsStatus(status="cancelling", message=detail or "User cancelled"),
+                )
+            return True
+
         # CAS-update the active run → cancelled
         active_run = self._storage.get_active_run(session_id)
         run_cas_ok = False
         if active_run is not None:
             try:
-                rows_updated = self._storage.update_run(
+                rows_updated = self._store.finalize_run_with_event(
                     active_run["id"],
+                    session_id,
                     status="cancelled",
                     error=detail or "User cancelled",
-                    expect_status="running",
+                    event_payload={"reason": detail or "User cancelled"},
+                    expect_status=str(active_run.get("status") or "running"),
                 )
                 # P0_3: check CAS result before touching session state
                 # Older Storage adapters returned None after a successful
@@ -1411,7 +1423,7 @@ class AgentService:
                 session_id,
                 WsStatus(status="cancelled", message=detail or "User cancelled"),
             )
-        return cancelled
+        return cancelled or run_cas_ok
 
     # ── Config snapshot ───────────────────────────────────────────────────
 

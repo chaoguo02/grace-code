@@ -33,6 +33,7 @@ class SessionUnitOfWork:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
         self._outbox = OutboxStore(db_path)
+        self._outbox.install()
 
     @property
     def outbox(self) -> OutboxStore:

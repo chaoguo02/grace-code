@@ -27,8 +27,6 @@ class TopologyPolicy:
     parent_reserve_ratio: float = 0.25
     recovery_reserve_ratio: float = 0.10
     nested_enabled: bool = False
-    team_enabled: bool = False
-    team_approved: bool = False
     worktree_writes: bool = False
 
     def __post_init__(self) -> None:
@@ -83,7 +81,7 @@ class TopologyPlanner:
         selected, reason, explanation = self._validate(candidate, shape, policy)
         items = self._selected_items(shape.work_items, selected, policy)
         if (
-            selected in {AgentTopology.FAN_OUT_FAN_IN, AgentTopology.TEAM}
+            selected is AgentTopology.FAN_OUT_FAN_IN
             and len(items) < len(shape.work_items)
         ):
             reason = "fanout_reduced_by_limits"
@@ -108,7 +106,9 @@ class TopologyPlanner:
         if count == 0:
             return AgentTopology.SINGLE
         if shape.coordination_need is CoordinationNeed.PEER_TO_PEER:
-            return AgentTopology.TEAM
+            # Peer messaging is intentionally unsupported. The primary owns
+            # coordination and aggregates isolated worker results.
+            return AgentTopology.FAN_OUT_FAN_IN
         if shape.has_dependencies:
             return AgentTopology.CHAIN
         if count == 1:
@@ -137,20 +137,6 @@ class TopologyPlanner:
         affordable = self._affordable_workers(policy)
         if affordable == 0:
             return AgentTopology.SINGLE, "delegation_budget_insufficient", "Reserved parent and recovery budget leaves no worker budget."
-        if candidate is AgentTopology.TEAM:
-            if shape.coordination_need is not CoordinationNeed.PEER_TO_PEER:
-                candidate = AgentTopology.FAN_OUT_FAN_IN
-                reason = "team_not_needed"
-            elif not policy.team_enabled:
-                candidate = AgentTopology.FAN_OUT_FAN_IN
-                reason = "team_feature_disabled"
-            elif not policy.team_approved:
-                candidate = AgentTopology.FAN_OUT_FAN_IN
-                reason = "team_approval_required"
-            else:
-                return AgentTopology.TEAM, "peer_coordination_required", "Approved teammates need direct communication and a shared task board."
-            fallback, fallback_reason, explanation = self._validate(candidate, shape, policy)
-            return fallback, reason, f"Team was downgraded: {explanation}"
         if candidate is AgentTopology.NESTED:
             if not policy.nested_enabled or policy.max_subagent_spawn_depth - policy.current_depth < 2:
                 fallback = AgentTopology.CHAIN if shape.has_dependencies else AgentTopology.FAN_OUT_FAN_IN
@@ -208,7 +194,7 @@ class TopologyPlanner:
             return ()
         if topology is AgentTopology.ONE_TO_ONE:
             return items[:1]
-        if topology in {AgentTopology.FAN_OUT_FAN_IN, AgentTopology.TEAM}:
+        if topology is AgentTopology.FAN_OUT_FAN_IN:
             return items[: self._affordable_workers(policy)]
         return items
 

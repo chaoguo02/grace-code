@@ -57,7 +57,6 @@ class AgentTopology(str, Enum):
     FAN_OUT_FAN_IN = "fan_out_fan_in"
     CHAIN = "chain"
     NESTED = "nested"
-    TEAM = "team"
 
 
 def _non_empty(value: str, name: str) -> str:
@@ -280,4 +279,3 @@ class TaskShape:
                 return True
             seen.update(current)
         return False
-

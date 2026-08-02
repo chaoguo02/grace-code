@@ -232,7 +232,7 @@ class AgentBatchTool(BaseTool):
 
         run_context = self._run_context
         run_id = f"delegation-{uuid.uuid4().hex}"
-        store = self._runtime._store
+        store = self._runtime.session_store
         budget = {
             "available_tokens": decision.estimated_budget.available_tokens,
             "parent_reserve_tokens": (
@@ -406,11 +406,6 @@ class AgentBatchTool(BaseTool):
                 expected_version=int(current.get("version", 0)),
                 report_count=len(reports),
             )
-            if terminal_event is not None:
-                self._emit(
-                    "delegation_completed", run_id,
-                    {"_persisted_event": terminal_event},
-                )
             return ToolResult(
                 success=False,
                 output="",
@@ -460,12 +455,6 @@ class AgentBatchTool(BaseTool):
         terminal_event = persisted_run.pop("_terminal_event", None)
         final_status = str(persisted_run.get("status", "failed"))
         final_phase = str(persisted_run.get("phase", final_status))
-        if isinstance(terminal_event, dict):
-            self._emit(
-                "delegation_completed",
-                run_id,
-                {"_persisted_event": terminal_event},
-            )
         ordered = [reports[task.id] for task in tasks]
         output = self._format_result(run_id, topology, ordered)
         success = final_status == "completed" and not failed_required
@@ -508,7 +497,7 @@ class AgentBatchTool(BaseTool):
         store_task_id = f"{run_id}:{task.id}"
         started = time.monotonic()
         child_identity: dict[str, Any] = {}
-        persisted = self._runtime._store.get_delegation_task(store_task_id)
+        persisted = self._runtime.session_store.get_delegation_task(store_task_id)
         if persisted is not None and str(persisted["status"]) == "cancelled":
             return WorkerReport(
                 task_id=task.id,
@@ -524,7 +513,7 @@ class AgentBatchTool(BaseTool):
         def child_created(child: Any) -> None:
             child_identity["id"] = child.id
             child_identity["generation"] = int(child.generation)
-            started = self._runtime._store.update_delegation_task(
+            started = self._runtime.session_store.update_delegation_task(
                 store_task_id,
                 status="running",
                 child_session_id=child.id,
@@ -578,7 +567,7 @@ class AgentBatchTool(BaseTool):
                 budget_tokens=max(
                     1,
                     int(run_context.budget.token_remaining * 0.65)
-                    // max(1, len(self._runtime._store.list_delegation_tasks(run_id))),
+                    // max(1, len(self._runtime.session_store.list_delegation_tasks(run_id))),
                 ),
                 parent_max_steps=run_context.delegation_step_limit,
                 cancellation_token=run_context.cancellation,
@@ -644,7 +633,7 @@ class AgentBatchTool(BaseTool):
         *,
         integration_status: str | None = None,
     ) -> None:
-        persisted = self._runtime._store.update_delegation_task(
+        persisted = self._runtime.session_store.update_delegation_task(
             f"{run_id}:{task.id}",
             status=report.status.value,
             child_session_id=(
@@ -892,17 +881,17 @@ class AgentBatchTool(BaseTool):
         )
         from agent.session.topology_planner import TopologyPlanner, TopologyPolicy
 
-        parent = self._runtime._store.get_session(self._parent_session_id)
+        parent = self._runtime.session_store.get_session(self._parent_session_id)
         if parent is None:
             raise ValueError(f"Unknown parent session: {self._parent_session_id}")
         all_records = []
-        pending = [self._runtime._store.get_session(parent.root_id or parent.id)]
+        pending = [self._runtime.session_store.get_session(parent.root_id or parent.id)]
         while pending:
             record = pending.pop()
             if record is None:
                 continue
             all_records.append(record)
-            pending.extend(self._runtime._store.list_child_sessions(record.id))
+            pending.extend(self._runtime.session_store.list_child_sessions(record.id))
         terminal = {"completed", "partial", "failed", "cancelled"}
         spawned = sum(record.parent_id is not None for record in all_records)
         active = sum(

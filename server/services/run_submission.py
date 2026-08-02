@@ -7,6 +7,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from server.domain_events import DomainEvent
+from server.services.event_outbox import OutboxStore
+
 
 class RunAlreadyActiveError(RuntimeError):
     pass
@@ -36,6 +39,8 @@ def submit_run_turn(
     run_id = str(uuid.uuid4())
     turn_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    outbox = OutboxStore(storage._db_path)
+    outbox.install()
 
     try:
         with storage._store._connect() as conn:
@@ -103,6 +108,18 @@ def submit_run_turn(
                    VALUES (?, 'user', ?, ?, ?)""",
                 (session_id, prompt, turn_id, now),
             )
+            outbox.append(conn, DomainEvent(
+                event_type="run.submitted",
+                session_id=session_id,
+                aggregate_id=run_id,
+                aggregate_version=1,
+                occurred_at=now,
+                payload={
+                    "turn_id": turn_id,
+                    "turn_index": turn_index,
+                    "idempotency_key": key,
+                },
+            ))
             conn.execute("COMMIT")
             return SubmittedRun(
                 run_id=run_id,

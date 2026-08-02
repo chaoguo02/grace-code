@@ -615,7 +615,7 @@ class WsMemoryWritten:
         return _to_dict(self)
 
 
-# ── Compact + Resource events (P1: replacing publish_raw) ──────────────
+# ── Compact + Resource events ───────────────────────────────────────────
 
 @dataclass
 class WsCompactStatus:

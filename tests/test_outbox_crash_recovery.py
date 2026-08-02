@@ -78,6 +78,8 @@ class TestCrashRecovery:
 
     def test_poison_event_goes_to_dead_letter(self, db_path):
         """After max attempts, event is dead-lettered and doesn't block others."""
+        from server.services.event_outbox import OutboxRelay
+
         store = OutboxStore(db_path)
         conn = sqlite3.connect(db_path)
         store.ensure_tables(conn)
@@ -86,18 +88,30 @@ class TestCrashRecovery:
         conn.commit()
         conn.close()
 
-        batch = store.claim_batch("w1", limit=10)
-        assert len(batch) == 2
+        delivered = []
+        def deliver(record):
+            if record.event_id == "ev-poison":
+                raise ValueError("poison")
+            delivered.append(record.event_id)
 
-        # Fail the poison event repeatedly
-        for i in range(5):
-            store.reschedule("ev-poison", "w1", f"fail attempt {i}")
-        store.dead_letter("ev-poison", "w1", "fatal after retries")
+        relay = OutboxRelay(store, deliver, worker_id="w1")
+        for _ in range(relay.MAX_ATTEMPTS):
+            batch = store.claim_batch("w1", limit=10)
+            for record in batch:
+                relay._deliver_one(record)
+            with store._connect() as c:
+                c.execute(
+                    "UPDATE event_outbox SET available_at='2020-01-01T00:00:00' "
+                    "WHERE event_id='ev-poison' AND status='pending'"
+                )
 
-        # Good event should still be claimable (after reschedule)
-        batch2 = store.claim_batch("w1", limit=10)
-        poison_ids = {r.event_id for r in batch2}
-        assert "ev-poison" not in poison_ids  # dead-lettered
+        with store._connect() as c:
+            statuses = dict(c.execute(
+                "SELECT event_id, status FROM event_outbox"
+            ).fetchall())
+        assert statuses["ev-poison"] == "dead_letter"
+        assert statuses["ev-good"] == "delivered"
+        assert delivered == ["ev-good"]
 
 
 def _ensure_trace_table(conn):

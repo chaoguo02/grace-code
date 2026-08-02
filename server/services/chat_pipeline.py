@@ -62,6 +62,7 @@ class ChatPipelinePorts:
     loaded_rules: Callable[[], list]
     accumulate_session_stats: Callable[[str, RunResult], None]
     compact_session_async: Callable[[str], None]
+    finalize_run: Callable[..., bool] = lambda *args, **kwargs: False
     event_bus: Any = None
     plan_revisions: Any = None
 
@@ -607,7 +608,21 @@ class ChatPipeline:
                 self.finish(request, result)
             except Exception as exc:
                 logger.exception("ChatPipeline failed for session %s", request.session_id)
-                if self._event_bus is not None:
+                _rc = request.run_context
+                _run_id = getattr(_rc, "run_id", "") if _rc else ""
+                if _run_id:
+                    self._ports.finalize_run(
+                        _run_id,
+                        request.session_id,
+                        status="failed",
+                        error=str(exc),
+                        event_payload={
+                            "turn_id": getattr(_rc, "turn_id", ""),
+                            "turn_index": getattr(_rc, "turn_index", 0),
+                        },
+                        expect_status="running",
+                    )
+                if self._event_bus is not None and not _run_id:
                     # Send run_terminal (not status:failed) — consistent with _finalize_run.
                     # If run_context is available, use its run_id/turn_id so the frontend
                     # can deduplicate by run_id and properly archive the optimistic turn.
@@ -620,18 +635,6 @@ class ChatPipeline:
                         status="failed", error=str(exc),
                         session_id=request.session_id,
                     ))
-                    # Also CAS-update the Run record so DB reflects the failure
-                    _run_id = getattr(_rc, "run_id", "") if _rc else ""
-                    if _run_id:
-                        try:
-                            self._runtime.update_run(
-                                _run_id,
-                                status="failed",
-                                error=str(exc),
-                                expect_status="running",
-                            )
-                        except Exception:
-                            pass
             finally:
                 self._runtime.release_session(request.session_id)
                 self._runtime.release_backend_for_session(request.session_id)

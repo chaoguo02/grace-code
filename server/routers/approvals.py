@@ -551,8 +551,9 @@ async def _start_submitted_plan_run(
             run_context=context,
         )
     except Exception as exc:
-        service._storage.update_run(
+        service._store.finalize_run_with_event(
             submitted.run_id,
+            session_id,
             status="failed",
             error=str(exc),
             expect_status="queued",

@@ -141,7 +141,7 @@ def test_startup_recovery_reconciles_running_session_to_cancelled_run(tmp_path):
     assert recovered_session.error == "User cancelled"
 
 
-def test_cancel_immediately_reconciles_session_status() -> None:
+def test_cancel_active_run_defers_terminal_commit_to_runtime_finalizer() -> None:
     updates = []
     storage = SimpleNamespace(
         get_active_run=lambda session_id: {"id": "run-1"},
@@ -163,7 +163,4 @@ def test_cancel_immediately_reconciles_session_status() -> None:
     service._event_bus = event_bus
 
     assert service.cancel_run("session-1", "stop now") is True
-    assert updates[0][0:2] == ("run", "run-1")
-    assert updates[1] == (
-        "session", "session-1", SessionStatus.CANCELLED, "stop now",
-    )
+    assert updates == []

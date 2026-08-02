@@ -123,12 +123,7 @@ class DelegationRunScheduler:
                         future.result()
         converged = self._store.reconcile_delegation_run(run_id)
         terminal_event = converged.pop("_terminal_event", None)
-        if isinstance(terminal_event, dict):
-            self._emit(
-                "delegation_completed", run_id,
-                {"_persisted_event": terminal_event},
-            )
-        else:
+        if not isinstance(terminal_event, dict):
             self._emit("delegation_phase_changed", run_id, {
                 "phase": str(converged.get("phase", "")),
                 "status": str(converged.get("status", "")),
@@ -184,13 +179,13 @@ class DelegationRunScheduler:
 
         contract = TaskContract.for_subagent(
             definition,
-            self._runtime._root_agent_config,
+            self._runtime.root_agent_config,
             parent_budget_tokens=min(
-                self._runtime._root_agent_config.budget_tokens,
+                self._runtime.root_agent_config.budget_tokens,
                 definition.max_tokens
-                or self._runtime._root_agent_config.budget_tokens,
+                or self._runtime.root_agent_config.budget_tokens,
             ),
-            parent_max_steps=self._runtime._root_agent_config.max_steps,
+            parent_max_steps=self._runtime.root_agent_config.max_steps,
         )
         started_at = time.monotonic()
         try:

@@ -276,7 +276,7 @@ class ReplayService:
         bus = getattr(self._service, "_event_bus", None)
         if bus is None:
             return
-        bus.publish_raw(record["session_id"], {
+        bus.publish_live(record["session_id"], {
             "type": event_type,
             "replay_execution": record,
         })

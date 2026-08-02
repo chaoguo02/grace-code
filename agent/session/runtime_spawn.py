@@ -404,7 +404,7 @@ def spawn_agent(
     ))
 
     # Subagent permission inheritance (CC-aligned: parent mode overrides child)
-    _child_permission_mode = self._resolve_child_permission_mode(
+    _child_permission_mode = self.resolve_child_permission_mode(
         parent_definition,
         definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,
     )
@@ -764,23 +764,7 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                         converged = self._store.reconcile_delegation_run(
                             delegation_run_id
                         )
-                        terminal_event = converged.pop("_terminal_event", None)
-                        callback = getattr(self, "_event_callback", None)
-                        if isinstance(terminal_event, dict) and callback is not None:
-                            from agent.task import Event, EventType
-
-                            callback(Event(
-                                event_type=EventType.DELEGATION_COMPLETED,
-                                task_id=delegation_run_id,
-                                session_id=str(converged["parent_session_id"]),
-                                payload={
-                                    "delegation_run_id": delegation_run_id,
-                                    "parent_session_id": str(
-                                        converged["parent_session_id"]
-                                    ),
-                                    "_persisted_event": terminal_event,
-                                },
-                            ))
+                        converged.pop("_terminal_event", None)
                 except Exception:
                     logger.exception(
                         "Failed to persist delegation result for child %s — "

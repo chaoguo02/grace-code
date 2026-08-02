@@ -694,7 +694,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         from agent.session.run_evidence import EvidenceEntry
         rows = [
             EvidenceEntry.from_dict(row).to_dict()
-            for row in service._runtime._store.list_evidence(run_id)
+            for row in service.list_run_evidence(run_id)
         ]
         return {
             "run_id": run_id,
@@ -897,11 +897,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         _runtime = getattr(service, '_runtime', None)
         for sid in body.session_ids:
             if _runtime is not None:
-                _runtime.cleanup_session(sid)
-                storage = getattr(service, "_storage", None)
-                if storage is not None:
-                    for run in storage.list_runs(sid, limit=10_000):
-                        _runtime._store.delete_run_evidence(str(run["id"]))
+                service.cleanup_session_resources(sid)
         if hasattr(service, "_event_bus") and service._event_bus is not None:
             for sid in body.session_ids:
                 _fire_and_forget_cleanup(
@@ -937,11 +933,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         # Clean up all runtime resources via the official API
         _runtime = getattr(service, '_runtime', None)
         if _runtime is not None:
-            _runtime.cleanup_session(session_id)
-            storage = getattr(service, "_storage", None)
-            if storage is not None:
-                for run in storage.list_runs(session_id, limit=10_000):
-                    _runtime._store.delete_run_evidence(str(run["id"]))
+            service.cleanup_session_resources(session_id)
 
         # Clean up plan file
         if hasattr(service, 'remove_plan_file'):

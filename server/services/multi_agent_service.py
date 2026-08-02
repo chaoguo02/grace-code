@@ -210,10 +210,6 @@ class MultiAgentService:
         if terminal_event is None:
             actual = self._store.get_delegation_run(run_id) or current
             raise ValueError(f"Delegation already converged as {actual['status']}")
-        self._emit_delegation_event(
-            "delegation_completed", run_id,
-            {"_persisted_event": terminal_event},
-        )
         return {
             "delegation_run_id": run_id,
             "status": "cancelled",

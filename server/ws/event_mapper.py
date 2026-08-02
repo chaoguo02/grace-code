@@ -45,17 +45,31 @@ def map_domain_to_ws(record) -> dict | None:
         return {
             "type": "run_started", "run_id": record.aggregate_id,
             "session_id": record.session_id,
+            "turn_id": payload.get("turn_id", ""),
+            "turn_index": payload.get("turn_index", 0),
             "timestamp": record.occurred_at,
         }
-    if event_type in ("run.completed", "run.cancelled", "run.failed"):
+    if event_type.startswith("run.") and event_type not in (
+        "run.submitted", "run.started",
+    ):
         return {
             "type": "run_terminal", "run_id": record.aggregate_id,
-            "status": event_type.split(".")[1],
+            "status": payload.get("status", event_type.split(".", 1)[1]),
             "session_id": record.session_id,
+            "turn_id": payload.get("turn_id", ""),
+            "turn_index": payload.get("turn_index", 0),
+            "summary": payload.get("summary", ""),
             "steps_taken": payload.get("steps_taken", 0),
-            "total_tokens": payload.get("tokens_used", 0),
+            "total_tokens": payload.get("total_tokens", payload.get("tokens_used", 0)),
             "error": payload.get("error", ""),
+            "termination_reason": payload.get("termination_reason", "none"),
+            "verification_status": payload.get("verification_status", "not_applicable"),
+            "verification_reason": payload.get("verification_reason", "none"),
+            "verification": payload.get("verification", {}),
+            "workspace_delta": payload.get("workspace_delta", {}),
+            "evidence_summary": payload.get("evidence_summary", {}),
             "timestamp": record.occurred_at,
+            "event_id": record.event_id,
         }
     if event_type == "tool.executed":
         return {
@@ -63,6 +77,19 @@ def map_domain_to_ws(record) -> dict | None:
             "invocation_id": payload.get("invocation_id", ""),
             "success": payload.get("success", True),
             "session_id": record.session_id,
+            "timestamp": record.occurred_at,
+        }
+    if event_type == "delegation.completed":
+        return {
+            "type": "delegation_completed",
+            "event_id": record.event_id,
+            "session_id": record.session_id,
+            "run_id": payload.get("run_id", ""),
+            "delegation_run_id": record.aggregate_id,
+            "status": payload.get("status", ""),
+            "phase": payload.get("phase", ""),
+            "report_count": payload.get("report_count", 0),
+            "version": payload.get("version", record.aggregate_version),
             "timestamp": record.occurred_at,
         }
 

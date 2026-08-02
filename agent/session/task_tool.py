@@ -663,7 +663,7 @@ class AgentTool(BaseTool):
             delegation_run_id = f"delegation-{uuid.uuid4().hex}"
             task_key = str(params.get("task_id") or "worker").strip() or "worker"
             persisted_task_id = f"{delegation_run_id}:{task_key}"
-            self._runtime._store.create_delegation_run(
+            self._runtime.session_store.create_delegation_run(
                 run_id=delegation_run_id,
                 parent_session_id=self._parent_session_id,
                 parent_run_id=str(getattr(run_context, "run_id", "") or ""),
@@ -678,7 +678,7 @@ class AgentTool(BaseTool):
                     "parent_reserved": True,
                 },
             )
-            self._runtime._store.create_delegation_task(
+            self._runtime.session_store.create_delegation_task(
                 task_id=persisted_task_id,
                 delegation_run_id=delegation_run_id,
                 agent_type=plan.facts.subagent_type,
@@ -696,7 +696,7 @@ class AgentTool(BaseTool):
             )
 
             def _child_created(child):
-                self._runtime._store.update_delegation_task(
+                self._runtime.session_store.update_delegation_task(
                     persisted_task_id,
                     status="running",
                     child_session_id=child.id,
@@ -765,12 +765,12 @@ class AgentTool(BaseTool):
                 self._circuit_breaker.record_subagent_failure()
             if "persisted_task_id" in locals():
                 try:
-                    self._runtime._store.update_delegation_task(
+                    self._runtime.session_store.update_delegation_task(
                         persisted_task_id,
                         status="failed",
                         error=str(exc),
                     )
-                    self._runtime._store.complete_delegation_run(
+                    self._runtime.session_store.complete_delegation_run(
                         delegation_run_id, status="failed",
                     )
                 except Exception:

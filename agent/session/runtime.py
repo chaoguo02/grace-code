@@ -7,7 +7,7 @@ import logging
 import threading
 import time as _time
 import uuid
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -61,6 +61,23 @@ class ExplicitDelegationError(ValueError):
     """An explicit child request cannot be honored by the parent contract."""
 
 
+@dataclass(frozen=True)
+class RuntimeDependencies:
+    """Immutable composition contract for SessionRuntime infrastructure."""
+
+    store: SessionStore
+    backend: LLMBackend
+    base_registry: ToolRegistry
+    agent_registry: AgentRegistryV2
+    root_agent_config: AgentConfig
+    log_dir: str
+    memory_context: object | None = None
+    hook_dispatcher: object | None = None
+    mcp_integration: object | None = None
+    event_callback: object | None = None
+    governor: object | None = None
+
+
 def _inject_shared_read_cache(
     registry: ToolRegistry,
     read_cache: object,
@@ -103,18 +120,45 @@ class SessionRuntime:
     def __init__(
         self,
         *,
-        store: SessionStore,
-        backend: LLMBackend,
-        base_registry: ToolRegistry,
-        agent_registry: AgentRegistryV2,
-        root_agent_config: AgentConfig,
-        log_dir: str,
+        dependencies: RuntimeDependencies | None = None,
+        store: SessionStore | None = None,
+        backend: LLMBackend | None = None,
+        base_registry: ToolRegistry | None = None,
+        agent_registry: AgentRegistryV2 | None = None,
+        root_agent_config: AgentConfig | None = None,
+        log_dir: str | None = None,
         memory_context=None,
         hook_dispatcher=None,
         mcp_integration=None,
         event_callback=None,
         governor=None,
     ) -> None:
+        if dependencies is not None:
+            if any(value is not None for value in (
+                store, backend, base_registry, agent_registry,
+                root_agent_config, log_dir, memory_context, hook_dispatcher,
+                mcp_integration, event_callback, governor,
+            )):
+                raise ValueError(
+                    "dependencies cannot be combined with legacy constructor arguments"
+                )
+            store = dependencies.store
+            backend = dependencies.backend
+            base_registry = dependencies.base_registry
+            agent_registry = dependencies.agent_registry
+            root_agent_config = dependencies.root_agent_config
+            log_dir = dependencies.log_dir
+            memory_context = dependencies.memory_context
+            hook_dispatcher = dependencies.hook_dispatcher
+            mcp_integration = dependencies.mcp_integration
+            event_callback = dependencies.event_callback
+            governor = dependencies.governor
+        if any(value is None for value in (
+            store, backend, base_registry, agent_registry,
+            root_agent_config, log_dir,
+        )):
+            raise TypeError("SessionRuntime requires complete RuntimeDependencies")
+
         self._store = store
         self._backend = backend
         self._base_registry = base_registry
@@ -159,7 +203,6 @@ class SessionRuntime:
         # Set by AgentService.  Signature: (session_id, event_dict) -> None.
         # Unlike _event_callback which receives agent.task.Event objects,
         # this receives pre-formatted WS message dicts ready for broadcast.
-        self._publish_run_terminal: Callable[[str, dict], None] | None = None
         # Per-session ApprovalBroker instances for headless Web mode.
         # CC-aligned: each session has its own blocking approval queue,
         # equivalent to CC's per-session stdin control_request channel.
@@ -356,6 +399,14 @@ class SessionRuntime:
     @property
     def agent_registry(self) -> AgentRegistryV2:
         return self._agent_registry
+
+    @property
+    def session_store(self) -> SessionStore:
+        return self._store
+
+    @property
+    def root_agent_config(self) -> AgentConfig:
+        return self._root_agent_config
 
     @property
     def governor(self):
@@ -1157,28 +1208,13 @@ class SessionRuntime:
             try:
                 _run_id = getattr(_run_ctx, "run_id", None)
                 if _run_id:
-                    _updated = self._store.update_run(
+                    _updated = self._store.start_run_with_event(
                         _run_id,
-                        status="running",
-                        expect_status="queued",
+                        getattr(_run_ctx, "session_id", session_id),
+                        turn_id=getattr(_run_ctx, "turn_id", ""),
+                        turn_index=getattr(_run_ctx, "turn_index", 0),
                     )
-                    if _updated:
-                        # Emit run_started WS event (synthetic)
-                        if self._publish_run_terminal is not None:
-                            import uuid as _uuid_mod
-                            from datetime import datetime as _dt, timezone as _tz
-                            self._publish_run_terminal(
-                                getattr(_run_ctx, "session_id", session_id),
-                                {
-                                    "type": "run_started",
-                                    "run_id": _run_id,
-                                    "turn_id": getattr(_run_ctx, "turn_id", ""),
-                                    "turn_index": getattr(_run_ctx, "turn_index", 0),
-                                    "timestamp": _dt.now(_tz.utc).isoformat(),
-                                    "event_id": str(_uuid_mod.uuid4()),
-                                },
-                            )
-                    else:
+                    if not _updated:
                         logger.warning("Run %s CAS transition queued→running failed", _run_id)
             except Exception:
                 logger.debug("Run lifecycle transition skipped", exc_info=True)
@@ -1763,14 +1799,7 @@ class SessionRuntime:
         *,
         error: str = "",
     ) -> None:
-        """Transition run to terminal state and broadcast run_terminal.
-
-        1. CAS-update the Run record (single transaction)
-        2. Broadcast run_terminal via _publish_run_terminal.
-           The callback sends through EventBus.publish_raw() which
-           persists to trace_events AND broadcasts to WS in one code path
-           — same as all other events. No skip_persist bypass.
-        """
+        """Atomically transition a Run and append its durable terminal fact."""
         if run_ctx is None:
             return
         _run_id = getattr(run_ctx, "run_id", None)
@@ -1807,9 +1836,6 @@ class SessionRuntime:
                 else dict(_delta_obj or {})
             )
             _session_id = getattr(run_ctx, "session_id", "")
-            import uuid as _uuid_mod
-            from datetime import datetime as _dt, timezone as _tz
-
             _evidence_manager = getattr(self, "_evidence_stores", None)
             _requirements_by_run = getattr(
                 self, "_active_evidence_requirements", {},
@@ -1861,38 +1887,17 @@ class SessionRuntime:
                 ))
 
             # 1. CAS update — best-effort transition from 'running'
-            _updated = self._store.update_run(
+            _updated = self._store.finalize_run_with_event(
                 _run_id,
+                _session_id,
                 status=status,
                 summary=_summary,
                 steps_taken=_steps,
                 total_tokens=_tokens,
                 error=error,
-                termination_reason=_termination_reason,
-                verification_status=_verification_status,
-                verification_reason=_verification_reason,
-                verification_checks=_checks,
-                workspace_delta=_workspace_delta,
-                expect_status="running",
-            )
-            if not _updated:
-                logger.warning("Run %s CAS running→%s failed (already terminal) — "
-                              "run_terminal will still be emitted",
-                              _run_id[:8], status)
-
-            # 2. Broadcast run_terminal — ALWAYS, even if CAS failed.
-            #    If we don't emit this, the frontend stays in "Running" forever.
-            if self._publish_run_terminal is not None:
-                _terminal_evt = {
-                    "type": "run_terminal",
-                    "run_id": _run_id,
+                event_payload={
                     "turn_id": getattr(run_ctx, "turn_id", ""),
                     "turn_index": getattr(run_ctx, "turn_index", 0),
-                    "status": status,
-                    "summary": _summary,
-                    "steps_taken": _steps,
-                    "total_tokens": _tokens,
-                    "error": error,
                     "termination_reason": _termination_reason,
                     "verification_status": _verification_status,
                     "verification_reason": _verification_reason,
@@ -1902,8 +1907,7 @@ class SessionRuntime:
                         "checks": _checks,
                     },
                     "workspace_delta": ({
-                        key: value
-                        for key, value in _workspace_delta.items()
+                        key: value for key, value in _workspace_delta.items()
                         if key != "patch"
                     } | {
                         "patch_available": bool(_workspace_delta.get("patch")),
@@ -1911,13 +1915,16 @@ class SessionRuntime:
                     "evidence_summary": _build_terminal_evidence_summary(
                         _terminal_store,
                     ),
-                    "timestamp": _dt.now(_tz.utc).isoformat(),
-                    "event_id": str(_uuid_mod.uuid4()),
-                }
-                try:
-                    self._publish_run_terminal(_session_id, _terminal_evt)
-                except Exception:
-                    logger.debug("publish_run_terminal failed", exc_info=True)
+                },
+                expect_status="running",
+            )
+            if not _updated:
+                logger.warning("Run %s CAS running→%s failed (already terminal) — "
+                              "run_terminal will still be emitted",
+                              _run_id[:8], status)
+
+            # 2. Broadcast run_terminal — ALWAYS, even if CAS failed.
+            #    If we don't emit this, the frontend stays in "Running" forever.
         except Exception:
             logger.exception("Failed to finalize run %s", _run_id)
 
@@ -2474,7 +2481,7 @@ class SessionRuntime:
                         tool_name, f"MCP server '{server_name}': {reason}",
                     )
 
-    def _resolve_child_permission_mode(
+    def resolve_child_permission_mode(
         self, parent: AgentDefinition, child: AgentDefinition | None
     ) -> str:
         """CC-aligned: resolve effective permission_mode for a child subagent.
@@ -2540,9 +2547,6 @@ class SessionRuntime:
 
     def set_stats_recorder(self, recorder: object | None) -> None:
         self._stats_recorder = recorder
-
-    def set_publish_run_terminal(self, callback: object | None) -> None:
-        self._publish_run_terminal = callback
 
     def set_evidence_event_callback(self, callback: object | None) -> None:
         if hasattr(self, "_evidence_stores") and self._evidence_stores is not None:

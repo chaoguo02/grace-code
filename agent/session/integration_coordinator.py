@@ -358,11 +358,7 @@ class DelegationIntegrationCoordinator:
     def _broadcast_terminal(
         self, run_id: str, terminal_event: object,
     ) -> None:
-        if isinstance(terminal_event, dict):
-            self._emit(
-                "delegation_completed", run_id,
-                {"_persisted_event": terminal_event},
-            )
+        """Live terminal delivery is owned by the durable OutboxRelay."""
 
     def _result(
         self, run_id: str, outcomes: list[dict[str, object]],

@@ -11,6 +11,9 @@ import json
 import logging
 import sqlite3
 
+from server.services.event_outbox import OutboxStore
+from server.ws.event_mapper import map_domain_to_ws
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,6 +28,8 @@ class TraceProjection:
 
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
+        self._outbox = OutboxStore(db_path)
+        self._outbox.install()
 
     def project(self, record) -> bool:
         """Project one outbox record → session_trace_events.
@@ -35,17 +40,16 @@ class TraceProjection:
         trace insert.  If either fails, both roll back.
         """
         conn = sqlite3.connect(self._db_path)
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("BEGIN IMMEDIATE")
 
             # Check if already projected (idempotency gate)
-            existing = conn.execute(
-                "SELECT 1 FROM event_projection_receipts WHERE consumer_name=? AND event_id=?",
-                (self.CONSUMER_NAME, record.event_id),
-            ).fetchone()
-            if existing:
-                conn.execute("ROLLBACK")
+            if not self._outbox.try_record_projection(
+                conn, self.CONSUMER_NAME, record.event_id,
+            ):
+                conn.execute("COMMIT")
                 return False  # Already done
 
             # Get next sequence
@@ -56,6 +60,15 @@ class TraceProjection:
             sequence = row[0] if row else 1
 
             payload = _safe_loads(record.payload_json)
+            projected = map_domain_to_ws(record) or {
+                "type": record.event_type,
+                "event_id": record.event_id,
+                "session_id": record.session_id,
+                "aggregate_id": record.aggregate_id,
+                "payload": payload,
+                "timestamp": record.occurred_at,
+            }
+            stored = {**projected, "seq": sequence, "sequence": sequence}
 
             # Insert trace
             conn.execute(
@@ -63,24 +76,9 @@ class TraceProjection:
                    (session_id, seq, event_type, timestamp, event_json, source, child_session_id)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (record.session_id, sequence,
-                 record.event_type, record.occurred_at,
-                 json.dumps({
-                     "type": record.event_type,
-                     "event_id": record.event_id,
-                     "session_id": record.session_id,
-                     "aggregate_id": record.aggregate_id,
-                     "payload": payload,
-                     "seq": sequence,
-                 }, ensure_ascii=False),
+                 str(projected.get("type") or record.event_type), record.occurred_at,
+                 json.dumps(stored, ensure_ascii=False),
                  "outbox_relay", ""),
-            )
-
-            # P0-2: Receipt in SAME transaction
-            conn.execute(
-                """INSERT INTO event_projection_receipts
-                   (consumer_name, event_id, processed_at)
-                   VALUES (?, ?, ?)""",
-                (self.CONSUMER_NAME, record.event_id, _utc_now()),
             )
 
             conn.execute("COMMIT")
