@@ -34,7 +34,18 @@ def submit_run_turn(
     prompt: str,
     idempotency_key: str = "",
 ) -> SubmittedRun:
-    """Create run, turn index, and user message in one SQLite transaction."""
+    """Create run, turn index, and user message in one SQLite transaction.
+
+    P19: GRACE_RUNTIME_MODE=NATIVE routes to RunCoordinator.
+    LEGACY (default) uses the inline SQLite path.
+    """
+    import os as _os
+    if _os.environ.get("GRACE_RUNTIME_MODE") == "NATIVE":
+        return _submit_via_coordinator(
+            storage, session_id=session_id, prompt=prompt,
+            idempotency_key=idempotency_key,
+        )
+
     key = idempotency_key.strip()
     run_id = str(uuid.uuid4())
     turn_id = str(uuid.uuid4())
@@ -129,3 +140,51 @@ def submit_run_turn(
             )
     except sqlite3.IntegrityError as exc:
         raise RunAlreadyActiveError("RUN_ALREADY_ACTIVE") from exc
+
+
+def _submit_via_coordinator(storage, *, session_id: str, prompt: str,
+                            idempotency_key: str = "") -> SubmittedRun:
+    """P19: Route run submission through the new RunCoordinator."""
+    from core.eventing.identifiers import SessionId
+    from application.commands.run_commands import SubmitRun
+    from application.coordinators.run_coordinator import RunCoordinator
+    from runtime_core.runtime import AgentRuntime
+    from runtime_core.ports import RuntimePorts
+    from application.transactions.unit_of_work import SessionUnitOfWork
+
+    # Build coordinator with the storage-backed UoW
+    class _StorageUoW:
+        def execute(self, fn):
+            conn = sqlite3.connect(storage._db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                fn(_StorageTx(conn))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    class _StorageTx:
+        def __init__(self, conn):
+            self.conn = conn
+        def append_fact(self, envelope) -> None:
+            pass  # OutboxStore integration in next iteration
+
+    uow = _StorageUoW()
+    rt = AgentRuntime(RuntimePorts())
+    coord = RunCoordinator(rt, uow)
+
+    cmd = SubmitRun(session_id=SessionId(session_id), prompt=prompt,
+                    idempotency_key=idempotency_key)
+    envelope = coord.submit(cmd)
+
+    run_id = str(envelope.aggregate_id)
+    return SubmittedRun(
+        run_id=run_id,
+        turn_id=str(envelope.event_id),
+        turn_index=0,
+        created=True,
+    )

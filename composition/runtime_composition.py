@@ -23,8 +23,12 @@ class RuntimeComposition:
         self._db_path = db_path
 
     def assemble(self) -> dict:
-        """Return a dict of assembled components, keyed by role name."""
-        components: dict = {}
+        """Return a dict of assembled components, keyed by role name.
+
+        P19: Wired to run_submission.py via GRACE_RUNTIME_MODE=NATIVE.
+        P20-P22: Multi-agent, Context, Worktree extraction pending.
+        """
+        components: dict = {"mode": self._mode}
 
         if self._mode in ("NATIVE", "SHADOW"):
             from application.events.schema_registry import SchemaRegistry
@@ -47,23 +51,17 @@ class RuntimeComposition:
             ports = RuntimePorts()
 
             def _deliver(record):
-                envelope = None  # OutboxRecord → EventEnvelope (mapper in R3.4)
-                if envelope:
-                    for receipt in runner.handle(envelope):
-                        pass
+                pass  # P19: envelope reconstruction pending mapper
 
             relay = OutboxRelay(outbox, _deliver)
             runtime = AgentRuntime(ports)
-            coordinator = RunCoordinator(runtime, None)  # UoW injected later
+            coordinator = RunCoordinator(runtime, None)
 
-            components["registry"] = registry
-            components["outbox"] = outbox
-            components["relay"] = relay
-            components["runtime"] = runtime
-            components["coordinator"] = coordinator
-            components["trace"] = trace
-            components["stats"] = stats
-            components["ws_gateway"] = ws_gw
-            components["mode"] = self._mode
+            for k, v in [
+                ("registry", registry), ("outbox", outbox), ("relay", relay),
+                ("runtime", runtime), ("coordinator", coordinator),
+                ("trace", trace), ("stats", stats), ("ws_gateway", ws_gw),
+            ]:
+                components[k] = v
 
         return components
