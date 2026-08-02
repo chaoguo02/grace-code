@@ -384,6 +384,9 @@ class EventBus:
         are injected into every translated message as envelope fields.
         """
         try:
+            # S6: _persisted_event protocol — scheduled for outbox migration.
+            # Subagent code passes pre-persisted trace events through this path.
+            # TODO: replace with direct outbox INSERT in subagent CAS transaction.
             persisted = (getattr(event, "payload", {}) or {}).get("_persisted_event")
             target_session_id = getattr(event, "session_id", None)
             if isinstance(persisted, dict) and target_session_id:
