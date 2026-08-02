@@ -422,6 +422,7 @@ class EventBus:
         run_context: Any = None,
         skip_persist: bool = False,
     ) -> None:
+        """DEPRECATED (R3.5): use publish_typed() instead.  Scheduled for removal."""
         """Push a pre-formatted WS message to one session's subscribers.
 
         When *skip_persist* is True, the message is broadcast directly
