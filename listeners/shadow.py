@@ -13,6 +13,7 @@ class ShadowRunner:
         self._old = old_handler
         self._new = new_handler
         self._mismatches = 0
+        self._new_failures = 0
 
     def __call__(self, *args, **kwargs):
         old_result = None
@@ -24,9 +25,10 @@ class ShadowRunner:
         try:
             new_result = self._new(*args, **kwargs)
         except Exception as exc:
+            self._new_failures += 1
             logger.debug("Shadow: new handler failed: %s", exc)
 
-        if old_result != new_result:
+        if old_result is not None and new_result is not None and old_result != new_result:
             self._mismatches += 1
             logger.info("Shadow mismatch #%d: old=%s new=%s", self._mismatches, old_result, new_result)
 
