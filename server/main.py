@@ -154,7 +154,11 @@ def create_app(service: AgentService) -> FastAPI:
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
-        # Startup: no-op; AgentService is fully initialized before app creation.
+        # Startup: start outbox relay (R3.4)
+        _outbox_relay = getattr(service, '_outbox_relay', None)
+        if _outbox_relay is not None:
+            await _outbox_relay.start()
+            logger.info("Outbox relay started")
         yield
         # Shutdown: release resources
         await service.shutdown()

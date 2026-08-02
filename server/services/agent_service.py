@@ -114,6 +114,7 @@ class AgentService:
         self._memory_stop_event: Any | None = None
         self._memory_maintenance_task: Any | None = None
         self._observe_retries: bool = os.environ.get("FORGE_OBSERVE_RETRIES") == "1"
+        self._outbox_relay: object | None = None  # R3.4: started in lifespan
         """P2-18 runtime switch: when True, LLM retry metrics are logged."""
 
         # ── 1. Load config ──
@@ -1487,6 +1488,15 @@ class AgentService:
             except Exception:
                 pass
 
-        # 6. Close the single Tool/Skills/MCP lifecycle root.
+        # 6. Stop outbox relay (R3.4) — drain pending events before DB close
+        if hasattr(self, '_outbox_relay') and self._outbox_relay is not None:
+            try:
+                remaining = await self._outbox_relay.stop(drain_timeout_s=5.0)
+                if remaining:
+                    logger.warning("Outbox relay stopped with %d undelivered events", remaining)
+            except Exception:
+                logger.debug("Outbox relay shutdown failed", exc_info=True)
+
+        # 7. Close the single Tool/Skills/MCP lifecycle root.
         if self._registry is not None:
             self._registry.close()

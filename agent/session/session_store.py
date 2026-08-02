@@ -2206,9 +2206,9 @@ class SessionStore:
         Returns True if CAS succeeded and outbox was written.
         The trace projection will pick up the outbox event separately.
         """
+        # S5: Outbox is the default. Legacy path retained for one cycle.
         import os as _os
-        if _os.environ.get("GRACE_OUTBOX_TERMINAL_EVENTS") != "1":
-            # Fallback to legacy path
+        if _os.environ.get("GRACE_LEGACY_TERMINAL_EVENTS") == "1":
             result = self.transactional_finalize_run(
                 run_id=run_id,
                 terminal_event={"type": f"run_{status}", "status": status},
