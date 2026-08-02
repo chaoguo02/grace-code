@@ -593,12 +593,10 @@ class AgentService:
         from server.services.project_overview_service import ProjectOverviewService
         self._project_overview_service = ProjectOverviewService(self)
 
-        # ── Memory maintenance daemon: periodic decay + TTL expiry ──
-        self._memory_maintenance_stop = threading.Event()
-        self._memory_maintenance_thread = threading.Thread(
-            target=self._memory_maintenance_loop, daemon=True,
-        )
-        self._memory_maintenance_thread.start()
+        # ── Memory maintenance daemon (P23: extracted to jobs/) ──
+        from jobs.memory_maintenance import MemoryMaintenanceJob
+        self._memory_job = MemoryMaintenanceJob(self._memory_store)
+        self._memory_job.start_thread()
 
         logger.info(
             "AgentService initialized — repo=%s, model=%s",
@@ -1480,8 +1478,9 @@ class AgentService:
             self._runtime.dispose()
 
         # 5. Memory maintenance
-        if hasattr(self, '_memory_maintenance_stop'):
-            self._memory_maintenance_stop.set()
+        # P23: Memory maintenance via standalone job
+        if hasattr(self, '_memory_job') and self._memory_job is not None:
+            self._memory_job.stop_thread()
         if self._memory_stop_event is not None:
             self._memory_stop_event.set()
         if self._memory_maintenance_task is not None:
