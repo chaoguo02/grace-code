@@ -184,3 +184,54 @@ class TestCancellationHandle:
         assert h.is_active
         h.cancel()
         assert not h.is_active
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# H6 — CancellationHandle → ProcessRegistry binding
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCancelKillsProcesses:
+    """H6: cancel() notifies ProcessRegistry to kill subprocesses."""
+
+    def test_cancel_calls_registry_cancel_all(self):
+        """When a ProcessRegistry is bound, cancel() must call cancel_all()."""
+        from hook_core.process_runner import ProcessRegistry
+        import subprocess, sys
+
+        registry = ProcessRegistry()
+        # Register a dummy process
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        registry.register("test-hook", proc)
+
+        handle = CancellationHandle(process_registry=registry)
+        handle.cancel()
+
+        # Process should be killed
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        assert proc.poll() is not None, "H6: Process must be killed on cancel"
+
+    def test_cancel_without_registry_no_error(self):
+        """Without a ProcessRegistry, cancel() should not raise."""
+        handle = CancellationHandle()  # no registry
+        handle.cancel()  # must not raise
+        assert handle.cancelled
+
+    def test_class_level_default_registry(self):
+        """Class-level set_process_registry propagates to new handles."""
+        from hook_core.process_runner import ProcessRegistry
+        registry = ProcessRegistry()
+        CancellationHandle.set_process_registry(registry)
+
+        h = CancellationHandle()
+        assert h._process_registry is not None, (
+            "H6: class-level registry must propagate to new handles"
+        )
+        # Reset default
+        CancellationHandle._default_process_registry = None

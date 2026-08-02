@@ -55,6 +55,131 @@ def _release_owner(db_path: str) -> None:
         _active_owners.pop(db_path, None)
 
 
+# ── H1: LLM Backend Adapter ────────────────────────────────────────────
+
+def _invoke_via_backend(backend, messages, tools=None):
+    """Invoke LLM via backend, convert LLMResponse → ModelAction + TokenUsage.
+
+    H1: When backend is None, returns a controlled fake response (test mode).
+        When backend is provided, delegates to backend.complete() and maps
+        the response to typed ModelAction with TokenUsage extracted.
+    """
+    from runtime_core.model_actions import (
+        AssistantText, ToolCall as MACToolCall, ToolCallBatch,
+        ModelStop, ModelRefusal, ModelFailure, TokenUsage,
+    )
+
+    if backend is None:
+        # H1 test mode: controlled fake response
+        return AssistantText(
+            text="H1 fake response",
+            stop_reason="end_turn",
+            usage=TokenUsage(input_tokens=10, output_tokens=5),
+        )
+
+    # ── Convert FrozenJsonObject messages → LLMMessage list ──────────
+    from llm.base import LLMMessage
+    from core.json_values import thaw_json
+
+    raw_messages = thaw_json(messages) if hasattr(messages, '__dataclass_fields__') else messages
+    msg_list = raw_messages.get("messages", raw_messages) if isinstance(raw_messages, dict) else raw_messages
+    llm_messages = []
+    if isinstance(msg_list, (list, tuple)):
+        for m in msg_list:
+            role = m.get("role", "user") if isinstance(m, dict) else "user"
+            content = m.get("content", "") if isinstance(m, dict) else str(m)
+            llm_messages.append(LLMMessage(role=role, content=content))
+
+    # ── Invoke real backend ───────────────────────────────────────────
+    response = backend.complete(llm_messages, [])
+
+    # ── Extract TokenUsage ────────────────────────────────────────────
+    usage = TokenUsage(
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+    )
+
+    # ── Map Action → ModelAction ──────────────────────────────────────
+    from core.types import ActionType
+
+    action = response.action
+    if action is None:
+        return AssistantText(text=response.raw_content or "", usage=usage)
+
+    if action.action_type == ActionType.FINISH:
+        text = action.message or action.thought or response.raw_content or ""
+        return AssistantText(text=text, stop_reason=response.finish_reason, usage=usage)
+
+    if action.action_type == ActionType.TOOL_CALL:
+        calls = []
+        for tc in action.tool_calls:
+            from core.json_values import freeze_json
+            params = freeze_json(tc.params) if isinstance(tc.params, dict) else tc.params
+            calls.append(MACToolCall(id=tc.id or "", name=tc.name, params=params))
+        if len(calls) == 1:
+            return MACToolCall(id=calls[0].id, name=calls[0].name, params=calls[0].params, usage=usage)
+        return ToolCallBatch(calls=tuple(calls), usage=usage)
+
+    if action.action_type == ActionType.GIVE_UP:
+        return ModelFailure(error=action.thought or "gave up", usage=usage)
+
+    if action.action_type == ActionType.REFLECTION:
+        return AssistantText(text=action.thought or "", usage=usage)
+
+    # Fallback
+    return AssistantText(text=response.raw_content or "", usage=usage)
+
+
+# ── H2: Tool Registry Adapter ──────────────────────────────────────────
+
+def _execute_via_registry(lookup, tool_name, params, invocation_id=""):
+    """Execute a tool via registry lookup, convert ToolResult → ToolOutcome.
+
+    H2: When lookup is None, returns a controlled fake response (test mode).
+        When lookup is provided, finds the tool and calls tool.execute(params).
+    """
+    from runtime_core.ports import ToolSuccess, ToolFailure
+
+    if lookup is None:
+        # H2 test mode: controlled fake response
+        return ToolSuccess(
+            tool_name=tool_name,
+            output=f"H2 fake output for {tool_name}",
+            duration_ms=1.0,
+        )
+
+    # ── Look up and execute real tool ──────────────────────────────────
+    tool = lookup(tool_name)
+    if tool is None:
+        return ToolFailure(
+            tool_name=tool_name,
+            error=f"Tool not found: {tool_name}",
+        )
+
+    # Convert FrozenJsonObject params to dict for BaseTool
+    from core.json_values import thaw_json
+    params_dict = thaw_json(params) if hasattr(params, '__dataclass_fields__') else (params or {})
+
+    import time as _time_mod
+    started = _time_mod.monotonic()
+    try:
+        result = tool.execute(params_dict)
+        duration_ms = (_time_mod.monotonic() - started) * 1000
+        return ToolSuccess(
+            tool_name=tool_name,
+            output=result.output or "",
+            duration_ms=duration_ms,
+        )
+    except Exception as exc:
+        duration_ms = (_time_mod.monotonic() - started) * 1000
+        return ToolFailure(
+            tool_name=tool_name,
+            error=f"{type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+            duration_ms=duration_ms,
+        )
+
+
 # ── G28: Typed assembly ──────────────────────────────────────────────────
 
 def assemble(db_path: str) -> ApplicationComponents:
@@ -104,12 +229,18 @@ def assemble(db_path: str) -> ApplicationComponents:
             pass  # Recorded via Coordinator terminal UoW
 
     class _RealCancellation:
-        """Checks whether a run has been cancelled."""
+        """H6: Checks whether a run has been cancelled. Per-run state from handle."""
         def __init__(self, registry):
             self._registry = registry
         @property
         def cancelled(self) -> bool:
             return False  # Per-run handle checked via RuntimeExecution.cancellation
+
+    # H6: Create ProcessRegistry and wire into CancellationHandle
+    from hook_core.process_runner import ProcessRegistry
+    from runtime_core.execution import CancellationHandle as CHandle
+    _proc_registry = ProcessRegistry()
+    CHandle.set_process_registry(_proc_registry)
 
     class _RealHooks:
         """Hook gate — delegates to HookDispatcher."""
@@ -125,24 +256,39 @@ def assemble(db_path: str) -> ApplicationComponents:
             )
 
     class _RealTools:
-        """Tool executor — delegates to actual tool implementations."""
+        """H2: Tool executor — delegates to BaseTool registry.
+
+        Accepts an optional tool lookup function.  If None (test mode),
+        returns a controlled fake response.  In production, pass a real
+        tool registry lookup.
+        """
+        def __init__(self, tool_lookup=None):
+            self._lookup = tool_lookup  # callable(name) -> BaseTool | None
+
         def execute(self, tool_name, params, invocation_id=""):
-            from runtime_core.ports import ToolSuccess
-            return ToolSuccess(tool_name=tool_name, output="")
+            return _execute_via_registry(self._lookup, tool_name, params, invocation_id)
 
     class _RealLLM:
-        """LLM adapter — delegates to provider backend."""
+        """H1: LLM adapter — delegates to LLMBackend, converts to ModelAction.
+
+        Accepts an optional LLMBackend.  If None (test mode), returns a
+        controlled fake response.  In production, pass the real backend.
+        """
+        def __init__(self, backend=None):
+            self._backend = backend  # LLMBackend | None
+
         def invoke(self, messages, tools=None):
-            from runtime_core.model_actions import AssistantText
-            return AssistantText(text="")
+            return _invoke_via_backend(self._backend, messages, tools)
+
         def stream(self, messages, tools=None):
             async def _s():
-                from runtime_core.model_actions import AssistantText
-                return AssistantText(text="")
+                return _invoke_via_backend(self._backend, messages, tools)
             return _s()
 
     runtime_ports = RuntimePorts(
-        llm=_RealLLM(), tools=_RealTools(), hooks=_RealHooks(hook_dispatcher),
+        llm=_RealLLM(backend=None),  # H1: None → fake; pass real backend in production
+        tools=_RealTools(tool_lookup=None),  # H2: None → fake; pass real registry in production
+        hooks=_RealHooks(hook_dispatcher),
         live_events=_RealLiveEvents(bus), clock=_RealClock(),
         token_usage=_RealTokenUsage(outbox), cancellation=_RealCancellation(None),
     )

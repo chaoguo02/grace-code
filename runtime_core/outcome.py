@@ -60,6 +60,8 @@ class RuntimeOutcome:
     status: RunStatus
     steps_taken: int = 0
     tokens_used: int = 0
+    input_tokens: int = 0   # H3: separated from tokens_used for accurate recording
+    output_tokens: int = 0  # H3: separated from tokens_used for accurate recording
     summary: str = ""
     error: str = ""
     cancellation_reason: CancellationReason | None = None

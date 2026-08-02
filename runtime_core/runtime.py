@@ -31,16 +31,25 @@ class AgentRuntime:
         loop = StepLoop(self._ports)
         outcome = loop.execute(context)
 
-        # Publish live event (non-authoritative)
+        # H7: Publish live event with FrozenJsonObject payload (not bare string)
+        from core.json_values import freeze_json
         self._ports.live_events.publish(
             event_type=f"run.{outcome.status.value}.v1",
-            payload=outcome.summary,
+            payload=freeze_json({
+                "run_id": str(outcome.run_id),
+                "status": outcome.status.value,
+                "summary": outcome.summary,
+                "steps_taken": outcome.steps_taken,
+                "tokens_used": outcome.tokens_used,
+            }),
         )
 
-        # Record token usage
+        # H3: Record separated input/output token usage
         if outcome.tokens_used > 0:
             self._ports.token_usage.record(
-                context.run_id, outcome.tokens_used, 0,
+                context.run_id,
+                outcome.input_tokens or outcome.tokens_used,
+                outcome.output_tokens,
             )
 
         return outcome

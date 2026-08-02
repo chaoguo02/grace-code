@@ -62,7 +62,11 @@ class HookGatePort(Protocol):
 # ── Ports ───────────────────────────────────────────────────────────────────
 
 class LLMPort(Protocol):
-    """Call the language model.  Returns typed ModelAction."""
+    """Call the language model.  Returns typed ModelAction.
+
+    H0: Returned ModelAction carries optional TokenUsage in its .usage field.
+    Adapters MUST populate usage from the provider's response metadata.
+    """
     def invoke(self, messages: FrozenJsonObject,
                tools: FrozenJsonObject | None = None) -> ModelAction: ...
 

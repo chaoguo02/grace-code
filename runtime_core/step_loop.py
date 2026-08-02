@@ -27,7 +27,10 @@ from runtime_core.model_actions import (
     ModelFailure,
 )
 from runtime_core.execution import CancellationHandle
-from runtime_core.outcome import RuntimeOutcome, RunStatus, CancellationReason
+from runtime_core.outcome import (
+    RuntimeOutcome, RunStatus, CancellationReason,
+    ToolEvidence, RunEvidence,
+)
 from runtime_core.ports import RuntimePorts, HookGateResult, ToolOutcome, ToolSuccess, ToolFailure, ToolDenied
 from runtime_core.tool_scheduler import ToolScheduler, ToolMetadata
 from hook_core.inputs import PreToolUseInput, PostToolUseInput
@@ -41,6 +44,19 @@ class ToolResult:
     hook_allowed: bool = True
     hook_deny_reason: str = ""
     post_hook_context: str = ""
+
+    # H4: Evidence derived from this tool execution
+    @property
+    def evidence(self) -> ToolEvidence:
+        success = self.hook_allowed and (
+            isinstance(self.outcome, ToolSuccess) if self.outcome else False
+        )
+        duration = getattr(self.outcome, 'duration_ms', 0.0) if self.outcome else 0.0
+        return ToolEvidence(
+            tool_name=self.tool_call.name,
+            success=success,
+            duration_ms=duration,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,11 +85,18 @@ class StepLoop:
         steps: list[StepResult] = []
         total_tokens_in = 0
         total_tokens_out = 0
+        # H4: Collect tool evidence throughout the run
+        tool_evidences: list[ToolEvidence] = []
+        files_touched: set[str] = set()
+        hook_blocks: list[str] = []
 
         for turn in range(context.max_steps):
             # G18: Cancellation check at top of every iteration
             if context.cancellation.cancelled:
-                return self._cancelled_outcome(context.run_id, steps, total_tokens_in + total_tokens_out)
+                return self._cancelled_outcome(context.run_id, steps,
+                                               total_tokens_in + total_tokens_out,
+                                               total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks)
 
             # ── 1. Model call ───────────────────────────────────────
             conv_json = freeze_json({
@@ -86,14 +109,20 @@ class StepLoop:
             try:
                 model_action = self._ports.llm.invoke(conv_json)
             except Exception as exc:
-                return RuntimeOutcome.failed(
+                return self._finalize_outcome(RuntimeOutcome.failed(
                     context.run_id, error=f"LLM invoke failed: {exc}",
                     steps=len(steps),
                     tokens=total_tokens_in + total_tokens_out,
-                )
+                ), total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks)
 
-            step_tokens_in = 100
-            step_tokens_out = 50
+            # H3: Extract real token usage from model action (no more hardcoded 100/50)
+            if model_action is not None and hasattr(model_action, 'usage') and model_action.usage is not None:
+                step_tokens_in = model_action.usage.input_tokens
+                step_tokens_out = model_action.usage.output_tokens
+            else:
+                step_tokens_in = 0
+                step_tokens_out = 0
             total_tokens_in += step_tokens_in
             total_tokens_out += step_tokens_out
 
@@ -102,22 +131,36 @@ class StepLoop:
                 steps.append(StepResult(turn_index=turn, model_action=model_action,
                                         should_continue=False,
                                         tokens_input=step_tokens_in, tokens_output=step_tokens_out))
-                return RuntimeOutcome.completed(context.run_id, steps=len(steps),
-                                                tokens=total_tokens_in + total_tokens_out,
-                                                summary=model_action.text[:500])
+                return self._finalize_outcome(RuntimeOutcome.completed(
+                    context.run_id, steps=len(steps),
+                    tokens=total_tokens_in + total_tokens_out,
+                    summary=model_action.text[:500]), total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks)
 
             if isinstance(model_action, ModelStop):
                 steps.append(StepResult(turn_index=turn, model_action=model_action,
                                         should_continue=False,
                                         tokens_input=step_tokens_in, tokens_output=step_tokens_out))
-                return RuntimeOutcome.completed(context.run_id, steps=len(steps),
-                                                tokens=total_tokens_in + total_tokens_out,
-                                                summary=model_action.text or model_action.stop_reason)
+                return self._finalize_outcome(RuntimeOutcome.completed(
+                    context.run_id, steps=len(steps),
+                    tokens=total_tokens_in + total_tokens_out,
+                    summary=model_action.text or model_action.stop_reason),
+                    total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks)
 
             if isinstance(model_action, (ToolCall, ToolCallBatch)):
                 calls = (model_action,) if isinstance(model_action, ToolCall) else model_action.calls
-                tool_results = self._process_tool_calls(calls, context=context)
-                # G19: Could use _process_tool_calls_parallel for async execution
+                # H5: Default to parallel execution for multi-tool batches
+                if isinstance(model_action, ToolCallBatch) and len(calls) > 1:
+                    import asyncio
+                    tool_results = asyncio.run(
+                        self._process_tool_calls_parallel(calls, context=context)
+                    )
+                else:
+                    tool_results = self._process_tool_calls(calls, context=context)
+                # H4: Collect tool evidence from results
+                for tr in tool_results:
+                    tool_evidences.append(tr.evidence)
 
                 # Publish live events for each tool result
                 for tr in tool_results:
@@ -137,34 +180,65 @@ class StepLoop:
                 steps.append(StepResult(turn_index=turn, model_action=model_action,
                                         should_continue=False,
                                         tokens_input=step_tokens_in, tokens_output=step_tokens_out))
-                return RuntimeOutcome.blocked(context.run_id, steps=len(steps),
-                                              tokens=total_tokens_in + total_tokens_out,
-                                              blocked_by="model_refusal", detail=model_action.reason)
+                return self._finalize_outcome(RuntimeOutcome.blocked(
+                    context.run_id, steps=len(steps),
+                    tokens=total_tokens_in + total_tokens_out,
+                    blocked_by="model_refusal", detail=model_action.reason),
+                    total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks)
 
             if isinstance(model_action, ModelFailure):
                 if model_action.retryable:
                     steps.append(StepResult(turn_index=turn, model_action=model_action,
                                             tokens_input=step_tokens_in, tokens_output=step_tokens_out))
                     continue
-                return RuntimeOutcome.failed(context.run_id, error=model_action.error,
-                                             steps=len(steps),
-                                             tokens=total_tokens_in + total_tokens_out)
+                return self._finalize_outcome(RuntimeOutcome.failed(
+                    context.run_id, error=model_action.error,
+                    steps=len(steps),
+                    tokens=total_tokens_in + total_tokens_out),
+                    total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks)
 
-        return RuntimeOutcome.blocked(context.run_id, steps=len(steps),
-                                      tokens=total_tokens_in + total_tokens_out,
-                                      blocked_by="max_steps",
-                                      detail=f"max_steps={context.max_steps}")
+        return self._finalize_outcome(RuntimeOutcome.blocked(
+            context.run_id, steps=len(steps),
+            tokens=total_tokens_in + total_tokens_out,
+            blocked_by="max_steps",
+            detail=f"max_steps={context.max_steps}"),
+            total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks)
 
     # ── G17: Tool call pipeline ────────────────────────────────────────
 
-    def _cancelled_outcome(self, run_id: RunId, steps: list, tokens: int) -> RuntimeOutcome:
-        """Build cancelled outcome with completed step evidence."""
-        return RuntimeOutcome.cancelled(
+    @staticmethod
+    def _finalize_outcome(outcome: RuntimeOutcome, input_tokens: int,
+                          output_tokens: int,
+                          tool_evidences: list[ToolEvidence],
+                          files_touched: set[str],
+                          hook_blocks: list[str]) -> RuntimeOutcome:
+        """H3+H4: Inject tokens + evidence into a frozen outcome."""
+        object.__setattr__(outcome, 'input_tokens', input_tokens)
+        object.__setattr__(outcome, 'output_tokens', output_tokens)
+        if tool_evidences or files_touched or hook_blocks:
+            evidence = RunEvidence(
+                tool_calls=tuple(tool_evidences),
+                files_touched=tuple(sorted(files_touched)),
+                hook_blocks=tuple(hook_blocks),
+            )
+            object.__setattr__(outcome, 'evidence', evidence)
+        return outcome
+
+    def _cancelled_outcome(self, run_id: RunId, steps: list, tokens: int,
+                           tokens_in: int = 0, tokens_out: int = 0,
+                           tool_evidences=None, files_touched=None,
+                           hook_blocks=None) -> RuntimeOutcome:
+        """H6: Build cancelled outcome with evidence."""
+        return self._finalize_outcome(RuntimeOutcome.cancelled(
             run_id,
             reason=CancellationReason.USER_REQUESTED,
             steps=len(steps),
             tokens=tokens,
-        )
+        ), tokens_in, tokens_out,
+           tool_evidences or [], files_touched or set(), hook_blocks or [])
 
     def _process_tool_calls(self, calls: tuple[ToolCall, ...],
                             context: RuntimeExecution | None = None) -> list[ToolResult]:

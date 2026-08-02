@@ -111,3 +111,75 @@ class TestLifecycle:
         lifecycle.start()
         lifecycle.stop()
         # No exception = OK
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# H1 — _RealLLM returns non-empty ModelAction with TokenUsage
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLLMAdapter:
+    """H1: _RealLLM.invoke() returns real text + TokenUsage, not empty stub."""
+
+    def test_invoke_returns_non_empty_text(self, temp_db):
+        comp = assemble(temp_db)
+        result = comp.runtime_ports.llm.invoke(None)
+        assert result.text != "", (
+            "H1 FAIL: _RealLLM.invoke() must not return empty text"
+        )
+
+    def test_invoke_returns_token_usage(self, temp_db):
+        comp = assemble(temp_db)
+        result = comp.runtime_ports.llm.invoke(None)
+        assert result.usage is not None, (
+            "H1 FAIL: _RealLLM.invoke() must return TokenUsage"
+        )
+        assert result.usage.input_tokens > 0, (
+            "H1 FAIL: input_tokens must be > 0"
+        )
+        assert result.usage.output_tokens > 0, (
+            "H1 FAIL: output_tokens must be > 0"
+        )
+
+    def test_invoke_with_fake_backend(self, temp_db):
+        """H1: When backend is None, returns controlled fake response for tests."""
+        comp = assemble(temp_db)
+        result = comp.runtime_ports.llm.invoke(None)
+        assert result.text == "H1 fake response", (
+            f"H1: expected fake response, got {result.text!r}"
+        )
+
+    def test_stream_also_returns_non_empty(self, temp_db):
+        comp = assemble(temp_db)
+        import asyncio
+        async def _run():
+            coro = comp.runtime_ports.llm.stream(None)
+            result = await coro
+            assert result.text != "", "H1: stream must return non-empty"
+        asyncio.run(_run())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# H2 — _RealTools returns non-empty ToolOutcome
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestToolAdapter:
+    """H2: _RealTools.execute() returns real output, not empty stub."""
+
+    def test_execute_returns_non_empty_output(self, temp_db):
+        comp = assemble(temp_db)
+        result = comp.runtime_ports.tools.execute("read", None)
+        assert result.output != "", (
+            "H2 FAIL: _RealTools.execute() must not return empty output"
+        )
+
+    def test_execute_returns_tool_name(self, temp_db):
+        comp = assemble(temp_db)
+        result = comp.runtime_ports.tools.execute("write", None)
+        assert result.tool_name == "write"
+
+    def test_execute_fake_contains_tool_name_in_output(self, temp_db):
+        comp = assemble(temp_db)
+        result = comp.runtime_ports.tools.execute("bash", None)
+        assert "bash" in result.output, (
+            f"H2: fake output should mention tool name, got {result.output!r}"
+        )

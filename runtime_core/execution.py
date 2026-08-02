@@ -43,14 +43,28 @@ class CancellationHandle:
             return RuntimeOutcome.cancelled(...)
     """
 
-    def __init__(self) -> None:
+    # H6: Class-level default — set once at composition time
+    _default_process_registry = None
+
+    @classmethod
+    def set_process_registry(cls, registry) -> None:
+        cls._default_process_registry = registry
+
+    def __init__(self, process_registry=None) -> None:
         self._cancelled = False
         self._lock = threading.Lock()
+        # H6: Use passed registry or class-level default
+        self._process_registry = process_registry or self._default_process_registry
 
     def cancel(self) -> None:
-        """Signal cancellation.  Idempotent."""
+        """Signal cancellation.  Idempotent.  Also kills subprocesses (H6)."""
         with self._lock:
+            if self._cancelled:
+                return
             self._cancelled = True
+        # H6: Kill all in-flight hook/tool subprocesses
+        if self._process_registry is not None:
+            self._process_registry.cancel_all()
 
     @property
     def cancelled(self) -> bool:

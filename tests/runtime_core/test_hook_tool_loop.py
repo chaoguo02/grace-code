@@ -246,3 +246,55 @@ class TestPostToolNonBlocking:
         outcome = loop.execute(_context(max_steps=1))
         # Must continue despite PostToolUse crash
         assert outcome.status == RunStatus.BLOCKED  # max_steps
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# H4 — Evidence collection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestEvidenceCollection:
+    """H4: Evidence is non-None after tool execution."""
+
+    def test_tool_execution_produces_evidence(self):
+        hooks = FakeHooks(HookGateResult(allowed=True))
+        ports = RuntimePorts(
+            llm=FakeLLM(ToolCall(id="t1", name="read", params=freeze_json({"f": "x"}))),
+            tools=FakeTools(), hooks=hooks,
+            live_events=FakeLiveEvents(), clock=FakeClock(),
+            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+        )
+        loop = StepLoop(ports)
+        outcome = loop.execute(_context(max_steps=1))
+        assert outcome.evidence is not None, (
+            "H4 FAIL: evidence must not be None after tool execution"
+        )
+        assert len(outcome.evidence.tool_calls) == 1, (
+            f"Expected 1 tool evidence, got {len(outcome.evidence.tool_calls)}"
+        )
+
+    def test_evidence_tool_name_correct(self):
+        hooks = FakeHooks(HookGateResult(allowed=True))
+        ports = RuntimePorts(
+            llm=FakeLLM(ToolCall(id="t1", name="bash", params=freeze_json({"cmd": "ls"}))),
+            tools=FakeTools(), hooks=hooks,
+            live_events=FakeLiveEvents(), clock=FakeClock(),
+            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+        )
+        loop = StepLoop(ports)
+        outcome = loop.execute(_context(max_steps=1))
+        assert outcome.evidence.tool_calls[0].tool_name == "bash"
+
+    def test_denied_tool_also_produces_evidence(self):
+        """H4: Denied tools should also record evidence (hook_allowed=False)."""
+        hooks = FakeHooks(HookGateResult(allowed=False, reason="blocked"))
+        ports = RuntimePorts(
+            llm=FakeLLM(ToolCall(id="t1", name="rm", params=freeze_json({}))),
+            tools=FakeTools(), hooks=hooks,
+            live_events=FakeLiveEvents(), clock=FakeClock(),
+            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+        )
+        loop = StepLoop(ports)
+        outcome = loop.execute(_context(max_steps=1))
+        assert outcome.evidence is not None
+        # Denied tool still produces evidence
+        assert len(outcome.evidence.tool_calls) >= 1

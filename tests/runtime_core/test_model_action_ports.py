@@ -224,6 +224,75 @@ class TestRuntimePorts:
 RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "runtime_core")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# H0 — TokenUsage + usage field on all ModelAction subclasses
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTokenUsage:
+    """H0: TokenUsage is frozen; all 6 ModelAction types accept usage."""
+
+    def test_token_usage_frozen(self):
+        from runtime_core.model_actions import TokenUsage
+        u = TokenUsage(input_tokens=100, output_tokens=50)
+        assert u.input_tokens == 100
+        assert u.output_tokens == 50
+        assert u.total == 150
+        with pytest.raises(Exception):
+            u.input_tokens = 200  # type: ignore
+
+    def test_token_usage_defaults(self):
+        from runtime_core.model_actions import TokenUsage
+        u = TokenUsage()
+        assert u.input_tokens == 0
+        assert u.output_tokens == 0
+        assert u.cache_read_tokens == 0
+        assert u.cache_write_tokens == 0
+
+    def test_assistant_text_accepts_usage(self):
+        from runtime_core.model_actions import AssistantText, TokenUsage
+        u = TokenUsage(input_tokens=10, output_tokens=5)
+        a = AssistantText(text="hello", usage=u)
+        assert a.usage is not None
+        assert a.usage.input_tokens == 10
+
+    def test_assistant_text_usage_defaults_to_none(self):
+        from runtime_core.model_actions import AssistantText
+        a = AssistantText(text="hi")
+        assert a.usage is None  # backward compatible
+
+    def test_tool_call_accepts_usage(self):
+        from runtime_core.model_actions import ToolCall, TokenUsage
+        from core.json_values import freeze_json
+        u = TokenUsage(input_tokens=20, output_tokens=10)
+        tc = ToolCall(id="1", name="read", params=freeze_json({"f": "x"}), usage=u)
+        assert tc.usage is not None
+        assert tc.usage.total == 30
+
+    def test_tool_call_batch_accepts_usage(self):
+        from runtime_core.model_actions import ToolCallBatch, TokenUsage
+        u = TokenUsage(input_tokens=30, output_tokens=15)
+        batch = ToolCallBatch(calls=(), usage=u)
+        assert batch.usage is not None
+
+    def test_model_stop_accepts_usage(self):
+        from runtime_core.model_actions import ModelStop, TokenUsage
+        u = TokenUsage(input_tokens=5, output_tokens=2)
+        s = ModelStop(stop_reason="end_turn", usage=u)
+        assert s.usage is not None
+
+    def test_model_refusal_accepts_usage(self):
+        from runtime_core.model_actions import ModelRefusal, TokenUsage
+        u = TokenUsage(input_tokens=8, output_tokens=0)
+        r = ModelRefusal(reason="policy", usage=u)
+        assert r.usage is not None
+
+    def test_model_failure_accepts_usage(self):
+        from runtime_core.model_actions import ModelFailure, TokenUsage
+        u = TokenUsage(input_tokens=3, output_tokens=0)
+        f = ModelFailure(error="timeout", usage=u)
+        assert f.usage is not None
+
+
 class TestStaticGate:
     """G15: ports.py uses typed interfaces, not object/dict."""
 

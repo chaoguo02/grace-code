@@ -16,11 +16,15 @@ from pathlib import Path
 import pytest
 
 from core.eventing.identifiers import SessionId, RunId
-from application.commands.run_commands import SubmitRun, IdempotencyConflict, RunAlreadyActive
+from runtime_core.execution import RuntimeExecution, ConversationSnapshot
+from runtime_core.model_actions import TokenUsage
+from application.commands.run_commands import SubmitRun, IdempotencyConflict, RunAlreadyActive, ExecuteRun
 from application.coordinators.run_coordinator import RunCoordinator
 from application.events.schema_registry import SchemaRegistry
 from infrastructure.outbox.sqlite_store import SqliteOutboxStore
 from infrastructure.sqlite.run_uow import SqliteUnitOfWork
+from infrastructure.outbox.owner_lease import OwnerLease
+from runtime_core.outcome import RunStatus
 
 
 class FakeRuntime:
@@ -103,4 +107,105 @@ class TestNativeRunE2E:
         )
         assert "_StorageTx" not in source, (
             "G31: _StorageTx nested class must be removed"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# H8 — End-to-end fake-adapter verification
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestE2EFakeAdapter:
+    """H8: Full pipeline with fake adapters — submit → execute → terminal."""
+
+    def test_full_pipeline_evidence_and_tokens(self, temp_db):
+        """E2E: assemble → submit → execute → verify evidence + tokens."""
+        from composition.runtime_composition import assemble
+        comp = assemble(temp_db)
+
+        # Submit
+        cmd = SubmitRun(session_id=SessionId("s-e2e"), prompt="hello",
+                        idempotency_key="ik-e2e-h8")
+        result = comp.run_coordinator.submit(cmd)
+        assert isinstance(result, RunId), f"Expected RunId, got {type(result).__name__}"
+        run_id = result
+
+        # Execute via coordinator
+        outcome = comp.runtime.run(
+            RuntimeExecution(
+                session_id=SessionId("s-e2e"),
+                run_id=run_id,
+                max_steps=5,
+                conversation=ConversationSnapshot(
+                    messages=({"role": "user", "content": "hello"},),
+                ),
+            )
+        )
+        # H8: After H0-H7, fake LLM returns text + usage, tools return output
+        assert outcome.status in (RunStatus.COMPLETED, RunStatus.BLOCKED), (
+            f"Expected COMPLETED or BLOCKED, got {outcome.status}"
+        )
+        # H4: Evidence is None for text-only completions (no tools ran)
+        # Tool evidence is verified in test_e2e_with_tool_call below
+        # H3: Tokens must be non-zero
+        assert outcome.tokens_used > 0, (
+            f"H8 FAIL: tokens_used must be > 0, got {outcome.tokens_used}"
+        )
+        # H3: Input/output separated
+        assert outcome.input_tokens > 0, (
+            f"H8 FAIL: input_tokens must be > 0, got {outcome.input_tokens}"
+        )
+        assert outcome.output_tokens > 0, (
+            f"H8 FAIL: output_tokens must be > 0, got {outcome.output_tokens}"
+        )
+
+    def test_e2e_with_tool_call(self, temp_db):
+        """E2E: run with a tool call produces tool evidence."""
+        from composition.runtime_composition import assemble
+        from runtime_core.model_actions import ToolCall
+        from core.json_values import freeze_json
+
+        comp = assemble(temp_db)
+
+        # Create a FakeLLM that returns a tool call
+        tc = ToolCall(id="t1", name="read", params=freeze_json({"f": "x"}),
+                      usage=TokenUsage(input_tokens=30, output_tokens=10))
+        # Override the LLM port with a controlled one
+        comp.runtime_ports.llm.invoke = lambda m, t=None: tc
+
+        outcome = comp.runtime.run(
+            RuntimeExecution(
+                session_id=SessionId("s-e2e-tool"),
+                run_id=RunId("r-e2e-tool"),
+                max_steps=5,
+                conversation=ConversationSnapshot(
+                    messages=({"role": "user", "content": "read x"},),
+                ),
+            )
+        )
+        # H4: Tool evidence must include the tool call
+        assert outcome.evidence is not None
+        assert len(outcome.evidence.tool_calls) >= 1, (
+            f"H8: expected tool evidence, got {len(outcome.evidence.tool_calls)}"
+        )
+
+    def test_e2e_performance_baseline(self, temp_db):
+        """H8: Fake adapter E2E must complete in < 2 seconds."""
+        import time as _time
+        from composition.runtime_composition import assemble
+        comp = assemble(temp_db)
+
+        started = _time.monotonic()
+        outcome = comp.runtime.run(
+            RuntimeExecution(
+                session_id=SessionId("s-perf"),
+                run_id=RunId("r-perf"),
+                max_steps=3,
+                conversation=ConversationSnapshot(
+                    messages=({"role": "user", "content": "hi"},),
+                ),
+            )
+        )
+        elapsed = (_time.monotonic() - started) * 1000
+        assert elapsed < 2000, (
+            f"H8: E2E too slow: {elapsed:.0f}ms (must be < 2000ms)"
         )
