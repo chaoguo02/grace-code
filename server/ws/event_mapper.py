@@ -1,8 +1,9 @@
 """
-R3.4: WS Event Mapper — DomainEvent → WsEvent DTO.
+G38: DEPRECATED — replaced by server.ws.native_event_mapper.NativeEventMapper.
 
-Separates durable domain facts from ephemeral WebSocket notifications.
-The mapper is a pure function: DomainEvent in → WsEvent out (or None).
+Old mapper uses record.payload dict access with .get() calls.
+New code MUST use NativeEventMapper which reads from Typed EventEnvelope.
+Kept for backward compat only — will be removed in G42.
 """
 
 from __future__ import annotations

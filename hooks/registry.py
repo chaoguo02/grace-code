@@ -1,8 +1,7 @@
-"""
-hooks/registry.py
+"""G40: DEPRECATED — replaced by hook_core.registry.HookRegistry (G12).
 
-Hook registry: stores external (command) and internal (Python callable) hooks,
-loaded from settings.json or registered programmatically.
+Hook registry: stores external and internal hooks.
+Kept for backward compat.  Will be deleted in full deletion phase.
 
 Config format in .grace/settings.json:
 {

@@ -1,0 +1,213 @@
+"""ToolCallValidator — contract enforcement between LLM output and Tool execution.
+
+Claude Code pattern: the LLM is an "action generator" operating within a strict
+contract. Every tool call MUST pass validation against the registered tool
+schemas BEFORE execution. Invalid calls are rejected at the control plane,
+not leaked to the data plane (Runtime).
+
+This module sits between core.py's Action parsing and ToolRegistry execution.
+It does NOT modify the Action — it only returns a pass/fail result. On failure,
+the main loop injects a structured error observation so the LLM can self-correct
+on the next turn.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent.task import ToolCall
+    from llm.base import LLMToolSchema
+
+
+@dataclass
+class ValidationResult:
+    """Result of tool call validation against registered schemas."""
+    valid: bool
+    error_type: str = ""         # "unknown_tool" | "missing_required" | "duplicate_call"
+    error_message: str = ""
+    offending_tool: str = ""     # which tool call failed
+
+
+def validate_tool_calls(
+    tool_calls: list,
+    tool_schemas: list,
+) -> ValidationResult:
+    """Validate tool calls against the registered tool schemas.
+
+    This is the CONTROL PLANE — it enforces the contract between "what the LLM
+    asked for" and "what the system can do." Invalid tool calls are rejected
+    BEFORE they reach the Runtime.
+
+    Checks (in order):
+        1. Tool name exists in schemas (→ "unknown_tool")
+        2. Required params are present (→ "missing_required")
+        3. No duplicate calls within the same action (→ "duplicate_call")
+
+    Returns ValidationResult(valid=True) if all checks pass.
+    """
+    schema_map: dict[str, any] = {s.name: s for s in tool_schemas}
+
+    for tc in tool_calls:
+        name = getattr(tc, "name", "")
+        params = getattr(tc, "params", {}) or {}
+
+        # ── Check 1: Tool name exists ──
+        if name not in schema_map:
+            available = ", ".join(sorted(schema_map.keys()))
+            return ValidationResult(
+                valid=False,
+                error_type="unknown_tool",
+                error_message=(
+                    f"Unknown tool '{name}'. Available tools: {available}"
+                ),
+                offending_tool=name,
+            )
+
+        # ── Check 2: Required params present ──
+        schema = schema_map[name]
+        required: list[str] = schema.parameters.get("required", []) if hasattr(schema, "parameters") else []
+        for field in required:
+            if field not in params:
+                return ValidationResult(
+                    valid=False,
+                    error_type="missing_required",
+                    error_message=(
+                        f"Tool '{name}' requires parameter '{field}'. "
+                        f"Your call was missing this field. Please retry with the required parameter."
+                    ),
+                    offending_tool=name,
+                )
+
+    # ── Check 2b: Parameter validation (P1-2: jsonschema) ──
+        if not isinstance(params, dict):
+            return _invalid_params(
+                name,
+                "parameters must be an object",
+            )
+        root_schema = schema.parameters if hasattr(schema, "parameters") else {}
+        if root_schema:
+            from core.schema_validator import SchemaValidator
+            validator = SchemaValidator(root_schema)
+            result = validator.safe_parse(params)
+            if not result.valid:
+                feedback = validator.format_errors_for_llm(result.errors)
+                legacy_paths = [
+                    "params" + "".join(
+                        f"[{part}]" if part.isdigit() else f".{part}"
+                        for part in error.path.strip("/").split("/")
+                        if part
+                    )
+                    for error in result.errors
+                    if error.path and error.path != "/"
+                ]
+                if legacy_paths:
+                    feedback += "\n  Parameter paths: " + ", ".join(legacy_paths)
+                return _invalid_params(name, feedback)
+
+    # ── Check 3: Duplicate detection ──
+    if len(tool_calls) > 1:
+        seen: set[tuple] = set()
+        for tc in tool_calls:
+            name = getattr(tc, "name", "")
+            params = getattr(tc, "params", {}) or {}
+            try:
+                key = (name, json.dumps(params, sort_keys=True, ensure_ascii=False))
+            except (TypeError, ValueError):
+                key = (name, str(params))
+            if key in seen:
+                return ValidationResult(
+                    valid=False,
+                    error_type="duplicate_call",
+                    error_message=(
+                        f"Duplicate tool call: '{name}' was called twice in the same "
+                        f"response with identical parameters. Remove the duplicate and retry."
+                    ),
+                    offending_tool=name,
+                )
+            seen.add(key)
+
+    return ValidationResult(valid=True)
+
+
+def _invalid_params(tool_name: str, detail: str) -> ValidationResult:
+    return ValidationResult(
+        valid=False,
+        error_type="invalid_params",
+        error_message=f"Tool '{tool_name}' has invalid parameters: {detail}.",
+        offending_tool=tool_name,
+    )
+
+
+def _validate_json_value(value: Any, schema: dict, *, path: str) -> str:
+    """Validate the JSON-Schema subset used by tool contracts."""
+    if not isinstance(schema, dict):
+        return ""
+
+    expected = schema.get("type")
+    if isinstance(expected, list):
+        errors = [
+            _validate_json_value(value, {**schema, "type": item}, path=path)
+            for item in expected
+        ]
+        if all(errors):
+            return f"{path} must match one of {expected}"
+        return ""
+
+    type_checks = {
+        "string": lambda item: isinstance(item, str),
+        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+        "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+        "boolean": lambda item: isinstance(item, bool),
+        "object": lambda item: isinstance(item, dict),
+        "array": lambda item: isinstance(item, list),
+        "null": lambda item: item is None,
+    }
+    if expected in type_checks and not type_checks[expected](value):
+        expected_label = {
+            "string": "a string",
+            "integer": "an integer",
+            "number": "a number",
+            "boolean": "a boolean",
+            "object": "an object",
+            "array": "an array",
+            "null": "null",
+        }.get(expected, str(expected))
+        return f"{path} must be {expected_label}, got {type(value).__name__}"
+
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{path} must be one of {schema['enum']}"
+
+    if expected == "object" and isinstance(value, dict):
+        properties = schema.get("properties", {})
+        for required in schema.get("required", []):
+            if required not in value:
+                return f"{path}.{required} is required"
+        if schema.get("additionalProperties") is False:
+            unknown = sorted(set(value) - set(properties))
+            if unknown:
+                return f"{path} contains unknown field '{unknown[0]}'"
+        for key, item in value.items():
+            if key in properties:
+                error = _validate_json_value(
+                    item,
+                    properties[key],
+                    path=f"{path}.{key}",
+                )
+                if error:
+                    return error
+
+    if expected == "array" and isinstance(value, list):
+        item_schema = schema.get("items", {})
+        for index, item in enumerate(value):
+            error = _validate_json_value(
+                item,
+                item_schema,
+                path=f"{path}[{index}]",
+            )
+            if error:
+                return error
+
+    return ""

@@ -1,0 +1,367 @@
+"""
+llm/base.py
+
+LLMBackend 抽象基类，定义所有 backend 必须实现的统一接口。
+Agent Core 只依赖这个抽象，永不 import 具体 SDK。
+
+还包含：
+- LLMMessage / LLMResponse / LLMToolSchema 数据类（跨 backend 统一格式）
+- MockBackend（测试专用，按脚本返回预设 action，不消耗 API）
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable
+
+from core.base import Action, ActionType, LLMToolSchema, ToolCall
+
+StreamCallback = Callable[[str], None]
+
+
+# ---------------------------------------------------------------------------
+# 跨 backend 统一数据格式
+# ---------------------------------------------------------------------------
+
+class MessageKind(str, Enum):
+    """Type-safe message kind for control flow — NOT parsed from text."""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+    TOOL_RESULT = "tool_result"
+    COMPACTION_BOUNDARY = "compaction_boundary"
+    RUNTIME_NOTICE = "runtime_notice"
+    PLAN_CONTEXT = "plan_context"
+
+
+@dataclass
+class LLMMessage:
+    """
+    发送给 LLM 的单条消息。
+    role: "system" | "user" | "assistant" | "tool"
+    content: 纯文本 str，或 content blocks 列表（Anthropic cache_control 格式）。
+    tool_call_id 仅在 role=="tool" 时使用（工具执行结果关联到对应的 tool_use）。
+    tool_calls 仅在 role=="assistant" 时使用（native function calling 模式）。
+    kind: MessageKind — 类型化的消息种类, 替代文本前缀匹配。
+    """
+    role: str
+    content: "str | list[dict[str, Any]]"
+    tool_call_id: str | None = None
+    tool_calls: "list[ToolCall] | None" = None
+    kind: MessageKind | None = None
+    created_at: str = ""                # ISO timestamp from DB (added for timeline ordering)
+
+
+@dataclass
+class CacheStats:
+    """Prompt caching 统计信息。"""
+    cache_read_tokens: int = 0          # 从缓存读取的 token 数
+    cache_creation_tokens: int = 0      # 写入缓存的 token 数（首次缓存成本稍高）
+    non_cached_input_tokens: int = 0    # 未命中缓存的输入 token 数
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """缓存命中率 = cached / total input tokens。"""
+        total = self.cache_read_tokens + self.cache_creation_tokens + self.non_cached_input_tokens
+        if total == 0:
+            return 0.0
+        return self.cache_read_tokens / total
+
+    @property
+    def has_cache_activity(self) -> bool:
+        return self.cache_read_tokens > 0 or self.cache_creation_tokens > 0
+
+
+@dataclass
+class LLMResponse:
+    """
+    LLM 返回的统一响应格式。
+    backend 负责把各家 API 的原始响应解析成这个结构。
+    """
+    action: Action                      # 解析好的 Action，含 tool_call 或 finish/give_up
+    raw_content: str                    # LLM 原始文本输出
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_stats: CacheStats = field(default_factory=CacheStats)
+    finish_reason: str = ""             # provider finish_reason ("stop"/"length"/"tool_calls")
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+# ---------------------------------------------------------------------------
+# StreamEvent — CC-aligned streaming tool dispatch
+# ---------------------------------------------------------------------------
+
+
+class StreamEventKind(str, Enum):
+    TEXT_DELTA = "text_delta"
+    TOOL_USE = "tool_use"
+    FINISH = "finish"
+    ERROR = "error"
+
+
+@dataclass
+class StreamEvent:
+    """A single event yielded during streaming LLM response.
+
+    CC-aligned: tool_use blocks are dispatched as soon as their arguments
+    finish streaming, enabling speculative execution while the model continues.
+    """
+    kind: StreamEventKind
+    text: str = ""
+    tool_call: ToolCall | None = None
+    finish_message: str = ""
+    thought: str = ""
+    input_tokens: int = 0
+    """Prompt tokens consumed (set on FINISH event only)."""
+    output_tokens: int = 0
+    """Completion tokens produced (set on FINISH event only)."""
+
+
+# ---------------------------------------------------------------------------
+# 抽象基类
+# ---------------------------------------------------------------------------
+
+class LLMBackend(ABC):
+    """
+    所有 LLM backend 必须实现的接口。
+
+    子类实现 complete()，负责：
+    1. 把 LLMMessage 列表转换为各家 API 的请求格式
+    2. 发送请求
+    3. 把响应解析为 LLMResponse（含 Action）
+    """
+
+    @abstractmethod
+    def complete(
+        self,
+        messages: list[LLMMessage],
+        tools: list[LLMToolSchema],
+    ) -> LLMResponse:
+        """
+        调用 LLM，返回解析好的响应。
+
+        Args:
+            messages: 完整对话历史，含 system prompt
+            tools:    可用工具的 schema 列表
+
+        Returns:
+            LLMResponse，其中 action 已解析完毕，core.py 直接使用
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        """返回当前使用的模型名称，用于日志和统计。"""
+        ...
+
+    @property
+    def supports_function_calling(self) -> bool:
+        """
+        是否支持 function calling。
+        默认 True；不支持的模型（如 DeepSeek R1）覆盖返回 False。
+        """
+        return True
+
+    @property
+    def max_context_window(self) -> int:
+        """
+        模型的最大上下文窗口大小（token 数）。
+        默认 128K，子类覆盖。TokenBudget 据此动态分配预算。
+        """
+        return 128_000
+
+    def stream(
+        self,
+        messages: "list[LLMMessage]",
+        tools: "list[LLMToolSchema]",
+        on_text: "StreamCallback | None" = None,
+        on_thought: "StreamCallback | None" = None,
+    ) -> "LLMResponse":
+        """
+        流式调用 LLM。默认 fallback 到 complete()。
+        on_text:    模型最终回答（message）的流式回调
+        on_thought: 模型推理过程（thought）的流式回调，仅推理模型有内容
+        """
+        response = self.complete(messages, tools)
+        if on_text and response.raw_content:
+            on_text(response.raw_content)
+        return response
+
+    def close(self) -> None:
+        """Release underlying connections and abort in-flight requests.
+
+        Default no-op.  Backends with persistent connections (OpenAI, etc.)
+        override this to close their SDK client and unblock producer threads.
+        Called during shutdown and session cleanup.
+        """
+        pass
+
+    def stream_iter(
+        self,
+        messages: "list[LLMMessage]",
+        tools: "list[LLMToolSchema]",
+    ):
+        """Yield StreamEvent objects during streaming LLM response.
+
+        CC-aligned: the agent loop can dispatch tool_use blocks as they arrive
+        rather than waiting for the full response. Backends that support native
+        streaming override this; the default fallback converts a complete()
+        response into events.
+
+        Yields:
+            StreamEvent(kind=TEXT_DELTA)  — for rendering
+            StreamEvent(kind=TOOL_USE)    — dispatch to executor
+            StreamEvent(kind=FINISH)      — stream complete
+            StreamEvent(kind=ERROR)       — stream failed
+        """
+        try:
+            response = self.complete(messages, tools)
+        except Exception as exc:
+            yield StreamEvent(kind=StreamEventKind.ERROR, text=str(exc))
+            return
+
+        action = response.action
+        # For non-reasoning models action.thought carries the full response
+        # text (identical to action.message).  Emit it as plain text so the
+        # agent loop routes it to the assistant text stream instead of the
+        # "Thinking" block.  When thought and message differ the model has
+        # genuine reasoning content — keep it as thought.
+        if action.thought:
+            if action.message and action.thought == action.message:
+                yield StreamEvent(
+                    kind=StreamEventKind.TEXT_DELTA,
+                    text=action.thought,
+                )
+            else:
+                yield StreamEvent(
+                    kind=StreamEventKind.TEXT_DELTA,
+                    thought=action.thought,
+                )
+
+        if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
+            for tc in action.tool_calls:
+                yield StreamEvent(kind=StreamEventKind.TOOL_USE, tool_call=tc)
+
+        yield StreamEvent(
+            kind=StreamEventKind.FINISH,
+            finish_message=action.message or "",
+            text=response.raw_content or "",
+            thought=(
+                action.thought or ""
+                if (action.message and action.thought != action.message)
+                else ""
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# MockBackend — 测试专用
+# ---------------------------------------------------------------------------
+
+class MockBackend(LLMBackend):
+    """
+    测试专用 backend，按脚本顺序返回预设的 Action。
+
+    用法：
+        script = [
+            Action(ActionType.TOOL_CALL, "run tests", [ToolCall("shell", {"cmd": "pytest"})]),
+            Action(ActionType.FINISH, "all tests pass", message="Done"),
+        ]
+        backend = MockBackend(script)
+        # 每次调用 complete() 返回 script 中的下一个 Action
+        # 脚本用完后自动返回 GIVE_UP
+
+    好处：
+    - 完全不消耗 API，测试快且稳定
+    - 可以精确控制 agent 走哪条路径
+    - 可以模拟"连续相同 action"触发死循环检测
+    """
+
+    def __init__(
+        self,
+        script: list[Action],
+        input_tokens: int = 100,
+        output_tokens: int = 50,
+        summary_responses: list[str] | None = None,
+    ) -> None:
+        self._script = script
+        self._index = 0
+        self._summary_responses = summary_responses or []
+        self._summary_index = 0
+        self._input_tokens = input_tokens
+        self._output_tokens = output_tokens
+        # 记录所有 complete() 调用，供测试断言
+        self.call_count = 0
+        self.received_messages: list[list[LLMMessage]] = []
+        self.received_tools: list[list[str]] = []
+
+    @property
+    def model_name(self) -> str:
+        return "mock-model"
+
+    def complete(
+        self,
+        messages: list[LLMMessage],
+        tools: list[LLMToolSchema],
+    ) -> LLMResponse:
+        import uuid
+
+        self.call_count += 1
+        self.received_messages.append(messages)
+        self.received_tools.append([tool.name for tool in tools])
+
+        is_evidence_summary = (
+            not tools
+            and self._summary_responses
+            and messages
+            and "structured evidence summaries" in str(messages[0].content)
+        )
+        if is_evidence_summary:
+            if self._summary_index < len(self._summary_responses):
+                raw_content = self._summary_responses[self._summary_index]
+                self._summary_index += 1
+            else:
+                raw_content = ""
+            return LLMResponse(
+                action=Action(ActionType.FINISH, "summary", message=raw_content),
+                raw_content=raw_content,
+                input_tokens=self._input_tokens,
+                output_tokens=self._output_tokens,
+            )
+
+        if self._index < len(self._script):
+            action = self._script[self._index]
+            self._index += 1
+        else:
+            # 脚本用完，返回 GIVE_UP 防止 core.py 死循环
+            action = Action(
+                action_type=ActionType.GIVE_UP,
+                thought="MockBackend script exhausted.",
+                message="No more scripted actions.",
+            )
+
+        # Assign synthetic ID for tool calls without one (native tool_use round-trip)
+        for tc in action.tool_calls:
+            if tc.id is None:
+                tc.id = f"mock_{uuid.uuid4().hex[:8]}"
+
+        return LLMResponse(
+            action=action,
+            raw_content=f"[mock] {action!r}",
+            input_tokens=self._input_tokens,
+            output_tokens=self._output_tokens,
+        )
+
+    def reset(self) -> None:
+        """重置脚本指针，复用同一个 backend 跑多个测试。"""
+        self._index = 0
+        self._summary_index = 0
+        self.call_count = 0
+        self.received_messages.clear()
+        self.received_tools.clear()

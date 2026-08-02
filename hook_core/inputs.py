@@ -1,14 +1,17 @@
 """
-CC-aligned hook input contracts — frozen, one class per event.
+G11: Hook typed inputs — FrozenJsonObject, no untyped dict, no legacy context.
 
-Each input class carries only the fields relevant to its event.
-No dict passthrough for decision-critical fields.
+Each lifecycle point has its own frozen input class.
+- tool_input uses FrozenJsonObject
+- Stop uses OutcomeCandidate summary (not full mutable messages)
+- Zero Any imports in this module
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+
+from core.json_values import FrozenJsonObject, freeze_json
 
 
 # ── Tool execution ──────────────────────────────────────────────────────────
@@ -16,7 +19,7 @@ from typing import Any
 @dataclass(frozen=True, slots=True)
 class PreToolUseInput:
     tool_name: str
-    tool_input: dict[str, Any]
+    tool_input: FrozenJsonObject  # G11: was dict[str, Any]
     session_id: str = ""
     tool_use_id: str = ""
     cwd: str = ""
@@ -25,7 +28,7 @@ class PreToolUseInput:
 @dataclass(frozen=True, slots=True)
 class PostToolUseInput:
     tool_name: str
-    tool_input: dict[str, Any]
+    tool_input: FrozenJsonObject  # G11: was dict[str, Any]
     tool_output: str = ""
     session_id: str = ""
     tool_use_id: str = ""
@@ -35,7 +38,7 @@ class PostToolUseInput:
 @dataclass(frozen=True, slots=True)
 class PostToolUseFailureInput:
     tool_name: str
-    tool_input: dict[str, Any]
+    tool_input: FrozenJsonObject  # G11: was dict[str, Any]
     error_message: str = ""
     error_type: str = ""
     session_id: str = ""
@@ -53,7 +56,7 @@ class PostToolBatchInput:
 @dataclass(frozen=True, slots=True)
 class PermissionRequestInput:
     tool_name: str
-    tool_input: dict[str, Any]
+    tool_input: FrozenJsonObject  # G11: was dict[str, Any]
     required_permissions: frozenset[str] = frozenset()
     session_id: str = ""
     agent_id: str = ""
@@ -62,7 +65,7 @@ class PermissionRequestInput:
 @dataclass(frozen=True, slots=True)
 class PermissionDeniedInput:
     tool_name: str
-    tool_input: dict[str, Any]
+    tool_input: FrozenJsonObject  # G11: was dict[str, Any]
     session_id: str = ""
 
 
@@ -78,6 +81,7 @@ class UserPromptSubmitInput:
 
 @dataclass(frozen=True, slots=True)
 class StopInput:
+    """G11: Uses summary fields, NOT full mutable message list."""
     session_id: str = ""
     stop_hook_active: bool = False
     last_assistant_message: str = ""
@@ -85,13 +89,13 @@ class StopInput:
     tokens_used: int = 0
     agent_id: str = ""
     agent_type: str = ""
-    messages: list[dict[str, Any]] | None = None
+    outcome_summary: str = ""  # G11: replaced messages: list[dict[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
 class StopFailureInput:
     session_id: str = ""
-    error_type: str = ""  # "rate_limit" | "overloaded" | "billing_error" | ...
+    error_type: str = ""
 
 
 # ── Session lifecycle ───────────────────────────────────────────────────────
@@ -100,13 +104,13 @@ class StopFailureInput:
 class SessionStartInput:
     session_id: str = ""
     agent_type: str = ""
-    source: str = ""  # "startup" | "resume" | "clear"
+    source: str = ""
 
 
 @dataclass(frozen=True, slots=True)
 class SessionEndInput:
     session_id: str = ""
-    reason: str = ""  # "completed" | "cancelled" | "error"
+    reason: str = ""
 
 
 # ── Subagents ───────────────────────────────────────────────────────────────
@@ -132,7 +136,7 @@ class SubagentStopInput:
 class PreCompactInput:
     session_id: str = ""
     tokens_before: int = 0
-    trigger: str = ""  # "auto" | "manual"
+    trigger: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,4 +151,4 @@ class PostCompactInput:
 class NotificationInput:
     session_id: str = ""
     message: str = ""
-    level: str = ""  # "info" | "warning" | "error"
+    level: str = ""

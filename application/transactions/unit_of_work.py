@@ -6,7 +6,10 @@ Protocol only.  No SQLite, no server imports.  Eliminates agent→server depende
 
 from __future__ import annotations
 
-from typing import Protocol, Callable, TypeVar
+from typing import TYPE_CHECKING, Protocol, Callable, TypeVar
+
+if TYPE_CHECKING:
+    from application.events.envelope import EventEnvelope
 
 T = TypeVar("T")
 
@@ -24,7 +27,7 @@ class SessionTransaction(Protocol):
 
     # ── State mutation methods ───────────────────────────────────────────
 
-    def increment_generation(self, session_id) -> int:
+    def increment_generation(self, session_id: str) -> int:
         """Increment session's run_generation, return the NEW turn_index.
 
         Must be called inside a transaction.  Raises ValueError if session
@@ -32,22 +35,34 @@ class SessionTransaction(Protocol):
         """
         ...
 
-    def create_run(self, *, run_id, session_id, turn_id, turn_index,
-                   idempotency_key: str, prompt: str) -> None:
+    def create_run(self, *, run_id: str, session_id: str, turn_id: str,
+                   turn_index: int, idempotency_key: str,
+                   prompt: str) -> None:
         """Insert a row into the runs table with status='queued'."""
         ...
 
-    def insert_message(self, *, session_id, role: str, content: str,
+    def insert_message(self, *, session_id: str, role: str, content: str,
                        turn_id: str) -> None:
         """Insert a row into session_messages."""
         ...
 
-    def append_fact(self, envelope) -> None:
+    def append_fact(self, envelope: "EventEnvelope") -> None:
         """Append a durable fact event to the outbox.
 
         *envelope* must be an EventEnvelope with a registered payload type.
         This is NOT a dict passthrough.
         """
+        ...
+
+    # ── G22: Idempotency / active run checks ────────────────────────────
+
+    def check_active_run(self, session_id: str) -> str | None:
+        """Return active run_id if one exists, else None."""
+        ...
+
+    def check_idempotency(self, session_id: str, key: str,
+                          digest: str) -> tuple[str, str] | None:
+        """Check idempotency key.  Returns (run_id, existing_digest) or None."""
         ...
 
     # ── Transaction control ──────────────────────────────────────────────

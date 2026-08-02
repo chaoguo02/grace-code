@@ -1,4 +1,8 @@
-"""Synchronous policy-hook dispatcher with explicit authority contracts."""
+"""G40: DEPRECATED — replaced by hook_core.dispatcher.HookDispatcher (G14).
+
+Synchronous policy-hook dispatcher with explicit authority contracts.
+Kept for backward compat.  Will be deleted in full deletion phase.
+"""
 
 from __future__ import annotations
 

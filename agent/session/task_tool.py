@@ -33,7 +33,8 @@ from core.base import BaseTool, ToolResult
 
 if TYPE_CHECKING:
     from agent.session.models import AgentRunResult
-    from agent.session.runtime import SessionRuntime
+    # G36M-4: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+    from agent.session.runtime import SessionRuntime  # noqa: G36M
 
 logger = logging.getLogger(__name__)
 

@@ -1,4 +1,4 @@
-"""Executable contract tests for the CC-native hook engine."""
+"""G36M-final: Tests old hooks.* package (deprecated). New tests in tests/hook_core/."""
 
 from pathlib import Path
 

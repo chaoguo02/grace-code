@@ -19,7 +19,9 @@ def init_hook_dispatcher(
 ) -> Any:
     """Create HookDispatcher with memory consolidation hooks."""
     from hooks import HookEvent, HookMatcher, HookRegistry, InternalHook
-    from hook_core.bridge import _create_bridge
+    # G36M-final: bridge.py deleted — use native HookDispatcher directly
+    from hook_core.registry import HookRegistry as NativeHookRegistry
+    from hook_core.dispatcher import HookDispatcher
 
     registry = HookRegistry()
     settings_path = repo_path / ".grace" / "settings.json"
@@ -51,5 +53,6 @@ def init_hook_dispatcher(
                 pass
         registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))
 
-    dispatcher = _create_bridge(registry, cwd=str(repo_path.resolve()))
+    native_registry = NativeHookRegistry()
+    dispatcher = HookDispatcher(native_registry)
     return dispatcher

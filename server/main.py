@@ -51,7 +51,8 @@ from dotenv import load_dotenv
 load_dotenv(_ROOT / ".env")
 
 from server.services.agent_service import AgentService
-from server.services.event_bus import EventBus
+# G36M-8: DEPRECATED — replaced by eventing.scoped_bus.ScopedEventBus (G5) + assemble() (G28)
+from server.services.event_bus import EventBus  # noqa: G36M
 
 logger = logging.getLogger(__name__)
 
@@ -138,12 +139,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 # ─── App factory ────────────────────────────────────────────────────────────
 
 
-def create_app(service: AgentService) -> FastAPI:
+def create_app(service: AgentService | None = None,
+                native_components=None) -> FastAPI:
     """Create and configure the FastAPI application.
 
+    G29: Supports native_components (typed object graph).
+    Falls back to old AgentService if native_components is None.
+
     Args:
-        service: Initialised AgentService singleton holding the
-            SessionRuntime and all sub-services.
+        service: Legacy AgentService (optional when native_components provided).
+        native_components: ApplicationComponents from G28 assemble().
 
     Returns:
         FastAPI app with all routes mounted.
@@ -354,10 +359,19 @@ def main() -> None:
     print(f"  model   : {args.model or '(from config)'}")
     print(f"  provider: {args.provider or '(from config)'}")
 
-    # Create EventBus
-    event_bus = EventBus(repo_path=repo_path)
+    # G37: Native object graph — single startup path
+    from composition.runtime_composition import assemble
+    from composition.application_components import ApplicationLifecycle
 
-    # Create AgentService
+    db_path = os.path.join(repo_path, ".grace", "grace.db")
+    print("  Assembling Native object graph...")
+    components = assemble(db_path)
+    lifecycle = ApplicationLifecycle(components)
+    lifecycle.start()
+    print(f"  Native relay started")
+
+    # Backward compat: also create legacy service for routes that still need it
+    event_bus = EventBus(repo_path=repo_path)
     service = AgentService(
         repo_path=repo_path,
         config_path=args.config,
@@ -368,8 +382,7 @@ def main() -> None:
         base_url=args.base_url,
         max_steps=args.max_steps,
     )
-
-    # Ensure root session exists
+    service._native_components = components  # G37: pass native components through
     root_id = service.ensure_root_session()
     print(f"  root    : {root_id}")
 

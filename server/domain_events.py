@@ -1,12 +1,9 @@
 """
-R3.0: DomainEvent v2 — stable protocol envelope.
+G38: DEPRECATED — replaced by application.events.envelope.EventEnvelope + FrozenJsonObject.
 
-Design:
-- event_type is a stable protocol name (not Python class name).
-- All fields frozen, JSON-safe, no Any.
-- event_id generated at fact creation; replay MUST reuse the same id.
-- aggregate_id + aggregate_version enable ordered replay per aggregate.
-- session_id is the single scope source.
+Old DomainEvent with `payload: dict` is kept for backward compat only.
+New code MUST use EventEnvelope[RunCompletedV1] etc. from application.events.
+asdict() is replaced by explicit codec in application.events.envelope.
 """
 
 from __future__ import annotations

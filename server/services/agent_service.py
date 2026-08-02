@@ -198,10 +198,10 @@ class AgentService:
                 len(recovered),
             )
 
-        # Durable lifecycle chain: transaction -> outbox -> trace -> live WS.
-        # N0: When NATIVE mode owns the pipeline, the legacy relay must NOT
-        # compete for the same outbox table.
-        if os.environ.get("GRACE_RUNTIME_MODE") != "NATIVE":
+        # G37: When native components own the pipeline, the legacy relay
+        # must NOT compete for the same outbox table.
+        _has_native = getattr(self, '_native_components', None) is not None
+        if not _has_native and os.environ.get("GRACE_RUNTIME_MODE") != "NATIVE":
             from server.services.event_outbox import OutboxRelay, OutboxStore
             from server.projections.projection_runner import ProjectionRunner
             from server.projections.trace_projection import TraceProjection
@@ -484,7 +484,8 @@ class AgentService:
         self._log_dir = str(ProjectStatePaths.for_project(self.repo_path).logs)
 
         # ── 9. SessionRuntime ──
-        from agent.session.runtime import RuntimeDependencies, SessionRuntime
+        # G36M-3: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+        from agent.session.runtime import RuntimeDependencies, SessionRuntime  # noqa: G36M
 
         # ── HookDispatcher with memory consolidation STOP hook ──
         # Must be created BEFORE SessionRuntime (passed via constructor).

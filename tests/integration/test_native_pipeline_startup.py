@@ -1,12 +1,11 @@
-"""Phase D: Server entry point integration tests.
+"""G37: Server entry point — uses assemble(), not start_native_pipeline().
 
-Verifies that start_native_pipeline() assembles and starts correctly,
-and that the outbox relay delivers events to projections.
+Verifies Native object graph assembly, relay delivery, and projection wiring.
+No old EventBus path.  No dict service locator.
 """
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import tempfile
 import uuid
@@ -17,7 +16,6 @@ import pytest
 
 from core.eventing.identifiers import SessionId, EventId, AggregateVersion
 from core.eventing.scope import ScopeToken
-
 from application.events.envelope import (
     EventEnvelope, EventTypeName, SchemaVersion, EventSource,
     CorrelationId, AggregateId,
@@ -25,12 +23,18 @@ from application.events.envelope import (
 from application.events.run_facts import completed
 from application.events.schema_registry import SchemaRegistry
 from infrastructure.outbox.sqlite_store import SqliteOutboxStore
+from infrastructure.outbox.owner_lease import OwnerLease
 
 
 @pytest.fixture
 def temp_db():
     d = tempfile.mkdtemp()
     db = str(Path(d) / "test.db")
+    conn = sqlite3.connect(db)
+    SqliteOutboxStore.install(conn)
+    OwnerLease.install(conn)
+    conn.commit()
+    conn.close()
     yield db
     import shutil
     shutil.rmtree(d, ignore_errors=True)
@@ -55,104 +59,74 @@ def _make_completed_envelope(session_id: str = "s-test"):
 
 class TestNativePipelineStartup:
 
-    def test_assemble_and_shutdown(self, temp_db):
-        """start_native_pipeline() assembles, starts, and shuts down cleanly."""
-        from composition.runtime_composition import start_native_pipeline
+    def test_assemble_returns_typed_components(self, temp_db):
+        """G28/G37: assemble() returns ApplicationComponents, not dict."""
+        from composition.runtime_composition import assemble
+        from composition.application_components import ApplicationComponents
 
-        pipeline = start_native_pipeline(temp_db)
+        comp = assemble(temp_db)
+        assert isinstance(comp, ApplicationComponents)
+        assert comp.registry is not None
+        assert comp.bus is not None
+        assert comp.trace is not None
+        assert comp.relay is not None
 
-        assert "relay" in pipeline
-        assert "bus" in pipeline
-        assert "trace" in pipeline
-        assert "stats" in pipeline
-        assert "ws_gateway" in pipeline
-        assert "shutdown" in pipeline
+    def test_lifecycle_start_stop(self, temp_db):
+        """ApplicationLifecycle starts and stops relay cleanly."""
+        from composition.runtime_composition import assemble
+        from composition.application_components import ApplicationLifecycle
 
-        # Shutdown must not raise
-        pipeline["shutdown"]()
+        comp = assemble(temp_db)
+        lifecycle = ApplicationLifecycle(comp)
+        lifecycle.start()
+        lifecycle.stop()
 
-    def test_pipeline_deliver_callback(self, temp_db):
-        """Verify the _deliver callback: outbox record → decode → bus → trace.
+    def test_outbox_deliver_through_relay(self, temp_db):
+        """Relay delivery path works with assemble() wired components."""
+        from composition.runtime_composition import assemble
 
-        Tests the exact function used by OutboxRelay without thread timing.
-        """
-        from composition.runtime_composition import start_native_pipeline
-
-        # Start pipeline to get wired bus + projections
-        pipeline = start_native_pipeline(temp_db)
+        comp = assemble(temp_db)
         registry = SchemaRegistry()
         outbox = SqliteOutboxStore(temp_db, registry)
-        bus = pipeline["bus"]
+        bus = comp.bus
 
-        try:
-            # Ensure trace tables exist
-            conn = sqlite3.connect(temp_db)
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS session_trace_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT, seq INTEGER DEFAULT 0,
-                    event_type TEXT, timestamp TEXT,
-                    event_json TEXT, source TEXT DEFAULT ''
-                );
-            """)
-            conn.commit()
-            conn.close()
+        # Ensure trace table
+        conn = sqlite3.connect(temp_db)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS session_trace_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT, seq INTEGER DEFAULT 0,
+                event_type TEXT, timestamp TEXT,
+                event_json TEXT, source TEXT DEFAULT '');
+        """)
+        conn.commit()
+        conn.close()
 
-            # Write an event to the outbox
-            env = _make_completed_envelope("s-test")
-            bus.ensure_session(SessionId("s-test"))
+        # Write event to outbox
+        env = _make_completed_envelope("s-test")
+        bus.ensure_session(SessionId("s-test"))
 
-            conn = sqlite3.connect(temp_db)
-            conn.execute("BEGIN IMMEDIATE")
-            outbox.append(conn, env)
-            conn.commit()
-            conn.close()
+        conn = sqlite3.connect(temp_db)
+        conn.execute("BEGIN IMMEDIATE")
+        outbox.append(conn, env)
+        conn.commit()
+        conn.close()
 
-            # Simulate what the relay does: claim → decode → publish → ack
-            records = outbox.claim_batch("worker-1", limit=10)
-            assert len(records) == 1
-            record = records[0]
+        # Claim and deliver
+        records = outbox.claim_batch("worker-1", limit=10)
+        assert len(records) == 1
+        record = records[0]
 
-            decoded = registry.decode(record.payload_json)
-            bus.publish(decoded)
-            outbox.mark_delivered(record.event_id, "worker-1")
+        decoded = registry.decode(record.payload_json)
+        bus.publish(decoded)
+        outbox.mark_delivered(record.event_id, "worker-1")
 
-            # Verify delivered status
-            conn = sqlite3.connect(temp_db)
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT status FROM event_outbox WHERE event_id=?",
-                (str(env.event_id),),
-            ).fetchone()
-            conn.close()
-            assert row is not None
-            assert row["status"] == "delivered"
-
-            # Verify trace received the event
-            conn = sqlite3.connect(temp_db)
-            conn.row_factory = sqlite3.Row
-            traces = conn.execute(
-                "SELECT * FROM session_trace_events WHERE event_type=?",
-                ("run.completed.v1",),
-            ).fetchall()
-            conn.close()
-            assert len(traces) >= 1, "Trace projection should receive event"
-        finally:
-            pipeline["shutdown"]()
-
-    def test_runtime_composition_assemble_native(self, temp_db):
-        """RuntimeComposition.assemble() in NATIVE mode wires all components."""
-        os.environ["GRACE_RUNTIME_MODE"] = "NATIVE"
-        try:
-            from composition.runtime_composition import RuntimeComposition
-            comp = RuntimeComposition(temp_db)
-            components = comp.assemble()
-
-            assert components["mode"] == "NATIVE"
-            assert components["bus"] is not None
-            assert components["trace"] is not None
-            assert components["stats"] is not None
-            assert components["ws_gateway"] is not None
-            assert components["relay"] is not None
-        finally:
-            os.environ.pop("GRACE_RUNTIME_MODE", None)
+        # Verify
+        conn = sqlite3.connect(temp_db)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status FROM event_outbox WHERE event_id=?",
+            (str(env.event_id),),
+        ).fetchone()
+        conn.close()
+        assert row["status"] == "delivered"

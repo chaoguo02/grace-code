@@ -1,8 +1,7 @@
-"""
-R3.4: Trace Projection — idempotent outbox→trace_events consumer.
+"""G36M-2: DEPRECATED — replaced by listeners/trace_projection.py (G25).
 
-P0-2 fixed: receipt and trace insert are in the SAME transaction.
-Projection failure throws to Relay — the relay handles retry/dead-letter.
+Trace Projection — idempotent outbox→trace_events consumer.
+Kept for backward compat.  New code must use TraceProjection from listeners/.
 """
 
 from __future__ import annotations

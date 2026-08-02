@@ -18,7 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 from server.routers.approvals import ToolApprovalBody
-from server.services.event_bus import _translate_event
+# G36M-2: DEPRECATED import — replaced by NativeEventMapper (G27)
+from server.services.event_bus import _translate_event  # noqa: G36M
 from server.schemas.session import (
     CancelRequest,
     CancelResponse,

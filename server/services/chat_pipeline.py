@@ -28,10 +28,12 @@ from agent.task import RunResult, TaskIntent
 from llm.base import LLMMessage
 
 if TYPE_CHECKING:
-    from agent.session.runtime import SessionRuntime
+    # G36M-3: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+    from agent.session.runtime import SessionRuntime  # noqa: G36M
     from hooks.protocol import HookAttachment
     from llm.base import LLMBackend
-    from server.services.event_bus import EventBus
+    # G36M-3: DEPRECATED — use eventing.scoped_bus.ScopedEventBus (G5)
+    from server.services.event_bus import EventBus  # noqa: G36M
 
 logger = logging.getLogger(__name__)
 

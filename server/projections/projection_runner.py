@@ -1,7 +1,7 @@
-"""Durable outbox projection pipeline.
+"""G36M-2: DEPRECATED — replaced by listeners/projection_runner.py (G8).
 
-Trace persistence is authoritative and transactional. Live WebSocket delivery
-is a best-effort projection of an already durable fact.
+Durable outbox projection pipeline.
+Kept for backward compat.  New code must use ProjectionDispatcher from listeners/.
 """
 
 from __future__ import annotations

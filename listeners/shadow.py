@@ -1,4 +1,8 @@
-"""P18: Shadow composition — run new path alongside old, compare results."""
+"""G42: DEPRECATED — Online shadow mode replaced by offline ShadowComparator (G30).
+
+Offline replay is the authoritative comparison path.  Online dual-run
+is no longer supported in production.
+"""
 from __future__ import annotations
 
 import logging

@@ -1,4 +1,4 @@
-"""Security-boundary regression tests for permissions, hooks, and tool execution."""
+"""G36M-final: Tests old hooks.* + old registry (deprecated). New tests in tests/hook_core/."""
 
 from __future__ import annotations
 

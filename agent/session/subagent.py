@@ -33,7 +33,8 @@ if TYPE_CHECKING:
     from core.policy import PhasePolicy
     from hitl.pipeline import PermissionPipeline
     from agent.session.models import SessionRecord, WorktreeEvidence
-    from agent.session.runtime import SessionRuntime
+    # G36M-5: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+    from agent.session.runtime import SessionRuntime  # noqa: G36M
     from agent.session.task_contract import TaskContract
 
 _SUBAGENT_SUMMARY_RULE = """[Subagent Contract — CC-aligned delegation protocol]

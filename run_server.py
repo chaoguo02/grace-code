@@ -1,11 +1,14 @@
-"""Quick start script for the Grace Code Web MVP server."""
+"""G29: Single Native startup — no old EventBus, no dual relay.
+
+Startup order: migration → components → owner lease → relay → API admission.
+Shutdown order: stop admission → relay drain → gateway close → DB close.
+"""
+
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from server.services.agent_service import AgentService
-from server.services.event_bus import EventBus
-from server.main import create_app, validate_bind_host
 import uvicorn
+from server.main import create_app, validate_bind_host
 
 if __name__ == "__main__":
     import argparse
@@ -23,23 +26,26 @@ if __name__ == "__main__":
     print(f"Starting Grace Code Web MVP on {args.host}:{args.port}")
     print(f"  repo: {repo}")
 
-    event_bus = EventBus()
-    service = AgentService(repo_path=repo, event_bus=event_bus)
-    service.ensure_root_session()
-    app = create_app(service)
+    # G29: Single Native startup
+    db_path = os.path.join(repo, ".grace", "grace.db")
 
-    # P19: Start native event pipeline when GRACE_RUNTIME_MODE=NATIVE
-    _native_shutdown = None
-    if os.environ.get("GRACE_RUNTIME_MODE") == "NATIVE":
-        from composition.runtime_composition import start_native_pipeline
-        db_path = os.path.join(repo, ".grace", "grace.db")
-        if os.path.exists(db_path):
-            _native = start_native_pipeline(db_path)
-            _native_shutdown = _native["shutdown"]
-            print(f"  Native event pipeline started (worker={_native['relay']._worker_id})")
+    from composition.runtime_composition import assemble
+    from composition.application_components import ApplicationLifecycle
+
+    print("  Assembling Native object graph...")
+    components = assemble(db_path)
+    lifecycle = ApplicationLifecycle(components)
+
+    # Migration already done by assemble (SqliteOutboxStore.install)
+    # Start relay
+    lifecycle.start()
+    print(f"  Native relay started (owner={components.lease.owner_id})")
+
+    # Create FastAPI app with native components
+    app = create_app(native_components=components)
 
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     finally:
-        if _native_shutdown is not None:
-            _native_shutdown()
+        lifecycle.stop()
+        print("  Native relay stopped")

@@ -222,7 +222,8 @@ def build_registry_for_session(
         # Register agent-scoped hooks on the session registry
         if spec.hooks:
             from hooks.events import HookEvent
-            from hooks.registry import ExternalHookConfig
+            # G36M-6: DEPRECATED — use hook_core.registry.HookRegistry (G12)
+            from hooks.registry import ExternalHookConfig  # noqa: G36M
             from hooks.matcher import HookMatcher
             for hook_group in spec.hooks:
                 if not isinstance(hook_group, dict):

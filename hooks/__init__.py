@@ -1,11 +1,7 @@
-"""
-hooks/ — Event-driven hook system for lifecycle extensibility.
+"""G36M-1: DEPRECATED — replaced by hook_core (G11-G14).
 
-Core components:
-- HookEvent: lifecycle event types (PreToolUse, PostToolUse, Stop, etc.)
-- HookContext: event context passed to hooks
-- HookDispatcher: central event dispatch (match → execute → decide)
-- HookRegistry: stores external (command) and internal (callable) hooks
+hooks/ — Event-driven hook system for lifecycle extensibility.
+Kept for backward compat.  New code must use hook_core.registry + hook_core.dispatcher.
 """
 
 from hooks.events import (

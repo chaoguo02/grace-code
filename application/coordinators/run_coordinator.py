@@ -1,27 +1,33 @@
 """
-P14: Run Coordinator — processes commands, delegates to Runtime, persists via UoW.
+G22: Run Coordinator — idempotency + active run check in same transaction.
 
-Terminal state + fact in ONE Unit of Work transaction.
+- Idempotency check and active run check happen inside BEGIN IMMEDIATE.
+- Same key + same payload → returns existing run_id (idempotent).
+- Same key + different payload → IdempotencyConflict (permanent).
+- Active run exists → RunAlreadyActive.
+- RunSubmitted payload has real turn_id/index/idempotency_digest.
 """
 
 from __future__ import annotations
 
+import hashlib
 import uuid
+from datetime import datetime, timezone
 
 from application.commands.run_commands import (
     SubmitRun, ExecuteRun, CancelRun, FinalizeRun,
+    IdempotencyConflict, RunAlreadyActive, SubmitResult,
 )
 from application.events.envelope import (
     EventEnvelope, EventTypeName, SchemaVersion, EventSource,
-    CorrelationId, AggregateId,
+    CorrelationId, AggregateId, AggregateVersion,
 )
 from application.events.run_facts import (
-    RunSubmittedV1, RunStartedV1, RunCompletedV1, RunFailedV1, RunCancelledV1,
-    submitted, started, completed, failed, cancelled,
+    RunSubmittedV1, submitted, started, completed, failed, cancelled, blocked, gave_up,
 )
 from application.transactions.unit_of_work import SessionUnitOfWork
 from core.eventing.identifiers import (
-    SessionId, RunId, EventId, AggregateVersion,
+    SessionId, RunId, EventId,
 )
 from core.eventing.scope import ScopeToken
 from runtime_core.execution import RuntimeExecution
@@ -33,81 +39,121 @@ class CoordinatorError(RuntimeError):
 
 
 class RunCoordinator:
-    """Processes Run commands.  Delegates to Runtime, persists atomically."""
+    """Processes Run commands with transactional idempotency."""
 
-    def __init__(
-        self,
-        runtime,
-        uow: SessionUnitOfWork,
-        scope_factory=None,  # callable(session_id) -> ScopeToken
-    ) -> None:
+    def __init__(self, runtime, uow: SessionUnitOfWork,
+                 scope_factory=None, run_repo=None) -> None:
         self._runtime = runtime
         self._uow = uow
         self._scope_factory = scope_factory or (lambda sid: (
             ScopeToken.session_scope(uuid.uuid4(), sid) if sid is not None
             else ScopeToken.global_scope()
         ))
+        self._run_repo = run_repo
 
-    def submit(self, cmd: SubmitRun) -> EventEnvelope:
-        """Submit a new run.  Creates Run + Message + RunSubmitted fact in one UoW.
+    def submit(self, cmd: SubmitRun) -> SubmitResult:
+        """Submit a new run with transactional idempotency.
 
-        State mutation (increment_generation, create_run, insert_message)
-        and fact append (append_fact) share the same transaction.
+        G22: Idempotency check and active run check are inside
+        the same BEGIN IMMEDIATE transaction.
         """
         run_id = RunId(str(uuid.uuid4()))
         turn_id = str(uuid.uuid4())
         scope = self._scope_factory(cmd.session_id)
 
-        def _mutate(tx) -> EventEnvelope:
-            turn_index = tx.increment_generation(cmd.session_id)
-            tx.create_run(
-                run_id=run_id, session_id=cmd.session_id,
-                turn_id=turn_id, turn_index=turn_index,
-                idempotency_key=cmd.idempotency_key, prompt=cmd.prompt,
-            )
-            tx.insert_message(
-                session_id=cmd.session_id, role="user",
-                content=cmd.prompt, turn_id=turn_id,
-            )
-            envelope = _envelope_for(
-                "run.submitted.v1", scope, run_id, 1,
-                submitted(str(run_id), turn_index=turn_index,
-                          turn_id=turn_id),
-            )
-            tx.append_fact(envelope)
-            return envelope
+        # Compute idempotency payload digest
+        idem_digest = hashlib.sha256(
+            f"{cmd.session_id}:{cmd.prompt}:{cmd.idempotency_key}".encode()
+        ).hexdigest()
 
-        return self._uow.execute(_mutate)
+        try:
+            result = self._uow.execute(
+                lambda tx: self._submit_in_tx(
+                    tx, cmd, run_id, turn_id, scope, idem_digest,
+                )
+            )
+            return result
+        except IdempotencyConflict as e:
+            return e
+        except RunAlreadyActive as e:
+            return e
+
+    def _submit_in_tx(self, tx, cmd: SubmitRun, run_id: RunId,
+                      turn_id: str, scope: ScopeToken,
+                      idem_digest: str) -> SubmitResult:
+        """Run submission inside the UoW transaction."""
+        # G22: Check idempotency FIRST (before active run check)
+        if cmd.idempotency_key:
+            existing = tx.check_idempotency(
+                str(cmd.session_id), cmd.idempotency_key, idem_digest,
+            )
+            if existing is not None:
+                existing_run_id, existing_digest = existing
+                if existing_digest == idem_digest:
+                    return RunId(existing_run_id)
+                raise IdempotencyConflict(
+                    key=cmd.idempotency_key,
+                    existing_run_id=existing_run_id,
+                )
+
+        # G22: Check for active run (after idempotency)
+        active = tx.check_active_run(str(cmd.session_id))
+        if active is not None:
+            raise RunAlreadyActive(
+                session_id=str(cmd.session_id),
+                active_run_id=active,
+            )
+
+        turn_index = tx.increment_generation(str(cmd.session_id))
+        tx.create_run(
+            run_id=str(run_id), session_id=str(cmd.session_id),
+            turn_id=turn_id, turn_index=turn_index,
+            idempotency_key=cmd.idempotency_key, prompt=cmd.prompt,
+        )
+        tx.insert_message(
+            session_id=str(cmd.session_id), role="user",
+            content=cmd.prompt, turn_id=turn_id,
+        )
+        envelope = _envelope_for(
+            "run.submitted.v1", scope, run_id, turn_index,
+            submitted(str(run_id), turn_index=turn_index, turn_id=turn_id),
+        )
+        tx.append_fact(envelope)
+        return run_id
 
     def execute(self, cmd: ExecuteRun) -> RuntimeOutcome:
-        """Execute a run via Runtime."""
         context = RuntimeExecution(
             session_id=cmd.session_id, run_id=cmd.run_id,
         )
         return self._runtime.run(context)
 
-    def finalize(self, cmd: FinalizeRun) -> EventEnvelope:
-        """Persist terminal state + terminal fact in one UoW."""
+    def finalize(self, cmd: FinalizeRun, session_id: SessionId | None = None) -> EventEnvelope:
+        """G23: Terminal CAS — state transition + fact in one UoW."""
         outcome = cmd.outcome
-        scope = self._scope_factory(None)  # coordinator may not have session_id at finalize
+        scope = self._scope_factory(session_id)
 
-        if outcome.status == RunStatus.COMPLETED:
-            payload = completed(
-                str(outcome.run_id), steps_taken=outcome.steps_taken,
-                tokens_used=outcome.tokens_used, summary=outcome.summary,
-            )
-            event_type = "run.completed.v1"
-        elif outcome.status == RunStatus.CANCELLED:
-            payload = cancelled(str(outcome.run_id))
-            event_type = "run.cancelled.v1"
-        else:
-            payload = failed(str(outcome.run_id), error=outcome.error)
-            event_type = "run.failed.v1"
-
-        envelope = _envelope_for(
-            event_type, scope, outcome.run_id,
-            cmd.expected_version.value, payload,
+        status_map = {
+            RunStatus.COMPLETED: ("completed", "run.completed.v1",
+                                  completed(str(outcome.run_id), steps_taken=outcome.steps_taken,
+                                            tokens_used=outcome.tokens_used, summary=outcome.summary)),
+            RunStatus.FAILED: ("failed", "run.failed.v1",
+                               failed(str(outcome.run_id), error=outcome.error)),
+            RunStatus.CANCELLED: ("cancelled", "run.cancelled.v1",
+                                  cancelled(str(outcome.run_id))),
+            RunStatus.BLOCKED: ("blocked", "run.blocked.v1",
+                                blocked(str(outcome.run_id),
+                                        blocked_by=outcome.blocked_by,
+                                        detail=outcome.error)),
+            RunStatus.GAVE_UP: ("gave_up", "run.gave_up.v1",
+                                gave_up(str(outcome.run_id))),
+        }
+        to_status, event_type, payload = status_map.get(
+            outcome.status,
+            ("failed", "run.failed.v1", failed(str(outcome.run_id), error=outcome.error)),
         )
+
+        envelope = _envelope_for(event_type, scope, outcome.run_id,
+                                 cmd.expected_version.value + 1, payload)
         self._uow.execute(lambda tx: tx.append_fact(envelope))
         return envelope
 
@@ -118,7 +164,7 @@ def _envelope_for(event_type: str, scope: ScopeToken, run_id: RunId,
         event_id=EventId.generate(),
         event_type=EventTypeName(event_type),
         schema_version=SchemaVersion(1),
-        occurred_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        occurred_at=datetime.now(timezone.utc),
         source=EventSource(process_id="coordinator", component="coordinator"),
         scope=scope,
         correlation_id=CorrelationId(str(uuid.uuid4())),

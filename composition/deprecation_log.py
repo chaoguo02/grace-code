@@ -1,8 +1,8 @@
-"""
-P25-P28: Deprecation log — tracks which old modules are scheduled for deletion
-and under what conditions.
+"""G42: DEPRECATED — Deletion tracking complete.
 
-Each entry records:
+All old modules have been deprecated (G37-G41).  This file is the final
+deprecation log retained for audit purposes only.
+"""
   - module: old module path
   - replacement: new module path
   - gate: condition for deletion

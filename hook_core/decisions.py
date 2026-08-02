@@ -1,14 +1,17 @@
 """
-CC-aligned hook decision types — frozen, per-event, explicit semantics.
+G11: Hook typed decisions — FrozenJsonObject, typed unions, per-event types.
 
-Each hook event has a specific decision shape.
-PreToolUse uses a four-way permission model: deny > defer > ask > allow.
+- updated_input uses FrozenJsonObject, not untyped mappings
+- HookContractViolation for invalid/unknown inputs
+- Each lifecycle point has an independent decision type
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
+
+from core.json_values import FrozenJsonObject, freeze_json
 
 
 class PermissionDecision(StrEnum):
@@ -36,13 +39,30 @@ class StopVerdict(StrEnum):
     BLOCK = "block"
 
 
+# ── Contract violation ──────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class HookContractViolation:
+    """Returned when hook input/decision types mismatch the contract.
+
+    E.g. raw dict passed where FrozenJsonObject expected, or unknown
+    decision type for a given lifecycle point.
+    """
+    reason: str = ""
+    detail: str = ""
+
+
 # ── PreToolUse ──────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)
 class PreToolUseDecision:
     permission: PermissionDecision = PermissionDecision.ALLOW
-    updated_input: dict | None = None
+    updated_input: FrozenJsonObject | None = None
     reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.updated_input is not None and isinstance(self.updated_input, dict):
+            object.__setattr__(self, "updated_input", freeze_json(self.updated_input))
 
 
 # ── PostToolUse ─────────────────────────────────────────────────────────────
@@ -51,7 +71,7 @@ class PreToolUseDecision:
 class PostToolUseDecision:
     additional_context: str = ""
     replace_output: str | None = None
-    decision: str = ""  # "block" to feed back to model (tool already ran)
+    decision: str = ""
 
 
 # ── PostToolUseFailure ──────────────────────────────────────────────────────
@@ -68,7 +88,7 @@ class PostToolUseFailureDecision:
 class UserPromptSubmitDecision:
     block: bool = False
     reason: str = ""
-    updated_input: dict | None = None
+    updated_input: FrozenJsonObject | None = None  # G11: was dict | None
 
 
 # ── Stop ────────────────────────────────────────────────────────────────────
@@ -94,9 +114,41 @@ class PreCompactDecision:
     reason: str = ""
 
 
-# ── Default (for events without a specific decision shape) ──────────────────
+# ── PermissionRequest ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class PermissionRequestDecision:
+    permission: PermissionDecision = PermissionDecision.ALLOW
+    reason: str = ""
+
+
+# ── G11: Per-event decision registry ────────────────────────────────────────
+# Maps lifecycle event names to their expected decision types.
+# Used by HookDispatcher to validate decision contract.
+
+# ── Backward compat (used by dispatcher, bridge — removed in G14/G39) ──────
 
 @dataclass(frozen=True, slots=True)
 class ObserveDecision:
-    """Used for notification-only events (SubagentStart, SessionEnd, etc.)."""
+    """Deprecated: each event should use its specific decision type."""
     pass
+
+
+EVENT_DECISION_MAP: dict[str, type] = {
+    "PreToolUse": PreToolUseDecision,
+    "PostToolUse": PostToolUseDecision,
+    "PostToolUseFailure": PostToolUseFailureDecision,
+    "PostToolBatch": ObserveDecision,
+    "UserPromptSubmit": UserPromptSubmitDecision,
+    "Stop": StopDecision,
+    "StopFailure": ObserveDecision,
+    "SessionStart": SessionStartDecision,
+    "SessionEnd": ObserveDecision,
+    "SubagentStart": ObserveDecision,
+    "SubagentStop": ObserveDecision,
+    "PreCompact": PreCompactDecision,
+    "PostCompact": ObserveDecision,
+    "PermissionRequest": PermissionRequestDecision,
+    "PermissionDenied": ObserveDecision,
+    "Notification": ObserveDecision,
+}

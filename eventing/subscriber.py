@@ -1,18 +1,53 @@
 """
-P4: Subscriber Protocol — typed event consumption contract.
+G7: Subscriber Protocol — typed event consumption, zero business imports.
+
+HandlerOutcome replaces DeliveryReceipt in the port layer.
+Subscriber implementations return HandlerOutcome (Accepted | Rejected | Failed).
+Variance fixed: PayloadT is contravariant.
 """
 
 from __future__ import annotations
 
-from typing import Protocol, TypeVar, runtime_checkable
+from dataclasses import dataclass
+from typing import Awaitable, Protocol, TypeVar, runtime_checkable
 
 PayloadT = TypeVar("PayloadT", contravariant=True)
 
 
-class DeliveryReceipt:
-    """Proof that a subscriber received and processed an event.
+# ── HandlerOutcome — receipt at the port boundary ──────────────────────────
 
-    Immutable after construction.
+@dataclass(frozen=True, slots=True)
+class Accepted:
+    """Handler successfully processed the event."""
+    subscriber_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Rejected:
+    """Handler rejected the event (e.g. wrong type version)."""
+    subscriber_id: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class HandlerFailed:
+    """Handler raised an exception."""
+    subscriber_id: str = ""
+    error: str = ""
+
+
+HandlerOutcome = Accepted | Rejected | HandlerFailed
+
+
+# ── Backward-compatible DeliveryReceipt ────────────────────────────────────
+# Kept until G8+ listeners are migrated to HandlerOutcome.
+
+
+class DeliveryReceipt:
+    """Backward-compatible receipt.  Prefer HandlerOutcome for new code.
+
+    G7 keeps this export so existing listeners (trace, stats, ws_gateway)
+    continue to work until their migration phases.
     """
 
     __slots__ = ("_event_id", "_subscriber_id", "_success")
@@ -43,20 +78,16 @@ class DeliveryReceipt:
         return cls(event_id, subscriber_id, False)
 
 
+# ── Subscriber ─────────────────────────────────────────────────────────────
+
 @runtime_checkable
 class EventSubscriber(Protocol[PayloadT]):
-    """Typed subscriber for one event type.
+    """Typed subscriber for one event type — sync handler."""
 
-    Usage:
-        class TraceProjection:
-            def on_event(self, envelope: EventEnvelope[RunCompletedV1]) -> DeliveryReceipt:
-                ...
-    """
+    def on_event(self, message) -> HandlerOutcome:
+        """Process an event.  MUST return a HandlerOutcome.
 
-    def on_event(self, envelope) -> DeliveryReceipt:
-        """Process an event.  MUST return a DeliveryReceipt.
-
-        Exceptions are caught by the bus and result in DeliveryReceipt.failed().
+        Exceptions caught by the bus → HandlerFailed.
         """
         ...
 
@@ -65,5 +96,5 @@ class EventSubscriber(Protocol[PayloadT]):
 class AsyncEventSubscriber(Protocol[PayloadT]):
     """Async variant — for subscribers that need I/O."""
 
-    async def on_event(self, envelope) -> DeliveryReceipt:
+    async def on_event(self, message) -> HandlerOutcome:
         ...

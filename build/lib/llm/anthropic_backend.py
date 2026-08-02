@@ -1,0 +1,340 @@
+"""
+llm/anthropic_backend.py
+
+Anthropic Claude 原生 backend。
+
+消息格式差异（和 OpenAI 对比）：
+- system prompt 单独传，不混在 messages 里
+- tool 调用结果用 role="user" + content type "tool_result"
+- 响应里 tool_use block 和 text block 可以并存
+- stop_reason: "tool_use" | "end_turn" | "max_tokens"
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from agent.task import Action, ActionType, ToolCall
+from llm.base import CacheStats, LLMBackend, LLMMessage, LLMResponse, LLMToolSchema
+
+logger = logging.getLogger(__name__)
+
+
+class AnthropicBackend(LLMBackend):
+    """
+    使用 anthropic SDK 调用 Claude 系列模型。
+
+    支持：
+    - tool_use（function calling）
+    - 流式（stream=True，当前实现非流式，v2 可扩展）
+    - extended thinking（claude-3-7-sonnet 等支持）
+    """
+
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        max_tokens: int = 4096,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        try:
+            import anthropic as _anthropic
+            self._client = _anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds)
+        except ImportError:
+            raise ImportError("anthropic package not installed. Run: pip install anthropic")
+
+        self._model = model
+        self._max_tokens = max_tokens
+        self._timeout_seconds = timeout_seconds
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @property
+    def max_context_window(self) -> int:
+        return 200_000
+
+    def complete(
+        self,
+        messages: list[LLMMessage],
+        tools: list[LLMToolSchema],
+    ) -> LLMResponse:
+        # 提取 system prompt（Anthropic 单独传）
+        system_parts: list[str | list] = []
+        non_system: list[LLMMessage] = []
+        for msg in messages:
+            if msg.role == "system":
+                # 支持字符串或结构体（含 cache_control 的列表）
+                system_parts.append(msg.content)
+            else:
+                non_system.append(msg)
+        system_content = _merge_anthropic_system(system_parts)
+
+        # 转换 messages 格式
+        api_messages = _to_anthropic_messages(non_system)
+
+        # 转换 tools 格式
+        api_tools = [
+            _to_anthropic_tool(t) for t in tools if not t.deferred
+        ]
+
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": self._max_tokens,
+            "messages": api_messages,
+        }
+        if system_content:
+            kwargs["system"] = system_content
+        if api_tools:
+            kwargs["tools"] = api_tools
+
+        logger.debug(
+            "Anthropic request: model=%s messages=%d tools=%d",
+            self._model, len(api_messages), len(api_tools),
+        )
+
+        response = self._client.messages.create(**kwargs)
+
+        logger.debug(
+            "Anthropic response: stop_reason=%s input_tokens=%d output_tokens=%d",
+            response.stop_reason,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+        )
+
+        action = _parse_anthropic_response(response)
+
+        cache_stats = _extract_cache_stats(response.usage)
+
+        return LLMResponse(
+            action=action,
+            raw_content=_extract_text(response),
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_stats=cache_stats,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 格式转换
+# ---------------------------------------------------------------------------
+
+def _to_anthropic_messages(messages: list[LLMMessage]) -> list[dict]:
+    """
+    把 LLMMessage 列表转为 Anthropic API 的 messages 格式。
+
+    Native tool_use 模式：
+    - assistant + tool_calls → content blocks: [text, tool_use, ...]
+    - role="tool" + tool_call_id → role=user, content=[tool_result block]
+
+    Text fallback 模式（tool_calls=None, tool_call_id=None）：
+    - 直接传递 role + content
+    """
+    result = []
+    for msg in messages:
+        if msg.tool_calls:
+            # Native: assistant message with tool_use blocks
+            content_blocks = []
+            if msg.content:
+                content_blocks.append({"type": "text", "text": msg.content})
+            for tc in msg.tool_calls:
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.name,
+                    "input": tc.params,
+                })
+            result.append({"role": "assistant", "content": content_blocks})
+        elif msg.tool_call_id:
+            # Native: tool result
+            result.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id,
+                    "content": msg.content if isinstance(msg.content, str) else str(msg.content),
+                }],
+            })
+        else:
+            # If role is "tool" but tool_call_id is None (edge case from
+            # text-mode parsing), wrap it as a user message so the API
+            # accepts it.  Anthropic rejects {"role": "tool", ...}.
+            safe_role = "user" if msg.role == "tool" else msg.role
+            result.append({"role": safe_role, "content": msg.content})
+    return result
+
+
+def _merge_anthropic_system(parts: list[str | list]) -> str | list:
+    """Merge every system message without losing structured cache blocks."""
+    if not parts:
+        return ""
+    if all(isinstance(part, str) for part in parts):
+        return "\n\n".join(part for part in parts if part)
+
+    blocks: list[dict[str, Any]] = []
+    for part in parts:
+        if isinstance(part, list):
+            blocks.extend(
+                block for block in part if isinstance(block, dict)
+            )
+        elif part:
+            blocks.append({"type": "text", "text": str(part)})
+    return blocks
+
+
+def _to_anthropic_tool(schema: LLMToolSchema) -> dict:
+    """转换为 Anthropic tool schema 格式。"""
+    return {
+        "name": schema.name,
+        "description": schema.description,
+        "input_schema": schema.parameters,
+    }
+
+
+def _extract_cache_stats(usage: Any) -> CacheStats:
+    """从 Anthropic usage 对象中提取 prompt caching 统计。"""
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    input_tokens = getattr(usage, "input_tokens", 0) or 0
+    return CacheStats(
+        cache_read_tokens=cache_read,
+        cache_creation_tokens=cache_creation,
+        non_cached_input_tokens=max(0, input_tokens - cache_read - cache_creation),
+    )
+
+
+def _extract_text(response: Any) -> str:
+    """从响应的 content blocks 中提取所有 text。"""
+    parts = []
+    for block in response.content:
+        if getattr(block, "type", None) == "text" and isinstance(getattr(block, "text", None), str):
+            parts.append(block.text)
+    return "\n".join(parts)
+
+
+def _parse_anthropic_response(response: Any) -> Action:
+    """
+    把 Anthropic API 响应解析为 Action。
+
+    优先级：
+    1. stop_reason == "tool_use" → 找 tool_use block → TOOL_CALL
+    2. stop_reason == "end_turn" → FINISH
+    3. 其他（max_tokens 等） → GIVE_UP
+    """
+    # 提取 thought（text block 内容）
+    thought = _extract_text(response).strip() or "(no thought)"
+
+    if response.stop_reason == "tool_use":
+        # 收集所有 tool_use block（Claude 支持并行 tool use）
+        tool_calls = []
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_calls.append(ToolCall(
+                    name=block.name,
+                    params=dict(block.input),
+                    id=block.id,
+                ))
+        if tool_calls:
+            return Action(
+                action_type=ActionType.TOOL_CALL,
+                thought=thought,
+                tool_calls=tool_calls,
+            )
+        # stop_reason 是 tool_use 但没找到 block（理论上不会发生）
+        return Action(
+            action_type=ActionType.GIVE_UP,
+            thought=thought,
+            message="stop_reason=tool_use but no tool_use block found",
+        )
+
+    if response.stop_reason == "end_turn":
+        # 检查 text 内容是否包含任务完成的意图
+        # 简单判断：有文字内容就认为是 FINISH
+        if thought and thought != "(no thought)":
+            return Action(
+                action_type=ActionType.FINISH,
+                thought=thought,
+                message=thought,
+            )
+        return Action(
+            action_type=ActionType.GIVE_UP,
+            thought=thought,
+            message="Model ended turn with no content",
+        )
+
+    # max_tokens 或其他 stop_reason
+    return Action(
+        action_type=ActionType.GIVE_UP,
+        thought=thought,
+        message=f"Unexpected stop_reason: {response.stop_reason}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 流式支持
+# ---------------------------------------------------------------------------
+
+from llm.base import StreamCallback
+
+# Anthropic 流式适配器
+# Python 不允许事后修改继承，用 monkey-patch 把 stream() 方法加进去
+
+def _anthropic_stream(
+    self: "AnthropicBackend",
+    messages: list,
+    tools: list,
+    on_text: StreamCallback | None = None,
+) -> LLMResponse:
+    """
+    Anthropic 流式调用实现。
+    用 anthropic SDK 的 stream() context manager，
+    边收 text_delta 边调用 on_text 回调实时打印。
+    """
+    # 提取 system prompt
+    system_parts: list[str | list] = []
+    non_system = []
+    for msg in messages:
+        if msg.role == "system":
+            system_parts.append(msg.content)
+        else:
+            non_system.append(msg)
+    system_content = _merge_anthropic_system(system_parts)
+
+    api_messages = _to_anthropic_messages(non_system)
+    api_tools = [
+        _to_anthropic_tool(t) for t in tools if not t.deferred
+    ]
+
+    kwargs: dict = {
+        "model": self._model,
+        "max_tokens": self._max_tokens,
+        "messages": api_messages,
+    }
+    if system_content:
+        kwargs["system"] = system_content
+    if api_tools:
+        kwargs["tools"] = api_tools
+
+    # 使用 stream() context manager
+    with self._client.messages.stream(**kwargs) as stream:
+        for text_chunk in stream.text_stream:
+            if on_text and text_chunk:
+                on_text(text_chunk)
+
+        # 流结束后拿最终完整响应
+        final = stream.get_final_message()
+
+    action = _parse_anthropic_response(final)
+    cache_stats = _extract_cache_stats(final.usage)
+    return LLMResponse(
+        action=action,
+        raw_content=_extract_text(final),
+        input_tokens=final.usage.input_tokens,
+        output_tokens=final.usage.output_tokens,
+        cache_stats=cache_stats,
+    )
+
+# 把 stream() 方法绑定到 AnthropicBackend
+AnthropicBackend.stream = _anthropic_stream

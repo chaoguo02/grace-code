@@ -61,7 +61,8 @@ class ChatSession:
     ) -> None:
         from agent.core import AgentConfig
         from context.history import ConversationHistory
-        from agent.session.runtime import SessionRuntime
+        # G36M-6: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+        from agent.session.runtime import SessionRuntime  # noqa: G36M
         from agent.session.session_store import SessionStore
         from agent.session.agent_registry import AgentRegistryV2
         from agent.session import default_session_db_path

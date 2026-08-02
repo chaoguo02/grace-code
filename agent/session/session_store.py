@@ -2198,7 +2198,8 @@ class SessionStore:
         turn_index: int = 0,
     ) -> bool:
         """CAS queued->running and append run.started atomically."""
-        from server.domain_events import DomainEvent
+        # G36M-3: DEPRECATED — use application.events.envelope.EventEnvelope (G3)
+        from server.domain_events import DomainEvent  # noqa: G36M
         from server.services.event_outbox import OutboxStore
 
         outbox = OutboxStore(self._db_path)

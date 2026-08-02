@@ -1,4 +1,8 @@
-"""Session Runtime — fresh-context child-session orchestration."""
+"""G41: DEPRECATED — replaced by runtime_core.step_loop.StepLoop + runtime_core.runtime.AgentRuntime (G15-G20).
+
+Session Runtime — fresh-context child-session orchestration.
+Kept for backward compat.  Will be deleted in full deletion phase.
+"""
 
 from __future__ import annotations
 

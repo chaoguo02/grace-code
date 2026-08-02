@@ -1,3 +1,4 @@
+# G36M-final: Tests old SessionRuntime + EventBus (deprecated). New tests in tests/runtime_core/ + tests/eventing/.
 from __future__ import annotations
 
 from types import SimpleNamespace

@@ -13,7 +13,8 @@ from agent.session.models import (
     WorktreeEvidence, WorkspaceMode,
 )
 from agent.session.agent_registry import AgentRegistryV2, resolve_tool_name, resolve_tool_set
-from agent.session.runtime import SessionRuntime, ExplicitDelegationError, default_session_db_path
+# G36M-5: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+from agent.session.runtime import SessionRuntime, ExplicitDelegationError, default_session_db_path  # noqa: G36M
 from agent.session.session_store import SessionStore
 from agent.session.task_tool import AgentTool
 from agent.session.agent_control_tool import AgentControlAction, AgentControlTool

@@ -30,7 +30,8 @@ from llm.base import LLMMessage
 from config.env import SubagentSafetyLimits
 
 if TYPE_CHECKING:
-    from agent.session.runtime import SessionRuntime
+    # G36M-5: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+    from agent.session.runtime import SessionRuntime  # noqa: G36M
     from core.policy import PhasePolicy
 
 logger = logging.getLogger(__name__)
@@ -618,7 +619,8 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
     finally:
         self._active_evidence_stores.pop(child.id, None)
         if evidence_store is not None:
-            from agent.session.runtime import _flush_skill_activations
+            # G36M-5: DEPRECATED — use runtime_core (G15-G20)
+            from agent.session.runtime import _flush_skill_activations  # noqa: G36M
             _flush_skill_activations(
                 evidence_store,
                 self._pending_skill_activations.pop(child.id, []),

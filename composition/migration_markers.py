@@ -1,8 +1,8 @@
-"""
-P23-P28: Migration markers — what to delete when native paths are authoritative.
+"""G42: DEPRECATED — Native paths are now authoritative (G28-G31).
 
-Each marker identifies:
-  - What to delete
+Migration complete.  This file is retained for audit trail only.
+GRACE_RUNTIME_MODE is no longer checked in production code paths.
+"""
   - When (after which verification gate)
   - How to roll back
 """
