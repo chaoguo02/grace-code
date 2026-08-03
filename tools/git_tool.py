@@ -350,3 +350,175 @@ class GitCommitTool(BaseTool):
             output=output,
             error=None if success else output,
         )
+
+
+class GitSnapshotTool(BaseTool):
+    """创建工作区快照：git add -A + git commit，返回 commit hash。
+
+    对齐架构 S1 "关键修改前快照"：在执行批量重构等高风险操作前调用，
+    之后可用 git_revert 恢复快照，而不是让 LLM 重新生成反向 Diff。
+    """
+
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.WRITE_VCS}),
+        path_access=PathAccess.WORKSPACE_WIDE,
+    )
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
+
+    def __init__(self, runtime: Runtime | None = None) -> None:
+        from core.process import LocalRuntime
+        self._runtime = runtime or LocalRuntime()
+
+    @property
+    def name(self) -> str:
+        return "git_snapshot"
+
+    @property
+    def risk_level(self) -> str:
+        from core.base import RiskLevel
+        return RiskLevel.HIGH
+
+    @property
+    def description(self) -> str:
+        return (
+            "Create a workspace snapshot (git add -A + git commit). "
+            "Run this BEFORE risky refactors so changes can be rolled back "
+            "via git_revert. Returns the snapshot commit hash."
+        )
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "Snapshot message (default: 'agent checkpoint snapshot')",
+                },
+                "cwd": {"type": "string", "description": "Repository root directory"},
+            },
+            "required": [],
+        }
+
+    def execute(self, params: dict[str, Any]) -> ToolResult:
+        cwd = params.get("cwd")
+        message = params.get("message", "agent checkpoint snapshot").strip()
+
+        ok, output, _tool_err = _run_git(["add", "-A"], cwd=cwd, runtime=self._runtime)
+        if not ok:
+            return ToolResult(success=False, output=output, error=output, tool_error=_tool_err)
+
+        ok, output, _tool_err = _run_git(
+            ["commit", "-m", message], cwd=cwd, runtime=self._runtime,
+        )
+        if not ok:
+            # Nothing to commit → HEAD is still a valid snapshot point
+            if "nothing to commit" in output or "no changes added" in output:
+                ok2, hout, _ = _run_git(
+                    ["rev-parse", "HEAD"], cwd=cwd, runtime=self._runtime,
+                )
+                return ToolResult(
+                    success=True,
+                    output=f"No changes to snapshot. Current HEAD={hout.strip()}",
+                )
+            return ToolResult(success=False, output=output, error=output, tool_error=_tool_err)
+
+        ok, hout, _ = _run_git(["rev-parse", "HEAD"], cwd=cwd, runtime=self._runtime)
+        commit_hash = hout.strip() if ok else "?"
+        return ToolResult(
+            success=True,
+            output=f"Snapshot created: {commit_hash}\n{output}",
+            metadata={"evidence": {"snapshot_commit": commit_hash}},
+        )
+
+
+class GitRevertTool(BaseTool):
+    """回滚工作区到快照。
+
+    mode=workspace → 丢弃所有未提交改动（git checkout -- .）
+    mode=commit   → 恢复指定快照 commit 的内容（git checkout <hash> -- .）
+
+    DANGEROUS：workspace 模式会丢失未提交工作。requires_user_interaction=True
+    强制走人机确认（Phase 2 权限管线）。
+    """
+
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.WRITE_VCS}),
+        path_access=PathAccess.WORKSPACE_WIDE,
+        requires_user_interaction=True,
+    )
+
+    def isReadOnly(self, params: dict[str, Any] | None = None) -> bool:
+        return False
+
+    def __init__(self, runtime: Runtime | None = None) -> None:
+        from core.process import LocalRuntime
+        self._runtime = runtime or LocalRuntime()
+
+    @property
+    def name(self) -> str:
+        return "git_revert"
+
+    @property
+    def risk_level(self) -> str:
+        from core.base import RiskLevel
+        return RiskLevel.HIGH
+
+    @property
+    def description(self) -> str:
+        return (
+            "Roll back the workspace to a snapshot. "
+            "mode='workspace' discards ALL uncommitted changes (git checkout -- .). "
+            "mode='commit' restores a snapshot commit's content (git checkout <hash> -- .). "
+            "DANGEROUS: uncommitted work is lost. Requires confirmation."
+        )
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["workspace", "commit"],
+                    "default": "workspace",
+                    "description": "workspace: discard uncommitted changes; commit: restore a snapshot",
+                },
+                "commit": {
+                    "type": "string",
+                    "description": "Snapshot commit hash (required when mode=commit)",
+                },
+                "cwd": {"type": "string", "description": "Repository root directory"},
+            },
+            "required": [],
+        }
+
+    def execute(self, params: dict[str, Any]) -> ToolResult:
+        cwd = params.get("cwd")
+        mode = params.get("mode", "workspace")
+
+        if mode == "commit":
+            commit = params.get("commit", "").strip()
+            if not commit:
+                return ToolResult(
+                    success=False, output="",
+                    error="commit hash is required when mode='commit'",
+                )
+            ok, output, _tool_err = _run_git(
+                ["checkout", commit, "--", "."], cwd=cwd, runtime=self._runtime,
+            )
+            label = f"snapshot {commit}"
+        else:
+            ok, output, _tool_err = _run_git(
+                ["checkout", "--", "."], cwd=cwd, runtime=self._runtime,
+            )
+            label = "last commit"
+
+        return ToolResult(
+            success=ok,
+            output=f"Reverted workspace to {label}.\n{output}" if ok else output,
+            error=None if ok else output,
+            tool_error=_tool_err,
+        )
