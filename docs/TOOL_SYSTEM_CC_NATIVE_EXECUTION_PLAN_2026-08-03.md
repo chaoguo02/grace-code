@@ -150,3 +150,51 @@ tests/test_runtime_architecture_gates.py            (R3 扩展)
 - ❌ 不重复 T0/T1/T2（已闭合）。
 - ❌ 不做 tool_search / 数千工具 lazy-load（超出当前阶段，作后续迭代）。
 - ❌ 不改 `ToolErrorType` / `ERROR_RETRY_MAP` / `from_base_tool`（已验证正确）。
+
+---
+
+# 6. CC 行为纠偏（2026-08-03 补充，基于 CC 实际行为/官方文档/开源代码）
+
+> 此节纠正本计划及前置设计规范中的若干 CC 误读，避免后续继续误导。引用依据：
+> Anthropic Tool Use API / Claude Code Hooks 文档 / CC 开源镜像与社区源码分析。
+
+## 6.1 Schema strict — 不是 CC 编排机制 ❌
+
+- `strict: true` 是 **OpenAI Structured Outputs** 概念；Anthropic 对应的是 **JSON Schema Validation**（`input_schema` + `additionalProperties: false`），且是**服务端后置校验**，非生成时前置约束。
+- CC 源码**无全局 strict 注入**。CC 靠详尽的 `description` + few-shot 引导；参数错了，靠 `validation_error` ToolFailure 让模型下一轮自修正。
+- **结论**：本计划不将 "strict 前置强制" 列为目标（之前讨论中的建议作废）。
+
+## 6.2 tool_choice 动态切换 — CC 几乎不用 Runtime 主动接管 ⚠️
+
+- CC StepLoop 绝大多数 turn **硬编码 auto**，不会因空转/权限拒绝自动切 any/tool/none；这些模式供外部调用者（IDE/测试）使用。
+- CC 防失控靠：System Prompt 强指令 + Max Turns 硬上限（~200）+ Token Budget 熔断（compact/summarize）+ PostToolUse Hook 注入纠正上下文。
+- **结论**：`LLMPort.invoke(tool_choice=...)` 参数支持 + auto 默认即 CC 对齐；**不实现** "动态切换策略函数"（那是 LangGraph/AutoGen 思路）。
+
+## 6.3 PreToolUse 四决策 ✅ 已对齐
+
+- allow/deny/ask/defer 是 CC Hooks 明确定义的返回值，[step_loop.py](runtime_core/step_loop.py) 四条路径齐全。
+- `defer` 实际语义：**等待并行 batch 其他工具完成后重评**，服务于并行安全，非通用条件延迟。当前实现将其标记为拒绝（近似），完整语义可选后续增强。
+
+## 6.4 PostToolBatch 触发点 ✅ / 作用被高估 ⚠️
+
+- 触发点存在（[step_loop.py](runtime_core/step_loop.py#L188)）✅。
+- 返回值**仅限** `additionalContext`（追加对话历史）和 `updatedToolOutput`（替换本批结果）；**不能**改 tool_choice 或注入 system prompt。是"只读聚合 + 有限写入"的观察点，**不是**编排决策点（决策始终由 LLM 下一轮推理做出）。
+- **结论**：不实现 "hook 写入 forced_tool_choice"（非 CC 行为）。
+
+## 6.5 结构化错误语义 ✅ CC 核心 / ERROR_RETRY_MAP 是超越增强
+
+- CC 依赖 `is_error: true` + 可读 error message 驱动模型自愈；**没有** Runtime 静默重试——timeout/network 也作为 `tool_result(is_error=true)` 回传，模型自行决定重试。
+- 本实现 `ToolFailure.error_type` 枚举 + `ERROR_RETRY_MAP` 是**超越 CC 的增强**（automatic 类自动指数退避重试），不是 CC 标准行为。保留它，但**不标榜为 CC 对齐**——它是有价值的自主设计。
+- **结论**：结构化错误类型 = CC 对齐 ✅；自动重试 = 自主增强（区别于 CC）。
+
+## 6.6 对当前实现的最终判断
+
+| 项 | CC 对齐 | 自主增强 |
+|---|---|---|
+| PreToolUse 四决策 | ✅ | — |
+| PostToolBatch 触发点 | ✅ | — |
+| 结构化 error_type + is_error | ✅ | — |
+| tool_choice 参数 + auto 默认 | ✅ | — |
+| Runtime 自动重试（ERROR_RETRY_MAP） | — | ✅ 超越 CC |
+| 并行 sibling 失败隔离（G19） | — | ✅ 优于 CC（CC 会取消整批） |
+| RiskLevel + TrustAccumulator 权限累积 | — | ✅ 超越 CC |

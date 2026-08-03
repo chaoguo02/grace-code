@@ -15,6 +15,14 @@ from core.eventing.identifiers import SessionId, RunId
 
 @dataclass(frozen=True, slots=True)
 class ConversationSnapshot:
+    """不可变对话快照。messages 元素为规范 dict（Phase 2 保真契约）：
+
+      {"role": "user"|"system", "content": str|list[dict]}  普通消息
+      {"role": "assistant", "content": str, "tool_calls": [{id,name,params}]}  tool_use
+      {"role": "tool", "tool_call_id": str, "content": str, "is_error": bool}  tool_result
+    tool_calls/tool_call_id 必须全程保真（对齐 CC List[ContentBlock]），
+    不得扁平化为纯文本。
+    """
     messages: tuple[dict, ...] = ()
     system_prompt: str = ""
     project_instructions: str = ""

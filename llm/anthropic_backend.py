@@ -137,7 +137,10 @@ def _to_anthropic_messages(messages: list[LLMMessage]) -> list[dict]:
         if msg.tool_calls:
             # Native: assistant message with tool_use blocks
             content_blocks = []
-            if msg.content:
+            if isinstance(msg.content, list):
+                # Phase 4: content 已是 ContentBlock list → 原样拆块
+                content_blocks.extend(msg.content)
+            elif msg.content:
                 content_blocks.append({"type": "text", "text": msg.content})
             for tc in msg.tool_calls:
                 content_blocks.append({
@@ -148,15 +151,15 @@ def _to_anthropic_messages(messages: list[LLMMessage]) -> list[dict]:
                 })
             result.append({"role": "assistant", "content": content_blocks})
         elif msg.tool_call_id:
-            # Native: tool result
-            result.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": msg.tool_call_id,
-                    "content": msg.content if isinstance(msg.content, str) else str(msg.content),
-                }],
-            })
+            # Native: tool result（Phase 4: 透传 is_error 语义）
+            _block: dict = {
+                "type": "tool_result",
+                "tool_use_id": msg.tool_call_id,
+                "content": msg.content if isinstance(msg.content, str) else str(msg.content),
+            }
+            if getattr(msg, "is_error", False):
+                _block["is_error"] = True
+            result.append({"role": "user", "content": [_block]})
         else:
             # If role is "tool" but tool_call_id is None (edge case from
             # text-mode parsing), wrap it as a user message so the API

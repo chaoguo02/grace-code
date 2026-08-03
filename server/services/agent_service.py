@@ -907,18 +907,43 @@ class AgentService:
                 from core.base import ToolRegistry as CoreToolRegistry
                 coord = self._native_components.run_coordinator
 
-                # Build conversation from session messages
+                # Build conversation from session messages (Phase 3: 富 dict 保真)
                 msgs = self._storage.list_messages(session_id, limit=50)
-                conv = ConversationSnapshot(messages=tuple(
-                    {"role": m["role"], "content": m["content"]} for m in msgs
-                ))
+                conv_msgs = []
+                for m in msgs:
+                    d = {"role": m.role, "content": m.content}
+                    if getattr(m, "tool_calls", None):
+                        d["tool_calls"] = [
+                            {
+                                "id": tc.id, "name": tc.name,
+                                "params": dict(tc.params) if isinstance(tc.params, dict) else tc.params,
+                            }
+                            for tc in m.tool_calls
+                        ]
+                    if getattr(m, "tool_call_id", None):
+                        d["tool_call_id"] = m.tool_call_id
+                        d["is_error"] = bool(getattr(m, "is_error", False))
+                    conv_msgs.append(d)
+                conv = ConversationSnapshot(messages=tuple(conv_msgs))
 
-                # Build capabilities from tool registry
+                # Build capabilities from tool registry (Phase 3: 补 parameters)
                 caps = CapabilitySnapshot()
                 if hasattr(self, '_tool_registry'):
                     caps = CapabilitySnapshot(
                         tool_schemas=tuple(
-                            {"name": t.name, "description": t.schema.get("description","")}
+                            {
+                                "name": t.name,
+                                "description": (
+                                    t.schema.get("description", "")
+                                    if hasattr(t, "schema") and isinstance(t.schema, dict)
+                                    else ""
+                                ),
+                                "parameters": (
+                                    t.parameters_schema
+                                    if hasattr(t, "parameters_schema")
+                                    else {}
+                                ),
+                            }
                             for t in self._tool_registry.list_tools()
                         ) if hasattr(self._tool_registry, 'list_tools') else ()
                     )

@@ -76,21 +76,15 @@ def _invoke_via_backend(backend, messages, tools=None, tool_choice=None):
             usage=TokenUsage(input_tokens=10, output_tokens=5),
         )
 
-    # ── Convert FrozenJsonObject messages → LLMMessage list ──────────
-    from llm.base import LLMMessage
-    from core.json_values import thaw_json
+    # ── Convert messages → LLMMessage list via typed mapper (Phase 1) ──
+    # 废除扁平化：tool_calls / tool_call_id / content blocks 全程保真。
+    from llm.message_mapper import messages_to_llm, tool_dicts_to_schemas
 
-    raw_messages = thaw_json(messages) if hasattr(messages, '__dataclass_fields__') else messages
-    msg_list = raw_messages.get("messages", raw_messages) if isinstance(raw_messages, dict) else raw_messages
-    llm_messages = []
-    if isinstance(msg_list, (list, tuple)):
-        for m in msg_list:
-            role = m.get("role", "user") if isinstance(m, dict) else "user"
-            content = m.get("content", "") if isinstance(m, dict) else str(m)
-            llm_messages.append(LLMMessage(role=role, content=content))
+    llm_messages = messages_to_llm(messages)
 
-    # ── Invoke real backend ───────────────────────────────────────────
-    response = backend.complete(llm_messages, [])
+    # ── Invoke real backend (tools 透传，不再硬编码 []) ──────────────
+    api_tools = tool_dicts_to_schemas(tools) if tools else []
+    response = backend.complete(llm_messages, api_tools)
 
     # ── Extract TokenUsage ────────────────────────────────────────────
     usage = TokenUsage(

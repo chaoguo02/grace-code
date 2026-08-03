@@ -68,42 +68,50 @@ class RuntimeOutcome:
     cancellation_reason: CancellationReason | None = None
     blocked_by: str = ""
     evidence: RunEvidence | None = None
+    messages: tuple = ()
+    """Phase 5: 本次 run 产生的 assistant/tool 消息（规范 dict：
+    {"role","content","tool_calls"|"tool_call_id","is_error"}），
+    供跨轮持久化写入 session_messages。digest() 排除此字段（对话数据）。"""
 
     # ── Factory methods ────────────────────────────────────────────────
 
     @classmethod
     def completed(cls, run_id: RunId, steps: int = 0, tokens: int = 0,
                   summary: str = "",
-                  evidence: RunEvidence | None = None) -> RuntimeOutcome:
+                  evidence: RunEvidence | None = None,
+                  messages: tuple = ()) -> RuntimeOutcome:
         return cls(run_id=run_id, status=RunStatus.COMPLETED,
                    steps_taken=steps, tokens_used=tokens,
-                   summary=summary, evidence=evidence)
+                   summary=summary, evidence=evidence, messages=messages)
 
     @classmethod
     def failed(cls, run_id: RunId, error: str = "",
                steps: int = 0, tokens: int = 0,
-               evidence: RunEvidence | None = None) -> RuntimeOutcome:
+               evidence: RunEvidence | None = None,
+               messages: tuple = ()) -> RuntimeOutcome:
         return cls(run_id=run_id, status=RunStatus.FAILED,
                    error=error, steps_taken=steps, tokens_used=tokens,
-                   evidence=evidence)
+                   evidence=evidence, messages=messages)
 
     @classmethod
     def cancelled(cls, run_id: RunId,
                   reason: CancellationReason = CancellationReason.USER_REQUESTED,
                   steps: int = 0, tokens: int = 0,
-                  evidence: RunEvidence | None = None) -> RuntimeOutcome:
+                  evidence: RunEvidence | None = None,
+                  messages: tuple = ()) -> RuntimeOutcome:
         return cls(run_id=run_id, status=RunStatus.CANCELLED,
                    cancellation_reason=reason, steps_taken=steps,
-                   tokens_used=tokens, evidence=evidence)
+                   tokens_used=tokens, evidence=evidence, messages=messages)
 
     @classmethod
     def blocked(cls, run_id: RunId, blocked_by: str = "",
                 detail: str = "", steps: int = 0, tokens: int = 0,
-                evidence: RunEvidence | None = None) -> RuntimeOutcome:
+                evidence: RunEvidence | None = None,
+                messages: tuple = ()) -> RuntimeOutcome:
         return cls(run_id=run_id, status=RunStatus.BLOCKED,
                    steps_taken=steps, tokens_used=tokens,
                    summary=f"blocked by {blocked_by}", error=detail,
-                   blocked_by=blocked_by, evidence=evidence)
+                   blocked_by=blocked_by, evidence=evidence, messages=messages)
 
     # ── G20: Deterministic digest ──────────────────────────────────────
 

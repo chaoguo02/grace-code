@@ -35,6 +35,7 @@ from runtime_core.outcome import (
 from runtime_core.ports import RuntimePorts, HookGateResult, ToolOutcome, ToolSuccess, ToolFailure, ToolDenied, ToolErrorType
 from runtime_core.tool_scheduler import ToolScheduler, ToolMetadata
 from hook_core.inputs import PreToolUseInput, PostToolUseInput
+from runtime_core.message_builder import assistant_text_message, build_tool_messages
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +94,8 @@ class StepLoop:
         hook_blocks: list[str] = []
         # T10: Collect tool_result blocks for conversation backfill
         _pending_tool_results: list[dict] = []
+        # Phase 5: 收集本次 run 产生的 assistant/tool 消息（跨轮持久化）
+        collected_messages: list[dict] = []
         # R1: Derive session scope for live event routing
         import uuid as _uuid
         _exec_scope = ScopeToken.session_scope(
@@ -108,19 +111,24 @@ class StepLoop:
                     tool_evidences, files_touched, hook_blocks)
 
             # ── 1. Model call ───────────────────────────────────────
-            _msgs = [
-                {"role": m.get("role", ""), "content": m.get("content", "")}
-                for m in context.conversation.messages
-            ]
-            # T10: Prepend pending tool_result blocks from previous turns
+            # Phase 2: 原样直传 conversation.messages（保真 tool_calls/tool_call_id）
+            _msgs = list(context.conversation.messages)
+            # T10: Prepend pending tool messages (assistant tool_use + tool results)
             if _pending_tool_results:
                 _msgs.extend(_pending_tool_results)
                 _pending_tool_results = []
-            conv_json = freeze_json({"messages": _msgs})
+            # Phase 2: tools 透传（不再 freeze_json 包裹；messages 已是 list[dict]）
+            _tool_schemas = (
+                list(context.capabilities.tool_schemas)
+                if context.capabilities is not None
+                and getattr(context.capabilities, "tool_schemas", ())
+                else []
+            )
 
             try:
                 model_action = self._ports.llm.invoke(
-                    conv_json, tool_choice={"type": "auto"},
+                    _msgs, tools=_tool_schemas or None,
+                    tool_choice={"type": "auto"},
                 )
             except Exception as exc:
                 return self._finalize_outcome(RuntimeOutcome.failed(
@@ -142,6 +150,10 @@ class StepLoop:
 
             # ── 2. Process model action ─────────────────────────────
             if isinstance(model_action, AssistantText):
+                # Phase 5: 收集 assistant 文本消息（跨轮持久化）
+                collected_messages.append(
+                    assistant_text_message(model_action.text),
+                )
                 steps.append(StepResult(turn_index=turn, model_action=model_action,
                                         should_continue=False,
                                         tokens_input=step_tokens_in, tokens_output=step_tokens_out))
@@ -149,9 +161,14 @@ class StepLoop:
                     context.run_id, steps=len(steps),
                     tokens=total_tokens_in + total_tokens_out,
                     summary=model_action.text[:500]), total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks)
+                    tool_evidences, files_touched, hook_blocks,
+                    messages=tuple(collected_messages))
 
             if isinstance(model_action, ModelStop):
+                # Phase 5: 收集 assistant 文本消息（跨轮持久化）
+                collected_messages.append(
+                    assistant_text_message(model_action.text or model_action.stop_reason),
+                )
                 steps.append(StepResult(turn_index=turn, model_action=model_action,
                                         should_continue=False,
                                         tokens_input=step_tokens_in, tokens_output=step_tokens_out))
@@ -160,7 +177,8 @@ class StepLoop:
                     tokens=total_tokens_in + total_tokens_out,
                     summary=model_action.text or model_action.stop_reason),
                     total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks)
+                    tool_evidences, files_touched, hook_blocks,
+                    messages=tuple(collected_messages))
 
             if isinstance(model_action, (ToolCall, ToolCallBatch)):
                 calls = (model_action,) if isinstance(model_action, ToolCall) else model_action.calls
@@ -198,10 +216,12 @@ class StepLoop:
                     except Exception:
                         pass
 
-                # T10: Collect tool_result blocks for conversation backfill
-                for tr in tool_results:
-                    if tr.outcome is not None and hasattr(tr.outcome, 'to_chat_block'):
-                        _pending_tool_results.append(tr.outcome.to_chat_block())
+                # T10 / Phase 2/5: 生成 assistant(tool_calls) + role=tool(tool_call_id)
+                # 配对消息（message_builder，对齐 CC List[ContentBlock]，tool_use_id
+                # 与 tool_call.id 一一对应）。同批用于下一轮传输 + 跨轮持久化。
+                _roundtrip_msgs = build_tool_messages(calls, tool_results)
+                _pending_tool_results.extend(_roundtrip_msgs)
+                collected_messages.extend(_roundtrip_msgs)
 
                 # T21: Record per-tool token cost (spread step tokens across tools)
                 if len(tool_results) > 0 and step_tokens_in + step_tokens_out > 0:
@@ -226,7 +246,8 @@ class StepLoop:
                     tokens=total_tokens_in + total_tokens_out,
                     blocked_by="model_refusal", detail=model_action.reason),
                     total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks)
+                    tool_evidences, files_touched, hook_blocks,
+                    messages=tuple(collected_messages))
 
             if isinstance(model_action, ModelFailure):
                 if model_action.retryable:
@@ -238,7 +259,8 @@ class StepLoop:
                     steps=len(steps),
                     tokens=total_tokens_in + total_tokens_out),
                     total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks)
+                    tool_evidences, files_touched, hook_blocks,
+                    messages=tuple(collected_messages))
 
         return self._finalize_outcome(RuntimeOutcome.blocked(
             context.run_id, steps=len(steps),
@@ -246,7 +268,8 @@ class StepLoop:
             blocked_by="max_steps",
             detail=f"max_steps={context.max_steps}"),
             total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks)
+                    tool_evidences, files_touched, hook_blocks,
+                    messages=tuple(collected_messages))
 
     # ── G17: Tool call pipeline ────────────────────────────────────────
 
@@ -255,10 +278,13 @@ class StepLoop:
                           output_tokens: int,
                           tool_evidences: list[ToolEvidence],
                           files_touched: set[str],
-                          hook_blocks: list[str]) -> RuntimeOutcome:
-        """H3+H4: Inject tokens + evidence into a frozen outcome."""
+                          hook_blocks: list[str],
+                          messages: tuple = ()) -> RuntimeOutcome:
+        """H3+H4: Inject tokens + evidence (+ Phase 5 messages) into a frozen outcome."""
         object.__setattr__(outcome, 'input_tokens', input_tokens)
         object.__setattr__(outcome, 'output_tokens', output_tokens)
+        if messages:
+            object.__setattr__(outcome, 'messages', messages)
         if tool_evidences or files_touched or hook_blocks:
             evidence = RunEvidence(
                 tool_calls=tuple(tool_evidences),

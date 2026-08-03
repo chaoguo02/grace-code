@@ -528,6 +528,10 @@ class ChatPipeline:
             conversation=conv, capabilities=caps, max_steps=25,
         )
 
+        # Phase 5: 跨轮持久化 — 把 run 产生的 assistant/tool 消息写 session_messages，
+        # 供下一轮 HTTP 重建 conversation 时保留工具历史（tool_use_id 关联不丢）。
+        self._persist_native_messages(request.session_id, getattr(outcome, "messages", ()))
+
         # Finalize — write terminal state + fact to Outbox
         coord.finalize(
             FinalizeRun(run_id=outcome.run_id,
@@ -552,6 +556,43 @@ class ChatPipeline:
         )
         self._ports.accumulate_session_stats(request.session_id, result)
         return result
+
+    def _persist_native_messages(self, session_id: str, messages) -> None:
+        """Phase 5: 把 native run 的 assistant/tool 消息写入 session_messages。
+
+        messages 为规范 dict（role/content/tool_calls/tool_call_id/is_error）。
+        复用 session_service.append_message → serializer 保真序列化。
+        """
+        if not messages or not hasattr(self._ports, "session_service"):
+            return
+        append = getattr(self._ports.session_service, "append_message", None)
+        if append is None:
+            return
+        from llm.base import LLMMessage
+        from core.types import ToolCall as CoreToolCall
+        for m in messages:
+            role = m.get("role", "")
+            if role not in ("assistant", "tool"):
+                continue
+            try:
+                llm_msg = LLMMessage(
+                    role=role,
+                    content=m.get("content", ""),
+                    tool_call_id=m.get("tool_call_id"),
+                    is_error=bool(m.get("is_error", False)),
+                )
+                if m.get("tool_calls"):
+                    llm_msg.tool_calls = [
+                        CoreToolCall(
+                            name=tc.get("name", ""),
+                            params=dict(tc.get("params", {}) or {}),
+                            id=tc.get("id"),
+                        )
+                        for tc in m["tool_calls"]
+                    ]
+                append(session_id, llm_msg)
+            except Exception:
+                logger.debug("Native message persist skipped", exc_info=True)
 
     @staticmethod
     def _render_prepared_prompt(prepared: PreparedChatRun) -> str:

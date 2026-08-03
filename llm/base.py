@@ -60,6 +60,7 @@ class LLMMessage:
     tool_calls: "list[ToolCall] | None" = None
     kind: MessageKind | None = None
     created_at: str = ""                # ISO timestamp from DB (added for timeline ordering)
+    is_error: bool = False              # CC: tool_result block is_error 语义（role=="tool" 时）
 
 
 @dataclass

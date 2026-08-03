@@ -134,12 +134,12 @@ class LLMPort(Protocol):
       - {"type": "tool", "name": "..."} — force specific tool
       - {"type": "none"} — text-only response
     """
-    def invoke(self, messages: FrozenJsonObject,
-               tools: FrozenJsonObject | None = None,
+    def invoke(self, messages: "list[dict]",
+               tools: "list[dict] | None" = None,
                tool_choice: dict | None = None) -> ModelAction: ...
 
-    def stream(self, messages: FrozenJsonObject,
-               tools: FrozenJsonObject | None = None,
+    def stream(self, messages: "list[dict]",
+               tools: "list[dict] | None" = None,
                tool_choice: dict | None = None) -> Awaitable[ModelAction]: ...
 
 

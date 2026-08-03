@@ -329,11 +329,24 @@ class SessionService:
 
     # ── Messages ──────────────────────────────────────────────────────────
 
-    def get_messages(self, session_id: str) -> list[dict[str, Any]]:
-        """Get all messages for a session as JSON-safe dicts.
+    def append_message(self, session_id: str, message: Any) -> None:
+        """Persist one LLMMessage (Phase 5: native 跨轮持久化)。
+
+        复用 storage.append_message → message_serializer 序列化
+        content_json/tool_calls_json/tool_call_id。
+        """
+        if self._storage.get_session(session_id) is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        self._storage.append_message(session_id, message)
+
+    def get_messages(self, session_id: str,
+                     limit: int | None = None) -> list[dict[str, Any]]:
+        """Get messages for a session as JSON-safe dicts (rich, Phase 3).
 
         Args:
             session_id: The session to query.
+            limit: If set, return the most recent *limit* messages (for
+                native conversation rebuild).
 
         Returns:
             list[dict]: Each message has ``role``, ``content``,
@@ -346,7 +359,10 @@ class SessionService:
         if self._storage.get_session(session_id) is None:
             raise ValueError(f"Unknown session: {session_id}")
         msgs = self._storage.list_messages(session_id)
-        return [_serialize_message(m) for m in msgs]
+        result = [_serialize_message(m) for m in msgs]
+        if limit is not None and limit > 0:
+            result = result[-limit:]
+        return result
 
     # ── Events ────────────────────────────────────────────────────────────
 
