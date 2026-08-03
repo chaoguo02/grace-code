@@ -50,9 +50,13 @@ class FileEditTool(BaseTool):
         return False
 
     def __init__(self, read_cache: "FileReadCache | None" = None,
-                 workspace_root: str | None = None) -> None:
+                 workspace_root: str | None = None,
+                 protected_paths: tuple[str, ...] = (),
+                 allow_overrides: tuple[str, ...] = ()) -> None:
         self._read_cache = read_cache
         self._workspace_root = workspace_root
+        self._protected_paths = protected_paths
+        self._allow_overrides = allow_overrides
 
     aliases = ("file_edit",)
 
@@ -119,6 +123,19 @@ class FileEditTool(BaseTool):
             except ValueError as e:
                 return ToolResult(success=False, output="", error=str(e))
             path = Path(clean)
+
+        # ── Phase 1B: Protect critical paths (git/, .env, node_modules, ...) ──
+        # 对齐 Claude Code：workspace 内也默认拒绝写入受保护路径，除非显式 override。
+        from core.base import is_path_protected
+        if is_path_protected(str(path), self._protected_paths, self._allow_overrides):
+            return ToolResult(
+                success=False, output="",
+                error=(
+                    f"Edit to protected path '{path}' is not allowed "
+                    f"(protected: .git/, .env, __pycache__/, node_modules/, *.lock). "
+                    "Read it instead; to write, configure an explicit override."
+                ),
+            )
 
         # ── Read-before-Edit (Claude Code pattern) ──
         # For existing files: must have read the file this session.
@@ -237,22 +254,27 @@ class FileEditTool(BaseTool):
 
         new_content = content.replace(old_str, new_str, 1)
 
-        # ── Write atomically (tmp + os.replace) with symlink/TOCTOU protection ──
+        # ── Write atomically (tmp + os.replace) + syntax check + rollback ──
+        # Phase 1A: 写入要么成功且语法有效，要么回滚（不污染工作区）。
         if ws is not None:
-            from core.base import resolve_safe_parent, atomic_write_bytes
+            from core.base import resolve_safe_parent, atomic_write_checked
             safe_path, err = resolve_safe_parent(str(path), ws)
             if err:
                 return ToolResult(success=False, output="", error=err)
-            safe_path, err = atomic_write_bytes(safe_path, new_content.encode("utf-8"))
+            safe_path, err = atomic_write_checked(
+                safe_path, new_content.encode("utf-8"), str(path),
+            )
             if err:
                 return ToolResult(success=False, output="", error=err)
             write_path = safe_path
         else:
-            try:
-                path.write_text(new_content, encoding="utf-8")
-            except OSError as e:
-                return ToolResult(success=False, output="", error=str(e))
-            write_path = str(path.resolve())
+            from core.base import atomic_write_checked
+            safe_path, err = atomic_write_checked(
+                str(path.resolve()), new_content.encode("utf-8"), str(path),
+            )
+            if err:
+                return ToolResult(success=False, output="", error=err)
+            write_path = safe_path
 
         # ── Store edited content in read cache ──
         # The agent now knows the file contents — no need for a separate

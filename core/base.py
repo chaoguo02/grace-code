@@ -559,8 +559,9 @@ import os as _os
 import sys as _sys
 from pathlib import Path as _Path
 
-# Platform-adaptive: O_NOFOLLOW is POSIX-only
+# Platform-adaptive: O_NOFOLLOW is POSIX-only; O_BINARY is Windows-only
 _O_NOFOLLOW = getattr(_os, "O_NOFOLLOW", 0)
+_O_BINARY = getattr(_os, "O_BINARY", 0)  # Windows: prevent \n→\r\n text conversion
 
 
 def sanitize_path(user_path: str, workspace_root: str) -> str:
@@ -570,6 +571,12 @@ def sanitize_path(user_path: str, workspace_root: str) -> str:
     any file operation. Strips ../ traversal attempts without touching
     the filesystem.
     """
+    # Phase 1C: null byte injection — reject before any FS call (mkdir/open
+    # would otherwise leak ValueError "embedded null character").
+    if "\x00" in user_path:
+        raise ValueError(
+            f"Path '{user_path}' contains a null byte"
+        )
     if _os.path.isabs(user_path):
         clean = _os.path.normpath(user_path)
     else:
@@ -582,6 +589,51 @@ def sanitize_path(user_path: str, workspace_root: str) -> str:
             f"workspace '{workspace_root}'"
         )
     return clean
+
+
+# ── Protected paths (Phase 1B) ────────────────────────────────────────────
+# 对齐 Claude Code：隐式保护关键路径，workspace 内也默认拒绝写入。
+DEFAULT_PROTECTED_PATTERNS: tuple[str, ...] = (
+    ".git",         # git 元数据目录
+    ".env",         # 环境变量/密钥
+    "__pycache__",  # Python 缓存
+    "node_modules", # npm 依赖
+    "*.lock",       # 锁文件
+)
+
+
+def _path_matches_pattern(path_str: str, pattern: str) -> bool:
+    """Match *pattern* (glob) against any path segment or the full path."""
+    import fnmatch
+    norm = path_str.replace("\\", "/")
+    pat = pattern.replace("\\", "/")
+    # 仅去掉显式的 "./" 前缀；保留 ".env" 这类以点开头的 pattern（lstrip 会误删）
+    while pat.startswith("./"):
+        pat = pat[2:]
+    for part in norm.split("/"):
+        if fnmatch.fnmatch(part, pat):
+            return True
+    return fnmatch.fnmatch(norm, pat) or fnmatch.fnmatch(norm, f"*/{pat}")
+
+
+def is_path_protected(
+    path_str: str,
+    extra_patterns: Sequence[str] = (),
+    allow_overrides: Sequence[str] = (),
+) -> bool:
+    """True if *path_str* is a protected path (default or configured).
+
+    Explicit overrides win: if the path matches an *allow_overrides*
+    pattern it is NOT protected, regardless of protected patterns.
+    """
+    protected = tuple(DEFAULT_PROTECTED_PATTERNS) + tuple(extra_patterns)
+    for pat in allow_overrides:
+        if _path_matches_pattern(path_str, pat):
+            return False
+    for pat in protected:
+        if _path_matches_pattern(path_str, pat):
+            return True
+    return False
 
 
 def is_path_safe(target: str, workspace_root: str) -> bool:
@@ -654,7 +706,7 @@ def safe_open_for_write(full_path: str) -> tuple[int | None, str]:
     # Windows: explicit symlink check (O_NOFOLLOW is not available)
     if _sys.platform == "win32" and p.exists() and p.is_symlink():
         return None, f"Cannot write to symlink: {full_path}"
-    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC
+    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC | _O_BINARY
     if _O_NOFOLLOW:
         flags |= _O_NOFOLLOW
     try:
@@ -670,7 +722,7 @@ def safe_create_file(full_path: str) -> tuple[int | None, str]:
     p = _Path(full_path)
     if _sys.platform == "win32" and p.exists():
         return None, f"File already exists: {full_path}"
-    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL
+    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL | _O_BINARY
     if _O_NOFOLLOW:
         flags |= _O_NOFOLLOW
     try:
@@ -695,7 +747,7 @@ def atomic_write_bytes(full_path: str, data: bytes) -> tuple[str, str]:
     if _sys.platform == "win32" and p.exists() and p.is_symlink():
         return "", f"Cannot write to symlink: {full_path}"
     tmp = p.with_name(f".{p.name}.tmp.{_os.getpid()}")
-    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC
+    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC | _O_BINARY
     if _O_NOFOLLOW:
         flags |= _O_NOFOLLOW
     try:
@@ -715,6 +767,154 @@ def atomic_write_bytes(full_path: str, data: bytes) -> tuple[str, str]:
             pass
         return "", f"Cannot replace '{full_path}': {e}"
     return full_path, ""
+
+
+# ── Lightweight syntax validation + immediate rollback (Phase 1A) ───────────
+# 对齐 Claude Code "不污染工作区"原则：写入要么成功且语法有效，要么回滚。
+# 不做全量 AST（避免语言依赖）——按扩展名路由到轻量校验器。
+
+_EXT_SYNTAX_KIND = {
+    ".py": "py",
+    ".json": "json",
+    ".js": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+}
+
+
+def syntax_kind_for_path(path_str: str) -> str:
+    """Return the syntax-checker kind for *path_str* (e.g. "py", "json"), "" if unsupported."""
+    return _EXT_SYNTAX_KIND.get(_Path(path_str).suffix.lower(), "")
+
+
+def _syntax_check(kind: str, content: str) -> str:
+    """Run a lightweight syntax checker. Returns '' if valid, else error text.
+
+    - py    → py_compile (no runtime execution, syntax only)
+    - json  → json.loads
+    - js    → node --check (subprocess, 5s timeout; skipped if node missing)
+    """
+    if kind == "py":
+        import py_compile
+        import tempfile
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".py", delete=False, encoding="utf-8",
+            ) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            try:
+                py_compile.compile(tmp_path, doraise=True)
+                return ""
+            finally:
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except py_compile.PyCompileError as e:
+            return f"Python syntax error: {e}"
+        except Exception as e:
+            return f"Syntax check failed ({type(e).__name__}): {e}"
+    if kind == "json":
+        import json
+        try:
+            json.loads(content)
+            return ""
+        except Exception as e:
+            return f"JSON syntax error: {e}"
+    if kind == "js":
+        import subprocess
+        import tempfile
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".js", delete=False, encoding="utf-8",
+            ) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            try:
+                proc = subprocess.run(
+                    ["node", "--check", tmp_path],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if proc.returncode == 0:
+                    return ""
+                return f"JS syntax error: {proc.stderr.strip() or proc.stdout.strip()}"
+            finally:
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except FileNotFoundError:
+            return ""  # node unavailable → skip (do not block writes)
+        except Exception as e:
+            return f"Syntax check failed ({type(e).__name__}): {e}"
+    return ""
+
+
+def validate_content_for_path(path_str: str, content: str) -> str:
+    """Lightweight syntax validation for content destined for *path_str*.
+
+    Returns '' if valid or unsupported extension, else a human-readable
+    error message.  Used by atomic_write_checked and fallback write paths.
+    """
+    kind = syntax_kind_for_path(path_str)
+    if not kind:
+        return ""
+    return _syntax_check(kind, content)
+
+
+def _restore_file(full_path: str, original: bytes | None) -> None:
+    """Atomically restore *original* bytes to *full_path*, or delete it if created new."""
+    if original is None:
+        try:
+            _os.unlink(full_path)
+        except OSError:
+            pass
+        return
+    tmp = f"{full_path}.restore.{_os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(original)
+        _os.replace(tmp, full_path)
+    finally:
+        try:
+            if _os.path.exists(tmp):
+                _os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def atomic_write_checked(full_path: str, data: bytes,
+                         path_for_kind: str = "") -> tuple[str, str]:
+    """Atomic write + lightweight syntax validation + immediate rollback.
+
+    对齐 CC "不污染工作区"：写入要么成功且语法有效，要么回滚并返回错误。
+    校验失败时自动恢复原文件内容（原子写回），不留 .tmp 残留。
+
+    Returns (path, error); error is "" on success.
+    """
+    # 1. Backup existing content (byte-exact) for rollback
+    original: bytes | None = None
+    if _os.path.exists(full_path):
+        try:
+            with open(full_path, "rb") as f:
+                original = f.read()
+        except OSError:
+            original = None
+
+    # 2. Atomic write (tmp + os.replace)
+    written, err = atomic_write_bytes(full_path, data)
+    if err:
+        return "", err
+
+    # 3. Lightweight syntax validation
+    verr = validate_content_for_path(path_for_kind, data.decode("utf-8", errors="replace"))
+    if verr:
+        # 4. Rollback — restore original bytes atomically
+        _restore_file(full_path, original)
+        return "", verr
+
+    return written, ""
 
 
 def safe_read_text(target: str, workspace_root: str) -> tuple[str | None, str]:

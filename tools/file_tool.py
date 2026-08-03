@@ -539,7 +539,9 @@ class FileWriteTool(BaseTool):
 
     def __init__(self, allowed_paths: list[str | Path] | None = None,
                  read_cache: FileReadCache | None = None,
-                 workspace_root: str | None = None) -> None:
+                 workspace_root: str | None = None,
+                 protected_paths: tuple[str, ...] = (),
+                 allow_overrides: tuple[str, ...] = ()) -> None:
         self._allowed_paths = (
             {Path(path).expanduser().resolve() for path in allowed_paths}
             if allowed_paths is not None
@@ -547,6 +549,8 @@ class FileWriteTool(BaseTool):
         )
         self._read_cache = read_cache
         self._workspace_root = workspace_root
+        self._protected_paths = protected_paths
+        self._allow_overrides = allow_overrides
 
     aliases = ("file_write",)
 
@@ -598,6 +602,19 @@ class FileWriteTool(BaseTool):
                 return ToolResult(success=False, output="", error=str(e))
             path = Path(clean)
 
+        # ── Phase 1B: Protect critical paths (git/, .env, node_modules, ...) ──
+        # 对齐 Claude Code：workspace 内也默认拒绝写入受保护路径，除非显式 override。
+        from core.base import is_path_protected
+        if is_path_protected(str(path), self._protected_paths, self._allow_overrides):
+            return ToolResult(
+                success=False, output="",
+                error=(
+                    f"Write to protected path '{path}' is not allowed "
+                    f"(protected: .git/, .env, __pycache__/, node_modules/, *.lock). "
+                    "Read it instead; to write, configure an explicit override."
+                ),
+            )
+
         # ── Read-before-Write (CC-aligned safety gate) ──
         # For existing files: must have read the file this session.
         # New files (path doesn't exist yet) and symlinks to deleted
@@ -617,19 +634,23 @@ class FileWriteTool(BaseTool):
                           "Read the file first, then write to it.",
                 )
 
-        # ── Layers 2+3: resolve parent + atomic write (tmp + os.replace) ──
+        # ── Layers 2+3: resolve parent + atomic write + syntax check + rollback ──
+        # Phase 1A: 写入要么成功且语法有效，要么回滚（不污染工作区）。
         if ws is not None:
-            from core.base import resolve_safe_parent, atomic_write_bytes
+            from core.base import resolve_safe_parent, atomic_write_checked
             safe_path, err = resolve_safe_parent(str(path), ws)
             if err:
                 return ToolResult(success=False, output="", error=err)
 
-            safe_path, err = atomic_write_bytes(safe_path, content.encode("utf-8"))
+            safe_path, err = atomic_write_checked(
+                safe_path, content.encode("utf-8"), str(path),
+            )
             if err:
                 return ToolResult(success=False, output="", error=err)
             target_path = Path(safe_path)
         else:
             # No workspace — fall back to legacy behavior
+            from core.base import atomic_write_checked
             target_path = path.expanduser().resolve()
             if self._allowed_paths is not None and target_path not in self._allowed_paths:
                 return ToolResult(
@@ -638,9 +659,13 @@ class FileWriteTool(BaseTool):
                 )
             try:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(content, encoding="utf-8")
             except OSError as e:
                 return ToolResult(success=False, output="", error=str(e))
+            _, err = atomic_write_checked(
+                str(target_path), content.encode("utf-8"), str(target_path),
+            )
+            if err:
+                return ToolResult(success=False, output="", error=err)
 
         line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
 

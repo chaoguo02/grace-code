@@ -26,6 +26,15 @@ class AgentConfig:
     artifact_threshold_tokens: int = 2_000
     artifact_storage_dir: str = ""
     checkpoint_db_path: str = ""
+    # ── Phase 1B: per-path write protection (glob patterns) ──
+    readonly_paths: list[str] = field(default_factory=list)
+    """Additional protected path glob patterns beyond the defaults
+    (.git/, .env, __pycache__/, node_modules/, *.lock).  Writes to any
+    matching path are rejected by the Write/Edit tools unless explicitly
+    allowed via allow_write_to_protected."""
+    allow_write_to_protected: list[str] = field(default_factory=list)
+    """Explicit overrides (glob patterns) that re-enable writes to
+    otherwise-protected paths.  Must be set deliberately by the user."""
     missing_test_target_max_followups: int = 2
     max_parallel_tool_calls: int = 3
     history_max_messages: int = 200
