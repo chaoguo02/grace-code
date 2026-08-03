@@ -1524,6 +1524,16 @@ class SessionRuntime:
             # Preloaded skills are discovered while building runtime messages.
             # record_skill_activation() writes them directly to the active Store.
 
+            # ── Phase 3A: 断点续传 — 存在有效 RESUME_MARKER 时注入续传提示 ──
+            # 进程重启后：若 workspace 未变且有 marker，告知 LLM 从断点继续，
+            # 而非重做已完成 turns（宁可重跑，不可错误跳过 R-D）。
+            from agent.session.run_evidence import evaluate_resume
+            _resume_msg = evaluate_resume(self._store, session_id, session.repo_path)
+            if _resume_msg:
+                injected_messages.append(
+                    LLMMessage(role="system", content=_resume_msg),
+                )
+
             # ── Evidence summary for compaction-aware context ──
             from agent.session.run_evidence import build_evidence_projection
             _evidence_summary = build_evidence_projection(

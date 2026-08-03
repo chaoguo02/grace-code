@@ -1298,6 +1298,12 @@ class ReActAgent:
                         turn_number=step,
                         tool_batch=tool_batch,
                     )
+                    # Phase 3A: record evidence resume marker (breakpoint resume)
+                    self._record_resume_marker(
+                        session_id=getattr(self, "_session_id", ""),
+                        turn_number=step,
+                        tool_batch=tool_batch,
+                    )
                     continue
 
             else:
@@ -3506,6 +3512,37 @@ class ReActAgent:
             )
         except Exception:
             logger.debug("Checkpoint capture skipped", exc_info=True)
+
+    def _record_resume_marker(self, session_id: str, turn_number: int,
+                              tool_batch: Any) -> None:
+        """Phase 3A: 每 turn 边界记录 Evidence RESUME_MARKER（断点续传标记）。
+
+        独立于 checkpoint（后者默认关闭、仅调试）。marker 持久化到
+        run_evidence 表，进程重启后用 evaluate_resume() 判定是否可从断点
+        继续（跳过已完成 turns，而非从 step 0 重跑）。
+        """
+        store = getattr(self, "_evidence_store", None)
+        if store is None or not session_id:
+            return
+        try:
+            calls = []
+            if tool_batch is not None:
+                for obs in getattr(tool_batch, "observations", []) or []:
+                    calls.append(getattr(obs, "invocation_id", "") or "")
+            tool_calls_hash = hashlib.sha256(
+                json.dumps(calls, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:16]
+            repo = str(getattr(self, "_current_repo_path", "") or "")
+            from agent.session.run_evidence import workspace_files_hash
+            files_hash = workspace_files_hash(repo) if repo else ""
+            store.record_resume_marker(
+                session_id=session_id,
+                turn_id=str(turn_number),
+                tool_calls_hash=tool_calls_hash,
+                files_hash=files_hash,
+            )
+        except Exception:
+            logger.debug("Resume marker capture skipped", exc_info=True)
 
     def _build_long_term_context(self) -> str | None:
         """委托给 memory/injection_service.py。可被 _invalidate_ltc() 强制刷新。"""

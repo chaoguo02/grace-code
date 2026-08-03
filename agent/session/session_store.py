@@ -1881,6 +1881,23 @@ class SessionStore:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_resume_markers(self, session_id: str) -> list[dict[str, object]]:
+        """Phase 3A: 最近 RESUME_MARKER 列表（按 session，跨 run）。
+
+        用于断点续传：进程重启后从 run_evidence 表找到该 session 最近的
+        turn 边界标记，配合 workspace_files_hash 判定是否可从断点继续。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM run_evidence
+                WHERE session_id = ? AND kind = 'resume_marker'
+                ORDER BY sequence DESC, id DESC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def delete_run_evidence(self, root_run_id: str) -> None:
         """Delete all evidence for a root run (cascaded on session delete)."""
         with self._connect() as conn:

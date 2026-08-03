@@ -1191,6 +1191,36 @@ def should_resume_from_marker(
     return bool(stored) and stored == current_files_hash
 
 
+def evaluate_resume(session_store, session_id: str, repo_path: str) -> str | None:
+    """Return a resume-prompt message, or None when no valid marker exists.
+
+    Phase 3A integration: 进程重启后调用。从 run_evidence 表找到该 session
+    最近的 RESUME_MARKER，比对当前 workspace 文件哈希：
+      - 匹配（workspace 未变）→ 返回续传提示，引导 LLM 从断点继续而非重做
+      - 不匹配（workspace 已变）→ 返回 None，放弃恢复（宁可重跑，R-D）
+    """
+    try:
+        markers = session_store.list_resume_markers(session_id)
+        if not markers:
+            return None
+        last = markers[0]
+        metadata = json.loads(str(last.get("metadata_json") or "{}"))
+        stored_hash = str(metadata.get("files_hash") or "")
+        if not stored_hash:
+            return None
+        current = workspace_files_hash(repo_path)
+        if stored_hash != current:
+            return None
+        turn = last.get("turn_id") or last.get("sequence") or "?"
+        return (
+            f"[RESUME] Detected a valid checkpoint marker after turn {turn}. "
+            f"Workspace is unchanged. Continue from this point; do not redo "
+            f"already-completed work."
+        )
+    except Exception:
+        return None
+
+
 def _load_json(value: str, default: Any) -> Any:
     try:
         return json.loads(value)

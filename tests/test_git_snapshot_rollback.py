@@ -14,12 +14,21 @@ from pathlib import Path
 
 import pytest
 
+from core.process import LocalRuntime
 from tools.git_tool import GitRevertTool, GitSnapshotTool
 
 
 _NEED_GIT = pytest.mark.skipif(
     shutil.which("git") is None, reason="git CLI not available",
 )
+
+
+def _snapshot_tool(tmp_path):
+    return GitSnapshotTool(runtime=LocalRuntime(workspace_root=str(tmp_path)))
+
+
+def _revert_tool(tmp_path):
+    return GitRevertTool(runtime=LocalRuntime(workspace_root=str(tmp_path)))
 
 
 def _run(cmd, cwd):
@@ -45,7 +54,7 @@ def test_snapshot_creates_commit(tmp_path):
     _init_repo(tmp_path)
     (tmp_path / "base.txt").write_text("changed\n", encoding="utf-8")
 
-    result = GitSnapshotTool().execute({"cwd": str(tmp_path)})
+    result = GitSnapshotTool(runtime=LocalRuntime(workspace_root=str(tmp_path))).execute({"cwd": str(tmp_path)})
 
     assert result.success is True, f"snapshot 应成功，got {result.output}"
     # 生成了新 commit（HEAD 变化）
@@ -57,7 +66,7 @@ def test_snapshot_creates_commit(tmp_path):
 def test_snapshot_no_changes_returns_head(tmp_path):
     _init_repo(tmp_path)
 
-    result = GitSnapshotTool().execute({"cwd": str(tmp_path)})
+    result = GitSnapshotTool(runtime=LocalRuntime(workspace_root=str(tmp_path))).execute({"cwd": str(tmp_path)})
 
     assert result.success is True
     assert "No changes to snapshot" in result.output
@@ -68,7 +77,7 @@ def test_revert_workspace_discards_uncommitted_changes(tmp_path):
     _init_repo(tmp_path)
     (tmp_path / "base.txt").write_text("dirty\n", encoding="utf-8")
 
-    result = GitRevertTool().execute({
+    result = GitRevertTool(runtime=LocalRuntime(workspace_root=str(tmp_path))).execute({
         "cwd": str(tmp_path), "mode": "workspace",
     })
 
@@ -82,18 +91,18 @@ def test_revert_commit_restores_snapshot(tmp_path):
     _init_repo(tmp_path)
     # 快照 v1（base.txt = "v1"）
     (tmp_path / "base.txt").write_text("v1\n", encoding="utf-8")
-    GitSnapshotTool().execute({"cwd": str(tmp_path), "message": "v1"})
+    GitSnapshotTool(runtime=LocalRuntime(workspace_root=str(tmp_path))).execute({"cwd": str(tmp_path), "message": "v1"})
     v1_hash = _head(tmp_path)
 
     # 快照 v2（base.txt = "v2"）
     (tmp_path / "base.txt").write_text("v2\n", encoding="utf-8")
-    GitSnapshotTool().execute({"cwd": str(tmp_path), "message": "v2"})
+    GitSnapshotTool(runtime=LocalRuntime(workspace_root=str(tmp_path))).execute({"cwd": str(tmp_path), "message": "v2"})
 
     # 再修改（污染）
     (tmp_path / "base.txt").write_text("polluted\n", encoding="utf-8")
 
     # 回滚到 v1
-    result = GitRevertTool().execute({
+    result = GitRevertTool(runtime=LocalRuntime(workspace_root=str(tmp_path))).execute({
         "cwd": str(tmp_path), "mode": "commit", "commit": v1_hash,
     })
 
@@ -106,7 +115,7 @@ def test_revert_commit_restores_snapshot(tmp_path):
 @_NEED_GIT
 def test_revert_commit_requires_hash(tmp_path):
     _init_repo(tmp_path)
-    result = GitRevertTool().execute({"cwd": str(tmp_path), "mode": "commit"})
+    result = GitRevertTool(runtime=LocalRuntime(workspace_root=str(tmp_path))).execute({"cwd": str(tmp_path), "mode": "commit"})
     assert result.success is False
     assert "commit hash is required" in (result.error or "")
 
