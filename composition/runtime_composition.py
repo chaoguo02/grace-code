@@ -464,10 +464,33 @@ def assemble(db_path: str, *,
     hook_registry = HookRegistry()
     # Phase C: Load hook configuration from settings
     _perm_rules = {}
+    _perm_mode = ""
     if hook_settings is not None:
         _load_hooks_from_settings(hook_registry, hook_settings)
         _perm_rules = hook_settings.get("permission_rules", {})
+        _perm_mode = str(hook_settings.get("permission_mode", "") or "")
     hook_dispatcher = HookDispatcher(hook_registry)
+
+    # ── R1: wire permission_rules into a PermissionPipeline for Native path ──
+    # 对齐 CC：permission_rules（settings.json 的 "Write": "deny" 等）必须在
+    # Native StepLoop 生效。PermissionPipeline 同时承载 deny/ask/allow 规则 +
+    # 权限模式 + RiskLevel/TrustAccumulator（Phase 2 已接线）。
+    _permission_pipeline = None
+    if _perm_rules:
+        from hitl.permission_rule import PermissionRule
+        from hitl.pipeline import PermissionPipeline
+        _perm_rules_list = []
+        for _pat, _tier in _perm_rules.items():
+            try:
+                _perm_rules_list.append(
+                    PermissionRule.parse(str(_pat), tier=str(_tier)),
+                )
+            except ValueError:
+                continue  # 跳过非法规则语法
+        if _perm_rules_list:
+            _permission_pipeline = PermissionPipeline(rules=_perm_rules_list)
+            if _perm_mode:
+                _permission_pipeline.set_permission_mode(_perm_mode)
 
     # ── Runtime ─────────────────────────────────────────────────────
     from runtime_core.ports import (
@@ -525,10 +548,24 @@ def assemble(db_path: str, *,
     CHandle.set_process_registry(_proc_registry)
 
     class _RealHooks:
-        """Hook gate — delegates to HookDispatcher."""
-        def __init__(self, dispatcher):
+        """Hook gate — PermissionPipeline (R1) + HookDispatcher.
+
+        对齐 CC "权限是动态流水线"：PreToolUse 先经 PermissionPipeline 评估
+        （permission_rules + 权限模式 + RiskLevel/Trust），DENY 直接拦截；
+        ALLOW/未命中 → 继续 HookDispatcher（用户 hook 仍可 deny）。
+        """
+        def __init__(self, dispatcher, permission_pipeline=None,
+                     tool_registry=None):
             self._dispatcher = dispatcher
+            self._permission = permission_pipeline
+            self._tool_registry = tool_registry
+
         def check(self, event_type, hook_input, tool_name=""):
+            # R1: PreToolUse → permission pipeline gate first
+            if event_type == "PreToolUse" and self._permission is not None:
+                denied = self._permission_gate(tool_name, hook_input)
+                if denied is not None:
+                    return denied
             result = self._dispatcher.dispatch(event_type, hook_input, tool_name=tool_name)
             return HookGateResult(
                 allowed=not result.blocked,
@@ -536,6 +573,43 @@ def assemble(db_path: str, *,
                 updated_input=result.updated_input,
                 additional_context=result.additional_context,
             )
+
+        def _permission_gate(self, tool_name, hook_input):
+            """PermissionPipeline 评估；明确 DENY 返回阻止结果，否则 None（继续）。
+
+            只拦截**非 INTERACTIVE 层**的 DENY（Layer 1 安全底线 / Layer 3 规则 /
+            Layer 4 模式）。Native headless 无交互回调时，Layer 6 会 fail closed
+            返回 DENY(layer=INTERACTIVE)——那不代表规则拒绝，必须放行给
+            HookDispatcher / StepLoop 的 PermissionRequest 处理。
+            """
+            from hitl.pipeline import PermissionDecision, PermissionLayer
+            tool = self._resolve_tool(tool_name)
+            if tool is None:
+                return None  # 无法 resolve 工具 → 跳过 permission
+            params = getattr(hook_input, "tool_input", {}) or {}
+            from core.json_values import thaw_json
+            params_dict = (
+                thaw_json(params) if hasattr(params, '__dataclass_fields__')
+                else (params or {})
+            )
+            perm_result = self._permission.check(tool, params_dict)
+            if (perm_result.decision is PermissionDecision.DENY
+                    and perm_result.layer is not PermissionLayer.INTERACTIVE):
+                return HookGateResult(
+                    allowed=False,
+                    reason=perm_result.reason or "denied by permission rule",
+                )
+            return None
+
+        def _resolve_tool(self, tool_name):
+            tr = self._tool_registry
+            if tr is None:
+                return None
+            if callable(tr):
+                return tr(tool_name)
+            if hasattr(tr, 'resolve'):
+                return tr.resolve(tool_name)
+            return None
 
     class _RealTools:
         """H2+T19: Tool executor — delegates to BaseTool registry.
@@ -623,7 +697,11 @@ def assemble(db_path: str, *,
     runtime_ports = RuntimePorts(
         llm=_RealLLM(backend=llm_backend),  # Phase C: real backend or None (test)
         tools=_RealTools(tool_lookup=tool_registry, tool_registry=tool_registry),  # T19: dual path
-        hooks=_RealHooks(hook_dispatcher),
+        hooks=_RealHooks(
+            hook_dispatcher,
+            permission_pipeline=_permission_pipeline,
+            tool_registry=tool_registry,
+        ),  # R1: permission_rules gate on Native path
         live_events=_RealLiveEvents(bus), clock=_RealClock(),
         token_usage=_RealTokenUsage(outbox),
     )
