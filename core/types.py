@@ -162,6 +162,12 @@ class LLMToolSchema:
 # ---------------------------------------------------------------------------
 
 class RiskLevel(str, Enum):
+    """Declarative risk metadata assigned by tools.
+
+    Not yet consumed by PermissionPipeline (which uses isReadOnly()/ToolEffect
+    instead).  Kept as declarative metadata for future wiring — see
+    docs/MIGRATION_GAP_CLOSURE_EXECUTION_PLAN_2026-08-03.md.
+    """
     NONE = "none"
     LOW = "low"
     MEDIUM = "medium"

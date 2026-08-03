@@ -680,6 +680,43 @@ def safe_create_file(full_path: str) -> tuple[int | None, str]:
         return None, f"Cannot create '{full_path}': {e}"
 
 
+def atomic_write_bytes(full_path: str, data: bytes) -> tuple[str, str]:
+    """Atomically write *data* to *full_path* via tmp-file + os.replace.
+
+    Replaces the previous O_TRUNC in-place write with a tmp+rename atomic
+    pattern, so a crash mid-write never leaves a truncated target file.
+    Preserves the TOCTOU/symlink protections of ``safe_open_for_write``:
+    - POSIX: opens the tmp file with O_NOFOLLOW (kernel rejects symlinks);
+    - Windows: explicit is_symlink() check (no kernel symlink TOCTOU).
+
+    Returns ``(full_path, error)``; ``error`` is "" on success.
+    """
+    p = _Path(full_path)
+    if _sys.platform == "win32" and p.exists() and p.is_symlink():
+        return "", f"Cannot write to symlink: {full_path}"
+    tmp = p.with_name(f".{p.name}.tmp.{_os.getpid()}")
+    flags = _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC
+    if _O_NOFOLLOW:
+        flags |= _O_NOFOLLOW
+    try:
+        fd = _os.open(str(tmp), flags)
+        try:
+            _os.write(fd, data)
+        finally:
+            _os.close(fd)
+    except OSError as e:
+        return "", f"Cannot write '{full_path}': {e}"
+    try:
+        _os.replace(str(tmp), full_path)
+    except OSError as e:
+        try:
+            _os.unlink(str(tmp))
+        except OSError:
+            pass
+        return "", f"Cannot replace '{full_path}': {e}"
+    return full_path, ""
+
+
 def safe_read_text(target: str, workspace_root: str) -> tuple[str | None, str]:
     """Read file content with path safety check. Returns (content, error)."""
     if not is_path_safe(target, workspace_root):
@@ -991,7 +1028,7 @@ class ToolRegistry:
         pipeline = ToolExecutionPipeline(
             permission_pipeline=self._permission_pipeline,
             hook_dispatcher=self._hook_dispatcher,
-            tool_availability_guard=self._tool_availability_guard,
+            capability_registry=self._tool_availability_guard,
             session_id=getattr(self, "_session_id", ""),
             budget=getattr(self, "_budget", None),
             resource_governor=getattr(self, "_resource_governor", None),

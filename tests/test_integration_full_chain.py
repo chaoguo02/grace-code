@@ -24,6 +24,67 @@ def mem(name, description, content, *, confidence=0.85, scope="project", type="p
     )
 
 
+def _make_coordinator(db_path: str):
+    """Real RunCoordinator backed by the same test DB (submit_run_turn requires it)."""
+    import sqlite3
+    from application.coordinators.run_coordinator import RunCoordinator
+    from application.events.schema_registry import SchemaRegistry
+    from infrastructure.outbox.sqlite_store import SqliteOutboxStore
+    from infrastructure.sqlite.run_uow import SqliteUnitOfWork
+    from runtime_core.model_actions import ModelAction
+    from runtime_core.ports import (
+        RuntimePorts, ToolSuccess, HookGateResult,
+    )
+    from runtime_core.runtime import AgentRuntime
+    from server.services.event_outbox import OutboxStore
+
+    class _FakeLLM:
+        def invoke(self, messages, tools=None, tool_choice=None):
+            return ModelAction.stop(reason="test")
+
+    class _FakeTools:
+        def execute(self, tool_name, params, invocation_id=""):
+            return ToolSuccess(tool_name=tool_name)
+
+    class _FakeHooks:
+        def check(self, event_type, hook_input, tool_name=""):
+            return HookGateResult(allowed=True)
+
+    class _FakeLiveEvents:
+        def publish(self, event_type, payload, scope=None):
+            pass
+
+    class _FakeClock:
+        def now(self):
+            import time
+            return time.monotonic()
+
+        def deadline(self, timeout_s):
+            return self.now() + timeout_s
+
+    class _FakeTokenUsage:
+        def record(self, run_id, input_tokens, output_tokens):
+            pass
+
+    old_outbox = OutboxStore(db_path)
+    old_outbox.install()
+    conn = sqlite3.connect(db_path)
+    SqliteOutboxStore.migrate_add_columns(conn)
+    conn.commit()
+    conn.close()
+
+    registry = SchemaRegistry()
+    outbox_store = SqliteOutboxStore(db_path, registry)
+    ports = RuntimePorts(
+        llm=_FakeLLM(), tools=_FakeTools(), hooks=_FakeHooks(),
+        live_events=_FakeLiveEvents(), clock=_FakeClock(),
+        token_usage=_FakeTokenUsage(),
+    )
+    runtime = AgentRuntime(ports)
+    uow = SqliteUnitOfWork(db_path, outbox_store)
+    return RunCoordinator(runtime, uow)
+
+
 def test_full_chain_mock_backend_finish_with_memory_injection():
     """End-to-end: MockBackend FINISH → verify memory context was injected."""
     from agent.session.models import SessionMode
@@ -161,6 +222,7 @@ def test_transactional_run_prompt_is_not_persisted_twice(tmp_path):
         session_id=session.id,
         prompt="docs目录下有多少个文件",
         idempotency_key="one-prompt",
+        coordinator=_make_coordinator(str(tmp_path / "sessions.db")),
     )
     backend = MockBackend([
         Action(ActionType.FINISH, thought="", message="75"),

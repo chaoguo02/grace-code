@@ -617,19 +617,16 @@ class FileWriteTool(BaseTool):
                           "Read the file first, then write to it.",
                 )
 
-        # ── Layers 2+3: resolve parent + O_NOFOLLOW (TOCTOU protection) ──
+        # ── Layers 2+3: resolve parent + atomic write (tmp + os.replace) ──
         if ws is not None:
-            from core.base import resolve_safe_parent
+            from core.base import resolve_safe_parent, atomic_write_bytes
             safe_path, err = resolve_safe_parent(str(path), ws)
             if err:
                 return ToolResult(success=False, output="", error=err)
 
-            from core.base import safe_open_for_write
-            fd, err = safe_open_for_write(safe_path)
+            safe_path, err = atomic_write_bytes(safe_path, content.encode("utf-8"))
             if err:
                 return ToolResult(success=False, output="", error=err)
-            _os.write(fd, content.encode("utf-8"))
-            _os.close(fd)
             target_path = Path(safe_path)
         else:
             # No workspace — fall back to legacy behavior

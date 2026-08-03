@@ -695,12 +695,6 @@ SANDBOX_CPUS = os.environ.get("FORGE_SANDBOX_CPUS", "2")
 SANDBOX_MEMORY = os.environ.get("FORGE_SANDBOX_MEMORY", "2g")
 SANDBOX_PIDS = int(os.environ.get("FORGE_SANDBOX_PIDS", "100"))
 
-# Environment variable whitelist passed into sandbox containers (Phase 10 P10-SEC-2).
-# Only FORGE_* and LANGFUSE_* vars are forwarded; everything else is silently dropped.
-SANDBOX_ENV_WHITELIST_PREFIXES: tuple[str, ...] = ("FORGE_", "LANGFUSE_", "PYTHONPATH", "PATH", "HOME")
-
-# Container workdir path
-
 # 容器内 repo 的挂载路径
 CONTAINER_WORKDIR = "/workspace"
 
@@ -738,6 +732,10 @@ class DockerRuntime(Runtime):
         self._container_id: str | None = None
         # 容器名加随机后缀，避免冲突
         self._container_name = f"coding-agent-sandbox-{uuid.uuid4().hex[:8]}"
+        # U4: expose a workspace boundary so ShellTool's P0_3 fail-closed check
+        # (getattr(runtime, "_workspace_root")) sees a valid value instead of
+        # None when paired with DockerRuntime.  /workspace is the mounted repo.
+        self._workspace_root = Path(CONTAINER_WORKDIR)
 
     @property
     def name(self) -> str:

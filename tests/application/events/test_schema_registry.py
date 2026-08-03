@@ -34,10 +34,11 @@ class TestSchemaRegistry:
         assert "child_task.started.v1" in types
         assert len(types) == 12
 
-    def test_duplicate_key_same_class_is_ok(self):
-        reg = SchemaRegistry()
-        reg.register(SchemaEntry("run.submitted.v1", 1, RunSubmittedV1))
-        # Same key, same class — no error
+    def test_duplicate_key_same_class_raises(self):
+        """G3: duplicate (event_type, version) key always fails, even if class matches."""
+        reg = SchemaRegistry()  # run.submitted.v1 is pre-registered by default
+        with pytest.raises(ValueError, match="Duplicate"):
+            reg.register(SchemaEntry("run.submitted.v1", 1, RunSubmittedV1))
 
     def test_duplicate_key_different_class_raises(self):
         reg = SchemaRegistry()

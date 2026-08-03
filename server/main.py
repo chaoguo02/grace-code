@@ -374,11 +374,6 @@ def main() -> None:
     from composition.application_components import ApplicationLifecycle
 
     db_path = os.path.join(repo_path, ".grace", "grace.db")
-    print("  Assembling Native object graph...")
-    components = assemble(db_path)
-    lifecycle = ApplicationLifecycle(components)
-    lifecycle.start()
-    print(f"  Native relay started")
 
     # Backward compat: also create legacy service for routes that still need it
     event_bus = EventBus(repo_path=repo_path)
@@ -392,6 +387,19 @@ def main() -> None:
         base_url=args.base_url,
         max_steps=args.max_steps,
     )
+
+    # M9: pass real backend + registry into the Native graph so _RealLLM /
+    # _RealTools execute real work instead of the H1/H2 fake responses.
+    print("  Assembling Native object graph...")
+    components = assemble(
+        db_path,
+        llm_backend=service._backend,
+        tool_registry=service._registry,
+    )
+    lifecycle = ApplicationLifecycle(components)
+    lifecycle.start()
+    print(f"  Native relay started")
+
     service._native_components = components  # G37: pass native components through
     root_id = service.ensure_root_session()
     print(f"  root    : {root_id}")

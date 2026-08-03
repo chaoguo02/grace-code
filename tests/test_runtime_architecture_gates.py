@@ -56,21 +56,19 @@ class TestFinalGate:
         handle.cancel()
 
         class S:
-            def invoke(self, m, t=None): return AssistantText(text="ok")
-            def stream(self, m, t=None):
+            def invoke(self, m, t=None, tool_choice=None): return AssistantText(text="ok")
+            def stream(self, m, t=None, tool_choice=None):
                 async def _s(): return AssistantText(text="ok"); return _s()
             def execute(self, n, p, i=""): return object()
             def check(self, e, i, t=""): return HookGateResult(allowed=True)
-            def publish(self, e, p): pass
+            def publish(self, e, p, scope=None): pass
             def now(self): return _time.monotonic()
             def deadline(self, s): return _time.monotonic() + s
             def record(self, r, i, o): pass
-            @property
-            def cancelled(self): return False
 
         s = S()
         ports = RuntimePorts(llm=s, tools=s, hooks=s, live_events=s,
-                             clock=s, token_usage=s, cancellation=s)
+                             clock=s, token_usage=s)
         loop = StepLoop(ports)
         started = _time.monotonic()
         loop.execute(ctx)

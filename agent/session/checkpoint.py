@@ -217,6 +217,9 @@ def _serialize_result(result: Any) -> dict:
     """Serialize a ToolResult to a JSON-safe dict for checkpoint storage."""
     if result is None:
         return {"success": True, "output": ""}
+    if isinstance(result, dict):
+        # Already a JSON-safe dict (e.g. direct tool output) — keep as-is.
+        return result
     if hasattr(result, "to_dict"):
         return result.to_dict()
     return {

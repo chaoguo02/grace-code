@@ -377,7 +377,7 @@ class ToolExecutionPipeline:
 
         import json
 
-        from agent.capability_registry import InterceptDecision
+        from agent.tool_availability_guard import InterceptDecision
         from core.base import ToolResult
 
         intercept = self._capability_registry.intercept(

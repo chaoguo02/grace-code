@@ -145,7 +145,10 @@ def test_missing_required_param_validation_maps_to_blocked():
     tool_calls = [ToolCall(id="1", name="Write", params={})]  # missing "path"
     validation = validate_tool_calls(tool_calls, schemas)
     assert not validation.valid
-    assert validation.error_type == "missing_required"
+    # M2: required-field enforcement now goes through the single SchemaValidator
+    # authority, so missing-required maps to the generic invalid_params type.
+    assert validation.error_type == "invalid_params"
+    assert "Missing required parameter 'path'" in validation.error_message
 
     fake_result = ToolResult.from_error(
         error_type=_TE.INVALID_PARAMS,

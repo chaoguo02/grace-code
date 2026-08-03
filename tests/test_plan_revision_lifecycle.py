@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,13 +10,80 @@ from fastapi.testclient import TestClient
 from agent.session.models import SessionMode, SessionStatus
 from agent.task import RunResult, RunStatus
 from app.storage.sqlite import SqliteStorageBackend
+from application.coordinators.run_coordinator import RunCoordinator
+from application.events.schema_registry import SchemaRegistry
+from infrastructure.outbox.sqlite_store import SqliteOutboxStore
+from infrastructure.sqlite.run_uow import SqliteUnitOfWork
+from runtime_core.ports import (
+    RuntimePorts, ToolSuccess, HookGateResult,
+)
+from runtime_core.model_actions import ModelAction
+from runtime_core.runtime import AgentRuntime
 from server.routers.approvals import (
     _transition_plan_metadata,
     create_approvals_router,
 )
 from server.services.chat_pipeline import ChatPipeline, ChatPipelinePorts, ChatRequest
+from server.services.event_outbox import OutboxStore
 from server.services.plan_revision_service import PlanRevisionService
 from server.services.session_service import SessionService
+
+
+# ── Fake ports + real coordinator (mirrors tests/test_run_submission.py) ──────
+
+class _FakeLLM:
+    def invoke(self, messages, tools=None, tool_choice=None):
+        return ModelAction.stop(reason="test")
+
+
+class _FakeTools:
+    def execute(self, tool_name, params, invocation_id=""):
+        return ToolSuccess(tool_name=tool_name)
+
+
+class _FakeHooks:
+    def check(self, event_type, hook_input, tool_name=""):
+        return HookGateResult(allowed=True)
+
+
+class _FakeLiveEvents:
+    def publish(self, event_type, payload, scope=None):
+        pass
+
+
+class _FakeClock:
+    def now(self):
+        import time
+        return time.monotonic()
+
+    def deadline(self, timeout_s):
+        return self.now() + timeout_s
+
+
+class _FakeTokenUsage:
+    def record(self, run_id, input_tokens, output_tokens):
+        pass
+
+
+def _make_coordinator(db_path: str):
+    """Create a real RunCoordinator backed by the same test DB as storage."""
+    old_outbox = OutboxStore(db_path)
+    old_outbox.install()
+    conn = sqlite3.connect(db_path)
+    SqliteOutboxStore.migrate_add_columns(conn)
+    conn.commit()
+    conn.close()
+
+    registry = SchemaRegistry()
+    outbox_store = SqliteOutboxStore(db_path, registry)
+    ports = RuntimePorts(
+        llm=_FakeLLM(), tools=_FakeTools(), hooks=_FakeHooks(),
+        live_events=_FakeLiveEvents(), clock=_FakeClock(),
+        token_usage=_FakeTokenUsage(),
+    )
+    runtime = AgentRuntime(ports)
+    uow = SqliteUnitOfWork(db_path, outbox_store)
+    return RunCoordinator(runtime, uow)
 
 
 def _setup(tmp_path):
@@ -119,6 +187,9 @@ def test_reject_endpoint_returns_typed_response_and_reuses_run(tmp_path):
         session_service=SessionService(storage),
         run_chat_async=MagicMock(),
         repo_path=str(tmp_path),
+        _native_components=SimpleNamespace(
+            run_coordinator=_make_coordinator(str(tmp_path / "sessions.db")),
+        ),
     )
     app = FastAPI()
     app.include_router(create_approvals_router(lambda: service))

@@ -19,9 +19,7 @@ def init_hook_dispatcher(
 ) -> Any:
     """Create HookDispatcher with memory consolidation hooks."""
     from hooks import HookEvent, HookMatcher, HookRegistry, InternalHook
-    # G36M-final: bridge.py deleted — use native HookDispatcher directly
-    from hook_core.registry import HookRegistry as NativeHookRegistry
-    from hook_core.dispatcher import HookDispatcher
+    from hooks.dispatcher import HookDispatcher
 
     registry = HookRegistry()
     settings_path = repo_path / ".grace" / "settings.json"
@@ -53,6 +51,8 @@ def init_hook_dispatcher(
                 pass
         registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))
 
-    native_registry = NativeHookRegistry()
-    dispatcher = HookDispatcher(native_registry)
-    return dispatcher
+    # Legacy HookDispatcher on the legacy HookRegistry: the hooks above are
+    # registered on *this* registry, so a native dispatcher (own registry)
+    # would never see them.  Native path wires its own registry in
+    # composition/runtime_composition.py.
+    return HookDispatcher(registry)

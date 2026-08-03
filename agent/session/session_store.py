@@ -22,7 +22,8 @@ from agent.session.models import (
     WorktreeDisposition,
     WorkspaceMode,
 )
-from llm.base import LLMMessage, MessageKind
+from llm.base import LLMMessage
+from agent.session.message_serializer import MessageKind
 
 
 def _utc_now() -> str:

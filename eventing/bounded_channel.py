@@ -240,13 +240,17 @@ class BoundedChannel(Generic[T]):
                     self._queue.task_done()
                     break
 
-                if self._handler_timeout_s is not None:
-                    await asyncio.wait_for(
-                        self._handler(item),
-                        timeout=self._handler_timeout_s,
-                    )
-                else:
-                    await self._handler(item)
+                result = self._handler(item)
+                # Handler may be sync or async — only await if awaitable.
+                # (await on a sync callable's None raises TypeError, which
+                # would silently release the semaphore and break backpressure.)
+                if hasattr(result, '__await__'):
+                    if self._handler_timeout_s is not None:
+                        await asyncio.wait_for(
+                            result, timeout=self._handler_timeout_s,
+                        )
+                    else:
+                        await result
 
             except asyncio.TimeoutError:
                 logger.warning(

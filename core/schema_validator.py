@@ -102,7 +102,17 @@ class SchemaValidator:
         """
         lines = ["Tool call validation failed:"]
         for e in errors:
-            lines.append(e.to_llm_feedback())
+            if e.keyword == "required":
+                # Friendly message for the common missing-parameter mistake.
+                # This replaces the pre-migration hand-written required check in
+                # llm/tool_call_validator.py (see MIGRATION_GAP_CLOSURE_EXECUTION_PLAN).
+                field = e.message.split("'")[1] if "'" in e.message else e.path
+                lines.append(
+                    f"  - Missing required parameter '{field}'. "
+                    "Please retry with the required parameter."
+                )
+            else:
+                lines.append(e.to_llm_feedback())
         return "\n".join(lines)
 
     @staticmethod

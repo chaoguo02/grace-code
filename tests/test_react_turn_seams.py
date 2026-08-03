@@ -399,7 +399,7 @@ def test_validate_action_contract_normalizes_ids_and_rejects_invalid_call():
     assert action.tool_calls[0].id.startswith("runtime_call_")
     assert result.status is ActionContractStatus.INVALID
     assert result.observation is not None
-    assert "requires parameter 'path'" in result.observation.error
+    assert "Missing required parameter 'path'" in result.observation.error
 
 
 def test_validate_action_contract_treats_empty_schema_set_as_authority_boundary():

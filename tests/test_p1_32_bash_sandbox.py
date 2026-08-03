@@ -149,3 +149,13 @@ class TestRootRemovalPatterns:
         """rm -rf /* must already be in _ROOT_REMOVAL_PATTERNS."""
         from hitl.pipeline import PermissionPipeline
         assert "rm -rf /*" in PermissionPipeline._ROOT_REMOVAL_PATTERNS
+
+    def test_fork_bomb_in_root_removal(self):
+        """Classic fork bomb ':(){:|:&};:' must be in _ROOT_REMOVAL_PATTERNS."""
+        from hitl.pipeline import PermissionPipeline
+        assert ":(){:|:&};:" in PermissionPipeline._ROOT_REMOVAL_PATTERNS
+
+    def test_chown_recursive_in_root_removal(self):
+        """chown -R must be in _ROOT_REMOVAL_PATTERNS (recursive ownership change)."""
+        from hitl.pipeline import PermissionPipeline
+        assert "chown -R" in PermissionPipeline._ROOT_REMOVAL_PATTERNS

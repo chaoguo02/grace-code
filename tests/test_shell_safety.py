@@ -155,3 +155,30 @@ class TestWorkspaceGuard:
         result = tool.execute({"command": "echo", "args": ["test"]})
         assert not result.success
         assert "workspace" in result.error.lower()
+
+    def test_docker_runtime_exposes_workspace_root(self):
+        """U4: DockerRuntime must expose _workspace_root so ShellTool's
+        fail-closed guard sees a valid boundary instead of 'not set'."""
+        from core.process import DockerRuntime, CONTAINER_WORKDIR
+        from pathlib import Path
+
+        rt = DockerRuntime(repo_path=".")
+        assert rt._workspace_root == Path(CONTAINER_WORKDIR)
+
+    def test_shell_tool_with_docker_runtime_passes_workspace_guard(self):
+        """U4: ShellTool + DockerRuntime no longer fails the P0_3 workspace guard."""
+        from tools.shell_tool import ShellTool
+        from core.process import DockerRuntime
+        from unittest.mock import MagicMock
+
+        rt = DockerRuntime(repo_path=".")
+        rt.execute = MagicMock(return_value=type(
+            "R", (), {"returncode": 0, "stdout": "hello", "stderr": "",
+                       "success": True, "output": "hello", "error": None})(),
+        )
+        tool = ShellTool(runtime=rt)
+        # The command does not exist as a direct exe, but the guard must pass
+        # (proving ws_root is set) before we hit shell fallback.
+        result = tool.execute({"command": "echo", "args": ["test"], "timeout": 5})
+        # Not the "Workspace root is not set" error — whatever else happens is fine.
+        assert "workspace root" not in (result.error or "").lower()

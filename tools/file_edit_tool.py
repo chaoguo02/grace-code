@@ -237,17 +237,15 @@ class FileEditTool(BaseTool):
 
         new_content = content.replace(old_str, new_str, 1)
 
-        # ── Write with O_NOFOLLOW (TOCTOU protection) ──
+        # ── Write atomically (tmp + os.replace) with symlink/TOCTOU protection ──
         if ws is not None:
-            from core.base import resolve_safe_parent, safe_open_for_write
+            from core.base import resolve_safe_parent, atomic_write_bytes
             safe_path, err = resolve_safe_parent(str(path), ws)
             if err:
                 return ToolResult(success=False, output="", error=err)
-            fd, err = safe_open_for_write(safe_path)
+            safe_path, err = atomic_write_bytes(safe_path, new_content.encode("utf-8"))
             if err:
                 return ToolResult(success=False, output="", error=err)
-            _os.write(fd, new_content.encode("utf-8"))
-            _os.close(fd)
             write_path = safe_path
         else:
             try:

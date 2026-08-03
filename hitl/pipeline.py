@@ -914,8 +914,10 @@ class PermissionPipeline:
         "rm -rf /*", "rm -rf ~/*",
         "find / -delete", "find / -exec rm",
         "chmod -R 000 /", "chmod -R 777 /",
+        "chown -R",              # recursive ownership change
         "> /dev/sda", "> /dev/hda", "> /dev/nvme",
         "mkfs", "dd if=",
+        ":(){:|:&};:",           # classic fork bomb
     )
 
     def _layer4_permission_mode(

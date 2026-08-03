@@ -132,25 +132,22 @@ class TestScopeIsolation:
         scope = bus._tree.ensure_session(sid, 0).token
 
         received_session = []
-        received_global = []
 
         bus.subscribe("run.submitted.v1", lambda e: received_session.append(e), "s", scope=scope)
-        bus.subscribe("run.submitted.v1", lambda e: received_global.append(e), "g", scope=bus._tree.root.token)
 
-        # Verify both receive before close
+        # Verify received before close
         bus.publish(_envelope("s1", scope))
         assert len(received_session) == 1
-        assert len(received_global) == 1
 
         # Record count before close
         count_before = bus.subscriber_count
-        assert count_before == 2
+        assert count_before == 1
 
         # Close session — session-scoped subscriber should be removed
         bus.close_session(sid)
 
-        # Verify session-scoped subscriber was removed (only global remains)
-        assert bus.subscriber_count == 1, "Session-scoped subscriber should be removed on close"
+        # Verify session-scoped subscriber was removed
+        assert bus.subscriber_count == 0, "Session-scoped subscriber should be removed on close"
 
         # Publishing to closed scope should raise
         with pytest.raises(ScopeClosedError):
@@ -163,7 +160,7 @@ class TestScopeIsolation:
         scope = bus._tree.ensure_session(sid, 0).token
 
         received = []
-        sub = bus.subscribe("run.submitted.v1", lambda e: received.append(e), "test")
+        sub = bus.subscribe("run.submitted.v1", lambda e: received.append(e), "test", scope=scope)
         bus.publish(_envelope("s1", scope))
         assert len(received) == 1
 

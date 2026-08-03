@@ -14,6 +14,7 @@ import pytest
 
 from eventing.bounded_channel import (
     BoundedChannel, ChannelFullError, ChannelClosedError, RejectedClosed,
+    TimedOut,
 )
 
 
@@ -37,13 +38,26 @@ class TestBoundedChannel:
         assert 42 in received
 
     def test_full_channel_blocks_with_timeout(self):
+        """G6: A genuinely-full channel (blocking consumer) blocks the publisher.
+
+        With a fast consumer the item drains immediately and a second put
+        legitimately succeeds — so the consumer must stay blocked on the
+        first item to prove backpressure.
+        """
+        consumed = asyncio.Event()
+
+        async def blocking_handler(x):
+            await consumed.wait()
+
         async def _run():
-            ch = BoundedChannel[int](capacity=1, consumer_handler=lambda x: None)
+            ch = BoundedChannel[int](capacity=1, consumer_handler=blocking_handler)
             ch.start_consumer()
             r1 = await ch.put(1)
             assert hasattr(r1, 'channel_id')  # Delivered receipt
-            r2 = await ch.put(2, timeout=0.01)
-            assert not isinstance(r2, type(r1))  # should be TimedOut
+            # Consumer is blocked on item 1 → channel is genuinely full
+            r2 = await ch.put(2, timeout=0.05)
+            assert isinstance(r2, TimedOut)  # should be TimedOut
+            consumed.set()
             await ch.shutdown()
         asyncio.run(_run())
 

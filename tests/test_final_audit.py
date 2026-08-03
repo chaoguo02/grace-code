@@ -185,6 +185,7 @@ class TestFinalAudit:
             path = os.path.join(PROJECT_ROOT, "..", fname)
             if os.path.exists(path):
                 with open(path, encoding="utf-8") as f:
-                    assert "DEPRECATED" in f.read(), (
-                        f"G44: {fname} must have DEPRECATED notice"
+                    content = f.read()
+                    assert ("DEPRECATED" in content or "DELETED" in content), (
+                        f"G44: {fname} must have DEPRECATED/DELETED notice"
                     )

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agent.task import ToolCall
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 class ValidationResult:
     """Result of tool call validation against registered schemas."""
     valid: bool
-    error_type: str = ""         # "unknown_tool" | "missing_required" | "duplicate_call"
+    error_type: str = ""         # "unknown_tool" | "invalid_params" | "duplicate_call"
     error_message: str = ""
     offending_tool: str = ""     # which tool call failed
 
@@ -43,7 +43,8 @@ def validate_tool_calls(
 
     Checks (in order):
         1. Tool name exists in schemas (→ "unknown_tool")
-        2. Required params are present (→ "missing_required")
+        2. Params validate against the tool's JSON Schema via SchemaValidator
+           (jsonschema — includes required-field enforcement, → "invalid_params")
         3. No duplicate calls within the same action (→ "duplicate_call")
 
     Returns ValidationResult(valid=True) if all checks pass.
@@ -66,22 +67,12 @@ def validate_tool_calls(
                 offending_tool=name,
             )
 
-        # ── Check 2: Required params present ──
         schema = schema_map[name]
-        required: list[str] = schema.parameters.get("required", []) if hasattr(schema, "parameters") else []
-        for field in required:
-            if field not in params:
-                return ValidationResult(
-                    valid=False,
-                    error_type="missing_required",
-                    error_message=(
-                        f"Tool '{name}' requires parameter '{field}'. "
-                        f"Your call was missing this field. Please retry with the required parameter."
-                    ),
-                    offending_tool=name,
-                )
 
-    # ── Check 2b: Parameter validation (P1-2: jsonschema) ──
+        # ── Check 2: Parameter validation (P1-2: jsonschema) ──
+        # Required-field presence is enforced by SchemaValidator (jsonschema
+        # "required" keyword); the LLM-friendly message is emitted through
+        # format_errors_for_llm() so self-correction feedback is preserved.
         if not isinstance(params, dict):
             return _invalid_params(
                 name,
@@ -139,75 +130,3 @@ def _invalid_params(tool_name: str, detail: str) -> ValidationResult:
         error_message=f"Tool '{tool_name}' has invalid parameters: {detail}.",
         offending_tool=tool_name,
     )
-
-
-def _validate_json_value(value: Any, schema: dict, *, path: str) -> str:
-    """Validate the JSON-Schema subset used by tool contracts."""
-    if not isinstance(schema, dict):
-        return ""
-
-    expected = schema.get("type")
-    if isinstance(expected, list):
-        errors = [
-            _validate_json_value(value, {**schema, "type": item}, path=path)
-            for item in expected
-        ]
-        if all(errors):
-            return f"{path} must match one of {expected}"
-        return ""
-
-    type_checks = {
-        "string": lambda item: isinstance(item, str),
-        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
-        "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
-        "boolean": lambda item: isinstance(item, bool),
-        "object": lambda item: isinstance(item, dict),
-        "array": lambda item: isinstance(item, list),
-        "null": lambda item: item is None,
-    }
-    if expected in type_checks and not type_checks[expected](value):
-        expected_label = {
-            "string": "a string",
-            "integer": "an integer",
-            "number": "a number",
-            "boolean": "a boolean",
-            "object": "an object",
-            "array": "an array",
-            "null": "null",
-        }.get(expected, str(expected))
-        return f"{path} must be {expected_label}, got {type(value).__name__}"
-
-    if "enum" in schema and value not in schema["enum"]:
-        return f"{path} must be one of {schema['enum']}"
-
-    if expected == "object" and isinstance(value, dict):
-        properties = schema.get("properties", {})
-        for required in schema.get("required", []):
-            if required not in value:
-                return f"{path}.{required} is required"
-        if schema.get("additionalProperties") is False:
-            unknown = sorted(set(value) - set(properties))
-            if unknown:
-                return f"{path} contains unknown field '{unknown[0]}'"
-        for key, item in value.items():
-            if key in properties:
-                error = _validate_json_value(
-                    item,
-                    properties[key],
-                    path=f"{path}.{key}",
-                )
-                if error:
-                    return error
-
-    if expected == "array" and isinstance(value, list):
-        item_schema = schema.get("items", {})
-        for index, item in enumerate(value):
-            error = _validate_json_value(
-                item,
-                item_schema,
-                path=f"{path}[{index}]",
-            )
-            if error:
-                return error
-
-    return ""

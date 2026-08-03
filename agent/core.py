@@ -834,6 +834,30 @@ class ReActAgent:
         else:
             _artifact_dir = _state_paths.artifacts
         self._artifact_store.set_storage_dir(_artifact_dir)
+
+        # U1: restore crash-recovery checkpoint when a checkpoint DB is configured.
+        # Default checkpoint_db_path="" → zero overhead, no restore attempt.
+        self._idempotent_cache = None
+        if self._cfg.checkpoint_db_path:
+            try:
+                from agent.session.checkpoint import (
+                    CheckpointManager, IdempotentToolCache,
+                )
+                _cp_mgr = CheckpointManager(self._cfg.checkpoint_db_path)
+                _cp = _cp_mgr.restore(
+                    str(getattr(self._cfg, "stats_session_id", "") or ""),
+                )
+                if _cp is not None:
+                    _cache = IdempotentToolCache()
+                    _cache.load_from_checkpoint(_cp)
+                    self._idempotent_cache = _cache
+                    logger.info(
+                        "Recovered checkpoint turn=%s from %s",
+                        _cp.turn_number, self._cfg.checkpoint_db_path,
+                    )
+            except Exception:
+                logger.warning("Checkpoint restore failed", exc_info=True)
+
         self._current_task_description = task.description
         self._current_task_metadata = dict(task.metadata or {})
         self._task_intent = task.intent

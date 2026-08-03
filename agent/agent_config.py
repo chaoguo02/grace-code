@@ -25,6 +25,7 @@ class AgentConfig:
     request_budget_tokens: int = 110_000
     artifact_threshold_tokens: int = 2_000
     artifact_storage_dir: str = ""
+    checkpoint_db_path: str = ""
     missing_test_target_max_followups: int = 2
     max_parallel_tool_calls: int = 3
     history_max_messages: int = 200

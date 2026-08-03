@@ -75,6 +75,9 @@ def trace_projection(db_path):
             source TEXT DEFAULT ''
         );
     """)
+    # G25: watermark table required by ProjectionStateStore.check_gap()
+    from listeners.projection_state import ProjectionStateStore
+    ProjectionStateStore.install(conn)
     conn.commit()
     conn.close()
     return tp
@@ -92,7 +95,8 @@ def ws_gateway():
 
 # ── Helper ──────────────────────────────────────────────────────────────────
 
-def _make_envelope(event_type: str, payload, session_id: str = "s-test"):
+def _make_envelope(event_type: str, payload, session_id: str = "s-test",
+                   scope: ScopeToken | None = None):
     sid = SessionId(session_id)
     return EventEnvelope(
         event_id=EventId.generate(),
@@ -100,7 +104,9 @@ def _make_envelope(event_type: str, payload, session_id: str = "s-test"):
         schema_version=SchemaVersion(1),
         occurred_at=datetime.now(timezone.utc),
         source=EventSource(process_id="test", component="runtime"),
-        scope=ScopeToken.session_scope(uuid.uuid4(), sid),
+        # G5: exact-scope routing — the envelope scope MUST be the tree's
+        # session token, else GLOBAL/SESSION subscribers never match.
+        scope=scope or ScopeToken.session_scope(uuid.uuid4(), sid),
         correlation_id=CorrelationId("corr-1"),
         causation_id=None,
         aggregate_id=AggregateId("r-test"),
@@ -117,20 +123,23 @@ class TestDecodeToBusToProjections:
         self, registry, bus, trace_projection
     ):
         """Envelope → JSON → decode → publish → trace projection receives it."""
+        # Ensure the session scope exists before building the envelope
+        sid = SessionId("s-test")
+        bus.ensure_session(sid)
+        scope = bus._tree.ensure_session(sid, 0).token
+
         env = _make_envelope(
             "run.completed.v1",
             completed("r-test", turn_index=1, steps_taken=3, tokens_used=500),
+            scope=scope,
         )
-        # Ensure the session scope exists before publishing
-        sid = SessionId("s-test")
-        bus.ensure_session(sid)
 
         # Round-trip through JSON
         js = env.canonical_json()
         decoded = registry.decode(js)
 
         # Publish to bus
-        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace", scope=bus._tree.root.token)
+        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace", scope=scope)
         bus.publish(decoded)
 
         # Trace projection should have written to DB
@@ -157,15 +166,17 @@ class TestDecodeToBusToProjections:
         """Stats projection counts events published via the bus."""
         sid = SessionId("s-test")
         bus.ensure_session(sid)
+        scope = bus._tree.ensure_session(sid, 0).token
 
         env = _make_envelope(
             "run.completed.v1",
             completed("r-test", steps_taken=2),
+            scope=scope,
         )
         js = env.canonical_json()
         decoded = registry.decode(js)
 
-        bus.subscribe("run.completed.v1", stats_projection.on_event, "stats", scope=bus._tree.root.token)
+        bus.subscribe("run.completed.v1", stats_projection.on_event, "stats", scope=scope)
         assert len(stats_projection.metrics) == 0
 
         bus.publish(decoded)
@@ -179,6 +190,7 @@ class TestDecodeToBusToProjections:
         """WS gateway broadcasts to session subscribers."""
         sid = SessionId("s-test")
         bus.ensure_session(sid)
+        scope = bus._tree.ensure_session(sid, 0).token
 
         received = []
         ws_gateway.subscribe("s-test", lambda m: received.append(m))
@@ -187,11 +199,12 @@ class TestDecodeToBusToProjections:
             "run.completed.v1",
             completed("r-test", summary="all good"),
             session_id="s-test",
+            scope=scope,
         )
         js = env.canonical_json()
         decoded = registry.decode(js)
 
-        bus.subscribe("run.completed.v1", ws_gateway.on_event, "ws", scope=bus._tree.root.token)
+        bus.subscribe("run.completed.v1", ws_gateway.on_event, "ws", scope=scope)
         bus.publish(decoded)
 
         assert len(received) == 1
@@ -204,17 +217,19 @@ class TestDecodeToBusToProjections:
         """All three projections receive the same published event."""
         sid = SessionId("s-test")
         bus.ensure_session(sid)
+        scope = bus._tree.ensure_session(sid, 0).token
 
         ws_received = []
         ws_gateway.subscribe("s-test", lambda m: ws_received.append(m))
 
-        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace", scope=bus._tree.root.token)
-        bus.subscribe("run.completed.v1", stats_projection.on_event, "stats", scope=bus._tree.root.token)
-        bus.subscribe("run.completed.v1", ws_gateway.on_event, "ws", scope=bus._tree.root.token)
+        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace", scope=scope)
+        bus.subscribe("run.completed.v1", stats_projection.on_event, "stats", scope=scope)
+        bus.subscribe("run.completed.v1", ws_gateway.on_event, "ws", scope=scope)
 
         env = _make_envelope(
             "run.completed.v1",
             completed("r-test", steps_taken=4, tokens_used=900, summary="done"),
+            scope=scope,
         )
         js = env.canonical_json()
         decoded = registry.decode(js)
@@ -284,6 +299,7 @@ class TestOutboxToBusIntegration:
 
         sid = SessionId("s-test")
         bus.ensure_session(sid)
+        scope = bus._tree.ensure_session(sid, 0).token
 
         outbox = SqliteOutboxStore(db_path, registry)
 
@@ -297,6 +313,7 @@ class TestOutboxToBusIntegration:
         env = _make_envelope(
             "run.completed.v1",
             completed("r-test", steps_taken=3, tokens_used=100),
+            scope=scope,
         )
         conn.execute("BEGIN IMMEDIATE")
         outbox.append(conn, env)
@@ -310,7 +327,7 @@ class TestOutboxToBusIntegration:
 
         # Decode and publish (this is what _deliver does)
         decoded = registry.decode(record.payload_json)
-        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace", scope=bus._tree.root.token)
+        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace", scope=scope)
         bus.publish(decoded)
 
         # Verify trace projection received

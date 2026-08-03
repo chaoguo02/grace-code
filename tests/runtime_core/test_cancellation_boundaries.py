@@ -29,8 +29,8 @@ from runtime_core.step_loop import StepLoop
 
 class FakeLLM:
     def __init__(self, response): self.response = response
-    def invoke(self, messages, tools=None): return self.response
-    def stream(self, messages, tools=None):
+    def invoke(self, messages, tools=None, tool_choice=None): return self.response
+    def stream(self, messages, tools=None, tool_choice=None):
         async def _s(): return self.response
         return _s()
 
@@ -46,7 +46,7 @@ class FakeHooks:
 
 
 class FakeLiveEvents:
-    def publish(self, event_type, payload): pass
+    def publish(self, event_type, payload, scope=None): pass
 
 
 class FakeClock:
@@ -58,17 +58,12 @@ class FakeTokenUsage:
     def record(self, run_id, input_tokens, output_tokens): pass
 
 
-class FakeCancellation:
-    @property
-    def cancelled(self): return False
-
-
 def _ports(llm_resp=None):
     return RuntimePorts(
         llm=FakeLLM(llm_resp or AssistantText(text="done")),
         tools=FakeTools(), hooks=FakeHooks(),
         live_events=FakeLiveEvents(), clock=FakeClock(),
-        token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+        token_usage=FakeTokenUsage(),
     )
 
 
@@ -147,7 +142,6 @@ class TestCancelDuringTools:
             llm=FakeLLM(batch), tools=CancelAfterFirstTools(),
             hooks=FakeHooks(), live_events=FakeLiveEvents(),
             clock=FakeClock(), token_usage=FakeTokenUsage(),
-            cancellation=FakeCancellation(),
         )
         loop = StepLoop(ports)
 

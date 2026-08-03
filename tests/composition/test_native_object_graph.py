@@ -322,3 +322,68 @@ class TestSchedulerMetadataBridge:
         assert len(batches) >= 2, (
             f"T3: Write tool should be serialized (own batch), got {len(batches)} batches"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# M4 — native tool execution routes through PolicyAwareToolRegistry
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNativePolicyEnforcement:
+    """M4: native _RealTools routes through PolicyAwareToolRegistry so phase
+    policy (allowed_write_paths) is enforced on the native path."""
+
+    def test_allowed_write_paths_enforced_on_native_path(self, temp_db, tmp_path):
+        from core.base import ToolRegistry
+        from core.policy import PhasePolicy
+        from core.policy_registry import PolicyAwareToolRegistry
+        from tools.file_tool import FileWriteTool
+        from runtime_core.ports import ToolSuccess, ToolFailure
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "src").mkdir(parents=True, exist_ok=True)
+
+        base = ToolRegistry()
+        base.register(FileWriteTool(workspace_root=str(ws)))
+        policy = PhasePolicy(
+            allowed_write_paths=frozenset({"src/a.txt"}),
+            strict_file_scope=True,
+        )
+        reg = PolicyAwareToolRegistry(
+            base=base, phase_policy=policy,
+            repo_path=str(ws), phase_name="test",
+        )
+        comp = assemble(temp_db, tool_registry=reg)
+        tools = comp.runtime_ports.tools
+
+        # Inside the allowed path → ToolSuccess
+        ok = tools.execute(
+            "Write", {"path": str(ws / "src" / "a.txt"), "content": "x"}, "inv1",
+        )
+        assert isinstance(ok, ToolSuccess), f"M4: expected ToolSuccess, got {ok}"
+
+        # Outside the allowed path → ToolFailure (policy block, not execution)
+        bad = tools.execute(
+            "Write", {"path": str(ws / "outside.txt"), "content": "x"}, "inv2",
+        )
+        assert isinstance(bad, ToolFailure), f"M4: expected ToolFailure, got {bad}"
+        assert "blocked" in bad.error.lower() or "denied" in bad.error.lower()
+
+    def test_plain_registry_keeps_execute_via_registry_path(self, temp_db, tmp_path):
+        """M4: a plain ToolRegistry (no phase policy) still executes directly."""
+        from core.base import ToolRegistry
+        from tools.file_tool import FileReadTool
+        from runtime_core.ports import ToolSuccess
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        target = ws / "file.txt"
+        target.write_text("hello", encoding="utf-8")
+
+        base = ToolRegistry()
+        base.register(FileReadTool(workspace_root=str(ws)))
+        comp = assemble(temp_db, tool_registry=base)
+        tools = comp.runtime_ports.tools
+
+        ok = tools.execute("Read", {"path": str(target)}, "inv1")
+        assert isinstance(ok, ToolSuccess), f"M4: expected ToolSuccess, got {ok}"

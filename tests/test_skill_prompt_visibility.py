@@ -24,7 +24,7 @@ class _PromptSkillRegistry:
 
     def format_for_prompt(self, *, llm_invocable_only: bool = True) -> str:
         assert llm_invocable_only is True
-        return "## Available Skills\n- **review**: Review code"
+        return "## Skills\n- **review**: Review code"
 
 
 def _primary_spec(*, tools: frozenset[str]) -> AgentDefinition:

@@ -833,20 +833,6 @@ def permission_prompt(request: "Any") -> "Any":
             sys.stdout.write(_dim("  (enter a, A, d, or d: <reason>)\n"))
 
 
-def _risk_color(risk: str) -> str:
-    """Return ANSI-colored risk label.
-
-    Accepts str for caller convenience (RiskLevel str Enum, raw strings from config).
-    Uses declarative mapping instead of if/elif chain.
-    """
-    _RISK_DISPLAY: dict[str, str] = {
-        "high": _red(_bold("HIGH")),
-        "medium": _yellow("MEDIUM"),
-        "low": _dim("low"),
-    }
-    return _RISK_DISPLAY.get(risk.lower(), _dim("none"))
-
-
 # ---------------------------------------------------------------------------
 # diff 高亮（rich 可用时）
 # ---------------------------------------------------------------------------

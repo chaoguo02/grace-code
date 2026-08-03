@@ -170,17 +170,18 @@ def _execute_via_registry(lookup, tool_name, params, invocation_id=""):
     if hasattr(tool, 'parameters_schema'):
         try:
             from core.schema_validator import SchemaValidator
-            validator = SchemaValidator()
             schema = tool.parameters_schema
-            if isinstance(schema, property):
-                schema = schema.__get__(tool)
-            result = validator.safe_parse(params_dict)
-            if not result.valid:
-                return ToolFailure(
-                    tool_name=tool_name,
-                    error=f"Schema validation failed: {result.errors}",
-                    error_type=ToolErrorType.VALIDATION_ERROR,
-                )
+            if callable(schema) and not isinstance(schema, dict):
+                schema = schema()
+            if schema:
+                validator = SchemaValidator(schema)
+                result = validator.safe_parse(params_dict)
+                if not result.valid:
+                    return ToolFailure(
+                        tool_name=tool_name,
+                        error=f"Schema validation failed: {result.errors}",
+                        error_type=ToolErrorType.VALIDATION_ERROR,
+                    )
         except ImportError:
             pass  # validator not available → skip
 
@@ -498,9 +499,59 @@ def assemble(db_path: str, *,
             self._registry = tool_registry  # T19: ToolRegistryPort | None
 
         def execute(self, tool_name, params, invocation_id=""):
+            # M4: route through PolicyAwareToolRegistry when present so phase
+            # policy (allowed_write_paths / allowed & denied tools) is enforced
+            # on the native path.  Plain ToolRegistry / callable lookup keeps
+            # the direct _execute_via_registry path.
+            _registry = self._registry
+            if _registry is not None:
+                from core.policy_registry import PolicyAwareToolRegistry
+                if isinstance(_registry, PolicyAwareToolRegistry):
+                    from core.json_values import thaw_json
+                    params_dict = (
+                        thaw_json(params)
+                        if hasattr(params, '__dataclass_fields__')
+                        else (params or {})
+                    )
+                    tool_result = _registry.execute_tool(
+                        tool_name, params_dict, invocation_id=invocation_id,
+                    )
+                    from runtime_core.ports import (
+                        ToolSuccess, ToolFailure, ToolErrorType,
+                    )
+                    if getattr(tool_result, "success", False):
+                        return ToolSuccess(
+                            tool_name=tool_name,
+                            output=getattr(tool_result, "output", "") or "",
+                            duration_ms=getattr(tool_result, "duration_ms", 0.0),
+                            tool_use_id=invocation_id,
+                        )
+                    return ToolFailure(
+                        tool_name=tool_name,
+                        error=(
+                            getattr(tool_result, "error", "")
+                            or getattr(tool_result, "output", "")
+                            or "tool call blocked by policy"
+                        ),
+                        error_type=ToolErrorType.EXECUTION_ERROR,
+                    )
             _lookup = self._lookup
             if _lookup is None and self._registry is not None:
-                _lookup = self._registry.resolve
+                _lookup = self._registry
+            # assemble() passes tool_registry as tool_lookup.  When it is a
+            # ToolRegistry (not a bare callable), build a name→tool resolver.
+            # ToolRegistry exposes resolve_name() (not the ToolRegistryPort
+            # resolve() that ToolRegistryAdapter used to bridge).
+            if _lookup is not None and not callable(_lookup):
+                _resolve = getattr(_lookup, "resolve", None)
+                if not callable(_resolve) and hasattr(_lookup, "resolve_name"):
+                    _reg = _lookup
+                    _tools_map = getattr(_reg, "_tools", {})
+                    _resolve = lambda _name, _r=_reg, _m=_tools_map: _m.get(
+                        _r.resolve_name(_name) or _name,
+                    )
+                if callable(_resolve):
+                    _lookup = _resolve
             return _execute_via_registry(_lookup, tool_name, params, invocation_id)
 
     class _RealLLM:
@@ -531,20 +582,11 @@ def assemble(db_path: str, *,
     # T12: Permission rules stored for T13 wiring
     # (frozen slots dataclass cannot have extra attributes; rules passed via
     #  hook_settings dict to _RealHooks in T13)
-    # T3: Populate tool scheduler with metadata from real tools
-    if tool_registry is not None:
-        from runtime_core.tool_scheduler import ToolScheduler
-        _sched = ToolScheduler()
-        # Extract BaseTool list from registry callable
-        _tools_list = []
-        try:
-            if hasattr(tool_registry, 'tools'):
-                _tools_list = list(tool_registry.tools)
-        except Exception:
-            pass
-        if _tools_list:
-            _sched.register_batch(_tools_list)
-        object.__setattr__(runtime_ports, '_scheduler', _sched)
+    # Note: ToolScheduler population was previously attempted via
+    # object.__setattr__(runtime_ports, '_scheduler', ...) but RuntimePorts is a
+    # frozen+slots dataclass, so that call always raised AttributeError.  StepLoop
+    # constructs its own empty scheduler (all-serial fallback), so the code was
+    # dead + broken.  Concurrency metadata wiring is deferred (see M9).
 
     # ── Projections ──────────────────────────────────────────────────
     projection_dispatcher = ProjectionDispatcher()

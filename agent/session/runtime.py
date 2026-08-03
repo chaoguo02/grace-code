@@ -258,12 +258,14 @@ class SessionRuntime:
         self._circuit_breaker = CircuitBreaker()
 
         # ── P1-6: Dynamic Capability Registry ──
-        from agent.capability_registry import CapabilityRegistry
-        self._capability_registry = CapabilityRegistry()
+        # Phase 0 rename: CapabilityRegistry → ToolAvailabilityGuard
+        # (agent/capability_registry.py was renamed to agent/tool_availability_guard.py).
+        from agent.tool_availability_guard import ToolAvailabilityGuard
+        self._tool_availability_guard = ToolAvailabilityGuard()
         # Register all builtin tools from the base registry
-        self._capability_registry.register_bulk(self._base_registry.tool_names)
-        # Wire the registry into the base ToolRegistry for physical interception
-        self._base_registry._capability_registry = self._capability_registry
+        self._tool_availability_guard.register_bulk(self._base_registry.tool_names)
+        # Wire the guard into the base ToolRegistry for physical interception
+        self._base_registry._tool_availability_guard = self._tool_availability_guard
         # Mark MCP tools as UNAVAILABLE if the bridge failed to connect
         self._sync_mcp_capabilities()
 
@@ -422,8 +424,8 @@ class SessionRuntime:
         return self._circuit_breaker
 
     @property
-    def capability_registry(self):
-        return self._capability_registry
+    def tool_availability_guard(self):
+        return self._tool_availability_guard
 
     # Public API for external callers
 
@@ -2473,7 +2475,7 @@ class SessionRuntime:
             return
         mcp_tool_names = getattr(self._mcp_integration, "tool_names", frozenset())
         for name in mcp_tool_names:
-            self._capability_registry.register(name)
+            self._tool_availability_guard.register(name)
 
         # Check for failed MCP servers
         failed_servers = getattr(self._mcp_integration, "failed_servers", None)
@@ -2481,7 +2483,7 @@ class SessionRuntime:
             for server_name, reason in failed_servers.items():
                 server_tools = getattr(self._mcp_integration, "server_tools", {}).get(server_name, [])
                 for tool_name in server_tools:
-                    self._capability_registry.mark_unavailable(
+                    self._tool_availability_guard.mark_unavailable(
                         tool_name, f"MCP server '{server_name}': {reason}",
                     )
 
@@ -2685,7 +2687,7 @@ class SessionRuntime:
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()
-        from agent.capability_registry import CapabilityState
+        from agent.tool_availability_guard import ToolAvailabilityState
         server_tools = self._mcp_integration.server_tools
         raw_names: set[str] = set()
 
@@ -2726,7 +2728,7 @@ class SessionRuntime:
         return frozenset(
             n
             for n in raw_names
-            if self._capability_registry.state_for(n) is CapabilityState.AVAILABLE
+            if self._tool_availability_guard.state_for(n) is ToolAvailabilityState.AVAILABLE
         )
 
     def _build_agent_config(self, spec: AgentDefinition) -> AgentConfig:

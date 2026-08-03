@@ -10,66 +10,100 @@ from __future__ import annotations
 import pytest
 
 from core.eventing.identifiers import SessionId, RunId
-from runtime_core.ports import RuntimePorts
+from runtime_core.model_actions import AssistantText
+from runtime_core.ports import (
+    RuntimePorts, HookGateResult, ToolSuccess,
+)
 from runtime_core.execution import RuntimeExecution
 from runtime_core.outcome import RuntimeOutcome, RunStatus
 from runtime_core.step_loop import StepLoop
 from runtime_core.runtime import AgentRuntime
 
 
-class FakeEventPort:
+# ── Fake ports (G15: all six ports required) ─────────────────────────────────
+
+class FakeLiveEvents:
     def __init__(self):
         self.published: list = []
 
-    def publish(self, event) -> None:
-        self.published.append(event)
+    def publish(self, event_type, payload, scope=None) -> None:
+        self.published.append((event_type, payload))
 
 
 class FakeLLMPort:
-    def invoke(self, messages, tools):
-        return {"role": "assistant", "content": "done", "stop_reason": "end_turn"}
+    def invoke(self, messages, tools=None, tool_choice=None):
+        return AssistantText(text="done")
+
+    def stream(self, messages, tools=None, tool_choice=None):
+        async def _s():
+            return AssistantText(text="done")
+        return _s()
 
 
-class FakeContextPort:
-    def get_context(self, session_id):
-        return {"messages": []}
+class FakeTools:
+    def execute(self, tool_name, params, invocation_id=""):
+        return ToolSuccess(tool_name=tool_name)
+
+
+class FakeHooks:
+    def check(self, event_type, hook_input, tool_name=""):
+        return HookGateResult(allowed=True)
+
+
+class FakeClock:
+    def now(self):
+        return 0.0
+
+    def deadline(self, timeout_s):
+        return timeout_s
+
+
+class FakeTokenUsage:
+    def __init__(self):
+        self.records: list = []
+
+    def record(self, run_id, input_tokens, output_tokens):
+        self.records.append((run_id, input_tokens, output_tokens))
+
+
+def _ports(live_events=None):
+    return RuntimePorts(
+        llm=FakeLLMPort(),
+        tools=FakeTools(),
+        hooks=FakeHooks(),
+        live_events=live_events or FakeLiveEvents(),
+        clock=FakeClock(),
+        token_usage=FakeTokenUsage(),
+    )
 
 
 class TestStepLoop:
 
     def test_completes(self):
-        ports = RuntimePorts(
-            llm=FakeLLMPort(),
-            context=FakeContextPort(),
-        )
+        ports = _ports()
         ctx = RuntimeExecution(
             session_id=SessionId("s1"), run_id=RunId("r1"), max_steps=3,
         )
         loop = StepLoop(ports)
         outcome = loop.execute(ctx)
         assert outcome.status == RunStatus.COMPLETED
-        assert len(loop.steps) > 0
+        assert outcome.steps_taken > 0
 
     def test_stops_at_max_steps(self):
-        ports = RuntimePorts(
-            llm=FakeLLMPort(),
-            context=FakeContextPort(),
-        )
+        ports = _ports()
         ctx = RuntimeExecution(
             session_id=SessionId("s1"), run_id=RunId("r1"), max_steps=2,
         )
         loop = StepLoop(ports)
         outcome = loop.execute(ctx)
-        assert len(loop.steps) <= 2
+        assert outcome.steps_taken <= 2
 
 
 class TestAgentRuntime:
 
     def test_run_publishes_outcome(self):
-        events = FakeEventPort()
-        ports = RuntimePorts(
-            events=events, llm=FakeLLMPort(), context=FakeContextPort(),
-        )
+        events = FakeLiveEvents()
+        ports = _ports(live_events=events)
         rt = AgentRuntime(ports)
         ctx = RuntimeExecution(
             session_id=SessionId("s1"), run_id=RunId("r1"), max_steps=1,

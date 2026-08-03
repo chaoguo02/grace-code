@@ -505,12 +505,18 @@ def _submit_plan_run(
     digest = hashlib.sha256(
         f"{session_id}\0{action}\0{discriminator}".encode("utf-8")
     ).hexdigest()[:32]
+    # Phase A: inject native coordinator (same pattern as sessions.py router)
+    coordinator = (
+        getattr(service, '_native_components', None)
+        and service._native_components.run_coordinator
+    ) if service is not None else None
     try:
         return submit_run_turn(
             service._storage,
             session_id=session_id,
             prompt=prompt,
             idempotency_key=f"plan:{action}:{digest}",
+            coordinator=coordinator,
         )
     except IdempotencyConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
