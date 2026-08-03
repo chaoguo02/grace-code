@@ -44,6 +44,21 @@ class PermissionDecision(str, Enum):
     DENY = "deny"
 
 
+def _risk_of(tool: "BaseTool", params: dict[str, Any]) -> str:
+    """Return the tool's risk level for this call (string: none/low/medium/high).
+
+    Uses BaseTool.classify_risk(params) when available (command-aware for
+    Shell), falling back to the declared risk_level.
+    """
+    classify = getattr(tool, "classify_risk", None)
+    if callable(classify):
+        try:
+            return classify(params)
+        except Exception:
+            pass
+    return str(getattr(tool, "risk_level", "low") or "low")
+
+
 class ToolApprovalMode(str, Enum):
     PROMPT = "prompt"
     AUTO = "auto"
@@ -209,6 +224,7 @@ class PermissionPipeline:
         project_root: str | None = None,
         circuit_breaker: Any = None,
         web_confirm_callback: WebConfirmCallback | None = None,
+        trust_accumulator: Any = None,
     ) -> None:
         self._deny_rules: list[PermissionRule] = []
         self._ask_rules: list[PermissionRule] = []
@@ -237,6 +253,9 @@ class PermissionPipeline:
         self._approved_prompts: list[dict[str, str]] = []
         self._write_allowed: bool = True
         """When False, all write-effect tools are denied."""
+        self._trust_accumulator = trust_accumulator
+        """Phase 2B: optional SessionTrustAccumulator — enables the
+        risk/trust joint decision (LOW/NONE risk + trusted → auto-ALLOW)."""
 
         for r in (rules or []):
             if r.tier is PermissionRuleTier.DENY:
@@ -613,6 +632,23 @@ class PermissionPipeline:
             return self._apply_tool_check(result, tool, params)
 
         if tier is PermissionRuleTier.ASK:
+            # Phase 2A: risk/trust joint decision — a LOW/NONE-risk tool that
+            # has been approved enough times is auto-allowed (reduces
+            # confirmation fatigue).  HIGH/MEDIUM risk NEVER auto-allows,
+            # regardless of trust (R-C hard rule).
+            if self._try_trust_auto_allow(tool, params):
+                result = PermissionResult(
+                    decision=PermissionDecision.ALLOW,
+                    layer=PermissionLayer.RULE,
+                    reason=(
+                        f"trusted low-risk tool auto-approved "
+                        f"(risk={_risk_of(tool, params)})"
+                    ),
+                    feedback="TRUST_AUTO_ALLOW",
+                )
+                self._stats.record(result)
+                return self._apply_tool_check(result, tool, params)
+
             # Phase 1: Ask — bypass-immune.  Always requires interactive
             # confirmation.  Does NOT short-circuit here; continues through
             # Layer 4 so plan/dontAsk can still block it.
@@ -691,6 +727,11 @@ class PermissionPipeline:
                 result = mandatory_denial
         if result.decision is PermissionDecision.ALLOW:
             result.updated_params = final_updates or None
+
+        # Phase 2B: record user decision back into the trust accumulator
+        # (confirmation → +trust, rejection → -trust).  Only genuine
+        # interactive decisions count — not auto_approve or hook blocks.
+        self._record_trust_feedback(tool, params, result)
 
         self._stats.record(result)
         return self._apply_tool_check(result, tool, final_params)
@@ -1072,6 +1113,54 @@ class PermissionPipeline:
         return None
 
     # ── Layer 6: Interactive Callback (CC-aligned) ──────────────────────
+
+    # ── Phase 2: risk/trust joint decision helpers ────────────────────────
+
+    def _try_trust_auto_allow(self, tool: "BaseTool",
+                              params: dict[str, Any]) -> bool:
+        """True if a LOW/NONE-risk ASK-rule tool is trusted enough to auto-allow.
+
+        R-C hard rule: HIGH/MEDIUM risk tools NEVER auto-allow, regardless
+        of accumulated trust.  Only NONE/LOW risk + trusted key is allowed.
+        """
+        if self._trust_accumulator is None:
+            return False
+        risk = _risk_of(tool, params)
+        from hitl.trust_accumulator import compute_trust_key
+        key = compute_trust_key(tool.name, params)
+        trusted = self._trust_accumulator.is_trusted(key)
+        score = self._trust_accumulator.trust_score(key)
+        if trusted and risk in ("none", "low"):
+            logger.debug(
+                "TRUST_DECISION tool=%s risk=%s trust_score=%.1f "
+                "rule=ASK decision=ALLOW (auto)",
+                tool.name, risk, score,
+            )
+        return trusted and risk not in ("high", "medium")
+
+    def _record_trust_feedback(self, tool: "BaseTool",
+                               params: dict[str, Any],
+                               result: PermissionResult) -> None:
+        """Feed an interactive user decision back into the trust accumulator."""
+        if self._trust_accumulator is None:
+            return
+        if result.layer is not PermissionLayer.INTERACTIVE:
+            return
+        if result.reason == "auto_approve":
+            return  # auto mode is not a user decision
+        from hitl.trust_accumulator import compute_trust_key
+        key = compute_trust_key(tool.name, params)
+        if result.decision is PermissionDecision.ALLOW:
+            self._trust_accumulator.record_approval(key)
+        else:
+            self._trust_accumulator.record_rejection(key)
+        logger.debug(
+            "TRUST_FEEDBACK tool=%s key=%s decision=%s "
+            "new_score=%.1f threshold=%d",
+            tool.name, key, result.decision.value,
+            self._trust_accumulator.trust_score(key),
+            getattr(self._trust_accumulator, "_threshold", 0),
+        )
 
     def _layer6_callback(
         self, tool_name: str, params: dict[str, Any], thought: str,

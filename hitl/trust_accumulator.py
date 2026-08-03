@@ -12,25 +12,87 @@ review layer.  See TOOL_SYSTEM_NORMALIZATION_DESIGN.md, Section 4.2 #4.
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Any
 
 # ── Public API ───────────────────────────────────────────────────────────
 
 
 class SessionTrustAccumulator:
-    """Tracks approved (tool_name, path, digest) within a session."""
+    """Tracks approved (tool_name, path, digest) within a session.
 
-    def __init__(self, *, threshold: int = 2) -> None:
-        self._approved: dict[tuple[str, str, str], int] = {}
+    Phase 2B: time-based decay — trust fades over time so a single long
+    session cannot accumulate unbounded trust (R-C).  Every approval
+    interval (default 10 min) the count decays by *decay_rate* (10%).
+    Rejections decrease trust immediately.
+    """
+
+    def __init__(self, *, threshold: int = 2,
+                 decay_interval_s: float = 600.0,
+                 decay_rate: float = 0.10) -> None:
+        self._approved: dict[tuple[str, str, str], list[float, float]] = {}
+        """key → [count (float), last_updated_ts]"""
         self._threshold = threshold
+        self._decay_interval_s = decay_interval_s
+        self._decay_rate = decay_rate
 
-    def record_approval(self, key: tuple[str, str, str]) -> None:
+    def _maybe_decay(self, key: tuple[str, str, str], now: float) -> None:
+        entry = self._approved.get(key)
+        if entry is None:
+            return
+        count, last = entry
+        if now - last >= self._decay_interval_s:
+            periods = int((now - last) / self._decay_interval_s)
+            for _ in range(periods):
+                count *= (1.0 - self._decay_rate)
+            # 原地修改，保持外部 entry 引用一致（勿替换新 list）
+            entry[0] = count
+            entry[1] = last + periods * self._decay_interval_s
+
+    def record_approval(self, key: tuple[str, str, str],
+                        now: float | None = None) -> None:
         """Record one explicit user approval for *key*."""
-        self._approved[key] = self._approved.get(key, 0) + 1
+        now = now if now is not None else time.time()
+        entry = self._approved.get(key)
+        if entry is None:
+            self._approved[key] = [1.0, now]
+        else:
+            self._maybe_decay(key, now)
+            entry[0] += 1.0
+            entry[1] = now
 
-    def is_trusted(self, key: tuple[str, str, str]) -> bool:
+    def record_rejection(self, key: tuple[str, str, str],
+                         now: float | None = None) -> None:
+        """Record one explicit user rejection for *key* (decreases trust).
+
+        Phase 2B: 用户拒绝后该 key 的信任下降一级，防止"一次确认永久信任"。
+        """
+        now = now if now is not None else time.time()
+        entry = self._approved.get(key)
+        if entry is None:
+            self._approved[key] = [0.0, now]
+        else:
+            self._maybe_decay(key, now)
+            entry[0] = max(0.0, entry[0] - 1.0)
+            entry[1] = now
+
+    def is_trusted(self, key: tuple[str, str, str],
+                   now: float | None = None) -> bool:
         """Return True if *key* has been approved >= threshold times."""
-        return self._approved.get(key, 0) >= self._threshold
+        entry = self._approved.get(key)
+        if entry is None:
+            return False
+        self._maybe_decay(key, now if now is not None else time.time())
+        return entry[0] >= self._threshold
+
+    def trust_score(self, key: tuple[str, str, str],
+                    now: float | None = None) -> float:
+        """Return the current (decay-adjusted) trust score for *key*."""
+        entry = self._approved.get(key)
+        if entry is None:
+            return 0.0
+        self._maybe_decay(key, now if now is not None else time.time())
+        return entry[0]
 
     def clear(self) -> None:
         """Reset all trust (called on session restart)."""
@@ -39,7 +101,7 @@ class SessionTrustAccumulator:
     @property
     def trusted_count(self) -> int:
         """Number of unique trusted keys (for observability)."""
-        return sum(1 for v in self._approved.values() if v >= self._threshold)
+        return sum(1 for v in self._approved.values() if v[0] >= self._threshold)
 
 
 # ── Key computation ──────────────────────────────────────────────────────
