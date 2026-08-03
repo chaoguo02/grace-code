@@ -404,8 +404,9 @@ def main() -> None:
     root_id = service.ensure_root_session()
     print(f"  root    : {root_id}")
 
-    # Create FastAPI app
-    app = create_app(service)
+    # Create FastAPI app — pass native_components so the lifespan handler
+    # knows the native relay is already running and skips the legacy relay.
+    app = create_app(service, native_components=components)
 
     # Auto-open browser
     url = f"http://{args.host}:{args.port}"
