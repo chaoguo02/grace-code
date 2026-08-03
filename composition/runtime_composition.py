@@ -612,16 +612,102 @@ def assemble(db_path: str, *,
             return None
 
     class _RealTools:
-        """H2+T19: Tool executor — delegates to BaseTool registry.
+        """H2+T19+T21: Tool executor + dynamic registry (R2).
 
         Accepts callable lookup (backward compat) or ToolRegistryPort (T19).
         T19: When tool_registry is provided, uses its resolve() method.
+        R2: Implements ToolRegistryPort dynamic interface (register/unregister/
+        resolve/list_names/metadata_for).  Dynamically-registered tools (e.g.
+        MCP servers discovered at runtime) execute BEFORE the static lookup.
         """
         def __init__(self, tool_lookup=None, tool_registry=None):
             self._lookup = tool_lookup
             self._registry = tool_registry  # T19: ToolRegistryPort | None
+            self._dynamic: dict[str, object] = {}  # R2: 动态注册的工具（name → BaseTool）
+
+        # ── R2: ToolRegistryPort dynamic interface ────────────────────────
+
+        def register(self, tool) -> None:
+            """Register a tool at runtime (incl. its aliases)."""
+            name = getattr(tool, "name", "") or ""
+            if not name:
+                return
+            self._dynamic[name] = tool
+            for alias in getattr(tool, "aliases", ()) or ():
+                self._dynamic[alias] = tool
+
+        def unregister(self, name: str) -> None:
+            """Remove a dynamically-registered tool."""
+            self._dynamic.pop(name, None)
+
+        def resolve(self, name: str) -> object | None:
+            """Resolve a tool: dynamic table → mcp__ alias → static lookup."""
+            if name in self._dynamic:
+                return self._dynamic[name]
+            if name.startswith("mcp__"):
+                parts = name.split("__", 2)
+                if len(parts) >= 3 and parts[2] in self._dynamic:
+                    return self._dynamic[parts[2]]
+            if self._lookup is not None:
+                if callable(self._lookup):
+                    return self._lookup(name)
+                res = getattr(self._lookup, "resolve", None)
+                if callable(res):
+                    return res(name)
+            if self._registry is not None:
+                res = getattr(self._registry, "resolve", None)
+                if callable(res):
+                    return res(name)
+            return None
+
+        def list_names(self) -> list[str]:
+            """List dynamically-registered tool names."""
+            return list(self._dynamic.keys())
+
+        def metadata_for(self, name: str):
+            """Bridge a tool's core metadata to runtime_core ToolMetadata."""
+            from runtime_core.tool_scheduler import ToolMetadata
+            tool = self.resolve(name)
+            if tool is None:
+                return None
+            return ToolMetadata.from_base_tool(tool)
+
+        def _execute_dynamic(self, tool, tool_name, params, invocation_id=""):
+            """Execute a dynamically-registered BaseTool directly."""
+            from core.json_values import thaw_json
+            from runtime_core.ports import (
+                ToolSuccess, ToolFailure, ToolErrorType,
+            )
+            params_dict = (
+                thaw_json(params) if hasattr(params, '__dataclass_fields__')
+                else (params or {})
+            )
+            try:
+                result = tool.execute(params_dict)
+                return ToolSuccess(
+                    tool_name=tool_name,
+                    output=getattr(result, "output", "") or "",
+                    duration_ms=getattr(result, "duration_ms", 0.0),
+                    tool_use_id=invocation_id,
+                )
+            except Exception as exc:
+                return ToolFailure(
+                    tool_name=tool_name,
+                    error=f"{type(exc).__name__}: {exc}",
+                    error_type=ToolErrorType.EXECUTION_ERROR,
+                )
 
         def execute(self, tool_name, params, invocation_id=""):
+            # ── R2: dynamically-registered tools execute first (incl. mcp__ alias) ──
+            dyn = self._dynamic
+            resolved = tool_name
+            if tool_name not in dyn and tool_name.startswith("mcp__"):
+                parts = tool_name.split("__", 2)
+                if len(parts) >= 3 and parts[2] in dyn:
+                    resolved = parts[2]
+            if resolved in dyn:
+                return self._execute_dynamic(dyn[resolved], tool_name, params, invocation_id)
+
             # M4: route through PolicyAwareToolRegistry when present so phase
             # policy (allowed_write_paths / allowed & denied tools) is enforced
             # on the native path.  Plain ToolRegistry / callable lookup keeps
