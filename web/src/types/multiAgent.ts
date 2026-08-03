@@ -1,3 +1,4 @@
+
 export interface MultiAgentNode {
   id: string;
   parent_id: string | null;
@@ -148,37 +149,6 @@ export interface DelegationTaskProjection {
   };
 }
 
-export interface AgentTeamProjection {
-  id?: string;
-  enabled: boolean;
-  available: boolean;
-  active: boolean;
-  state?: string;
-  approval_required: boolean;
-  arbitrary_agent_message_bus: boolean;
-  shared_task_board: boolean;
-  direct_messaging: boolean;
-  reason?: string;
-  recovery_note?: string;
-  members: Array<{
-    id: string;
-    role: string;
-    state: string;
-  }>;
-  task_board: Array<{
-    id: string;
-    goal: string;
-    dependencies: string[];
-    status: string;
-    assignee_id: string;
-    result_summary: string;
-  }>;
-  mailbox?: {
-    pending: number;
-    persisted?: boolean;
-  };
-}
-
 export interface MultiAgentSnapshot {
   selected_session_id: string;
   root_session_id: string;
@@ -230,5 +200,4 @@ export interface MultiAgentSnapshot {
   observability?: Record<string, unknown>;
   /** Phase 4: live resource governance state from ResourceGovernor. */
   resource?: Record<string, unknown>;
-  team?: AgentTeamProjection | null;
 }

@@ -18,7 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 from server.routers.approvals import ToolApprovalBody
-from server.services.event_bus import _translate_event
+# G36M-2: DEPRECATED import — replaced by NativeEventMapper (G27)
+from server.services.event_bus import _translate_event  # noqa: G36M
 from server.schemas.session import (
     CancelRequest,
     CancelResponse,
@@ -609,11 +610,17 @@ def create_sessions_router(get_service: Any) -> APIRouter:
                     RunAlreadyActiveError,
                     submit_run_turn,
                 )
+                # Phase A: Inject native coordinator if available
+                _coordinator = (
+                    getattr(service, '_native_components', None)
+                    and service._native_components.run_coordinator
+                ) if service is not None else None
                 submitted = submit_run_turn(
                     _storage,
                     session_id=session_id,
                     prompt=body.prompt,
                     idempotency_key=_idem_key,
+                    coordinator=_coordinator,
                 )
                 _run_id = submitted.run_id
                 _turn_id = submitted.turn_id
@@ -694,7 +701,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         from agent.session.run_evidence import EvidenceEntry
         rows = [
             EvidenceEntry.from_dict(row).to_dict()
-            for row in service._runtime._store.list_evidence(run_id)
+            for row in service.list_run_evidence(run_id)
         ]
         return {
             "run_id": run_id,
@@ -897,11 +904,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         _runtime = getattr(service, '_runtime', None)
         for sid in body.session_ids:
             if _runtime is not None:
-                _runtime.cleanup_session(sid)
-                storage = getattr(service, "_storage", None)
-                if storage is not None:
-                    for run in storage.list_runs(sid, limit=10_000):
-                        _runtime._store.delete_run_evidence(str(run["id"]))
+                service.cleanup_session_resources(sid)
         if hasattr(service, "_event_bus") and service._event_bus is not None:
             for sid in body.session_ids:
                 _fire_and_forget_cleanup(
@@ -937,11 +940,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         # Clean up all runtime resources via the official API
         _runtime = getattr(service, '_runtime', None)
         if _runtime is not None:
-            _runtime.cleanup_session(session_id)
-            storage = getattr(service, "_storage", None)
-            if storage is not None:
-                for run in storage.list_runs(session_id, limit=10_000):
-                    _runtime._store.delete_run_evidence(str(run["id"]))
+            service.cleanup_session_resources(session_id)
 
         # Clean up plan file
         if hasattr(service, 'remove_plan_file'):

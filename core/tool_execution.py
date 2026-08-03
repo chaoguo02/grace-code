@@ -1,8 +1,9 @@
-"""Atomic tool execution boundary.
+"""T23: DEPRECATED — Native Runtime (StepLoop + HookDispatcher + _RealTools)
+now handles tool execution.  This module's Pipeline (schema validation,
+permission, post-tool hooks) is being migrated to the Native path (T0-T22).
 
-The registry resolves names and descriptors.  This module owns the mandatory
-per-call sequence: schema validation, capability interception, permission
-evaluation, final-parameter validation, execution, and post-tool hooks.
+Kept for backward compatibility with legacy SessionRuntime path.
+New code MUST use runtime_core/step_loop.py _process_tool_calls.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ class ToolExecutionPipeline:
         *,
         permission_pipeline: Any = None,
         hook_dispatcher: Any = None,
-        tool_availability_guard: Any = None,
+        capability_registry: Any = None,
         session_id: str = "",
         budget: Any = None,
         resource_governor: Any = None,
@@ -45,14 +46,12 @@ class ToolExecutionPipeline:
     ) -> None:
         self._permission_pipeline = permission_pipeline
         self._hook_dispatcher = hook_dispatcher
-        self._tool_availability_guard = tool_availability_guard
+        self._capability_registry = capability_registry
         self._session_id = session_id
         self._budget = budget
         self._resource_governor = resource_governor
         self._root_session_resolver = root_session_resolver
         self._evidence_recorder = evidence_recorder
-
-    _NEVER_CANCELLED: "CancellationToken | None" = None  # lazy-init sentinel
 
     def execute(
         self,
@@ -61,53 +60,13 @@ class ToolExecutionPipeline:
         *,
         thought: str = "",
         invocation_id: str = "",
-        cancellation_token: "CancellationToken | None" = None,
+        cancel_token: object | None = None,  # CancellationHandle | None
     ) -> "ToolResult":
         """Validate and execute one logical call, including safe retries.
 
-        Args:
-            cancellation_token: If the tool declares
-                ``supports_cancellation=True``, this token is passed to the
-                tool for cooperative cancellation.  If ``None`` and the
-                tool supports cancellation, a never-cancelled sentinel is
-                auto-created.  If the tool does NOT support cancellation,
-                this parameter is ignored (the tool cannot be interrupted).
+        P0_3 Batch 2: *cancel_token* propagates to ResourceGovernor so
+        queued tools are released immediately on cancellation.
         """
-        from core.base import ToolResult
-        from core.types import RetryMode
-
-        # Resolve cancellation token: auto-create sentinel if tool supports it
-        if cancellation_token is None and tool.supports_cancellation:
-            if self._NEVER_CANCELLED is None:
-                from agent.session.run_context import CancellationToken
-                self._NEVER_CANCELLED = CancellationToken()
-            cancellation_token = self._NEVER_CANCELLED
-
-        # Phase 2 #6: Store cancellation token for _run_with_cancellation
-        self._cancellation = cancellation_token
-
-        import uuid as _uuid_mod
-        logical_id = invocation_id or f"tool_{_uuid_mod.uuid4().hex}"
-
-        # Phase 3 #7: TraceScope propagation — wrap entire execution in trace context
-        from observability.trace_context import current as _current_trace
-        _parent_trace = _current_trace()
-        _exec_trace = _parent_trace.child(
-            span_id=f"tool:{tool.name}",
-            invocation_id=logical_id,
-        )
-        from observability.trace_context import set_current as _set_trace
-        with _set_trace(_exec_trace):
-            return self._execute_inner(tool, params, thought, logical_id)
-
-    def _execute_inner(
-        self,
-        tool: "BaseTool",
-        params: dict[str, Any],
-        thought: str,
-        logical_id: str,
-    ) -> "ToolResult":
-        """Inner execution path — called within TraceScope context."""
         from core.base import ToolResult
         from core.types import RetryMode
 
@@ -115,9 +74,9 @@ class ToolExecutionPipeline:
         if validation_error is not None:
             return validation_error
 
-        availability_error = self._check_tool_availability(tool)
-        if availability_error is not None:
-            return availability_error
+        capability_error = self._check_capability(tool)
+        if capability_error is not None:
+            return capability_error
 
         # ── Per-tool budget gate (EXHAUSTED only — WARNING/CRITICAL
         #     are handled per-step to avoid double-penalty message injection) ──
@@ -129,6 +88,7 @@ class ToolExecutionPipeline:
                     detail=getattr(budget_status, "inject_message", "") or "Budget exhausted",
                 )
 
+        logical_id = invocation_id or f"tool_{uuid.uuid4().hex}"
         policy = tool.retry_policy(params)
 
         # ── Evidence: record tool call started ──
@@ -185,6 +145,7 @@ class ToolExecutionPipeline:
                     call.params,
                     invocation_id=logical_id,
                     attempt=attempt,
+                    cancel_token=cancel_token,
                 )
             except Exception as exc:
                 result = ToolResult.from_error(
@@ -233,9 +194,18 @@ class ToolExecutionPipeline:
         *,
         invocation_id: str,
         attempt: int,
+        cancel_token: object | None = None,
     ) -> "ToolResult":
-        """Execute one attempt under the shared external-work capacity."""
+        """Execute one attempt under the shared external-work capacity.
+
+        P0_3 Batch 2: cancel_token forwarded to ResourceGovernor.
+        P0_3 Batch 4: execution_timeout enforcement — on timeout, side-effect
+            is marked UNKNOWN (not FAILED — we don't know if it succeeded).
+        """
         from core.types import ToolEffect
+
+        # P0_3: per-tool execution timeout
+        tool_timeout = getattr(tool, "execution_timeout", None)
 
         governed_effects = {
             ToolEffect.EXECUTE,
@@ -247,7 +217,7 @@ class ToolExecutionPipeline:
             or (tool.metadata.effects & governed_effects)
         )
         if not needs_slot or self._resource_governor is None:
-            return self._run_with_cancellation(tool, params)
+            return tool.execute(params)
 
         from core.base import ToolResult
         from core.resource_governor import (
@@ -271,6 +241,9 @@ class ToolExecutionPipeline:
             getattr(self._resource_governor, "_config", None), "queue", None
         )
         timeout_s = float(getattr(queue_cfg, "timeout_seconds", 120.0))
+        # P0_3: per-tool execution_timeout overrides queue default
+        if tool_timeout is not None and tool_timeout > 0:
+            timeout_s = min(timeout_s, float(tool_timeout))
         admission = self._resource_governor.admit_wait(ResourceRequest(
             request_id=f"{invocation_id}:attempt-{attempt}",
             root_session_id=root_session_id or "unscoped",
@@ -278,6 +251,7 @@ class ToolExecutionPipeline:
             run_id=invocation_id,
             resources={ResourceKind.TOOL_SLOT: 1},
             timeout_s=timeout_s,
+            cancel_token=cancel_token,
         ))
         if (
             admission.outcome is not AdmissionOutcome.GRANTED
@@ -305,7 +279,7 @@ class ToolExecutionPipeline:
             }
             return error
         try:
-            return self._run_with_cancellation(tool, params)
+            return tool.execute(params)
         finally:
             admission.lease.release()
 
@@ -397,16 +371,16 @@ class ToolExecutionPipeline:
             detail=validation.error_message,
         )
 
-    def _check_tool_availability(self, tool: "BaseTool") -> "ToolResult | None":
-        if self._tool_availability_guard is None:
+    def _check_capability(self, tool: "BaseTool") -> "ToolResult | None":
+        if self._capability_registry is None:
             return None
 
         import json
 
-        from agent.tool_availability_guard import InterceptDecision
+        from agent.capability_registry import InterceptDecision
         from core.base import ToolResult
 
-        intercept = self._tool_availability_guard.intercept(
+        intercept = self._capability_registry.intercept(
             tool.name,
             session_id=self._session_id,
         )
@@ -417,28 +391,6 @@ class ToolExecutionPipeline:
             error_type=ToolErrorType.UNAVAILABLE,
             detail=f"Tool '{tool.name}' blocked: {feedback}",
         )
-
-    def _run_with_cancellation(
-        self,
-        tool: "BaseTool",
-        params: dict[str, Any],
-    ) -> "ToolResult":
-        """Execute tool, injecting CancellationToken if tool supports it.
-
-        Phase 2 #6: Tools that declare ``supports_cancellation=True``
-        receive a ``_cancellation_token`` attribute before ``execute()``
-        and have it cleared after.  The tool is responsible for checking
-        the token during execution (e.g., Bash sends SIGTERM when the
-        token fires).
-        """
-        token = getattr(self, "_cancellation", None)
-        if getattr(tool, "supports_cancellation", False) and token is not None:
-            tool._cancellation_token = token  # type: ignore[attr-defined]
-            try:
-                return tool.execute(params)
-            finally:
-                tool._cancellation_token = None  # type: ignore[attr-defined]
-        return tool.execute(params)
 
     def _fire_post_tool_hook(
         self,
@@ -472,3 +424,15 @@ class ToolExecutionPipeline:
                 *result.attachments,
                 *dispatch_result.attachments,
             )
+        transformed = dispatch_result.updated_output
+        if isinstance(transformed, str):
+            result.output = transformed
+        elif isinstance(transformed, dict):
+            output = transformed.get("output")
+            if isinstance(output, str):
+                result.output = output
+            metadata = transformed.get("metadata")
+            if isinstance(metadata, dict):
+                result.metadata = {**result.metadata, **metadata}
+            if "data" in transformed:
+                result.data = transformed["data"]

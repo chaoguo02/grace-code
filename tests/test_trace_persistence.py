@@ -1,3 +1,4 @@
+# G36M-final: Tests old SessionRuntime + EventBus (deprecated). New tests in tests/runtime_core/ + tests/eventing/.
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -264,13 +265,9 @@ def test_structured_run_outcome_is_persisted_and_projected(tmp_path):
 
 def test_finalize_run_keeps_runtime_facts_out_of_summary():
     store = MagicMock()
-    store.update_run.return_value = True
-    published = []
+    store.finalize_run_with_event.return_value = True
     runtime = SimpleNamespace(
         _store=store,
-        _publish_run_terminal=lambda session_id, event: published.append(
-            (session_id, event)
-        ),
     )
     result = RunResult(
         task_id="task-1",
@@ -302,12 +299,10 @@ def test_finalize_run_keeps_runtime_facts_out_of_summary():
         "completed",
     )
 
-    update_kwargs = store.update_run.call_args.kwargs
+    update_kwargs = store.finalize_run_with_event.call_args.kwargs
     assert update_kwargs["summary"] == "Clean final answer"
-    assert update_kwargs["verification_reason"] == "not_run"
-    assert update_kwargs["workspace_delta"]["patch"] == "private diff"
-    event = published[0][1]
-    assert event["summary"] == "Clean final answer"
-    assert event["verification"]["checks"][0]["status"] == "skipped"
-    assert event["workspace_delta"]["patch_available"] is True
-    assert "patch" not in event["workspace_delta"]
+    payload = update_kwargs["event_payload"]
+    assert payload["verification_reason"] == "not_run"
+    assert payload["verification"]["checks"][0]["status"] == "skipped"
+    assert payload["workspace_delta"]["patch_available"] is True
+    assert "patch" not in payload["workspace_delta"]

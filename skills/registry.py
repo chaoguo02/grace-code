@@ -43,69 +43,49 @@ class SkillSource:
     legacy_commands: bool = False
 
 
+# ── P2: Type-safe YAML frontmatter parsing helpers ──
 
-def _legacy_description_fallback(content: str, name: str) -> str:
-    """Phase 2 #5: extract description from body for commands without frontmatter."""
-    lines = content.split(chr(10))
-    body_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("```"):
-            continue
-        body_lines.append(stripped)
-    desc = " ".join(body_lines[:3])[:100].strip()
-    return desc if desc else f"(no description — {name})"
+_VALID_EFFORT_VALUES = frozenset({"", "low", "medium", "high", "xhigh", "max"})
+_VALID_CONTEXT_VALUES = frozenset({"", "fork"})
 
 
-def _validate_skill_description(meta: "SkillMetadata", source_id: str) -> None:
-    """Phase 1 #12: validate description at registration time.
+def _parse_bool(value: Any, *, default: bool = False) -> bool:
+    """Parse a YAML frontmatter boolean value safely.
 
-    Marks non-compliant skills as degraded with a WARNING log.
-    Degraded skills remain in the registry but are annotated.
+    Unlike bool("false"), this correctly handles string representations.
     """
-    from context.token_budget import estimate_tokens
-    desc = meta.description
-    if not desc or not desc.strip():
-        logger.warning(
-            "Skill %s from %s has empty description — degraded",
-            meta.name, source_id,
-        )
-        meta.description = f"(description unavailable — {meta.name})"
-        return
-    tokens = estimate_tokens(desc)
-    if tokens > 2000:
-        logger.warning(
-            "Skill %s description exceeds 2000 tokens (%d) — degraded",
-            meta.name, tokens,
-        )
-        meta.description = meta.description[:800] + "..."
-        return
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off", ""):
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
 
 
-def _sanitize_untrusted_content(content: str, provenance: str) -> str:
-    """Phase 1 #10: strip system-prompt injection patterns from untrusted skills.
+def _parse_effort(value: Any) -> str:
+    """Parse and validate the 'effort' field."""
+    s = str(value).strip().lower() if value else ""
+    if s not in _VALID_EFFORT_VALUES:
+        if s:
+            logger.warning("Invalid effort value '%s' — must be one of %s. Using default.", s, sorted(_VALID_EFFORT_VALUES))
+        return ""
+    return s
 
-    Conservative: false positives are acceptable, false negatives are not.
-    Builtin skills (trusted) bypass sanitization.
-    """
-    import re as _re
-    _INJECTION_PATTERNS = (
-        r"(?i)(ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|directives?|prompts?))",
-        r"(?i)(you\s+are\s+now\s+(a\s+)?(different|new|another)\s+(model|assistant|agent))",
-        r"(?i)(disregard\s+(all\s+)?(previous|prior|earlier)\s+(instructions?|context))",
-        r"(?i)(override\s+(system\s+)?(prompt|instructions?|rules?|behavior))",
-    )
-    sanitized = content
-    for pattern in _INJECTION_PATTERNS:
-        if _re.search(pattern, sanitized):
-            sanitized = _re.sub(pattern, "[content sanitized — untrusted source]", sanitized)
-            logger.warning(
-                "Sanitized injection pattern in untrusted skill from %s: %s",
-                provenance, pattern,
-            )
-    return sanitized
+
+def _parse_context(value: Any) -> str:
+    """Parse and validate the 'context' field."""
+    s = str(value).strip().lower() if value else ""
+    if s not in _VALID_CONTEXT_VALUES:
+        if s:
+            logger.warning("Invalid context value '%s' — must be one of %s. Using default.", s, sorted(_VALID_CONTEXT_VALUES))
+        return ""
+    return s
+
 
 @dataclass
 class SkillMetadata:
@@ -166,7 +146,6 @@ class SkillMetadata:
     source: str = "project"
     trusted: bool = True
     file_path: str = ""
-    _frontmatter: dict[str, Any] = field(default_factory=dict)  # Phase 0: stored for computed properties
 
     # ── Derived helpers ──
 
@@ -191,35 +170,6 @@ class SkillMetadata:
         p = file_path.replace("\\", "/")
         pp = Path(p)
         return any(pp.match(pat) for pat in self.paths)
-
-    # ── Phase 0: Computed properties for spawn protocol ──────────────
-
-    @property
-    def agent_kind(self) -> "AgentKind":
-        """Derived spawn identity — defaults to NAMED_SUBAGENT for fork skills.
-
-        Frontmatter can override via ``agent_kind`` key (e.g.
-        ``agent_kind: READONLY_SUBAGENT``).  Used by
-        AgentSpawnRequest.named() when context="fork".
-        """
-        from agent.session.models import AgentKind
-        raw = getattr(self, "_frontmatter", None) or {}
-        return raw.get("agent_kind", AgentKind.NAMED_SUBAGENT)
-
-    @property
-    def intent(self) -> "TaskIntent":
-        """Derived task intent — defaults to EDIT.
-
-        Frontmatter can override via ``intent`` key.
-        """
-        from agent.task import TaskIntent
-        raw = getattr(self, "_frontmatter", None) or {}
-        return raw.get("intent", TaskIntent.EDIT)
-
-    @property
-    def tools(self) -> frozenset[str]:
-        """Tools visible to the spawn context — defaults to allowed_tools."""
-        return getattr(self, "allowed_tools", frozenset())
 
 
 class SkillRegistry:
@@ -268,7 +218,6 @@ class SkillRegistry:
         self._lock = threading.RLock()
         self._fingerprint = ""
         self._change_detector: SkillChangeDetector | None = None
-        self._tool_registry: Any = None  # Phase 1: unified registry (None = rollback safe)
         self._discover()
         if live_reload:
             self._change_detector = SkillChangeDetector(self)
@@ -402,45 +351,6 @@ class SkillRegistry:
         total = len(metadata) + len(nested)
         logger.info("Discovered %d skills total (%d root, %d nested)", total, len(self._metadata), len(self._nested_metadata))
 
-        # Phase 1: Register skills as first-class tools in ToolRegistry
-        if self._tool_registry is not None:
-            self._register_skills_as_tools()
-
-    # ── Phase 1: Unified Tool Registration ──────────────────────────
-
-    def attach_tool_registry(self, registry: Any) -> None:
-        """Wire this SkillRegistry into a ToolRegistry for unified execution.
-
-        Phase 1: When a ToolRegistry is attached, discovered skills are
-        registered as ``SkillActivationTool`` instances in the unified
-        ``_tools`` dict.  When ``registry`` is ``None``, this is a no-op
-        (rollback safety — skills continue to work via the old
-        ``_metadata`` path with zero behavior change).
-        """
-        self._tool_registry = registry
-        if registry is not None and self._metadata:
-            self._register_skills_as_tools()
-
-    def _register_skills_as_tools(self) -> None:
-        """Register all discovered skills as SkillActivationTool instances."""
-        if self._tool_registry is None:
-            return
-        from skills.tool import SkillActivationTool
-        all_skills = {**self._metadata, **self._nested_metadata}
-        for name, meta in all_skills.items():
-            tool = SkillActivationTool(
-                meta,
-                skill_registry=self,
-                source=meta.source if getattr(meta, "trusted", True) else "mcp",
-            )
-            try:
-                self._tool_registry.register(tool)
-            except ValueError:
-                logger.warning(
-                    "Skill %r already registered in ToolRegistry — skipped",
-                    name,
-                )
-
     def _discover_source(
         self,
         source: "SkillSource",
@@ -546,13 +456,11 @@ class SkillRegistry:
             return SkillMetadata(
                 name=dir_name,
                 display_name=dir_name,
-                # Phase 2 #5: legacy description fallback
-                description=_legacy_description_fallback(content, dir_name),
+                description="",
                 dir_path=str(skill_file.parent),
                 source=source.name,
                 trusted=source.trusted,
                 file_path=str(skill_file),
-                _frontmatter={},
             )
 
         try:
@@ -564,14 +472,6 @@ class SkillRegistry:
                 exc,
             )
             return None
-
-        # Phase 3 #7: triggers deprecation
-        if "triggers" in fm_dict:
-            logger.info(
-                "Skill %s has deprecated 'triggers' field — ignored. "
-                "Use 'description' for LLM semantic matching instead.",
-                dir_name,
-            )
 
         # ── Parse paths: string, comma/space-separated, or YAML list ──
         raw_paths = fm_dict.get("paths", ())
@@ -611,17 +511,37 @@ class SkillRegistry:
         else:
             hooks = ()
 
-        meta = SkillMetadata(
+        # P2: Strong-type validation for boolean and enum fields
+        _disable_model = _parse_bool(fm_dict.get("disable-model-invocation"), default=False)
+        _user_invocable = _parse_bool(fm_dict.get("user-invocable"), default=True)
+        _effort = _parse_effort(fm_dict.get("effort", ""))
+        _context = _parse_context(fm_dict.get("context", ""))
+
+        # Warn on unknown frontmatter fields
+        _known_fields = {
+            "name", "description", "when_to_use", "disable-model-invocation",
+            "user-invocable", "model", "effort", "context", "agent",
+            "allowed-tools", "disallowed-tools", "paths", "arguments",
+            "evidence", "hooks",
+        }
+        for _key in fm_dict:
+            if _key not in _known_fields:
+                logger.warning(
+                    "Unknown frontmatter field '%s' in %s — will be ignored",
+                    _key, skill_file,
+                )
+
+        return SkillMetadata(
             name=dir_name,
             display_name=str(fm_dict.get("name", dir_name)),
             description=str(fm_dict.get("description", "")),
             when_to_use=str(fm_dict.get("when_to_use", "")),
             dir_path=str(skill_file.parent),
-            disable_model_invocation=bool(fm_dict.get("disable-model-invocation", False)),
-            user_invocable=bool(fm_dict.get("user-invocable", True)),
+            disable_model_invocation=_disable_model,
+            user_invocable=_user_invocable,
             model=str(fm_dict.get("model", "")),
-            effort=str(fm_dict.get("effort", "")),
-            context=str(fm_dict.get("context", "")),
+            effort=_effort,
+            context=_context,
             agent=str(fm_dict.get("agent", "")),
             paths=paths,
             arguments=named_args,
@@ -636,11 +556,7 @@ class SkillRegistry:
             source=source.name,
             trusted=source.trusted,
             file_path=str(skill_file),
-            _frontmatter=fm_dict,
         )
-        # Phase 1 #12: description validation
-        _validate_skill_description(meta, str(skill_file))
-        return meta
 
     @staticmethod
     def _load_mcp_dependencies(skill_dir: Path) -> frozenset[str]:
@@ -813,19 +729,44 @@ class SkillRegistry:
 
     @staticmethod
     def _run_skill_command(cmd: str, *, cwd: str, runtime: Any = None) -> str:
-        """Execute a skill inline command via Runtime (CC-aligned safety).
+        """Execute a skill inline command via safe Runtime.execute().
 
-        Without a Runtime, execution is refused — this prevents Skill content
-        from bypassing the PermissionPipeline, Hooks, and workspace boundaries.
+        P0: Uses runtime.execute() (argv mode, shell=False) instead of
+        runtime.exec() (shell=True).  This prevents shell injection via
+        inline command markers.
+
+        Without a Runtime, execution is refused.
+        Commands are blocked for untrusted skills (allow_execution=False).
         """
         if runtime is not None:
+            # P0: Validate workspace boundary
+            ws_root = getattr(runtime, "_workspace_root", None)
+            if ws_root is not None:
+                import os as _os
+                try:
+                    from pathlib import Path as _Path
+                    _Path(cwd).resolve().relative_to(_Path(str(ws_root)).resolve())
+                except (ValueError, OSError):
+                    logger.warning(
+                        "Skill inline command blocked (cwd outside workspace): %s", cmd[:80],
+                    )
+                    return "[blocked: cwd outside workspace boundary]"
+
             try:
-                result = runtime.exec(cmd, cwd=cwd, timeout=30)
+                # P0: Use execute() (argv-safe) not exec() (shell=True)
+                # Split command into executable + args for argv mode
+                import shlex as _shlex
+                parts = _shlex.split(cmd)
+                if not parts:
+                    return ""
+                exe = parts[0]
+                exe_args = parts[1:] if len(parts) > 1 else []
+                result = runtime.execute(exe, args=exe_args, cwd=cwd, timeout=30)
                 return (result.stdout or "").strip()
             except Exception as exc:
                 logger.warning("Skill command failed via Runtime: %s", exc)
                 return "[command failed: %s]" % exc
-        # No Runtime available — refuse to execute (CC-aligned safe fallback)
+        # No Runtime available -- refuse to execute (CC-aligned safe fallback)
         logger.warning("Skill inline command blocked (no Runtime): %s", cmd[:80])
         return "[blocked: skill inline command requires Runtime]"
 
@@ -985,18 +926,74 @@ class SkillRegistry:
             # Fallback: split on whitespace
             return arguments.split()
 
-    def format_for_prompt(self, *, llm_invocable_only: bool = True) -> str:
+    def format_for_prompt(
+        self, *,
+        llm_invocable_only: bool = True,
+        active_file_paths: list[str] | None = None,
+    ) -> str:
         """
         Format skill list for system prompt injection.
 
-        Compatibility wrapper: prompt-facing skill catalog rendering is owned by
-        capabilities.SkillCapabilityProvider + CapabilityPromptRenderer.
+        Aligned with Claude Code frontmatter:
+        - Skills with disable_model_invocation=true are hidden from LLM listing.
+        - user-invocable=false skills are still listed (LLM can auto-load them).
+        - when_to_use is appended to description for semantic matching.
+
+        P1: active_file_paths enables path-based skill discovery.
+        Skills whose path patterns match active files get a [RELEVANT] tag.
+
+        Args:
+            llm_invocable_only: if True (default), exclude skills that set
+                               disable-model-invocation: true.
+            active_file_paths: optional list of currently active/modified files.
         """
-        from capabilities import format_skills_for_prompt
-        return format_skills_for_prompt(
-            self,
-            llm_invocable_only=llm_invocable_only,
-        )
+        entries = self.list_skill_entries()
+        if not entries:
+            return ""
+
+        # P1: path-matched skills for active files
+        relevant_names: set[str] = set()
+        if active_file_paths:
+            matched = self.discover_for_paths(active_file_paths)
+            relevant_names = {m.name for m in matched}
+
+        user_skills = [
+            (name, meta)
+            for name, meta in entries
+            if meta.user_can_invoke
+        ]
+        model_skills = [
+            (name, meta)
+            for name, meta in entries
+            if meta.model_invocable
+        ]
+
+        lines = [
+            "## Available Skills",
+        ]
+
+        # Skills the user can invoke via /name
+        if user_skills:
+            names = ", ".join(f"/{name}" for name, _ in user_skills)
+            lines.append(f"User-invocable: {names}")
+
+        # Skills the LLM can auto-load (respects disable_model_invocation)
+        visible = model_skills if llm_invocable_only else entries
+
+        if visible:
+            lines.append("Use the `Skill` tool to load a skill (PREFERRED — saves context by injecting instructions without duplicating):")
+            for name, meta in visible:
+                desc = meta.description or "(no description)"
+                if meta.when_to_use:
+                    desc += f" (Use when: {meta.when_to_use})"
+                if meta.paths:
+                    desc += f" (Path scope: {', '.join(meta.paths)})"
+                # P1: mark skills relevant to active files
+                if name in relevant_names:
+                    desc = f"[RELEVANT to current files] {desc}"
+                lines.append(f"- **{name}**: {desc}")
+
+        return "\n".join(lines)
 
     def refresh(self) -> None:
         """Clear discovery memoization and atomically reload changed sources."""

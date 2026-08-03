@@ -1,13 +1,9 @@
+
 import { useEffect, useMemo, useState } from "react";
 import {
-  approveAgentTeam,
   cancelDelegationTask,
-  claimAgentTeamTask,
-  executeAgentTeamTask,
   getMultiAgentSnapshot,
-  rejectAgentTeam,
   retryDelegationTask,
-  shutdownAgentTeam,
 } from "../api/multiAgent";
 import { useSessionStore } from "../stores/sessionStore";
 import type {
@@ -154,7 +150,6 @@ export function MultiAgentControlPlane({
   const routing = snapshot?.routing || snapshot?.routing_decision;
   const runs = snapshot?.delegation_runs || [];
   const tasks = snapshot?.delegation_tasks || [];
-  const team = snapshot?.team;
   const failedTasks = tasks.filter((task) => (
     task.status === "failed" || task.status === "budget_exhausted"
   )).length;
@@ -218,147 +213,13 @@ export function MultiAgentControlPlane({
         <article><strong>{snapshot.consistency.unresolved_worktrees}</strong><span>unresolved worktrees</span></article>
       </section>
 
-      {team && (team.available || team.state === "recovery_required") && (
-        <section className="agent-control-card agent-team-board">
-          <div className="agent-section-heading">
-            <div>
-              <span className="agent-control-eyebrow">Explicit opt-in capability</span>
-              <h2>Agent Team</h2>
-            </div>
-            <span className={`agent-state state-${team.state || "inactive"}`}>
-              {team.state || "inactive"}
-            </span>
-          </div>
-          <p className="agent-team-explanation">
-            Teams are reserved for peer messaging and shared task ownership.
-            Ordinary fan-out remains parent-mediated and does not activate this channel.
-          </p>
-          {team.recovery_note && (
-            <div className="agent-control-warning">{team.recovery_note}</div>
-          )}
-          {team.approval_required && (
-            <div className="agent-team-approval">
-              <div>
-                <strong>Approval required</strong>
-                <span>
-                  {team.members.length || "Proposed"} member(s),{" "}
-                  {team.task_board.length || "proposed"} task(s). No teammate has started.
-                </span>
-              </div>
-              <button
-                type="button"
-                disabled={Boolean(busyAction)}
-                onClick={() => runAction(
-                  "team-approve",
-                  () => approveAgentTeam(snapshot.root_session_id),
-                )}
-              >
-                {busyAction === "team-approve" ? "Approving…" : "Approve team"}
-              </button>
-              <button
-                type="button"
-                className="secondary"
-                disabled={Boolean(busyAction)}
-                onClick={() => runAction(
-                  "team-reject",
-                  () => rejectAgentTeam(snapshot.root_session_id),
-                )}
-              >
-                Reject
-              </button>
-            </div>
-          )}
-          {team.members.length > 0 && (
-            <div className="agent-team-members">
-              {team.members.map((member) => (
-                <article key={member.id}>
-                  <strong>{member.id === snapshot.root_session_id ? "Lead" : member.id}</strong>
-                  <span>{member.role}</span>
-                  <small>{member.state}</small>
-                </article>
-              ))}
-            </div>
-          )}
-          {team.active && team.task_board.length > 0 && (
-            <div className="agent-team-tasks">
-              {team.task_board.map((task) => {
-                const teammate = team.members.find(
-                  (member) => member.id !== snapshot.root_session_id,
-                );
-                const actionKey = `team-task:${task.id}`;
-                return (
-                  <article key={task.id}>
-                    <div>
-                      <strong>{task.goal}</strong>
-                      <span>{task.status}</span>
-                      {task.result_summary && <p>{task.result_summary}</p>}
-                    </div>
-                    {task.status === "ready" && teammate && (
-                      <button
-                        type="button"
-                        disabled={Boolean(busyAction)}
-                        onClick={() => runAction(actionKey, async () => {
-                          const claim = await claimAgentTeamTask(
-                            snapshot.root_session_id,
-                            task.id,
-                            teammate.id,
-                          );
-                          await executeAgentTeamTask(
-                            snapshot.root_session_id,
-                            task.id,
-                            teammate.id,
-                            claim.lease_token,
-                          );
-                        })}
-                      >
-                        {busyAction === actionKey ? "Running…" : `Run as ${teammate.id}`}
-                      </button>
-                    )}
-                  </article>
-                );
-              })}
-            </div>
-          )}
-          {team.active && (
-            <div className="agent-team-shutdown">
-              <span>{team.mailbox?.pending || 0} pending peer message(s)</span>
-              <button
-                type="button"
-                className="secondary"
-                disabled={Boolean(busyAction)}
-                onClick={() => runAction(
-                  "team-shutdown",
-                  () => shutdownAgentTeam(snapshot.root_session_id, false),
-                )}
-              >
-                Complete team
-              </button>
-              <button
-                type="button"
-                className="secondary"
-                disabled={Boolean(busyAction)}
-                onClick={() => runAction(
-                  "team-cancel",
-                  () => shutdownAgentTeam(snapshot.root_session_id, true),
-                )}
-              >
-                Cancel team
-              </button>
-            </div>
-          )}
-        </section>
-      )}
-
       <section className="agent-control-card agent-routing-decision">
         <div className="agent-section-heading">
           <div>
             <span className="agent-control-eyebrow">Routing decision</span>
             <h2>{routing?.topology || (nodes.length > 1 ? "delegation tree" : "single")}</h2>
           </div>
-          <span className={`agent-team-capability ${team?.active ? "active" : ""}`}>
-            Team {team?.active ? "active" : team?.available ? "available" : "unavailable"}
-          </span>
-        </div>
+      </div>
         <div className="agent-routing-layout">
           <div>
             <strong>{routing?.reason_code || "legacy_session_projection"}</strong>
@@ -372,18 +233,6 @@ export function MultiAgentControlPlane({
           </div>
           <dl>
             <div><dt>Runtime limits</dt><dd>{budgetSummary(snapshot.limits)}</dd></div>
-            <div>
-              <dt>Agent Team</dt>
-              <dd>
-                {team
-                  ? `${team.direct_messaging ? "direct messaging" : "lead-mediated"} · ${team.shared_task_board ? "shared board" : "no shared board"}`
-                  : "Capability not reported"}
-              </dd>
-            </div>
-            <div>
-              <dt>Approval</dt>
-              <dd>{team?.approval_required ? "Required before activation" : "Not required / unavailable"}</dd>
-            </div>
           </dl>
         </div>
       </section>
@@ -498,6 +347,7 @@ export function MultiAgentControlPlane({
                 <div>
                   <strong>{taskLabel(task)}</strong>
                   <span className={task.required ? "required" : "optional"}>
+
                     {task.required ? "required" : "optional"}
                   </span>
                 </div>
@@ -615,9 +465,7 @@ export function MultiAgentControlPlane({
 
       <footer className="agent-control-disclosure">
         Completion communication means the persisted direct-child receipt channel.{" "}
-        {snapshot.disclosure.arbitrary_agent_message_bus
-          ? "This run exposes an Agent Team message bus."
-          : "Ordinary subagents report through their direct parent; no arbitrary message bus is implied."}{" "}
+        Ordinary subagents report through their direct parent; no arbitrary message bus is implied.
         Peak overlap is reconstructed from session intervals; no scheduler simulation ran.
       </footer>
     </div>

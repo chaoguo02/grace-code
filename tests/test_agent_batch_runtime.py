@@ -13,6 +13,10 @@ class _FakeRuntime:
         self._event_callback = None
         self.calls: list[dict[str, object]] = []
 
+    @property
+    def session_store(self):
+        return self._store
+
     def spawn_agent(self, **kwargs):
         from agent.session.models import AgentRunResult, AgentRunStatus
 
@@ -122,13 +126,13 @@ def test_agent_batch_persists_fan_out_and_worker_reports(tmp_path):
     with store._connect() as conn:
         terminal_events = conn.execute(
             """
-            SELECT event_json FROM session_trace_events
-            WHERE session_id = ? AND event_type = 'delegation_completed'
+            SELECT payload_json FROM event_outbox
+            WHERE session_id = ? AND event_type = 'delegation.completed'
             """,
             (parent.id,),
         ).fetchall()
     assert len(terminal_events) == 1
-    assert run_id in str(terminal_events[0]["event_json"])
+    assert run_id in str(terminal_events[0]["payload_json"])
 
 
 def test_agent_batch_chain_injects_dependency_summary(tmp_path):

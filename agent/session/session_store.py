@@ -34,6 +34,9 @@ class SessionStore:
         self._db_path = str(Path(db_path))
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        # P0_4: run schema migrations after base tables are created
+        from agent.session.message_serializer import SchemaMigrator
+        SchemaMigrator(self._db_path).ensure_latest()
 
     @property
     def db_path(self) -> str:
@@ -614,7 +617,10 @@ class SessionStore:
     # ── Context budget: tool output cap ───────────────────────────────────
     _MAX_TOOL_OUTPUT_CHARS: int = 2_000
     _MAX_INTERMEDIATE_ASSISTANT_CHARS: int = 500
-    _CONTEXT_TOKEN_BUDGET: int = 8_000
+    # P2: Legacy budget — ContextWindowManager (v2 default) handles actual
+    # trimming.  This ceiling is now a generous safety net, not the primary
+    # budget.  Set high enough to avoid conflicting with the v2 manager.
+    _CONTEXT_TOKEN_BUDGET: int = 200_000
 
     def append_message(self, session_id: str, message: LLMMessage) -> None:
         """Persist a message — full content, no truncation.
@@ -625,7 +631,7 @@ class SessionStore:
         if self.get_session(session_id) is None:
             raise ValueError(f"Unknown session: {session_id}")
         # Skip Runtime-only messages that should never appear in the frontend
-        if message.kind is MessageKind.RUNTIME_NOTICE:
+        if message.kind in (MessageKind.RUNTIME_NOTICE, MessageKind.PLAN_CONTEXT):
             return
         tool_name = None
         tool_calls_json = None
@@ -635,21 +641,34 @@ class SessionStore:
                 ensure_ascii=True,
             )
             tool_name = ",".join(tc.name for tc in message.tool_calls)
-        content = str(message.content)
+        from agent.session.message_serializer import (
+            content_to_json, content_to_text, infer_message_kind,
+        )
+        content_json_str = content_to_json(message.content)
+        content_text = content_to_text(message.content)
+        content_legacy = str(message.content)
+        _kind = infer_message_kind(
+            message.role,
+            getattr(message, "tool_call_id", None),
+            getattr(message, "tool_calls", None),
+        )
         _turn_id = getattr(message, "turn_id", "") or ""
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO session_messages (
-                    session_id, role, content, tool_call_id, tool_name,
+                    session_id, role, content, content_json, message_kind,
+                    tool_call_id, tool_name,
                     tool_calls_json, turn_id, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     message.role,
-                    content,
+                    content_legacy,
+                    content_json_str,
+                    _kind.value,
                     message.tool_call_id,
                     tool_name,
                     tool_calls_json,
@@ -775,20 +794,22 @@ class SessionStore:
                 ).fetchall()
             ]
 
-    # Runtime-injected messages start with these prefixes — they must never
-    # appear in the frontend.  The single source of truth is
-    # ``context.constants.matches_runtime_prefix()`` which uses a
-    # length-descending list to prevent substring shadowing.
-    #
-    # Kept as a class attribute for backward compatibility with tests that
-    # import ``SessionStore._RUNTIME_PREFIXES`` directly.
-    _RUNTIME_PREFIXES: tuple[str, ...] = ()  # deprecated — use context.constants
+    # Runtime-injected prompt-engineering messages start with these
+    # prefixes — they should never appear in the frontend.
+    _RUNTIME_PREFIXES: tuple[str, ...] = (
+        "[TASK ANCHOR]", "[ENVIRONMENT]", "[PRELOADED SKILLS]",
+        "[AGENT MEMORY]", "[TASK MODE]", "[ACTIVE POLICY]",
+        "[FEEDBACK]", "[PREVIOUS SESSION CONTEXT]", "[SYSTEM]",
+        "[MEMORY RESTORED]", "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]",
+        "[Conversation compacted", "[Earlier conversation summarized",
+    )
 
     def list_messages(self, session_id: str) -> list[LLMMessage]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, session_id, role, content, tool_call_id, tool_name,
+                SELECT id, session_id, role, content, content_json, message_kind,
+                       tool_call_id, tool_name,
                        tool_calls_json, turn_id, created_at
                 FROM session_messages
                 WHERE session_id = ?
@@ -797,11 +818,15 @@ class SessionStore:
                 (session_id,),
             ).fetchall()
         result: list[LLMMessage] = []
-        from context.constants import matches_runtime_prefix
         for row in rows:
-            content = row["content"] or ""
-            if matches_runtime_prefix(content):
-                continue  # skip Runtime-injected prompt engineering
+            # P0_4: filter by message_kind (precise) first; fall back to prefix (legacy)
+            _kind_str = row["message_kind"] if "message_kind" in row.keys() else None
+            if _kind_str and _kind_str in ("system", "runtime_notice", "plan_context"):
+                continue
+            if not _kind_str:
+                content = row["content"] or ""
+                if any(content.startswith(p) for p in self._RUNTIME_PREFIXES):
+                    continue
             tool_calls = None
             raw_tool_calls = row["tool_calls_json"]
             if raw_tool_calls:
@@ -809,12 +834,30 @@ class SessionStore:
                     ToolCall(name=tc["name"], params=tc["params"], id=tc.get("id"))
                     for tc in json.loads(raw_tool_calls)
                 ]
+            # P0_4: restore from content_json if available, fall back to content text
+            from agent.session.message_serializer import (
+                collapse_plain_text_content,
+                content_from_json,
+            )
+            restored_content = collapse_plain_text_content(content_from_json(
+                row["content_json"] if "content_json" in row.keys() else None,
+                fallback_text=row["content"] or "",
+            ))
+            # P0_4: restore correct message kind
+            if _kind_str:
+                try:
+                    restored_kind = MessageKind(_kind_str)
+                except ValueError:
+                    restored_kind = MessageKind.USER if row["role"] == "user" else MessageKind.ASSISTANT
+            else:
+                restored_kind = MessageKind.USER if row["role"] == "user" else MessageKind.ASSISTANT
+
             result.append(LLMMessage(
                 role=row["role"],
-                content=row["content"],
+                content=restored_content,
                 tool_call_id=row["tool_call_id"],
                 tool_calls=tool_calls,
-                kind=None,  # kind is never persisted — role field is sufficient
+                kind=restored_kind,
                 created_at=row["created_at"],
             ))
             # Attach DB id for incremental reload (subagent S4: live steering)
@@ -1383,7 +1426,7 @@ class SessionStore:
         report_count: int = 0,
         verification: dict[str, object] | None = None,
     ) -> dict[str, object] | None:
-        """Atomically CAS a delegation terminal state and append its trace.
+        """Atomically CAS a delegation terminal state and append its outbox fact.
 
         A successful call is the only path that creates ``delegation_completed``.
         Concurrent/stale callers lose the CAS and therefore cannot persist or
@@ -1392,6 +1435,10 @@ class SessionStore:
         """
         if status not in {"completed", "partial", "failed", "cancelled"}:
             raise ValueError(f"Invalid delegation terminal status: {status}")
+        from server.services.event_outbox import OutboxStore
+
+        outbox = OutboxStore(self._db_path)
+        outbox.install()
         now = _utc_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1430,40 +1477,26 @@ class SessionStore:
             if cursor.rowcount != 1:
                 conn.execute("ROLLBACK")
                 return None
-            seq_row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM session_trace_events "
-                "WHERE session_id = ?",
-                (str(row["parent_session_id"]),),
-            ).fetchone()
-            sequence = int(seq_row[0]) if seq_row else 1
             event = {
                 "type": "delegation_completed",
                 "session_id": str(row["parent_session_id"]),
                 "run_id": str(row["parent_run_id"]),
                 "delegation_run_id": run_id,
                 "event_id": f"delegation-terminal:{run_id}:{next_version}",
-                "sequence": sequence,
-                "seq": sequence,
                 "timestamp": now,
                 "status": status,
                 "phase": phase,
                 "report_count": report_count,
                 "version": next_version,
             }
-            conn.execute(
-                """
-                INSERT INTO session_trace_events (
-                    session_id, seq, event_type, timestamp, event_json,
-                    source, child_session_id
-                ) VALUES (?, ?, 'delegation_completed', ?, ?,
-                          'delegation_terminal', '')
-                """,
-                (
-                    str(row["parent_session_id"]),
-                    sequence,
-                    now,
-                    json.dumps(event, ensure_ascii=False),
-                ),
+            outbox.append_event(
+                conn,
+                event["event_id"],
+                "delegation.completed",
+                str(row["parent_session_id"]),
+                run_id,
+                next_version,
+                json.dumps(event, ensure_ascii=False),
             )
             conn.execute("COMMIT")
             return event
@@ -2084,67 +2117,119 @@ class SessionStore:
             logging.getLogger(__name__).exception("Failed to update run %s", run_id)
             return False
 
-    def transactional_finalize_run(
+    def finalize_run_with_event(
         self,
         run_id: str,
-        terminal_event: dict,
         session_id: str,
         *,
+        status: str = "completed",
         summary: str = "",
         steps_taken: int = 0,
         total_tokens: int = 0,
         error: str = "",
+        event_payload: dict | None = None,
         expect_status: str = "running",
-    ) -> dict | None:
-        """CAS-update Run + insert run_terminal trace in ONE transaction.
+    ) -> bool:
+        """R3.3: CAS-update Run + INSERT outbox event in ONE transaction.
 
-        Returns terminal_event dict with ``sequence`` injected,
-        or None if CAS failed.
+        Returns True if CAS succeeded and outbox was written.
+        The trace projection will pick up the outbox event separately.
         """
+        from server.services.event_outbox import OutboxStore
         import json as _json
+        import uuid as _uuid
+
+        event_id = str(_uuid.uuid4())
+        event_type = f"run.{status}"
+        terminal_payload = {
+            "status": status, "summary": summary,
+            "steps_taken": steps_taken, "total_tokens": total_tokens,
+            "error": error,
+        }
+        terminal_payload.update(event_payload or {})
+        payload = _json.dumps(terminal_payload, ensure_ascii=False)
+
         try:
+            outbox = OutboxStore(self._db_path)
+            outbox.install()
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
 
                 cur = conn.execute(
                     """UPDATE runs SET status = ?, summary = ?, steps_taken = ?,
-                       total_tokens = ?, error = ?, completed_at = ?,
-                       updated_at = ?
+                       total_tokens = ?, error = ?, termination_reason = ?,
+                       verification_status = ?, verification_reason = ?,
+                       verification_checks_json = ?, workspace_delta_json = ?,
+                       completed_at = ?, updated_at = ?
                        WHERE id = ? AND status = ?""",
-                    (terminal_event.get("status", "completed"),
-                     summary, steps_taken, total_tokens, error,
-                     _utc_now(), _utc_now(),
-                     run_id, expect_status),
+                    (
+                        status, summary, steps_taken, total_tokens, error,
+                        terminal_payload.get("termination_reason", "none"),
+                        terminal_payload.get("verification_status", "not_applicable"),
+                        terminal_payload.get("verification_reason", "none"),
+                        _json.dumps(terminal_payload.get("verification", {}).get("checks", []), ensure_ascii=False),
+                        _json.dumps(terminal_payload.get("workspace_delta", {}), ensure_ascii=False),
+                        _utc_now(), _utc_now(), run_id, expect_status,
+                    ),
                 )
                 if cur.rowcount != 1:
                     conn.execute("ROLLBACK")
-                    return None
+                    return False
 
-                row = conn.execute(
-                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM session_trace_events WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                sequence = row[0] if row else 1
-
-                stored = {**terminal_event, "seq": sequence, "sequence": sequence}
-                conn.execute(
-                    """INSERT INTO session_trace_events
-                       (session_id, seq, event_type, timestamp, event_json, source, child_session_id)
-                       VALUES (?, ?, ?, ?, ?, 'run_terminal', ?)""",
-                    (session_id, sequence,
-                     str(terminal_event.get("type") or "run_terminal"),
-                     str(terminal_event.get("timestamp") or ""),
-                     _json.dumps(stored, ensure_ascii=False),
-                     str(terminal_event.get("child_session_id") or "")),
+                outbox.append_event(
+                    conn, event_id, event_type, session_id,
+                    run_id, 1, payload,
                 )
 
                 conn.execute("COMMIT")
-                return stored
+                return True
         except Exception:
             import logging
             logging.getLogger(__name__).exception(
-                "Failed to transactional_finalize_run %s", run_id)
-            return None
+                "Failed to finalize_run_with_event %s", run_id)
+            return False
+
+    def start_run_with_event(
+        self,
+        run_id: str,
+        session_id: str,
+        *,
+        turn_id: str = "",
+        turn_index: int = 0,
+    ) -> bool:
+        """CAS queued->running and append run.started atomically."""
+        # G36M-3: DEPRECATED — use application.events.envelope.EventEnvelope (G3)
+        from server.domain_events import DomainEvent  # noqa: G36M
+        from server.services.event_outbox import OutboxStore
+
+        outbox = OutboxStore(self._db_path)
+        outbox.install()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    "UPDATE runs SET status='running', updated_at=? "
+                    "WHERE id=? AND status='queued'",
+                    (_utc_now(), run_id),
+                )
+                if cur.rowcount != 1:
+                    conn.execute("ROLLBACK")
+                    return False
+                outbox.append(conn, DomainEvent(
+                    event_type="run.started",
+                    session_id=session_id,
+                    aggregate_id=run_id,
+                    aggregate_version=2,
+                    payload={"turn_id": turn_id, "turn_index": turn_index},
+                ))
+                conn.execute("COMMIT")
+                return True
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Failed to start_run_with_event %s", run_id,
+            )
+            return False
 
     def update_metadata(
         self, session_id: str, extra: dict[str, Any]

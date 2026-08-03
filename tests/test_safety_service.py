@@ -141,7 +141,7 @@ def test_web_approval_callback_persists_resolved_decision() -> None:
 
     fake_service = SimpleNamespace(
         _runtime=SimpleNamespace(
-            _ensure_approval_broker=lambda session_id: broker,
+            ensure_approval_broker=lambda session_id: broker,
         ),
         _event_bus=_EventBus(),
     )

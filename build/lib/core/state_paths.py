@@ -1,0 +1,142 @@
+"""Physically isolated paths for Forge Agent runtime state."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import shutil
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+
+STATE_HOME_ENV = "FORGE_AGENT_STATE_DIR"
+
+
+class StateIsolationError(ValueError):
+    """Raised when runtime state would be placed inside the target project."""
+
+
+class StateMigration(Enum):
+    NOT_NEEDED = "not_needed"
+    COPIED = "copied"
+
+
+@dataclass(frozen=True)
+class ProjectStatePaths:
+    """All private runtime state for one canonical project root."""
+
+    project_root: Path
+    root: Path
+
+    @classmethod
+    def for_project(
+        cls,
+        project_root: str | Path,
+        *,
+        state_home: str | Path | None = None,
+    ) -> "ProjectStatePaths":
+        project = Path(project_root).resolve()
+        home = _state_home(state_home).resolve()
+        project_key = _project_key(project)
+        root = (home / "projects" / project_key).resolve()
+        try:
+            root.relative_to(project)
+        except ValueError:
+            pass
+        else:
+            raise StateIsolationError(
+                f"runtime state root must be outside project: {root}"
+            )
+        return cls(project_root=project, root=root)
+
+    @property
+    def sessions_db(self) -> Path:
+        return self.root / "sessions" / "sessions.db"
+
+    @property
+    def artifacts(self) -> Path:
+        return self.root / "artifacts"
+
+    @property
+    def goals(self) -> Path:
+        return self.root / "goals" / "goal.json"
+
+    @property
+    def datasets(self) -> Path:
+        return self.root / "datasets" / "grace-code-failures.jsonl"
+
+    @property
+    def plans(self) -> Path:
+        return self.root / "plans"
+
+    @property
+    def logs(self) -> Path:
+        return self.root / "logs"
+
+    @property
+    def experiments(self) -> Path:
+        return self.root / "experiments"
+
+    @property
+    def worktrees(self) -> Path:
+        return self.root / "worktrees"
+
+    @property
+    def review_snapshots(self) -> Path:
+        """Immutable workspace copies used by read-only review agents."""
+        return self.root / "review-snapshots"
+
+
+def migrate_legacy_session_db(
+    project_root: str | Path,
+    target: str | Path,
+) -> StateMigration:
+    """Copy the legacy project-local DB once, if neither has been migrated yet.
+
+    Only runs on the very first startup or when the new-format DB is absent.
+    Subsequent restarts leave the new-format DB untouched so that runtime
+    changes (session deletes, title edits, …) survive a server restart.
+    """
+    project = Path(project_root).resolve()
+
+    # Find legacy source
+    source: Path | None = None
+    for candidate in (
+        project / ".grace" / "v2" / "sessions.db",
+        project / ".forge-agent" / "v2" / "sessions.db",
+    ):
+        if candidate.is_file():
+            source = candidate
+            break
+
+    # No legacy DB — nothing to migrate
+    if source is None:
+        return StateMigration.NOT_NEEDED
+
+    destination = Path(target).resolve()
+
+    # Destination already exists — don't overwrite runtime changes
+    if destination.exists():
+        return StateMigration.NOT_NEEDED
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(source), str(destination))
+    return StateMigration.COPIED
+
+
+def _state_home(explicit: str | Path | None) -> Path:
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    configured = os.environ.get(STATE_HOME_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".grace" / "state"
+
+
+def _project_key(project: Path) -> str:
+    canonical = os.path.normcase(str(project))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", project.name).strip("-._")
+    return f"{slug or 'project'}-{digest}"

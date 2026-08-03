@@ -319,6 +319,9 @@ class BaseTool(ABC):
     aliases: tuple[str, ...] = ()
     """Alternative names the LLM might use (Claude Code conventions)."""
 
+    execution_timeout: float | None = None
+    """P0_3: Per-tool hard execution timeout in seconds.  None = no limit."""
+
     _registry: Any = None
     """Injected by ToolRegistry.register() — enables signal tools to set
     mode-switch flags on the registry for the main loop to pick up."""
@@ -950,11 +953,15 @@ class ToolRegistry:
         thought: str = "",
         *,
         invocation_id: str = "",
+        cancel_token: object | None = None,
     ) -> ToolResult:
         """
         按名称查找工具并执行。
         所有调用统一经过 PermissionPipeline 审批。
         工具不存在时返回 error ToolResult（不抛异常，让 agent 继续运行）。
+
+        P0_3 Batch 2: cancel_token forwarded to ToolExecutionPipeline
+        → ResourceGovernor for queue-wait cancellation.
         """
         start = time.perf_counter()
         result: ToolResult
@@ -971,6 +978,8 @@ class ToolRegistry:
             return result
 
         tool = self._tools[canonical]
+        # T27: DEPRECATED — Native path uses composition/_execute_via_registry
+        # which delegates to tool.execute() directly with retry + validation.
         from core.tool_execution import ToolExecutionPipeline
 
         # ── Evidence recorder (cached per-store) ──
@@ -996,6 +1005,7 @@ class ToolRegistry:
             params,
             thought=thought,
             invocation_id=invocation_id,
+            cancel_token=cancel_token,
         )
 
         self._record_timing(name, start, result)

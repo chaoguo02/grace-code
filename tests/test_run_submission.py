@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -13,32 +14,109 @@ from server.services.run_submission import (
 )
 from server.services.agent_service import AgentService
 
+from application.coordinators.run_coordinator import RunCoordinator
+from application.events.schema_registry import SchemaRegistry
+from infrastructure.outbox.sqlite_store import SqliteOutboxStore
+from infrastructure.sqlite.run_uow import SqliteUnitOfWork
+from runtime_core.ports import (
+    RuntimePorts, LLMPort, ToolPort, HookGatePort,
+    LiveEventPort, ClockPort, TokenUsagePort,
+    HookGateResult, ToolSuccess,
+)
+from runtime_core.model_actions import ModelAction
+from runtime_core.runtime import AgentRuntime
+
+
+# ── Fake Ports ────────────────────────────────────────────────────────────────
+
+class FakeLLM:
+    def invoke(self, messages, tools=None, tool_choice=None):
+        return ModelAction.stop(reason="test")
+    def stream(self, messages, tools=None, tool_choice=None):
+        async def _stream():
+            return ModelAction.stop(reason="test")
+        return _stream()
+
+
+class FakeTools:
+    def execute(self, tool_name, params, invocation_id=""):
+        return ToolSuccess(tool_name=tool_name)
+
+
+class FakeHooks:
+    def check(self, event_type, hook_input, tool_name=""):
+        return HookGateResult(allowed=True)
+
+
+class FakeLiveEvents:
+    def publish(self, event_type, payload, scope=None):
+        pass
+
+
+class FakeClock:
+    def now(self):
+        import time
+        return time.monotonic()
+    def deadline(self, timeout_s):
+        return self.now() + timeout_s
+
+
+class FakeTokenUsage:
+    def record(self, run_id, input_tokens, output_tokens):
+        pass
+
+
+def _make_coordinator(db_path: str):
+    """Create a RunCoordinator backed by the test DB."""
+    from server.services.event_outbox import OutboxStore
+    old_outbox = OutboxStore(db_path)
+    old_outbox.install()
+    conn = sqlite3.connect(db_path)
+    SqliteOutboxStore.migrate_add_columns(conn)
+    conn.commit()
+    conn.close()
+
+    ports = RuntimePorts(
+        llm=FakeLLM(), tools=FakeTools(), hooks=FakeHooks(),
+        live_events=FakeLiveEvents(), clock=FakeClock(),
+        token_usage=FakeTokenUsage(),
+    )
+    runtime = AgentRuntime(ports)
+    registry = SchemaRegistry()
+    outbox_store = SqliteOutboxStore(db_path, registry)
+    uow = SqliteUnitOfWork(db_path, outbox_store)
+    return RunCoordinator(runtime, uow)
+
 
 def _storage(tmp_path):
-    storage = SqliteStorageBackend(str(tmp_path / "sessions.db"))
+    db_path = str(tmp_path / "sessions.db")
+    storage = SqliteStorageBackend(db_path)
     session = storage.create_session(
         agent_name="plan",
         mode=SessionMode.PRIMARY,
         repo_path=str(tmp_path),
         title="Plan",
     )
-    return storage, session
+    coordinator = _make_coordinator(db_path)
+    return storage, session, coordinator
 
 
 def test_submit_run_turn_is_atomic_and_idempotent(tmp_path):
-    storage, session = _storage(tmp_path)
+    storage, session, coordinator = _storage(tmp_path)
 
     first = submit_run_turn(
         storage,
         session_id=session.id,
         prompt="Revise this plan",
         idempotency_key="plan:reject:one",
+        coordinator=coordinator,
     )
     second = submit_run_turn(
         storage,
         session_id=session.id,
         prompt="Revise this plan",
         idempotency_key="plan:reject:one",
+        coordinator=coordinator,
     )
 
     assert first.created is True
@@ -54,12 +132,13 @@ def test_submit_run_turn_is_atomic_and_idempotent(tmp_path):
 
 
 def test_submit_run_turn_rejects_conflicts(tmp_path):
-    storage, session = _storage(tmp_path)
+    storage, session, coordinator = _storage(tmp_path)
     submit_run_turn(
         storage,
         session_id=session.id,
         prompt="First",
         idempotency_key="same-key",
+        coordinator=coordinator,
     )
 
     with pytest.raises(IdempotencyConflictError):
@@ -68,6 +147,7 @@ def test_submit_run_turn_rejects_conflicts(tmp_path):
             session_id=session.id,
             prompt="Different",
             idempotency_key="same-key",
+            coordinator=coordinator,
         )
     with pytest.raises(RunAlreadyActiveError):
         submit_run_turn(
@@ -75,16 +155,18 @@ def test_submit_run_turn_rejects_conflicts(tmp_path):
             session_id=session.id,
             prompt="Parallel",
             idempotency_key="different-key",
+            coordinator=coordinator,
         )
 
 
 def test_startup_recovery_atomically_fails_orphaned_run_and_session(tmp_path):
-    storage, session = _storage(tmp_path)
+    storage, session, coordinator = _storage(tmp_path)
     submitted = submit_run_turn(
         storage,
         session_id=session.id,
         prompt="Hello",
         idempotency_key="orphan",
+        coordinator=coordinator,
     )
     storage.update_run(
         submitted.run_id,
@@ -110,12 +192,13 @@ def test_startup_recovery_atomically_fails_orphaned_run_and_session(tmp_path):
 
 
 def test_startup_recovery_reconciles_running_session_to_cancelled_run(tmp_path):
-    storage, session = _storage(tmp_path)
+    storage, session, coordinator = _storage(tmp_path)
     submitted = submit_run_turn(
         storage,
         session_id=session.id,
         prompt="Hello",
         idempotency_key="cancelled-orphan",
+        coordinator=coordinator,
     )
     storage.update_run(
         submitted.run_id,
@@ -141,7 +224,7 @@ def test_startup_recovery_reconciles_running_session_to_cancelled_run(tmp_path):
     assert recovered_session.error == "User cancelled"
 
 
-def test_cancel_immediately_reconciles_session_status() -> None:
+def test_cancel_active_run_defers_terminal_commit_to_runtime_finalizer() -> None:
     updates = []
     storage = SimpleNamespace(
         get_active_run=lambda session_id: {"id": "run-1"},
@@ -163,7 +246,4 @@ def test_cancel_immediately_reconciles_session_status() -> None:
     service._event_bus = event_bus
 
     assert service.cancel_run("session-1", "stop now") is True
-    assert updates[0][0:2] == ("run", "run-1")
-    assert updates[1] == (
-        "session", "session-1", SessionStatus.CANCELLED, "stop now",
-    )
+    assert updates == []

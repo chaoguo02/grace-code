@@ -31,6 +31,8 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=5.0.0",
+    "mypy>=1.15.0,<1.16",
+    "import-linter>=2.3,<3.0",
 ]
 mcp = [
     "mcp>=1.0.0,<2.0.0",
@@ -56,7 +58,13 @@ agent = "entry.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*", "observability*", "server*", "app*"]
+include = [
+    "agent*", "llm*", "tools*", "context*", "entry*", "config*",
+    "observability*", "server*", "app*",
+    # CC-Native architecture (G1)
+    "application*", "runtime_core*", "hook_core*", "eventing*",
+    "listeners*", "infrastructure*", "composition*", "core*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -81,3 +89,51 @@ markers = [
 [tool.coverage.run]
 source = ["agent", "llm", "tools", "context", "entry"]
 omit = ["tests/*"]
+
+# ── G1: mypy strict configuration ──────────────────────────────────────
+[tool.mypy]
+strict = true
+explicit_package_bases = true
+ignore_missing_imports = true
+# Core CC-Native directories — errors must trend to zero by G14/G20/G28/G44
+# G14 (Hook) → 0 errors, G20 (Runtime) → 0 errors, G28 (Composition) → 0 errors
+# G44 (Final) → 0 errors across all core directories
+packages = [
+    "application",
+    "runtime_core",
+    "hook_core",
+    "eventing",
+    "listeners",
+    "infrastructure",
+    "composition",
+    "core",
+]
+
+# ── G1: import-linter configuration ────────────────────────────────────
+[tool.importlinter]
+root_package = "grace_code"
+# Contract types:
+#   forbidden — A must not import B
+#   layers    — higher layers may import lower, not vice versa
+[[tool.importlinter.contracts]]
+id = "runtime_does_not_import_server"
+name = "runtime_does_not_import_server"
+type = "forbidden"
+description = "Runtime Core must not import Server/Listener/Repository modules"
+source_packages = ["runtime_core"]
+forbidden_modules = [
+    "server",
+    "sqlite3",
+    "infrastructure.sqlite",
+]
+
+[[tool.importlinter.contracts]]
+id = "eventing_does_not_import_business"
+name = "eventing_does_not_import_business"
+type = "forbidden"
+description = "EventBus must not import business event schemas"
+source_packages = ["eventing"]
+forbidden_modules = [
+    "application.events",
+    "application.coordinators",
+]

@@ -1,8 +1,7 @@
-"""Built-in hooks — framework-level safety nets registered at startup.
+"""G36M-1: DEPRECATED — replaced by hook_core (G11-G14).
 
-CC-aligned: these are internal hooks (Python callables) that fire alongside
-user-configured external hooks. They can be overridden by external hooks
-with the same event+matcher.
+Built-in hooks — framework-level safety nets registered at startup.
+Kept for backward compat.  New code must use HookRegistry.register() from hook_core.
 """
 
 from __future__ import annotations

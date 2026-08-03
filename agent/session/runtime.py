@@ -1,4 +1,8 @@
-"""Session Runtime — fresh-context child-session orchestration."""
+"""G41: DEPRECATED — replaced by runtime_core.step_loop.StepLoop + runtime_core.runtime.AgentRuntime (G15-G20).
+
+Session Runtime — fresh-context child-session orchestration.
+Kept for backward compat.  Will be deleted in full deletion phase.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ import logging
 import threading
 import time as _time
 import uuid
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -61,6 +65,23 @@ class ExplicitDelegationError(ValueError):
     """An explicit child request cannot be honored by the parent contract."""
 
 
+@dataclass(frozen=True)
+class RuntimeDependencies:
+    """Immutable composition contract for SessionRuntime infrastructure."""
+
+    store: SessionStore
+    backend: LLMBackend
+    base_registry: ToolRegistry
+    agent_registry: AgentRegistryV2
+    root_agent_config: AgentConfig
+    log_dir: str
+    memory_context: object | None = None
+    hook_dispatcher: object | None = None
+    mcp_integration: object | None = None
+    event_callback: object | None = None
+    governor: object | None = None
+
+
 def _inject_shared_read_cache(
     registry: ToolRegistry,
     read_cache: object,
@@ -103,18 +124,45 @@ class SessionRuntime:
     def __init__(
         self,
         *,
-        store: SessionStore,
-        backend: LLMBackend,
-        base_registry: ToolRegistry,
-        agent_registry: AgentRegistryV2,
-        root_agent_config: AgentConfig,
-        log_dir: str,
+        dependencies: RuntimeDependencies | None = None,
+        store: SessionStore | None = None,
+        backend: LLMBackend | None = None,
+        base_registry: ToolRegistry | None = None,
+        agent_registry: AgentRegistryV2 | None = None,
+        root_agent_config: AgentConfig | None = None,
+        log_dir: str | None = None,
         memory_context=None,
         hook_dispatcher=None,
         mcp_integration=None,
         event_callback=None,
         governor=None,
     ) -> None:
+        if dependencies is not None:
+            if any(value is not None for value in (
+                store, backend, base_registry, agent_registry,
+                root_agent_config, log_dir, memory_context, hook_dispatcher,
+                mcp_integration, event_callback, governor,
+            )):
+                raise ValueError(
+                    "dependencies cannot be combined with legacy constructor arguments"
+                )
+            store = dependencies.store
+            backend = dependencies.backend
+            base_registry = dependencies.base_registry
+            agent_registry = dependencies.agent_registry
+            root_agent_config = dependencies.root_agent_config
+            log_dir = dependencies.log_dir
+            memory_context = dependencies.memory_context
+            hook_dispatcher = dependencies.hook_dispatcher
+            mcp_integration = dependencies.mcp_integration
+            event_callback = dependencies.event_callback
+            governor = dependencies.governor
+        if any(value is None for value in (
+            store, backend, base_registry, agent_registry,
+            root_agent_config, log_dir,
+        )):
+            raise TypeError("SessionRuntime requires complete RuntimeDependencies")
+
         self._store = store
         self._backend = backend
         self._base_registry = base_registry
@@ -159,28 +207,22 @@ class SessionRuntime:
         # Set by AgentService.  Signature: (session_id, event_dict) -> None.
         # Unlike _event_callback which receives agent.task.Event objects,
         # this receives pre-formatted WS message dicts ready for broadcast.
-        self._publish_run_terminal: Callable[[str, dict], None] | None = None
         # Per-session ApprovalBroker instances for headless Web mode.
         # CC-aligned: each session has its own blocking approval queue,
         # equivalent to CC's per-session stdin control_request channel.
+        self._approval_brokers: dict[str, "ApprovalBroker"] = {}
         # Per-session web_confirm_callback factories, set by agent_service
         # before run_session().  keyed by session_id.
-        # Phase 4a: All pre-run staging state unified into a single dataclass.
-        # The 11 separate dicts (_web_confirm_callbacks, _stream_callbacks,
-        # _text_lifecycle_callbacks, _text_delta_callbacks,
-        # _pending_skill_activations, _session_permission_modes,
-        # _session_injected_rules, _pending_model_switches, _pending_effort,
-        # _pending_thinking, _pending_skill_modifiers) are replaced by one
-        # dict of SessionPreRunConfig, keyed by session_id.
-        from agent.session.pre_run_config import SessionPreRunConfig
-        self._pending_config: dict[str, "SessionPreRunConfig"] = {}
+        self._web_confirm_callbacks: dict[str, "WebConfirmCallback"] = {}
+        self._stream_callbacks: dict[str, "StreamCallback"] = {}
+        self._text_lifecycle_callbacks: dict[str, object] = {}
+        self._text_delta_callbacks: dict[str, object] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
-        # Phase 4b: Approval broker registry extracted to HeadlessApprovalService.
-        from server.services.headless_approval import HeadlessApprovalService
-        self._approval_service = HeadlessApprovalService()
         self._backend_store: dict[str, "LLMBackend"] = {}
-        # Live-steering message tracking state — per-session last-seen DB id.
-        self._claim_cursors: dict[str, int] = {}
+        # Pre-run Skill activations are isolated by session.  Once a run owns
+        # its Store, activations are recorded directly instead of passing
+        # through shared mutable "current run" state.
+        self._pending_skill_activations: dict[str, list[dict[str, object]]] = {}
         self._active_evidence_stores: dict[str, object] = {}
         self._active_evidence_requirements: dict[str, object] = {}
         from agent.session.run_evidence import EvidenceStoreManager
@@ -208,20 +250,20 @@ class SessionRuntime:
         # Set by AgentService to True when running in Web mode.
         # Child agents use this to decide whether to create web callbacks.
         self._is_web_mode: bool = False
-        self._teams: dict[str, object] = {}
-        self._team_proposals: dict[str, dict[str, object]] = {}
+        self._session_permission_modes: dict[str, str] = {}
+        self._session_injected_rules: dict[str, list] = {}
 
         # ── Circuit Breaker (code-level, not prompt-based) ──
         from core.circuit_breaker import CircuitBreaker
         self._circuit_breaker = CircuitBreaker()
 
         # ── P1-6: Dynamic Capability Registry ──
-        from agent.tool_availability_guard import ToolAvailabilityGuard
-        self._tool_availability_guard = ToolAvailabilityGuard()
+        from agent.capability_registry import CapabilityRegistry
+        self._capability_registry = CapabilityRegistry()
         # Register all builtin tools from the base registry
-        self._tool_availability_guard.register_bulk(self._base_registry.tool_names)
+        self._capability_registry.register_bulk(self._base_registry.tool_names)
         # Wire the registry into the base ToolRegistry for physical interception
-        self._base_registry._tool_availability_guard = self._tool_availability_guard
+        self._base_registry._capability_registry = self._capability_registry
         # Mark MCP tools as UNAVAILABLE if the bridge failed to connect
         self._sync_mcp_capabilities()
 
@@ -304,38 +346,30 @@ class SessionRuntime:
                 logger.debug(
                     "Per-session backend close failed", exc_info=True,
                 )
-        self._approval_service.clear()
-        self._pending_config.clear()
-        self._claim_cursors.clear()
+        self._approval_brokers.clear()
+        self._web_confirm_callbacks.clear()
+        self._stream_callbacks.clear()
+        self._text_lifecycle_callbacks.clear()
+        self._text_delta_callbacks.clear()
         self._cancellation_tokens.clear()
 
-    # ── Pre-run config staging (Phase 4a: unified into SessionPreRunConfig) ──
-
-    def _get_config(self, session_id: str) -> "SessionPreRunConfig":
-        """Return or create the pre-run config for *session_id*."""
-        from agent.session.pre_run_config import SessionPreRunConfig
-        if session_id not in self._pending_config:
-            self._pending_config[session_id] = SessionPreRunConfig(
-                created_at=time.perf_counter(),
-            )
-        return self._pending_config[session_id]
+    # ── P1-10 thin adapter methods (used by ChatPipeline) ────────────────
 
     def set_permission_mode_for_session(
         self, session_id: str, mode: str,
     ) -> None:
-        self._get_config(session_id).permission_mode = mode
+        self._session_permission_modes[session_id] = mode
 
     def set_injected_rules_for_session(
         self, session_id: str, rules: list,
     ) -> None:
-        self._get_config(session_id).injected_rules = tuple(rules)
+        self._session_injected_rules[session_id] = rules
 
     def pop_pending_permission_mode_override(self, session_id: str) -> str | None:
-        return self._get_config(session_id).permission_mode
+        return self._session_permission_modes.pop(session_id, None)
 
     def pop_injected_rules(self, session_id: str) -> list | None:
-        rules = self._get_config(session_id).injected_rules
-        return list(rules) if rules else None
+        return self._session_injected_rules.pop(session_id, None)
 
     # ── Backend store accessors ──────────────────────────────────────────
 
@@ -371,6 +405,14 @@ class SessionRuntime:
         return self._agent_registry
 
     @property
+    def session_store(self) -> SessionStore:
+        return self._store
+
+    @property
+    def root_agent_config(self) -> AgentConfig:
+        return self._root_agent_config
+
+    @property
     def governor(self):
         """The service-level ResourceGovernor. May be None in test contexts."""
         return self._governor
@@ -380,551 +422,26 @@ class SessionRuntime:
         return self._circuit_breaker
 
     @property
-    def tool_availability_guard(self):
-        return self._tool_availability_guard
+    def capability_registry(self):
+        return self._capability_registry
 
-    def propose_agent_team(
-        self,
-        *,
-        session_id: str,
-        members: list[dict[str, str]],
-        tasks: list[dict[str, object]],
-    ) -> dict[str, object]:
-        """Create an approval-gated team proposal without starting teammates."""
-        from agent.team import TeamFeatureConfig, TeamRuntime
+    # Public API for external callers
 
-        session = self._store.get_session(session_id)
-        if session is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        root_id = session.root_id or session.id
-        if session.id != root_id:
-            raise ValueError("Agent teams must be proposed from the root session")
-        existing_team = self._teams.get(root_id)
-        if (
-            existing_team is not None
-            and not existing_team.state.terminal
-        ):
-            raise RuntimeError(
-                "This session already has a pending or active Agent Team"
-            )
-        config = TeamFeatureConfig.from_environment()
-        if not config.enabled:
-            raise RuntimeError(
-                "Agent teams are disabled; set GRACE_AGENT_TEAMS_ENABLED=1"
-            )
-        if not members or len(members) + 1 > config.max_members:
-            raise ValueError(
-                f"Team requires 1-{config.max_members - 1} teammates"
-            )
-        member_ids = [str(item.get("id", "")).strip() for item in members]
-        if (
-            any(not value for value in member_ids)
-            or len(set(member_ids)) != len(member_ids)
-            or root_id in member_ids
-        ):
-            raise ValueError("Team member ids must be non-empty and unique")
-        parent_definition = self._agent_registry.get(session.agent_name)
-        allowed_roles = {
-            definition.name
-            for definition in self._agent_registry.delegatable_by(
-                parent_definition
-            )
-        }
-        member_roles = [
-            str(item.get("role", "")).strip() for item in members
-        ]
-        invalid_roles = sorted({
-            role for role in member_roles if role not in allowed_roles
-        })
-        if invalid_roles:
-            raise ValueError(
-                "Team member roles must be delegatable agent definitions; "
-                f"invalid={invalid_roles}, available={sorted(allowed_roles)}"
-            )
-        if not tasks or len(tasks) > config.max_tasks:
-            raise ValueError(
-                f"Team requires 1-{config.max_tasks} tasks"
-            )
-        task_ids = [str(item.get("id", "")).strip() for item in tasks]
-        if any(not value for value in task_ids) or len(set(task_ids)) != len(task_ids):
-            raise ValueError("Team task ids must be non-empty and unique")
-        task_id_set = set(task_ids)
-        normalized_tasks: list[dict[str, object]] = []
-        dependencies_by_id: dict[str, tuple[str, ...]] = {}
-        for item, task_id in zip(tasks, task_ids):
-            goal = str(item.get("goal", "")).strip()
-            if not goal:
-                raise ValueError(f"Team task {task_id!r} requires a goal")
-            dependencies = tuple(
-                str(value).strip()
-                for value in item.get("dependencies", [])
-            )
-            unknown = set(dependencies) - task_id_set
-            if unknown:
-                raise ValueError(
-                    f"Team task {task_id!r} has unknown dependencies: "
-                    f"{sorted(unknown)}"
-                )
-            if task_id in dependencies:
-                raise ValueError(
-                    f"Team task {task_id!r} cannot depend on itself"
-                )
-            dependencies_by_id[task_id] = dependencies
-            normalized_tasks.append({
-                **dict(item),
-                "id": task_id,
-                "goal": goal,
-                "dependencies": list(dependencies),
-            })
-        # Stable topological sort catches cycles before any live team state is
-        # created and also permits callers to submit tasks in arbitrary order.
-        ordered_tasks: list[dict[str, object]] = []
-        remaining = {
-            str(item["id"]): item for item in normalized_tasks
-        }
-        completed_ids: set[str] = set()
-        while remaining:
-            ready = [
-                task_id
-                for task_id in task_ids
-                if task_id in remaining
-                and set(dependencies_by_id[task_id]) <= completed_ids
-            ]
-            if not ready:
-                raise ValueError("Team task graph contains a dependency cycle")
-            for task_id in ready:
-                ordered_tasks.append(remaining.pop(task_id))
-                completed_ids.add(task_id)
-        team = TeamRuntime(
-            team_id=f"team-{root_id}",
-            lead_id=root_id,
-            config=config,
-            user_approved=False,
-        )
-        self._teams[root_id] = team
-        self._team_proposals[root_id] = {
-            "members": [dict(item) for item in members],
-            "tasks": ordered_tasks,
-        }
-        return {
-            "team_id": team.team_id,
-            "state": team.state.value,
-            "approval_required": True,
-            "member_count": len(members) + 1,
-            "task_count": len(tasks),
-        }
+    def get_approval_broker(self, session_id: str):
+        """Public accessor for session-scoped approval broker."""
+        return self._approval_brokers.get(session_id)
 
-    def approve_agent_team(self, *, session_id: str) -> dict[str, object]:
-        """Approve, populate, and activate a previously proposed team."""
-        from agent.team import BoardTask, TeamState
+    def cancel_all_sessions(self, reason: str = "shutdown") -> int:
+        """Cancel all active sessions.  Returns count of cancelled sessions."""
+        count = 0
+        for (session_id, gen) in list(self._cancellation_tokens.keys()):
+            if self.cancel_session(session_id, detail=reason):
+                count += 1
+        return count
 
-        session = self._store.get_session(session_id)
-        if session is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        root_id = session.root_id or session.id
-        team = self._teams.get(root_id)
-        proposal = self._team_proposals.get(root_id)
-        if team is None or proposal is None:
-            raise ValueError("No pending team proposal for this session")
-        if team.state is TeamState.AWAITING_APPROVAL:
-            team.approve()
-        for item in proposal["members"]:
-            team.add_member(str(item["id"]), str(item.get("role", "teammate")))
-        for item in proposal["tasks"]:
-            team.task_board.add(BoardTask(
-                id=str(item["id"]),
-                goal=str(item.get("goal", "")).strip(),
-                dependencies=tuple(
-                    str(value) for value in item.get("dependencies", [])
-                ),
-            ))
-        team.activate()
-        run_id = f"team-run-{uuid.uuid4().hex}"
-        self._store.create_delegation_run(
-            run_id=run_id,
-            parent_session_id=root_id,
-            topology="team",
-            reason_code="user_approved_peer_coordination",
-            explanation="User approved a shared task board and direct mailbox",
-            is_team=True,
-            budget={"max_members": team.config.max_members},
-        )
-        for item in proposal["tasks"]:
-            self._store.create_delegation_task(
-                task_id=f"{run_id}:{item['id']}",
-                delegation_run_id=run_id,
-                agent_type=str(item.get("agent", "teammate")),
-                purpose=str(item.get("purpose", "general")),
-                goal=str(item.get("goal", "")),
-                dependencies=tuple(
-                    f"{run_id}:{value}"
-                    for value in item.get("dependencies", [])
-                ),
-                required=bool(item.get("required", True)),
-            )
-        self._team_proposals.pop(root_id, None)
-        return {
-            "team_id": team.team_id,
-            "delegation_run_id": run_id,
-            "state": team.state.value,
-            "members": [member.id for member in team.members],
-        }
-
-    def reject_agent_team(self, *, session_id: str) -> dict[str, object]:
-        """Reject a pending proposal without starting or persisting workers."""
-        session = self._store.get_session(session_id)
-        if session is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        root_id = session.root_id or session.id
-        team = self._teams.get(root_id)
-        if team is None:
-            raise ValueError("No pending team proposal for this session")
-        team.reject()
-        self._team_proposals.pop(root_id, None)
-        return {"team_id": team.team_id, "state": team.state.value}
-
-    def send_team_message(
-        self,
-        *,
-        session_id: str,
-        sender_id: str,
-        recipient_id: str,
-        body: str,
-    ) -> dict[str, object]:
-        session = self._store.get_session(session_id)
-        if session is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        team = self._teams.get(session.root_id or session.id)
-        if team is None or team.state.value != "active":
-            raise ValueError("No active team for this session")
-        message = team.mailbox.send(sender_id, recipient_id, body)
-        return {
-            "id": message.id,
-            "sender_id": message.sender_id,
-            "recipient_id": message.recipient_id,
-            "body": message.body,
-            "created_at": message.created_at,
-        }
-
-    def coordinate_agent_team(
-        self,
-        *,
-        session_id: str,
-        action: str,
-        recipient_id: str = "",
-        message: str = "",
-    ) -> dict[str, object]:
-        """Authorize mailbox and board access from a real teammate session."""
-        session = self._store.get_session(session_id)
-        if session is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        metadata = session.metadata or {}
-        member_id = str(metadata.get("team_member_id", ""))
-        team_id = str(metadata.get("team_id", ""))
-        if not member_id or not team_id:
-            raise PermissionError(
-                "Team coordination is available only to approved teammates"
-            )
-        root_id = session.root_id or session.id
-        team = self._teams.get(root_id)
-        if (
-            team is None
-            or team.team_id != team_id
-            or team.state.value != "active"
-        ):
-            raise ValueError("The teammate's Agent Team is not active")
-        if member_id not in {member.id for member in team.members}:
-            raise PermissionError("The caller is not a registered teammate")
-        if action == "send":
-            sent = team.mailbox.send(member_id, recipient_id, message)
-            return {
-                "action": "sent",
-                "message_id": sent.id,
-                "sender_id": sent.sender_id,
-                "recipient_id": sent.recipient_id,
-            }
-        if action == "inbox":
-            received = team.mailbox.receive(member_id)
-            return {
-                "action": "inbox",
-                "messages": [
-                    {
-                        "id": item.id,
-                        "sender_id": item.sender_id,
-                        "body": item.body,
-                        "created_at": item.created_at,
-                    }
-                    for item in received
-                ],
-            }
-        if action == "board":
-            return {
-                "action": "board",
-                "tasks": [
-                    {
-                        "id": task.id,
-                        "goal": task.goal,
-                        "dependencies": list(task.dependencies),
-                        "status": task.state.value,
-                        "assignee_id": task.assignee_id,
-                        "result_summary": task.result_summary,
-                    }
-                    for task in team.task_board.list()
-                ],
-            }
-        raise ValueError("Team coordination action must be send, inbox, or board")
-
-    def claim_team_task(
-        self, *, session_id: str, task_id: str, member_id: str,
-    ) -> dict[str, object]:
-        session = self._store.get_session(session_id)
-        if session is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        team = self._teams.get(session.root_id or session.id)
-        if team is None or team.state.value != "active":
-            raise ValueError("No active team for this session")
-        if member_id not in {member.id for member in team.members}:
-            raise PermissionError("Team task claims require a registered member")
-        claimed = team.task_board.claim(task_id, member_id)
-        if claimed is None:
-            raise ValueError("Team task is not claimable")
-        task, lease = claimed
-        return {
-            "task_id": task.id,
-            "member_id": member_id,
-            "lease_token": lease.token,
-            "expires_at": lease.expires_at,
-        }
-
-    def complete_team_task(
-        self,
-        *,
-        session_id: str,
-        task_id: str,
-        member_id: str,
-        lease_token: str,
-        summary: str,
-        failed: bool = False,
-    ) -> dict[str, object]:
-        session = self._store.get_session(session_id)
-        if session is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        team = self._teams.get(session.root_id or session.id)
-        if team is None or team.state.value != "active":
-            raise ValueError("No active team for this session")
-        if member_id not in {member.id for member in team.members}:
-            raise PermissionError("Team task completion requires a registered member")
-        method = team.task_board.fail if failed else team.task_board.complete
-        task = method(task_id, member_id, lease_token, summary)
-        return {
-            "task_id": task.id,
-            "status": task.state.value,
-            "summary": task.result_summary,
-        }
-
-    def execute_team_task(
-        self,
-        *,
-        session_id: str,
-        task_id: str,
-        member_id: str,
-        lease_token: str,
-    ) -> AgentRunResult:
-        """Execute one claimed board task as a real named child session."""
-        from agent.session.task_contract import TaskContract
-        from agent.team import BoardTaskState
-
-        parent = self._store.get_session(session_id)
-        if parent is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        root_id = parent.root_id or parent.id
-        if parent.id != root_id:
-            raise ValueError("Team tasks execute under the root lead session")
-        team = self._teams.get(root_id)
-        if team is None or team.state.value != "active":
-            raise ValueError("No active team for this session")
-        members = {member.id: member for member in team.members}
-        member = members.get(member_id)
-        if member is None or member_id == team.lead_id:
-            raise PermissionError("A registered teammate must execute this task")
-        board_task = team.task_board.get(task_id)
-        lease = team.leases.get(task_id)
-        if (
-            board_task.state is not BoardTaskState.CLAIMED
-            or board_task.assignee_id != member_id
-            or lease is None
-            or lease.token != lease_token
-        ):
-            raise PermissionError("A valid claimed task lease is required")
-        definition = self._agent_registry.get(member.role)
-        parent_definition = self._agent_registry.get(parent.agent_name)
-        allowed = {
-            child.name
-            for child in self._agent_registry.delegatable_by(parent_definition)
-        }
-        if definition.name not in allowed:
-            raise PermissionError(
-                f"Teammate role {definition.name!r} is not delegatable by "
-                f"{parent.agent_name!r}"
-            )
-        messages = team.mailbox.receive(member_id)
-        peer_context = "\n".join(
-            f"- from {message.sender_id}: {message.body}"
-            for message in messages
-        )
-        prompt = (
-            f"TEAM TASK\n{board_task.goal}\n\n"
-            f"PEER MESSAGES\n{peer_context or 'None'}\n\n"
-            "Work only on this claimed task. Return a standalone result to the "
-            "team lead; do not expand scope."
-        )
-        team_runs = [
-            run for run in self._store.list_delegation_runs(root_id)
-            if bool(run.get("is_team"))
-        ]
-        if not team_runs:
-            raise ValueError("Active team has no durable delegation run")
-        run_id = str(team_runs[-1]["id"])
-        durable_task_id = f"{run_id}:{task_id}"
-
-        def created(child) -> None:
-            self._store.update_delegation_task(
-                durable_task_id,
-                status="running",
-                child_session_id=child.id,
-                generation=int(child.generation),
-            )
-
-        contract = TaskContract.for_subagent(
-            definition,
-            self._root_agent_config,
-            parent_budget_tokens=min(
-                self._root_agent_config.budget_tokens,
-                definition.max_tokens or self._root_agent_config.budget_tokens,
-            ),
-            parent_max_steps=self._root_agent_config.max_steps,
-        )
-        try:
-            result = self.run_explicit_delegation(
-                root_id,
-                request=ExplicitDelegationRequest(
-                    agent_name=definition.name,
-                    description=board_task.goal[:80],
-                    prompt=prompt,
-                ),
-                parent_intent=parent_definition.intent,
-                contract=contract,
-                child_metadata={
-                    "team_id": team.team_id,
-                    "team_member_id": member_id,
-                    "team_task_id": task_id,
-                    "delegation_run_id": run_id,
-                    "delegation_task_id": durable_task_id,
-                },
-                child_created_callback=created,
-            )
-            if result.worktree_disposition is WorktreeDisposition.PRESERVED:
-                team.task_board.await_review(
-                    task_id,
-                    member_id,
-                    lease_token,
-                    result.summary or "Worktree changes require lead review",
-                )
-            elif result.status in {
-                AgentRunStatus.COMPLETED,
-                AgentRunStatus.PARTIAL,
-            }:
-                team.task_board.complete(
-                    task_id, member_id, lease_token, result.summary,
-                )
-            else:
-                team.task_board.fail(
-                    task_id,
-                    member_id,
-                    lease_token,
-                    result.error or result.summary,
-                )
-            return result
-        except Exception as exc:
-            try:
-                team.task_board.fail(
-                    task_id, member_id, lease_token, str(exc),
-                )
-            except Exception:
-                logger.debug("Could not mark failed team task", exc_info=True)
-            raise
-
-    def resolve_team_task_review(
-        self,
-        *,
-        session_id: str,
-        task_id: str,
-        accepted: bool,
-        summary: str = "",
-    ) -> dict[str, object]:
-        """Converge a team board item only after its worktree was resolved."""
-        parent = self._store.get_session(session_id)
-        if parent is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        root_id = parent.root_id or parent.id
-        team = self._teams.get(root_id)
-        if team is None or team.state.value != "active":
-            raise ValueError("No active team for this session")
-        team_runs = [
-            run for run in self._store.list_delegation_runs(root_id)
-            if bool(run.get("is_team"))
-        ]
-        if not team_runs:
-            raise ValueError("Active team has no durable delegation run")
-        durable = self._store.get_delegation_task(
-            f"{team_runs[-1]['id']}:{task_id}"
-        )
-        if durable is None or not durable.get("child_session_id"):
-            raise ValueError("Team task has no child worktree result")
-        child = self._store.get_session(str(durable["child_session_id"]))
-        if child is None or child.agent_result is None:
-            raise ValueError("Team task child result is unavailable")
-        expected = (
-            WorktreeDisposition.APPLIED
-            if accepted else WorktreeDisposition.DISCARDED
-        )
-        if child.agent_result.worktree_disposition is not expected:
-            raise ValueError(
-                f"Resolve the child worktree as {expected.value!r} before "
-                "converging the team task"
-            )
-        task = team.task_board.resolve_review(
-            task_id,
-            accepted=accepted,
-            summary=summary or child.agent_result.summary,
-        )
-        return {
-            "task_id": task.id,
-            "status": task.state.value,
-            "summary": task.result_summary,
-        }
-
-    def shutdown_agent_team(
-        self, *, session_id: str, cancel: bool = False,
-    ) -> dict[str, object]:
-        session = self._store.get_session(session_id)
-        if session is None:
-            raise ValueError(f"Unknown session: {session_id}")
-        root_id = session.root_id or session.id
-        team = self._teams.get(root_id)
-        if team is None:
-            raise ValueError("No team for this session")
-        team.shutdown(cancel=cancel)
-        team_runs = [
-            run for run in self._store.list_delegation_runs(root_id)
-            if bool(run.get("is_team"))
-        ]
-        if team_runs:
-            self._store.complete_delegation_run(
-                str(team_runs[-1]["id"]),
-                status="cancelled" if cancel else "completed",
-            )
-        return {"team_id": team.team_id, "state": team.state.value}
+    def get_active_sessions(self) -> list[str]:
+        """Return list of active session IDs."""
+        return list(self._active_sessions)
 
     def cancel_session(self, session_id: str, detail: str = "") -> bool:
         """Cancel one active session; hierarchical tokens propagate to descendants."""
@@ -958,18 +475,20 @@ class SessionRuntime:
         """Release all runtime resources associated with a session.
 
         Callers (e.g. HTTP delete handler) must use this instead of reaching
-        into runtime internals like _approval_service, _pending_config,
+        into runtime internals like _approval_brokers, _web_confirm_callbacks,
         or _cancellation_tokens directly.
         """
         # 1. Cancel any running execution
         self.cancel_session(session_id)
 
         # 2. Clean up approval broker (prevents memory leak)
-        self._approval_service.remove(session_id)
+        self._approval_brokers.pop(session_id, None)
 
-        # 3. Clean up pre-run config (unified staging — Phase 4a)
-        self._pending_config.pop(session_id, None)
-        self._claim_cursors.pop(session_id, None)
+        # 3. Clean up web confirm callback
+        self._web_confirm_callbacks.pop(session_id, None)
+
+        # 4. Clean up stream callback
+        self._stream_callbacks.pop(session_id, None)
 
         # 5. Clean up cancellation tokens for this session and its children
         keys_to_remove = [
@@ -1291,8 +810,7 @@ class SessionRuntime:
                 pending_worktrees.append((child.id, result.worktree))
         incomplete_runs = [
             run for run in self._store.list_delegation_runs(session_id)
-            if not bool(run.get("is_team"))
-            and str(run.get("status")) == "running"
+            if str(run.get("status")) == "running"
         ]
         if not pending_worktrees and not incomplete_runs:
             return CompletionCheckResult(can_complete=True)
@@ -1326,6 +844,19 @@ class SessionRuntime:
             ),
         )
 
+    def add_completion_verifier(
+        self, verifier: "Callable[[CompletionContext], CompletionCheckResult | None]",
+    ) -> None:
+        """Register an external completion condition.
+
+        Verifiers run after the built-in checks (git diff, worktree disposition).
+        Return a CompletionCheckResult to block completion, or None to pass.
+        The *verifier* receives the CompletionContext (files read/written, etc.).
+        """
+        if not hasattr(self, '_completion_verifiers'):
+            self._completion_verifiers: list = []
+        self._completion_verifiers.append(verifier)
+
     # ── Worktree resolution (Gap 15, async queue) ─────────────────────
 
     def set_worktree_completion_callback(
@@ -1347,7 +878,6 @@ class SessionRuntime:
         import threading as _th
         self._worktree_queue: _q.Queue = _q.Queue()
         self._worktree_results: dict[str, dict] = {}
-        self._worktree_results_lock = _th.Lock()  # Phase 4b: fix TOCTOU race
         self._worktree_worker_started = True
 
         def _worker():
@@ -1359,20 +889,18 @@ class SessionRuntime:
                         break
                     parent_id, child_id, action, expected_revision = cmd
                     cmd_key = f"{child_id}_{action}"
-                    with self._worktree_results_lock:
-                        self._worktree_results[cmd_key] = {
-                            "status": "processing", "child_session_id": child_id,
-                            "action": action,
-                            "expected_revision": expected_revision,
-                        }
+                    self._worktree_results[cmd_key] = {
+                        "status": "processing", "child_session_id": child_id,
+                        "action": action,
+                        "expected_revision": expected_revision,
+                    }
                     result = self._resolve_worktree_sync(
                         parent_id,
                         child_id,
                         action,
                         expected_revision=expected_revision,
                     )
-                    with self._worktree_results_lock:
-                        self._worktree_results[cmd_key] = result
+                    self._worktree_results[cmd_key] = result
                     # Notify server layer via injected callback — clean layering.
                     _cb = getattr(self, '_worktree_completion_callback', None)
                     if _cb is not None:
@@ -1405,25 +933,24 @@ class SessionRuntime:
             raise ValueError("expected_revision is required")
         expected_revision = expected_revision.strip()
         cmd_key = f"{child_session_id}_{action}"
-        with self._worktree_results_lock:
-            _existing = getattr(self, '_worktree_results', {}).get(cmd_key)
-            if (
-                _existing
-                and _existing.get("expected_revision") == expected_revision
-                and _existing.get("status") in {
-                    "queued", "processing", "applied", "discarded",
-                    "retained", "no_changes",
-                }
-            ):
-                return cmd_key  # already enqueued — idempotent
-            self._worktree_results[cmd_key] = {
-                "status": "queued", "child_session_id": child_session_id,
-                "action": action,
-                "expected_revision": expected_revision,
+        _existing = getattr(self, '_worktree_results', {}).get(cmd_key)
+        if (
+            _existing
+            and _existing.get("expected_revision") == expected_revision
+            and _existing.get("status") in {
+                "queued", "processing", "applied", "discarded",
+                "retained", "no_changes",
             }
+        ):
+            return cmd_key  # already enqueued — idempotent
         self._worktree_queue.put(
             (parent_session_id, child_session_id, action, expected_revision)
         )
+        self._worktree_results[cmd_key] = {
+            "status": "queued", "child_session_id": child_session_id,
+            "action": action,
+            "expected_revision": expected_revision,
+        }
         return cmd_key
 
     def get_worktree_command_status(self, child_session_id: str, action: str) -> dict | None:
@@ -1685,28 +1212,13 @@ class SessionRuntime:
             try:
                 _run_id = getattr(_run_ctx, "run_id", None)
                 if _run_id:
-                    _updated = self._store.update_run(
+                    _updated = self._store.start_run_with_event(
                         _run_id,
-                        status="running",
-                        expect_status="queued",
+                        getattr(_run_ctx, "session_id", session_id),
+                        turn_id=getattr(_run_ctx, "turn_id", ""),
+                        turn_index=getattr(_run_ctx, "turn_index", 0),
                     )
-                    if _updated:
-                        # Emit run_started WS event (synthetic)
-                        if self._publish_run_terminal is not None:
-                            import uuid as _uuid_mod
-                            from datetime import datetime as _dt, timezone as _tz
-                            self._publish_run_terminal(
-                                getattr(_run_ctx, "session_id", session_id),
-                                {
-                                    "type": "run_started",
-                                    "run_id": _run_id,
-                                    "turn_id": getattr(_run_ctx, "turn_id", ""),
-                                    "turn_index": getattr(_run_ctx, "turn_index", 0),
-                                    "timestamp": _dt.now(_tz.utc).isoformat(),
-                                    "event_id": str(_uuid_mod.uuid4()),
-                                },
-                            )
-                    else:
+                    if not _updated:
                         logger.warning("Run %s CAS transition queued→running failed", _run_id)
             except Exception:
                 logger.debug("Run lifecycle transition skipped", exc_info=True)
@@ -1755,19 +1267,15 @@ class SessionRuntime:
             )
             self._active_evidence_stores[session_id] = _evidence_store
 
-            # ── Phase 4a: Consume pre-run config once ──
-            _pre_cfg = self._pending_config.pop(session_id, None)
-            if _pre_cfg is not None and _pre_cfg.is_stale:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    'Session %s pre-run config is stale (%.1fs) — discarded',
-                    session_id[:8], _time.perf_counter() - _pre_cfg.created_at,
+            # ── Wire WS event callback for live evidence streaming ──
+            if self._event_callback is not None:
+                _evidence_store._event_callback = lambda entry: (
+                    self._publish_evidence_event(entry, session_id)
                 )
-                _pre_cfg = None
 
             # ── Flush pending skill activations into evidence ──
-            _pending_activations = (
-                _pre_cfg.pending_skill_activations if _pre_cfg is not None else []
+            _pending_activations = self._pending_skill_activations.pop(
+                session_id, [],
             )
             _flush_skill_activations(_evidence_store, _pending_activations)
             if self._mcp_integration is not None:
@@ -1910,7 +1418,7 @@ class SessionRuntime:
             # sessions cannot interfere.
             from hitl.pipeline import PermissionSessionConfig
 
-            _web_cb = _pre_cfg.web_confirm_callback if _pre_cfg is not None else None
+            _web_cb = self._web_confirm_callbacks.pop(session_id, None)
             agent._full_registry.configure_permission_session(
                 PermissionSessionConfig(
                     mode=inject_permission_mode,
@@ -2008,16 +1516,8 @@ class SessionRuntime:
                     )
 
             history = ConversationHistory(max_messages=agent_cfg.history_max_messages)
-            from capabilities import build_capability_sections
-            agent._capability_sections = build_capability_sections(
-                spec=spec,
-                skill_registry=self._base_registry.skill_registry,
-                mcp_integration=self._mcp_integration,
-                agent_registry=self._agent_registry,
-            )
             injected_messages = self._build_runtime_messages(
                 spec, task_description, session_id=session_id,
-                inject_capability_context=False,
             )
             # Preloaded skills are discovered while building runtime messages.
             # record_skill_activation() writes them directly to the active Store.
@@ -2118,7 +1618,13 @@ class SessionRuntime:
             # (snip/micro-compact) rebuilds history objects in-place.
             import hashlib
 
-            from context.constants import matches_runtime_prefix
+            _RUNTIME_PREFIXES = ("[TASK ANCHOR]", "[ENVIRONMENT]", "[PRELOADED SKILLS]",
+                                 "[AGENT MEMORY]", "[TASK MODE]", "[ACTIVE POLICY]",
+                                 "[FEEDBACK]", "[PREVIOUS SESSION CONTEXT]",
+                                 "[SYSTEM]", "[MEMORY RESTORED]",
+                                 "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]",
+                                 "[Conversation compacted",
+                                 "[Earlier conversation summarized")
 
             def _msg_fingerprint(msg: LLMMessage) -> str:
                 """Stable content fingerprint — survives object recreation."""
@@ -2153,7 +1659,7 @@ class SessionRuntime:
                     if _msg_fingerprint(message) in _pre_run_fingerprints:
                         continue
                     content = str(message.content or "")
-                    if matches_runtime_prefix(content):
+                    if any(content.startswith(p) for p in _RUNTIME_PREFIXES):
                         continue
                     if _tid:
                         message.turn_id = _tid
@@ -2297,14 +1803,7 @@ class SessionRuntime:
         *,
         error: str = "",
     ) -> None:
-        """Transition run to terminal state and broadcast run_terminal.
-
-        1. CAS-update the Run record (single transaction)
-        2. Broadcast run_terminal via _publish_run_terminal.
-           The callback sends through EventBus.publish_raw() which
-           persists to trace_events AND broadcasts to WS in one code path
-           — same as all other events. No skip_persist bypass.
-        """
+        """Atomically transition a Run and append its durable terminal fact."""
         if run_ctx is None:
             return
         _run_id = getattr(run_ctx, "run_id", None)
@@ -2341,9 +1840,6 @@ class SessionRuntime:
                 else dict(_delta_obj or {})
             )
             _session_id = getattr(run_ctx, "session_id", "")
-            import uuid as _uuid_mod
-            from datetime import datetime as _dt, timezone as _tz
-
             _evidence_manager = getattr(self, "_evidence_stores", None)
             _requirements_by_run = getattr(
                 self, "_active_evidence_requirements", {},
@@ -2395,38 +1891,17 @@ class SessionRuntime:
                 ))
 
             # 1. CAS update — best-effort transition from 'running'
-            _updated = self._store.update_run(
+            _updated = self._store.finalize_run_with_event(
                 _run_id,
+                _session_id,
                 status=status,
                 summary=_summary,
                 steps_taken=_steps,
                 total_tokens=_tokens,
                 error=error,
-                termination_reason=_termination_reason,
-                verification_status=_verification_status,
-                verification_reason=_verification_reason,
-                verification_checks=_checks,
-                workspace_delta=_workspace_delta,
-                expect_status="running",
-            )
-            if not _updated:
-                logger.warning("Run %s CAS running→%s failed (already terminal) — "
-                              "run_terminal will still be emitted",
-                              _run_id[:8], status)
-
-            # 2. Broadcast run_terminal — ALWAYS, even if CAS failed.
-            #    If we don't emit this, the frontend stays in "Running" forever.
-            if self._publish_run_terminal is not None:
-                _terminal_evt = {
-                    "type": "run_terminal",
-                    "run_id": _run_id,
+                event_payload={
                     "turn_id": getattr(run_ctx, "turn_id", ""),
                     "turn_index": getattr(run_ctx, "turn_index", 0),
-                    "status": status,
-                    "summary": _summary,
-                    "steps_taken": _steps,
-                    "total_tokens": _tokens,
-                    "error": error,
                     "termination_reason": _termination_reason,
                     "verification_status": _verification_status,
                     "verification_reason": _verification_reason,
@@ -2436,8 +1911,7 @@ class SessionRuntime:
                         "checks": _checks,
                     },
                     "workspace_delta": ({
-                        key: value
-                        for key, value in _workspace_delta.items()
+                        key: value for key, value in _workspace_delta.items()
                         if key != "patch"
                     } | {
                         "patch_available": bool(_workspace_delta.get("patch")),
@@ -2445,13 +1919,16 @@ class SessionRuntime:
                     "evidence_summary": _build_terminal_evidence_summary(
                         _terminal_store,
                     ),
-                    "timestamp": _dt.now(_tz.utc).isoformat(),
-                    "event_id": str(_uuid_mod.uuid4()),
-                }
-                try:
-                    self._publish_run_terminal(_session_id, _terminal_evt)
-                except Exception:
-                    logger.debug("publish_run_terminal failed", exc_info=True)
+                },
+                expect_status="running",
+            )
+            if not _updated:
+                logger.warning("Run %s CAS running→%s failed (already terminal) — "
+                              "run_terminal will still be emitted",
+                              _run_id[:8], status)
+
+            # 2. Broadcast run_terminal — ALWAYS, even if CAS failed.
+            #    If we don't emit this, the frontend stays in "Running" forever.
         except Exception:
             logger.exception("Failed to finalize run %s", _run_id)
 
@@ -2850,23 +2327,27 @@ class SessionRuntime:
         First call seeds the tracker with the max existing id — no messages
         are returned until new ones are appended.
         """
-        # Phase 4a: Per-session claim cursor (replaces setattr/dynamic attr)
+        key = f"_last_msg_id_{session_id}"
         all_msgs = self._store.list_messages(session_id)
-        max_existing = max(
-            (getattr(msg, "db_id", 0) or 0 for msg in all_msgs),
-            default=0,
-        )
-        last_id = self._claim_cursors.get(session_id)
+        # Find the max existing id
+        max_existing = 0
+        for msg in all_msgs:
+            msg_id = getattr(msg, "db_id", 0) or 0
+            if msg_id > max_existing:
+                max_existing = msg_id
+        # Seed on first call
+        last_id = getattr(self, key, None)
         if last_id is None:
-            self._claim_cursors[session_id] = max_existing
+            setattr(self, key, max_existing)
             return []
+        # Return messages newer than last check
         new_msgs: list[LLMMessage] = []
         for msg in all_msgs:
             msg_id = getattr(msg, "db_id", 0) or 0
             if msg_id > last_id:
                 new_msgs.append(msg)
         if new_msgs:
-            self._claim_cursors[session_id] = max_existing
+            setattr(self, key, max_existing)
             logger.debug("Live steering: %d new message(s) for session %s", len(new_msgs), session_id)
         return new_msgs
 
@@ -2992,7 +2473,7 @@ class SessionRuntime:
             return
         mcp_tool_names = getattr(self._mcp_integration, "tool_names", frozenset())
         for name in mcp_tool_names:
-            self._tool_availability_guard.register(name)
+            self._capability_registry.register(name)
 
         # Check for failed MCP servers
         failed_servers = getattr(self._mcp_integration, "failed_servers", None)
@@ -3000,11 +2481,11 @@ class SessionRuntime:
             for server_name, reason in failed_servers.items():
                 server_tools = getattr(self._mcp_integration, "server_tools", {}).get(server_name, [])
                 for tool_name in server_tools:
-                    self._tool_availability_guard.mark_unavailable(
+                    self._capability_registry.mark_unavailable(
                         tool_name, f"MCP server '{server_name}': {reason}",
                     )
 
-    def _resolve_child_permission_mode(
+    def resolve_child_permission_mode(
         self, parent: AgentDefinition, child: AgentDefinition | None
     ) -> str:
         """CC-aligned: resolve effective permission_mode for a child subagent.
@@ -3042,15 +2523,45 @@ class SessionRuntime:
         child_mode = child.permission_mode if child else ""
         return child_mode or parent_mode
 
-    # ── Headless Web Approval (Phase 4b: delegated to HeadlessApprovalService) ─
+    # ── Headless Web Approval (CC control_request/control_response equivalent) ─
 
-    def _ensure_approval_broker(self, session_id: str) -> "ApprovalBroker":
-        """Get or create the per-session ApprovalBroker (delegated)."""
-        return self._approval_service.get_or_create(session_id)
+    def ensure_approval_broker(self, session_id: str) -> "ApprovalBroker":
+        """Get or create the per-session ApprovalBroker. (P2: public API)
+
+        One broker per session.  The agent thread blocks on
+        ``broker.wait_for_decision()``; the HTTP handler resolves via
+        ``broker.resolve()``.  This is the exact same synchronous-blocking
+        pattern as CC's stdin ``control_response``.
+        """
+        with self._active_sessions_lock:
+            if session_id not in self._approval_brokers:
+                from server.services.approval_broker import ApprovalBroker
+                self._approval_brokers[session_id] = ApprovalBroker(session_id)
+            return self._approval_brokers[session_id]
 
     def get_approval_broker(self, session_id: str) -> "ApprovalBroker | None":
-        """Return the ApprovalBroker for *session_id*, if one exists (delegated)."""
-        return self._approval_service.get(session_id)
+        """Return the ApprovalBroker for *session_id*, if one exists."""
+        with self._active_sessions_lock:
+            return self._approval_brokers.get(session_id)
+
+    # ── R4: IoC ports — replace direct _ field writes from server layer ──
+
+    def set_web_mode(self, enabled: bool) -> None:
+        self._is_web_mode = enabled
+
+    def set_stats_recorder(self, recorder: object | None) -> None:
+        self._stats_recorder = recorder
+
+    def set_evidence_event_callback(self, callback: object | None) -> None:
+        if hasattr(self, "_evidence_stores") and self._evidence_stores is not None:
+            self._evidence_stores.set_event_callback(callback)
+
+    def set_memory_event_callback(self, callback: object | None) -> None:
+        self._memory_event_callback = callback
+
+    def update_run(self, run_id: str, **kwargs) -> object:
+        """Public accessor for SessionStore.update_run()."""
+        return self._store.update_run(run_id, **kwargs)
 
     def set_web_confirm_callback(
         self, session_id: str, callback: "WebConfirmCallback",
@@ -3060,7 +2571,7 @@ class SessionRuntime:
         Called by agent_service before run_session().  The callback is
         injected into the PermissionPipeline during registry construction.
         """
-        self._get_config(session_id).web_confirm_callback = callback
+        self._web_confirm_callbacks[session_id] = callback
 
     def set_stream_callback(
         self, session_id: str, callback: "StreamCallback",
@@ -3071,7 +2582,7 @@ class SessionRuntime:
         each text delta is forwarded to this callback so the frontend can
         render thoughts as they arrive instead of waiting for completion.
         """
-        self._get_config(session_id).stream_callback = callback
+        self._stream_callbacks[session_id] = callback
 
     def set_text_stream_callbacks(
         self,
@@ -3085,29 +2596,47 @@ class SessionRuntime:
           - lifecycle_callback("start"|"end"|"aborted", block_id, reason)
           - delta_callback(block_id, text)
         """
-        cfg = self._get_config(session_id)
-        cfg.text_lifecycle_callback = lifecycle_callback
-        cfg.text_delta_callback = delta_callback
+        self._text_lifecycle_callbacks[session_id] = lifecycle_callback
+        self._text_delta_callbacks[session_id] = delta_callback
 
     # ── Model switching (mid-session) ────────────────────────────────────
 
     def set_pending_model(self, session_id: str, model: str, provider: str = "") -> None:
-        cfg = self._get_config(session_id)
-        cfg.model_switch = model
-        cfg.model_provider = provider
+        """Queue a model switch for the next run of *session_id*.
+
+        The switch takes effect on the next call to run_session() —
+        the backend is rebuilt before the agent starts.
+        """
+        if not hasattr(self, '_pending_model_switches'):
+            self._pending_model_switches: dict[str, tuple[str, str]] = {}
+        self._pending_model_switches[session_id] = (model, provider)
 
     def pop_pending_model(self, session_id: str) -> tuple[str, str] | None:
-        cfg = self._pending_config.get(session_id)
-        if cfg is None or not cfg.model_switch:
-            return None
-        return (cfg.model_switch, cfg.model_provider)
+        """Pop and return a queued model switch, or None."""
+        return getattr(self, '_pending_model_switches', {}).pop(session_id, None)
 
     def set_pending_effort(self, session_id: str, effort: str) -> None:
-        self._get_config(session_id).effort = effort
+        if not hasattr(self, '_pending_effort'):
+            self._pending_effort: dict[str, str] = {}
+        self._pending_effort[session_id] = effort
 
     def pop_pending_effort(self, session_id: str) -> str | None:
-        cfg = self._pending_config.get(session_id)
-        return cfg.effort if cfg is not None else None
+        return getattr(self, '_pending_effort', {}).pop(session_id, None)
+
+    def _publish_evidence_event(self, entry: Any, session_id: str) -> None:
+        """Publish an EvidenceEntry as a WS event through the EventBus."""
+        if self._event_callback is None:
+            return
+        try:
+            from agent.task import Event, EventType
+            self._event_callback(Event(
+                event_type=EventType("evidence_record"),
+                task_id=session_id,
+                session_id=session_id,
+                payload={"evidence": entry.to_dict()},
+            ))
+        except Exception:
+            pass
 
     def record_skill_activation(
         self, skill_name: str, *, source: str = "", fingerprint: str = "",
@@ -3127,21 +2656,28 @@ class SessionRuntime:
         if active_store is not None:
             _flush_skill_activations(active_store, [activation])
             return
-        self._get_config(session_id).pending_skill_activations.append(activation)
+        self._pending_skill_activations.setdefault(session_id, []).append(
+            activation,
+        )
 
     def set_pending_skill_modifier(self, session_id: str, modifier: Any) -> None:
-        self._get_config(session_id).skill_modifier = modifier
+        if not hasattr(self, "_pending_skill_modifiers"):
+            self._pending_skill_modifiers: dict[str, Any] = {}
+        self._pending_skill_modifiers[session_id] = modifier
 
     def pop_pending_skill_modifier(self, session_id: str) -> Any:
-        cfg = self._pending_config.get(session_id)
-        return cfg.skill_modifier if cfg is not None else None
+        return getattr(self, "_pending_skill_modifiers", {}).pop(
+            session_id,
+            None,
+        )
 
     def set_pending_thinking(self, session_id: str, enabled: bool) -> None:
-        self._get_config(session_id).thinking = enabled
+        if not hasattr(self, '_pending_thinking'):
+            self._pending_thinking: dict[str, bool] = {}
+        self._pending_thinking[session_id] = enabled
 
     def pop_pending_thinking(self, session_id: str) -> bool | None:
-        cfg = self._pending_config.get(session_id)
-        return cfg.thinking if cfg is not None else None
+        return getattr(self, '_pending_thinking', {}).pop(session_id, None)
 
     def set_pending_permission_mode_override(self, session_id: str, mode: str) -> None:
         self.set_permission_mode_for_session(session_id, mode)
@@ -3149,7 +2685,7 @@ class SessionRuntime:
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()
-        from agent.tool_availability_guard import ToolAvailabilityState
+        from agent.capability_registry import CapabilityState
         server_tools = self._mcp_integration.server_tools
         raw_names: set[str] = set()
 
@@ -3190,7 +2726,7 @@ class SessionRuntime:
         return frozenset(
             n
             for n in raw_names
-            if self._tool_availability_guard.state_for(n) is ToolAvailabilityState.AVAILABLE
+            if self._capability_registry.state_for(n) is CapabilityState.AVAILABLE
         )
 
     def _build_agent_config(self, spec: AgentDefinition) -> AgentConfig:
@@ -3208,7 +2744,6 @@ class SessionRuntime:
     def _build_runtime_messages(
         self, spec: AgentDefinition, task_description: str, *,
         session_id: str = "",
-        inject_capability_context: bool = True,
     ) -> list[LLMMessage]:
         """委托给 runtime_prompt_builder。"""
         from agent.session.runtime_prompt_builder import build_runtime_messages
@@ -3225,9 +2760,7 @@ class SessionRuntime:
             agent_registry=self._agent_registry,
             project_dir=self._agent_registry.project_dir if self._agent_registry else None,
             skill_registry=skill_registry,
-            mcp_integration=self._mcp_integration,
             on_skill_preload=_on_preload,
-            inject_capability_context=inject_capability_context,
         )
 
 

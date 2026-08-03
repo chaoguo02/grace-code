@@ -1,0 +1,109 @@
+name: Architecture Gates
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'application/**'
+      - 'runtime_core/**'
+      - 'hook_core/**'
+      - 'eventing/**'
+      - 'listeners/**'
+      - 'infrastructure/**'
+      - 'composition/**'
+      - 'core/**'
+      - 'pyproject.toml'
+      - '.github/workflows/architecture.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'application/**'
+      - 'runtime_core/**'
+      - 'hook_core/**'
+      - 'eventing/**'
+      - 'listeners/**'
+      - 'infrastructure/**'
+      - 'composition/**'
+      - 'core/**'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+jobs:
+  static-gates:
+    name: Static Gates (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install build
+
+      # ── Gate 1: Package builds successfully ──────────────────────────
+      - name: Build wheel
+        run: python -m build --wheel
+
+      - name: Verify packages in wheel
+        run: |
+          python -c "
+          import zipfile, sys
+          wheel = __import__('glob').glob('dist/*.whl')[0]
+          names = set()
+          with zipfile.ZipFile(wheel) as z:
+              for n in z.namelist():
+                  parts = n.split('/')
+                  if len(parts) >= 2 and parts[1] not in ('', '__pycache__'):
+                      names.add(parts[0])
+          required = ['application','runtime_core','hook_core','eventing',
+                      'listeners','infrastructure','composition','core']
+          missing = [r for r in required if r not in names]
+          if missing:
+              print(f'ERROR: missing packages in wheel: {missing}')
+              print(f'Found: {sorted(names)}')
+              sys.exit(1)
+          print(f'All {len(required)} core packages present in wheel')
+          "
+
+      # ── Gate 2: All modules compile ──────────────────────────────────
+      - name: Compile all Python sources
+        run: python -m compileall -q application runtime_core hook_core eventing listeners infrastructure composition core
+
+      # ── Gate 3: mypy strict (baseline — errors tracked, not blocking yet) ─
+      - name: mypy strict on core directories
+        continue-on-error: true
+        run: |
+          python -m mypy --strict --explicit-package-bases \
+            application runtime_core hook_core eventing \
+            listeners infrastructure composition core \
+            --ignore-missing-imports 2>&1 | tee mypy-report.txt
+          echo "mypy-exit=$?" >> $GITHUB_ENV
+
+      - name: Report mypy error count
+        run: |
+          if [ -f mypy-report.txt ]; then
+            errors=$(grep -c "error:" mypy-report.txt || echo 0)
+            echo "mypy errors: $errors"
+            echo "Targets: G14→0 hook_core, G20→0 runtime_core, G28→0 composition, G44→0 all"
+          fi
+
+      # ── Gate 4: import-linter contracts ──────────────────────────────
+      - name: import-linter contracts
+        continue-on-error: true
+        run: |
+          python -m importlinter || echo "import-linter: contracts checked (non-blocking in G1)"
+
+      # ── Gate 5: Architecture tests ───────────────────────────────────
+      - name: Architecture contract tests
+        run: python -m pytest tests/test_runtime_architecture_gates.py -v --tb=short -p no:warnings

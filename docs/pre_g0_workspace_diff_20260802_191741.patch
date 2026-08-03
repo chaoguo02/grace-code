@@ -1,0 +1,2818 @@
+﻿diff --git a/application/coordinators/run_coordinator.py b/application/coordinators/run_coordinator.py
+index b8642b7..1c90781 100644
+--- a/application/coordinators/run_coordinator.py
++++ b/application/coordinators/run_coordinator.py
+@@ -49,15 +49,35 @@ class RunCoordinator:
+         ))
+ 
+     def submit(self, cmd: SubmitRun) -> EventEnvelope:
+-        """Submit a new run.  Creates Run + RunSubmitted fact in one UoW."""
++        """Submit a new run.  Creates Run + Message + RunSubmitted fact in one UoW.
++
++        State mutation (increment_generation, create_run, insert_message)
++        and fact append (append_fact) share the same transaction.
++        """
+         run_id = RunId(str(uuid.uuid4()))
++        turn_id = str(uuid.uuid4())
+         scope = self._scope_factory(cmd.session_id)
+-        envelope = _envelope_for(
+-            "run.submitted.v1", scope, run_id, 1,
+-            submitted(str(run_id)),
+-        )
+-        self._uow.execute(lambda tx: tx.append_fact(envelope))
+-        return envelope
++
++        def _mutate(tx) -> EventEnvelope:
++            turn_index = tx.increment_generation(cmd.session_id)
++            tx.create_run(
++                run_id=run_id, session_id=cmd.session_id,
++                turn_id=turn_id, turn_index=turn_index,
++                idempotency_key=cmd.idempotency_key, prompt=cmd.prompt,
++            )
++            tx.insert_message(
++                session_id=cmd.session_id, role="user",
++                content=cmd.prompt, turn_id=turn_id,
++            )
++            envelope = _envelope_for(
++                "run.submitted.v1", scope, run_id, 1,
++                submitted(str(run_id), turn_index=turn_index,
++                          turn_id=turn_id),
++            )
++            tx.append_fact(envelope)
++            return envelope
++
++        return self._uow.execute(_mutate)
+ 
+     def execute(self, cmd: ExecuteRun) -> RuntimeOutcome:
+         """Execute a run via Runtime."""
+diff --git a/application/events/run_facts.py b/application/events/run_facts.py
+index 310ecd9..fe9d928 100644
+--- a/application/events/run_facts.py
++++ b/application/events/run_facts.py
+@@ -27,6 +27,7 @@ class RunTerminalStatus(StrEnum):
+ class RunSubmittedV1:
+     run_id: RunId
+     turn_index: int = 0
++    turn_id: str = ""
+ 
+     def __post_init__(self) -> None:
+         if self.turn_index < 0:
+@@ -90,8 +91,10 @@ class RunGaveUpV1:
+ 
+ # ── Factory helpers ─────────────────────────────────────────────────────────
+ 
+-def submitted(run_id: str, turn_index: int = 0) -> RunSubmittedV1:
+-    return RunSubmittedV1(run_id=RunId(run_id), turn_index=turn_index)
++def submitted(run_id: str, turn_index: int = 0,
++              turn_id: str = "") -> RunSubmittedV1:
++    return RunSubmittedV1(run_id=RunId(run_id), turn_index=turn_index,
++                          turn_id=turn_id)
+ 
+ def started(run_id: str, turn_index: int = 0) -> RunStartedV1:
+     return RunStartedV1(run_id=RunId(run_id), turn_index=turn_index)
+diff --git a/application/events/schema_registry.py b/application/events/schema_registry.py
+index f640379..2a4aafa 100644
+--- a/application/events/schema_registry.py
++++ b/application/events/schema_registry.py
+@@ -7,7 +7,10 @@ Only registered payload classes can be wrapped in EventEnvelope.
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++import types as _types
++import uuid as _uuid
++from dataclasses import dataclass, fields as dc_fields
++from datetime import datetime, timezone
+ from typing import Any
+ 
+ from application.events.run_facts import (
+@@ -19,6 +22,12 @@ from application.events.delegation_facts import (
+     DelegationCreatedV1, DelegationCompletedV1,
+     ChildTaskStartedV1, ChildTaskCompletedV1,
+ )
++from core.eventing.identifiers import RunId, TaskId, SessionId, EventId
++from core.eventing.scope import ScopeToken, ScopeKind
++from application.events.envelope import (
++    EventEnvelope, EventTypeName, SchemaVersion, EventSource,
++    CorrelationId, AggregateId, AggregateVersion,
++)
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -82,6 +91,96 @@ class SchemaRegistry:
+             return False
+         return isinstance(payload, entry.payload_class)
+ 
++    # ── Decode ──────────────────────────────────────────────────────────
++
++    def decode(self, json_str: str) -> EventEnvelope:
++        """Decode canonical JSON back to typed EventEnvelope.
++
++        Reconstructs the exact payload class registered for event_type.
++        Supports round-trip: decode(encode(envelope)) == envelope.
++        """
++        import json as _json
++
++        data = _json.loads(json_str)
++        event_type = data["event_type"]
++
++        entry = self._entries.get(event_type)
++        if entry is None:
++            raise ValueError(f"Unknown event type: {event_type}")
++
++        payload = _build_payload(entry.payload_class, data.get("payload", {}))
++
++        # Reconstruct scope
++        scope_data = data["scope"]
++        scope = ScopeToken(
++            kind=ScopeKind(scope_data["kind"]),
++            global_id=_uuid.UUID(scope_data["global_id"]),
++            generation=scope_data["generation"],
++            session_id=SessionId(scope_data["session_id"]) if scope_data.get("session_id") else None,
++            task_id=TaskId(scope_data["task_id"]) if scope_data.get("task_id") else None,
++        )
++
++        # Reconstruct source (format: "component/process_id")
++        source_str = data["source"]
++        if "/" in source_str:
++            component, process_id = source_str.split("/", 1)
++        else:
++            component, process_id = source_str, ""
++
++        return EventEnvelope(
++            event_id=EventId(value=_uuid.UUID(data["event_id"])),
++            event_type=EventTypeName(event_type),
++            schema_version=SchemaVersion(data["schema_version"]),
++            occurred_at=datetime.fromisoformat(data["occurred_at"]),
++            source=EventSource(process_id=process_id, component=component),
++            scope=scope,
++            correlation_id=CorrelationId(data["correlation_id"]),
++            causation_id=EventId(value=_uuid.UUID(data["causation_id"])) if data.get("causation_id") else None,
++            aggregate_id=AggregateId(data["aggregate_id"]),
++            aggregate_version=AggregateVersion(data["aggregate_version"]),
++            payload=payload,
++        )
++
+     @property
+     def registered_types(self) -> list[str]:
+         return sorted(self._entries.keys())
++
++
++# ── Payload reconstruction helpers ────────────────────────────────────────
++
++def _build_payload(payload_class: type, data: dict) -> Any:
++    """Reconstruct a typed payload dataclass from a plain dict."""
++    kwargs: dict[str, Any] = {}
++    for f in dc_fields(payload_class):
++        key = f.name
++        if key not in data:
++            continue
++        kwargs[key] = _coerce_field(f.type, data[key])
++    return payload_class(**kwargs)
++
++
++def _coerce_field(target_type: type, value: Any) -> Any:
++    """Coerce a JSON value to match the expected field type annotation."""
++    if value is None:
++        return None
++
++    # Handle Optional[X] = X | None (Python 3.10+ UnionType)
++    origin = getattr(target_type, '__origin__', None)
++    if origin is _types.UnionType:
++        args = getattr(target_type, '__args__', ())
++        non_none = [a for a in args if a is not type(None)]
++        if len(non_none) == 1:
++            return _coerce_field(non_none[0], value)
++        return value
++
++    # Handle nested dataclass (including RunId, TaskId) — dict values from asdict()
++    if hasattr(target_type, '__dataclass_fields__') and isinstance(value, dict):
++        return _build_payload(target_type, value)
++
++    # Value objects with single-arg string constructors (plain string values)
++    if target_type is RunId and isinstance(value, str):
++        return RunId(value)
++    if target_type is TaskId and isinstance(value, str):
++        return TaskId(value)
++
++    return value
+diff --git a/application/transactions/unit_of_work.py b/application/transactions/unit_of_work.py
+index 87790f8..352b883 100644
+--- a/application/transactions/unit_of_work.py
++++ b/application/transactions/unit_of_work.py
+@@ -6,7 +6,9 @@ Protocol only.  No SQLite, no server imports.  Eliminates agent→server depende
+ 
+ from __future__ import annotations
+ 
+-from typing import Protocol, Callable
++from typing import Protocol, Callable, TypeVar
++
++T = TypeVar("T")
+ 
+ 
+ class TransactionError(RuntimeError):
+@@ -20,6 +22,26 @@ class SessionTransaction(Protocol):
+     commit atomically or roll back together.
+     """
+ 
++    # ── State mutation methods ───────────────────────────────────────────
++
++    def increment_generation(self, session_id) -> int:
++        """Increment session's run_generation, return the NEW turn_index.
++
++        Must be called inside a transaction.  Raises ValueError if session
++        does not exist.
++        """
++        ...
++
++    def create_run(self, *, run_id, session_id, turn_id, turn_index,
++                   idempotency_key: str, prompt: str) -> None:
++        """Insert a row into the runs table with status='queued'."""
++        ...
++
++    def insert_message(self, *, session_id, role: str, content: str,
++                       turn_id: str) -> None:
++        """Insert a row into session_messages."""
++        ...
++
+     def append_fact(self, envelope) -> None:
+         """Append a durable fact event to the outbox.
+ 
+@@ -28,6 +50,8 @@ class SessionTransaction(Protocol):
+         """
+         ...
+ 
++    # ── Transaction control ──────────────────────────────────────────────
++
+     def commit(self) -> None:
+         """Commit the transaction.  Raises TransactionError on failure."""
+         ...
+@@ -41,15 +65,19 @@ class SessionUnitOfWork(Protocol):
+     """Transaction boundary for one session-scoped operation.
+ 
+     Usage:
+-        uow.execute(lambda tx: (
++        result = uow.execute(lambda tx: (
++            tx.increment_generation(sid),
++            tx.create_run(...),
++            tx.insert_message(...),
+             tx.append_fact(envelope),
+-            # ... other state writes via tx methods
+         ))
+     """
+ 
+-    def execute(self, fn: Callable[[SessionTransaction], None]) -> None:
++    def execute(self, fn: Callable[[SessionTransaction], T]) -> T:
+         """Run *fn* in a transaction.  Commit on success, rollback on error.
+ 
++        Returns whatever *fn* returns.
++
+         Raises:
+             TransactionError: if commit fails.
+         """
+diff --git a/composition/runtime_composition.py b/composition/runtime_composition.py
+index cc17321..af16289 100644
+--- a/composition/runtime_composition.py
++++ b/composition/runtime_composition.py
+@@ -25,8 +25,8 @@ class RuntimeComposition:
+     def assemble(self) -> dict:
+         """Return a dict of assembled components, keyed by role name.
+ 
+-        P19: Wired to run_submission.py via GRACE_RUNTIME_MODE=NATIVE.
+-        P20-P22: Multi-agent, Context, Worktree extraction pending.
++        When mode is NATIVE or SHADOW, the returned dict includes a fully
++        wired pipeline: OutboxRelay → ScopedEventBus → Projections.
+         """
+         components: dict = {"mode": self._mode}
+ 
+@@ -41,27 +41,118 @@ class RuntimeComposition:
+             from listeners.projection_runner import ProjectionRunner
+             from listeners.ws_gateway import WsGateway
+             from listeners.stats_projection import StatsProjection
++            from eventing.scoped_bus import ScopedEventBus
+ 
+             registry = SchemaRegistry()
+             outbox = SqliteOutboxStore(self._db_path, registry)
++            bus = ScopedEventBus()
++
++            # ── Projections ──────────────────────────────────────────
+             trace = TraceProjection(self._db_path)
+             stats = StatsProjection()
+-            runner = ProjectionRunner([trace, stats])
+             ws_gw = WsGateway()
+-            ports = RuntimePorts()
+ 
++            # Subscribe projections to the bus (GLOBAL scope — they
++            # receive all events; scope filtering is per-session via
++            # the bus's own publish logic which matches envelope.scope).
++            bus.subscribe("run.submitted.v1", trace.on_event, "trace")
++            bus.subscribe("run.started.v1", trace.on_event, "trace")
++            bus.subscribe("run.completed.v1", trace.on_event, "trace")
++            bus.subscribe("run.failed.v1", trace.on_event, "trace")
++            bus.subscribe("run.cancelled.v1", trace.on_event, "trace")
++            bus.subscribe("run.blocked.v1", trace.on_event, "trace")
++            bus.subscribe("run.gave_up.v1", trace.on_event, "trace")
++
++            for et in registry.registered_types:
++                if et.startswith("run."):
++                    bus.subscribe(et, stats.on_event, "stats")
++                    bus.subscribe(et, ws_gw.on_event, "ws_gateway")
++
++            # ── Delivery pipeline ────────────────────────────────────
+             def _deliver(record):
+-                pass  # P19: envelope reconstruction pending mapper
++                """Decode outbox JSON → typed EventEnvelope → publish to bus.
++
++                Exceptions MUST propagate so the Relay can reschedule/DLQ
++                instead of falsely marking the event as delivered.
++                """
++                envelope = registry.decode(record.payload_json)
++                bus.publish(envelope)
+ 
+             relay = OutboxRelay(outbox, _deliver)
+-            runtime = AgentRuntime(ports)
+-            coordinator = RunCoordinator(runtime, None)
++            runtime = AgentRuntime(RuntimePorts())
++            coordinator = RunCoordinator(runtime, None)  # UoW injected per-request
+ 
+             for k, v in [
+                 ("registry", registry), ("outbox", outbox), ("relay", relay),
+-                ("runtime", runtime), ("coordinator", coordinator),
++                ("bus", bus), ("runtime", runtime), ("coordinator", coordinator),
+                 ("trace", trace), ("stats", stats), ("ws_gateway", ws_gw),
+             ]:
+                 components[k] = v
+ 
+         return components
++
++
++def start_native_pipeline(db_path: str) -> dict:
++    """Start the native event pipeline: OutboxRelay → ScopedEventBus → Projections.
++
++    Call this once at server startup when GRACE_RUNTIME_MODE=NATIVE.
++    Returns a dict with {'relay', 'bus', 'shutdown'} — call shutdown() to stop.
++    """
++    import logging
++    logger = logging.getLogger(__name__)
++
++    from application.events.schema_registry import SchemaRegistry
++    from infrastructure.outbox.sqlite_store import SqliteOutboxStore
++    from infrastructure.outbox.relay import OutboxRelay
++    from listeners.trace_projection import TraceProjection
++    from listeners.stats_projection import StatsProjection
++    from listeners.ws_gateway import WsGateway
++    from eventing.scoped_bus import ScopedEventBus
++
++    registry = SchemaRegistry()
++    outbox = SqliteOutboxStore(db_path, registry)
++    bus = ScopedEventBus()
++
++    # Install outbox DDL
++    import sqlite3
++    conn = sqlite3.connect(db_path)
++    try:
++        SqliteOutboxStore.install(conn)
++        conn.commit()
++    finally:
++        conn.close()
++
++    # Projections
++    trace = TraceProjection(db_path)
++    stats = StatsProjection()
++    ws_gw = WsGateway()
++
++    # Subscribe projections to run events
++    for et in registry.registered_types:
++        if et.startswith("run."):
++            bus.subscribe(et, trace.on_event, "trace")
++            bus.subscribe(et, stats.on_event, "stats")
++            bus.subscribe(et, ws_gw.on_event, "ws_gateway")
++
++    # Delivery: decode outbox JSON → typed envelope → publish to bus
++    # Exceptions MUST propagate so Relay reschedules/DLQs instead of false ACK.
++    def _deliver(record):
++        envelope = registry.decode(record.payload_json)
++        sid = envelope.scope.session_id
++        if sid is not None:
++            try:
++                bus.ensure_session(sid)
++            except Exception:
++                pass  # session already ensured is harmless
++        bus.publish(envelope)
++
++    relay = OutboxRelay(outbox, _deliver)
++    relay.start()
++    logger.info("Native event pipeline started (relay=%s)", relay._worker_id)
++
++    def shutdown():
++        relay.stop()
++        logger.info("Native event pipeline stopped")
++
++    return {"relay": relay, "bus": bus, "trace": trace, "stats": stats,
++            "ws_gateway": ws_gw, "shutdown": shutdown}
+diff --git a/entry/bootstrap/hook_bootstrap.py b/entry/bootstrap/hook_bootstrap.py
+index 862eccb..6b56962 100644
+--- a/entry/bootstrap/hook_bootstrap.py
++++ b/entry/bootstrap/hook_bootstrap.py
+@@ -18,7 +18,8 @@ def init_hook_dispatcher(
+     backend: Any = None,
+ ) -> Any:
+     """Create HookDispatcher with memory consolidation hooks."""
+-    from hooks import HookDispatcher, HookEvent, HookMatcher, HookRegistry, InternalHook
++    from hooks import HookEvent, HookMatcher, HookRegistry, InternalHook
++    from hook_core.bridge import _create_bridge
+ 
+     registry = HookRegistry()
+     settings_path = repo_path / ".grace" / "settings.json"
+@@ -50,5 +51,5 @@ def init_hook_dispatcher(
+                 pass
+         registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))
+ 
+-    dispatcher = HookDispatcher(registry, cwd=str(repo_path.resolve()))
++    dispatcher = _create_bridge(registry, cwd=str(repo_path.resolve()))
+     return dispatcher
+diff --git a/eventing/scoped_bus.py b/eventing/scoped_bus.py
+index e940965..b5768b8 100644
+--- a/eventing/scoped_bus.py
++++ b/eventing/scoped_bus.py
+@@ -12,13 +12,36 @@ from typing import Callable
+ 
+ from application.events.envelope import EventEnvelope
+ from core.eventing.identifiers import SessionId, TaskId
+-from core.eventing.scope import ScopeKind
++from core.eventing.scope import ScopeKind, ScopeToken
+ from eventing.scope_tree import ScopeTree, ScopeClosedError, ScopeNotFoundError
+ from eventing.subscription import Subscription
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _scope_matches(
++    sub_scope: ScopeToken | None, event_scope: ScopeToken,
++) -> bool:
++    """Check whether a subscriber's scope matches an event's scope.
++
++    - None / GLOBAL: receives ALL events (backward compat)
++    - SESSION: only events from same session_id
++    - TASK: only events from same session_id AND task_id
++    """
++    if sub_scope is None:
++        return True
++    if sub_scope.kind == ScopeKind.GLOBAL:
++        return True
++    if sub_scope.kind == ScopeKind.SESSION:
++        return event_scope.session_id == sub_scope.session_id
++    if sub_scope.kind == ScopeKind.TASK:
++        return (
++            event_scope.session_id == sub_scope.session_id
++            and event_scope.task_id == sub_scope.task_id
++        )
++    return False
++
++
+ class ScopedEventBus:
+     """Synchronous event bus with exact-scope routing.
+ 
+@@ -47,9 +70,46 @@ class ScopedEventBus:
+ 
+     def close_session(self, session_id: SessionId) -> None:
+         self._tree.close_session(session_id)
++        self._remove_scoped_subscriptions(session_id=session_id)
+ 
+     def close_task(self, session_id: SessionId, task_id: TaskId) -> None:
+         self._tree.close_task(session_id, task_id)
++        self._remove_scoped_subscriptions(
++            session_id=session_id, task_id=task_id,
++        )
++
++    # ── Internal helpers ──────────────────────────────────────────────────
++
++    def _remove_scoped_subscriptions(
++        self,
++        session_id: SessionId | None = None,
++        task_id: TaskId | None = None,
++    ) -> None:
++        """Remove all subscriptions scoped to a given session or task."""
++        for event_type in list(self._subscribers.keys()):
++            kept = []
++            for _sub, handler in self._subscribers[event_type]:
++                sub_scope = _sub.scope
++                if sub_scope is None or sub_scope.kind == ScopeKind.GLOBAL:
++                    # GLOBAL-scope subscribers survive scope close
++                    kept.append((_sub, handler))
++                    continue
++                if task_id is not None and sub_scope.kind == ScopeKind.TASK:
++                    if (
++                        sub_scope.session_id == session_id
++                        and sub_scope.task_id == task_id
++                    ):
++                        continue  # drop this subscription
++                elif (
++                    session_id is not None
++                    and sub_scope.session_id == session_id
++                ):
++                    continue  # drop this subscription
++                kept.append((_sub, handler))
++            if kept:
++                self._subscribers[event_type] = kept
++            else:
++                del self._subscribers[event_type]
+ 
+     def close_all(self) -> None:
+         self._tree.close_all()
+@@ -61,9 +121,18 @@ class ScopedEventBus:
+         event_type: str,
+         handler: Callable[[EventEnvelope], None],
+         subscriber_id: str = "",
++        scope: ScopeToken | None = None,
+     ) -> Subscription:
+-        """Subscribe to *event_type*.  Returns handle for unsubscribe."""
+-        sub = Subscription(event_type, subscriber_id or str(id(handler)))
++        """Subscribe to *event_type*.  Returns handle for unsubscribe.
++
++        *scope* restricts delivery:
++        - None or GLOBAL → receives all events (backward compat)
++        - SESSION → only events from the same session
++        - TASK → only events from the same session AND task
++        """
++        sub = Subscription(
++            event_type, subscriber_id or str(id(handler)), scope=scope,
++        )
+         if event_type not in self._subscribers:
+             self._subscribers[event_type] = []
+         self._subscribers[event_type].append((sub, handler))
+@@ -93,10 +162,12 @@ class ScopedEventBus:
+                 f"(current: {node.generation})"
+             )
+ 
+-        # Deliver to matching subscribers
++        # Deliver to matching subscribers (scope + event_type)
+         for _sub, handler in self._subscribers.get(event_type, []):
+             if _sub.closed:
+                 continue
++            if not _scope_matches(_sub.scope, scope):
++                continue
+             try:
+                 handler(envelope)
+             except Exception:
+diff --git a/eventing/subscription.py b/eventing/subscription.py
+index 552d86e..4109637 100644
+--- a/eventing/subscription.py
++++ b/eventing/subscription.py
+@@ -4,6 +4,11 @@ P4: Subscription token — idempotent close, typed error on double-close.
+ 
+ from __future__ import annotations
+ 
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from core.eventing.scope import ScopeToken
++
+ 
+ class SubscriptionClosedError(RuntimeError):
+     """Subscription has already been closed."""
+@@ -16,12 +21,18 @@ class Subscription:
+     subscriber lists when a subscription is closed.
+     """
+ 
+-    __slots__ = ("_event_type", "_subscriber_id", "_closed")
++    __slots__ = ("_event_type", "_subscriber_id", "_closed", "_scope")
+ 
+-    def __init__(self, event_type: str, subscriber_id: str) -> None:
++    def __init__(
++        self,
++        event_type: str,
++        subscriber_id: str,
++        scope: "ScopeToken | None" = None,
++    ) -> None:
+         self._event_type = event_type
+         self._subscriber_id = subscriber_id
+         self._closed = False
++        self._scope = scope
+ 
+     @property
+     def event_type(self) -> str:
+@@ -31,6 +42,10 @@ class Subscription:
+     def subscriber_id(self) -> str:
+         return self._subscriber_id
+ 
++    @property
++    def scope(self) -> "ScopeToken | None":
++        return self._scope
++
+     @property
+     def closed(self) -> bool:
+         return self._closed
+diff --git a/hook_core/decisions.py b/hook_core/decisions.py
+index 46fef5d..c9235b5 100644
+--- a/hook_core/decisions.py
++++ b/hook_core/decisions.py
+@@ -1,7 +1,8 @@
+ """
+-P9: Hook decision types — frozen, explicit semantics.
++CC-aligned hook decision types — frozen, per-event, explicit semantics.
+ 
+-No Any/dict raw transform.  Each hook event has a specific decision shape.
++Each hook event has a specific decision shape.
++PreToolUse uses a four-way permission model: deny > defer > ask > allow.
+ """
+ 
+ from __future__ import annotations
+@@ -10,13 +11,27 @@ from dataclasses import dataclass, field
+ from enum import StrEnum
+ 
+ 
+-class HookDecision(StrEnum):
+-    ALLOW = "allow"
++class PermissionDecision(StrEnum):
++    """CC-aligned four-way permission with defined precedence.
++
++    Precedence (highest to lowest): deny > defer > ask > allow
++    """
+     DENY = "deny"
++    DEFER = "defer"
+     ASK = "ask"
++    ALLOW = "allow"
+ 
++    @staticmethod
++    def precedence() -> list["PermissionDecision"]:
++        return [
++            PermissionDecision.DENY,
++            PermissionDecision.DEFER,
++            PermissionDecision.ASK,
++            PermissionDecision.ALLOW,
++        ]
+ 
+-class StopDecision(StrEnum):
++
++class StopVerdict(StrEnum):
+     CONTINUE = "continue"
+     BLOCK = "block"
+ 
+@@ -25,7 +40,7 @@ class StopDecision(StrEnum):
+ 
+ @dataclass(frozen=True, slots=True)
+ class PreToolUseDecision:
+-    permission: HookDecision = HookDecision.ALLOW
++    permission: PermissionDecision = PermissionDecision.ALLOW
+     updated_input: dict | None = None
+     reason: str = ""
+ 
+@@ -36,6 +51,15 @@ class PreToolUseDecision:
+ class PostToolUseDecision:
+     additional_context: str = ""
+     replace_output: str | None = None
++    decision: str = ""  # "block" to feed back to model (tool already ran)
++
++
++# ── PostToolUseFailure ──────────────────────────────────────────────────────
++
++@dataclass(frozen=True, slots=True)
++class PostToolUseFailureDecision:
++    additional_context: str = ""
++    decision: str = ""
+ 
+ 
+ # ── UserPromptSubmit ────────────────────────────────────────────────────────
+@@ -44,19 +68,35 @@ class PostToolUseDecision:
+ class UserPromptSubmitDecision:
+     block: bool = False
+     reason: str = ""
++    updated_input: dict | None = None
+ 
+ 
+ # ── Stop ────────────────────────────────────────────────────────────────────
+ 
+ @dataclass(frozen=True, slots=True)
+ class StopDecision:
+-    decision: StopDecision = StopDecision.CONTINUE
++    decision: StopVerdict = StopVerdict.CONTINUE
+     reason: str = ""
+ 
+ 
++# ── SessionStart ────────────────────────────────────────────────────────────
++
++@dataclass(frozen=True, slots=True)
++class SessionStartDecision:
++    additional_context: str = ""
++
++
+ # ── PreCompact ──────────────────────────────────────────────────────────────
+ 
+ @dataclass(frozen=True, slots=True)
+ class PreCompactDecision:
+     block: bool = False
+     reason: str = ""
++
++
++# ── Default (for events without a specific decision shape) ──────────────────
++
++@dataclass(frozen=True, slots=True)
++class ObserveDecision:
++    """Used for notification-only events (SubagentStart, SessionEnd, etc.)."""
++    pass
+diff --git a/hook_core/dispatcher.py b/hook_core/dispatcher.py
+index 94e3236..48ca078 100644
+--- a/hook_core/dispatcher.py
++++ b/hook_core/dispatcher.py
+@@ -1,24 +1,27 @@
+ """
+-P11: Hook Dispatcher — awaited gate, total deadline, deny-overrides.
++CC-aligned HookDispatcher — match, execute, merge.
+ 
+-Aggregates results from multiple hooks.  Deny always wins.
+-Only supports awaited gate (no background hooks in P11).
++Precedence: deny > defer > ask > allow (CC four-way permission model).
++Deny short-circuits immediately.  Defer passes to next hook.
++Transform results are merged from all hooks.
+ """
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
+ import time
++from dataclasses import dataclass, field
+ 
+ from hook_core.decisions import (
+-    HookDecision, StopDecision, PreToolUseDecision, PostToolUseDecision,
+-    UserPromptSubmitDecision,
+-    PreCompactDecision,
++    PermissionDecision,
++    PreToolUseDecision, PostToolUseDecision, PostToolUseFailureDecision,
++    StopDecision, SessionStartDecision, PreCompactDecision,
++    UserPromptSubmitDecision, ObserveDecision,
+ )
++from hook_core.events import BLOCKABLE_EVENTS
+ from hook_core.executor import execute_hook, HookExecution
+ from hook_core.policies import (
+-    HookPolicy, FailurePolicy, DecisionAuthority,
+-    PRETOOL_USE, POSTTOOL_USE, USER_PROMPT_SUBMIT, STOP, PRECOMPACT,
++    HookPolicy, FailurePolicy,
++    policy_for, PRETOOL_USE,
+ )
+ from hook_core.registry import RegistrySnapshot, HookRegistration
+ 
+@@ -27,20 +30,34 @@ class HookDispatchTimeout(RuntimeError):
+     """Total dispatch deadline exceeded."""
+ 
+ 
+-@dataclass(frozen=True, slots=True)
++@dataclass
+ class DispatchResult:
+-    results: tuple[HookExecution, ...]
+-    total_duration_ms: float
++    """Aggregated result from dispatching an event to matching hooks."""
++
++    results: list[HookExecution] = field(default_factory=list)
++    total_duration_ms: float = 0.0
+     blocked: bool = False
+     block_reason: str = ""
+-    merged_decision: object | None = None  # aggregated typed decision
++    # PreToolUse: final permission after merging all hooks
++    permission: PermissionDecision | None = None
++    # Merged transform data
++    updated_input: dict | None = None
++    additional_context: str = ""
++    replace_output: str | None = None
++    # Warnings from non-blocking failures
++    warnings: list[str] = field(default_factory=list)
++
++    @property
++    def merged_decision(self) -> object | None:
++        """Return the final typed decision for backward compatibility."""
++        results = [r for r in self.results if r.decision is not None]
++        return results[-1].decision if results else None
+ 
+ 
+ class HookDispatcher:
+     """Awaited hook gate — dispatches to matching hooks, merges results.
+ 
+-    Deny always overrides allow.
+-    Fail-closed hooks block the operation on failure.
++    Deny always overrides allow.  Defer passes decision to next hook.
+     """
+ 
+     TOTAL_DEADLINE_S = 30.0
+@@ -50,24 +67,20 @@ class HookDispatcher:
+ 
+     def dispatch(
+         self,
+-        snapshot: RegistrySnapshot | None,
+         event_type: str,
+         hook_input: object,
+         *,
++        snapshot: RegistrySnapshot | None = None,
+         tool_name: str = "",
+     ) -> DispatchResult:
+-        """Dispatch to matching hooks, merge results.
+-
+-        For PreToolUse: deny wins over allow over ask.
+-        For Stop: block wins over continue.
+-        """
++        """Dispatch to matching hooks, merge results."""
+         started = time.monotonic()
++        policy = policy_for(event_type)
+         hooks = self._registry.get_hooks(snapshot, event_type, tool_name)
+-        policy = _policy_for(event_type)
++        is_blockable = event_type in {e.value for e in BLOCKABLE_EVENTS}
+ 
+-        results: list[HookExecution] = []
+-        blocked = False
+-        block_reason = ""
++        result = DispatchResult()
++        permission: PermissionDecision | None = None
+ 
+         for hook in hooks:
+             elapsed = time.monotonic() - started
+@@ -76,61 +89,120 @@ class HookDispatcher:
+                     f"Total dispatch deadline {self.TOTAL_DEADLINE_S}s exceeded"
+                 )
+ 
+-            result = execute_hook(hook.name, hook.handler, hook_input, policy)
+-            results.append(result)
+-
+-            # Check if this hook should block
+-            if policy.failure_policy == FailurePolicy.FAIL_CLOSED and result.decision is None:
+-                blocked = True
+-                block_reason = f"Hook '{hook.name}' failed (fail-closed): {result.error}"
+-                break
+-
+-            # Check decision-based blocking
+-            if event_type == "PreToolUse" and result.decision is not None:
+-                d = result.decision
+-                if getattr(d, "permission", None) == HookDecision.DENY:
+-                    blocked = True
+-                    block_reason = getattr(d, "reason", f"Hook '{hook.name}' denied")
+-                    break
+-
+-            if event_type == "Stop" and result.decision is not None:
+-                d = result.decision
+-                if getattr(d, "decision", None) == "block":
+-                    blocked = True
+-                    block_reason = getattr(d, "reason", f"Hook '{hook.name}' blocked stop")
+-                    break
+-
+-        total_ms = (time.monotonic() - started) * 1000
+-        merged = _merge_decisions(event_type, results) if results and not blocked else None
+-
+-        return DispatchResult(
+-            results=tuple(results),
+-            total_duration_ms=total_ms,
+-            blocked=blocked,
+-            block_reason=block_reason,
+-            merged_decision=merged,
+-        )
+-
+-
+-def _policy_for(event_type: str) -> HookPolicy:
+-    if event_type == "PreToolUse":
+-        return PRETOOL_USE
+-    if event_type == "PostToolUse":
+-        return POSTTOOL_USE
+-    if event_type == "UserPromptSubmit":
+-        return USER_PROMPT_SUBMIT
+-    if event_type in ("Stop", "SubagentStop"):
+-        return STOP
+-    if event_type == "PreCompact":
+-        return PRECOMPACT
+-    return HookPolicy(
+-        scheduling="awaited", decision_authority="observe",
+-        data_authority="observe", failure_policy="fail_open",
+-    )
+-
+-
+-def _merge_decisions(event_type: str, results: list[HookExecution]) -> object | None:
+-    for r in results:
+-        if r.decision is not None:
+-            return r.decision
+-    return None
++            # ── stop_hook_active guard ──────────────────────────────
++            if event_type == "Stop" and getattr(hook_input, "stop_hook_active", False):
++                continue  # never block when already in forced continuation
++
++            # ── Execute ─────────────────────────────────────────────
++            execution = execute_hook(hook.name, hook.handler, hook_input, policy)
++            result.results.append(execution)
++
++            # ── Handle failure ──────────────────────────────────────
++            if execution.decision is None:
++                failure_blocks = _resolve_failure(policy.failure_policy, is_blockable)
++                if failure_blocks:
++                    result.blocked = True
++                    result.block_reason = (
++                        f"Hook '{hook.name}' failed (fail-closed): {execution.error}"
++                    )
++                    return result
++                else:
++                    result.warnings.append(
++                        f"Hook '{hook.name}' failed: {execution.error}"
++                    )
++                    continue
++
++            decision = execution.decision
++
++            # ── Process decision by event type ──────────────────────
++            if event_type == "PreToolUse" and isinstance(decision, PreToolUseDecision):
++                perm = decision.permission
++                # Deny → immediate block
++                if perm == PermissionDecision.DENY:
++                    result.blocked = True
++                    result.block_reason = decision.reason or f"Hook '{hook.name}' denied"
++                    result.permission = PermissionDecision.DENY
++                    return result
++                # Track highest-precedence permission
++                permission = _merge_permission(permission, perm)
++                # Merge transforms
++                if decision.updated_input:
++                    result.updated_input = {
++                        **(result.updated_input or {}),
++                        **decision.updated_input,
++                    }
++                if decision.reason and not result.block_reason:
++                    result.block_reason = decision.reason
++
++            elif event_type == "Stop" and isinstance(decision, StopDecision):
++                if decision.decision == "block":
++                    result.blocked = True
++                    result.block_reason = decision.reason or f"Hook '{hook.name}' blocked stop"
++                    return result
++
++            elif event_type in ("PostToolUse", "PostToolUseFailure"):
++                if isinstance(decision, (PostToolUseDecision, PostToolUseFailureDecision)):
++                    if decision.decision == "block":
++                        result.block_reason = decision.reason or result.block_reason
++                    if getattr(decision, "additional_context", ""):
++                        sep = "\n" if result.additional_context else ""
++                        result.additional_context += sep + decision.additional_context
++                    if getattr(decision, "replace_output", None) is not None:
++                        result.replace_output = decision.replace_output
++
++            elif event_type == "UserPromptSubmit" and isinstance(decision, UserPromptSubmitDecision):
++                if decision.block:
++                    result.blocked = True
++                    result.block_reason = decision.reason or f"Hook '{hook.name}' blocked prompt"
++                    return result
++                if decision.updated_input:
++                    result.updated_input = decision.updated_input
++
++            elif event_type == "SessionStart" and isinstance(decision, SessionStartDecision):
++                if decision.additional_context:
++                    sep = "\n" if result.additional_context else ""
++                    result.additional_context += sep + decision.additional_context
++
++            elif event_type == "PreCompact" and isinstance(decision, PreCompactDecision):
++                if decision.block:
++                    result.blocked = True
++                    result.block_reason = decision.reason or f"Hook '{hook.name}' blocked compaction"
++                    return result
++
++        # ── Finalize ────────────────────────────────────────────────
++        result.total_duration_ms = (time.monotonic() - started) * 1000
++        if event_type == "PreToolUse":
++            result.permission = permission or PermissionDecision.ALLOW
++        return result
++
++
++def _merge_permission(current: PermissionDecision | None,
++                      incoming: PermissionDecision) -> PermissionDecision | None:
++    """Merge two permission decisions with defer semantics.
++
++    Defer means "I don't decide — pass to the next hook."
++    Otherwise, highest precedence wins: deny > defer > ask > allow.
++    """
++    if current is None:
++        return incoming
++    # Defer passes the decision to subsequent hooks
++    if incoming == PermissionDecision.DEFER:
++        return current
++    if current == PermissionDecision.DEFER:
++        return incoming
++    # Both are concrete decisions — highest precedence wins
++    prec = PermissionDecision.precedence()
++    cur_idx = prec.index(current)
++    inc_idx = prec.index(incoming)
++    return current if cur_idx <= inc_idx else incoming
++
++
++def _resolve_failure(failure_policy: FailurePolicy, is_blockable: bool) -> bool:
++    """Return True if a hook failure should block the operation."""
++    if failure_policy == FailurePolicy.FAIL_CLOSED:
++        return True
++    if failure_policy == FailurePolicy.EVENT_DEFAULT:
++        return is_blockable
++    if failure_policy == FailurePolicy.FAIL_TURN:
++        return is_blockable
++    return False  # FAIL_OPEN
+diff --git a/hook_core/executor.py b/hook_core/executor.py
+index 3bd8252..c1e9e2b 100644
+--- a/hook_core/executor.py
++++ b/hook_core/executor.py
+@@ -1,15 +1,19 @@
+ """
+-P11: Hook executor — runs a single hook, enforces policy timeout and failure.
++Hook executor — runs a single hook, enforces policy timeout and failure.
+ 
+-No dict return — always returns typed decision or raises.
++Supports two handler types:
++  - callable:  handler(input) → decision
++  - command:   subprocess with stdin JSON, exit-code protocol
+ """
+ 
+ from __future__ import annotations
+ 
++import json
++import subprocess
+ import time
+ from dataclasses import dataclass
+ 
+-from hook_core.policies import HookPolicy, FailurePolicy
++from hook_core.policies import HookPolicy
+ 
+ 
+ class HookTimeoutError(RuntimeError):
+@@ -35,11 +39,27 @@ def execute_hook(
+     hook_input: object,
+     policy: HookPolicy,
+ ) -> HookExecution:
+-    """Execute one hook with policy enforcement.
++    """Execute one hook.
+ 
+-    Returns HookExecution.  On failure, the decision is None.
+-    The caller decides how to handle failures based on FailurePolicy.
++    If *handler* is a callable, calls it synchronously.
++    If *handler* is a string, treats it as a shell command and runs via subprocess.
+     """
++    if callable(handler):
++        return _execute_callable(hook_name, handler, hook_input, policy)
++    if isinstance(handler, str):
++        return _execute_command(hook_name, handler, hook_input, policy)
++    return HookExecution(
++        hook_name=hook_name, decision=None, duration_ms=0.0,
++        error=f"Unsupported handler type: {type(handler).__name__}",
++    )
++
++
++def _execute_callable(
++    hook_name: str,
++    handler,
++    hook_input: object,
++    policy: HookPolicy,
++) -> HookExecution:
+     started = time.monotonic()
+ 
+     try:
+@@ -63,3 +83,128 @@ def execute_hook(
+         hook_name=hook_name, decision=result,
+         duration_ms=duration_ms,
+     )
++
++
++def _execute_command(
++    hook_name: str,
++    command: str,
++    hook_input: object,
++    policy: HookPolicy,
++) -> HookExecution:
++    """Execute a shell command hook with stdin JSON.
++
++    Exit code semantics (CC-aligned):
++      0 = success → stdout parsed as JSON decision
++      2 = blocking error → stderr is the block reason
++      other = non-blocking error
++    """
++    import dataclasses
++
++    started = time.monotonic()
++
++    # Serialize input to JSON for stdin
++    if hasattr(hook_input, '__dataclass_fields__'):
++        input_json = json.dumps(dataclasses.asdict(hook_input))
++    else:
++        input_json = json.dumps(hook_input)
++
++    try:
++        proc = subprocess.run(
++            command, shell=True, capture_output=True, text=True,
++            timeout=policy.timeout_s,
++            input=input_json,
++        )
++    except subprocess.TimeoutExpired:
++        duration_ms = (time.monotonic() - started) * 1000
++        return HookExecution(
++            hook_name=hook_name, decision=None,
++            duration_ms=duration_ms, timed_out=True,
++            error=f"Command '{command}' timed out after {policy.timeout_s}s",
++        )
++    except Exception as exc:
++        duration_ms = (time.monotonic() - started) * 1000
++        return HookExecution(
++            hook_name=hook_name, decision=None,
++            duration_ms=duration_ms, error=str(exc),
++        )
++
++    duration_ms = (time.monotonic() - started) * 1000
++
++    # Exit code 2 = blocking error
++    if proc.returncode == 2:
++        return HookExecution(
++            hook_name=hook_name, decision=None,
++            duration_ms=duration_ms,
++            error=f"[exit 2] {proc.stderr.strip() or 'blocked by hook'}",
++        )
++
++    # Exit code 0 = success, try to parse stdout as JSON
++    if proc.returncode == 0 and proc.stdout.strip():
++        try:
++            parsed = json.loads(proc.stdout)
++        except json.JSONDecodeError:
++            # Treat non-JSON stdout as raw context (for SessionStart etc.)
++            return HookExecution(
++                hook_name=hook_name,
++                decision={"raw_stdout": proc.stdout.strip()},
++                duration_ms=duration_ms,
++            )
++        # Try to convert parsed dict to a typed decision
++        decision = _parse_decision(parsed)
++        if decision is not None:
++            return HookExecution(
++                hook_name=hook_name, decision=decision,
++                duration_ms=duration_ms,
++            )
++        # Return raw parsed dict
++        return HookExecution(
++            hook_name=hook_name, decision=parsed,
++            duration_ms=duration_ms,
++        )
++
++    # Non-zero exit code (not 2) = non-blocking error
++    return HookExecution(
++        hook_name=hook_name, decision=None,
++        duration_ms=duration_ms,
++        error=f"[exit {proc.returncode}] {proc.stderr.strip() or proc.stdout.strip()}",
++    )
++
++
++def _parse_decision(parsed: dict) -> object | None:
++    """Try to convert a parsed JSON dict to a typed decision object."""
++    from hook_core.decisions import (
++        PermissionDecision, PreToolUseDecision, PostToolUseDecision,
++        StopDecision, StopVerdict, UserPromptSubmitDecision,
++    )
++
++    # CC-style: hookSpecificOutput.permissionDecision
++    hso = parsed.get("hookSpecificOutput", parsed)
++
++    if "permissionDecision" in hso:
++        perm_str = hso["permissionDecision"]
++        try:
++            perm = PermissionDecision(perm_str)
++        except ValueError:
++            perm = PermissionDecision.ALLOW
++        return PreToolUseDecision(
++            permission=perm,
++            updated_input=hso.get("updatedInput"),
++            reason=hso.get("permissionDecisionReason", ""),
++        )
++
++    # CC-style: decision: "block" (PostToolUse, Stop)
++    if parsed.get("decision") == "block":
++        reason = parsed.get("reason", "")
++        if "stop_hook" in parsed.get("hook_event_name", "").lower():
++            return StopDecision(decision=StopVerdict.BLOCK, reason=reason)
++        return PostToolUseDecision(decision="block", reason=reason)
++
++    # additionalContext (SessionStart)
++    if "additionalContext" in parsed:
++        from hook_core.decisions import SessionStartDecision
++        return SessionStartDecision(
++            additional_context=parsed["additionalContext"],
++        )
++
++    return None
++
+diff --git a/hook_core/inputs.py b/hook_core/inputs.py
+index 209c254..05b8772 100644
+--- a/hook_core/inputs.py
++++ b/hook_core/inputs.py
+@@ -1,8 +1,8 @@
+ """
+-P9: Hook event-specific input contracts — frozen, no Any/dict.
++CC-aligned hook input contracts — frozen, one class per event.
+ 
+-One input class per hook event.  Each class carries only the fields
+-relevant to that event.  No raw dict passthrough.
++Each input class carries only the fields relevant to its event.
++No dict passthrough for decision-critical fields.
+ """
+ 
+ from __future__ import annotations
+@@ -11,30 +11,62 @@ from dataclasses import dataclass
+ from typing import Any
+ 
+ 
+-# ── PreToolUse ──────────────────────────────────────────────────────────────
++# ── Tool execution ──────────────────────────────────────────────────────────
+ 
+ @dataclass(frozen=True, slots=True)
+ class PreToolUseInput:
+     tool_name: str
+-    tool_input: dict[str, Any]  # JSON-serializable tool params
+-    tool_use_id: str = ""
++    tool_input: dict[str, Any]
+     session_id: str = ""
++    tool_use_id: str = ""
++    cwd: str = ""
+ 
+ 
+-# ── PostToolUse ─────────────────────────────────────────────────────────────
+-
+ @dataclass(frozen=True, slots=True)
+ class PostToolUseInput:
+     tool_name: str
+     tool_input: dict[str, Any]
+     tool_output: str = ""
+-    tool_error: str = ""
+-    tool_use_id: str = ""
+     session_id: str = ""
++    tool_use_id: str = ""
+     success: bool = True
+ 
+ 
+-# ── UserPromptSubmit ────────────────────────────────────────────────────────
++@dataclass(frozen=True, slots=True)
++class PostToolUseFailureInput:
++    tool_name: str
++    tool_input: dict[str, Any]
++    error_message: str = ""
++    error_type: str = ""
++    session_id: str = ""
++    tool_use_id: str = ""
++
++
++@dataclass(frozen=True, slots=True)
++class PostToolBatchInput:
++    session_id: str = ""
++    tool_count: int = 0
++
++
++# ── Permissions ─────────────────────────────────────────────────────────────
++
++@dataclass(frozen=True, slots=True)
++class PermissionRequestInput:
++    tool_name: str
++    tool_input: dict[str, Any]
++    required_permissions: frozenset[str] = frozenset()
++    session_id: str = ""
++    agent_id: str = ""
++
++
++@dataclass(frozen=True, slots=True)
++class PermissionDeniedInput:
++    tool_name: str
++    tool_input: dict[str, Any]
++    session_id: str = ""
++
++
++# ── User input ──────────────────────────────────────────────────────────────
+ 
+ @dataclass(frozen=True, slots=True)
+ class UserPromptSubmitInput:
+@@ -42,28 +74,77 @@ class UserPromptSubmitInput:
+     session_id: str = ""
+ 
+ 
+-# ── Stop ────────────────────────────────────────────────────────────────────
++# ── Model output ────────────────────────────────────────────────────────────
+ 
+ @dataclass(frozen=True, slots=True)
+ class StopInput:
+     session_id: str = ""
++    stop_hook_active: bool = False
++    last_assistant_message: str = ""
+     steps_taken: int = 0
+     tokens_used: int = 0
++    agent_id: str = ""
++    agent_type: str = ""
++    messages: list[dict[str, Any]] | None = None
++
++
++@dataclass(frozen=True, slots=True)
++class StopFailureInput:
++    session_id: str = ""
++    error_type: str = ""  # "rate_limit" | "overloaded" | "billing_error" | ...
++
++
++# ── Session lifecycle ───────────────────────────────────────────────────────
++
++@dataclass(frozen=True, slots=True)
++class SessionStartInput:
++    session_id: str = ""
++    agent_type: str = ""
++    source: str = ""  # "startup" | "resume" | "clear"
++
++
++@dataclass(frozen=True, slots=True)
++class SessionEndInput:
++    session_id: str = ""
++    reason: str = ""  # "completed" | "cancelled" | "error"
+ 
+ 
+-# ── SubagentStop ────────────────────────────────────────────────────────────
++# ── Subagents ───────────────────────────────────────────────────────────────
++
++@dataclass(frozen=True, slots=True)
++class SubagentStartInput:
++    session_id: str = ""
++    agent_id: str = ""
++    agent_type: str = ""
++
+ 
+ @dataclass(frozen=True, slots=True)
+ class SubagentStopInput:
+     session_id: str = ""
++    agent_id: str = ""
+     agent_name: str = ""
+     steps_taken: int = 0
+ 
+ 
+-# ── PreCompact ──────────────────────────────────────────────────────────────
++# ── Compaction ──────────────────────────────────────────────────────────────
+ 
+ @dataclass(frozen=True, slots=True)
+ class PreCompactInput:
+     session_id: str = ""
+     tokens_before: int = 0
+     trigger: str = ""  # "auto" | "manual"
++
++
++@dataclass(frozen=True, slots=True)
++class PostCompactInput:
++    session_id: str = ""
++    tokens_after: int = 0
++
++
++# ── Notifications ───────────────────────────────────────────────────────────
++
++@dataclass(frozen=True, slots=True)
++class NotificationInput:
++    session_id: str = ""
++    message: str = ""
++    level: str = ""  # "info" | "warning" | "error"
+diff --git a/hook_core/matcher.py b/hook_core/matcher.py
+index 8a70053..575a065 100644
+--- a/hook_core/matcher.py
++++ b/hook_core/matcher.py
+@@ -1,55 +1,90 @@
+ """
+-P10: Hook matcher — compiled patterns.  Compile failure → reject config.
++CC-aligned hook matcher — NO regex, NO re module.
++
++Syntax (permission-rule style, aligned with Claude Code):
++  "*" / ""              → all tools
++  "Bash"                → exact match on tool name
++  "Edit|Write"          → pipe-separated OR list
++  "mcp__server__*"      → prefix wildcard (only trailing *)
++
++MCP tools follow convention:  mcp__<server>__<tool>
++Subagent tool name:           Task
++Skill tool name:              Skill
+ """
+ 
+ from __future__ import annotations
+ 
+-import re
+ from dataclasses import dataclass
+ 
+ 
+ class MatcherCompileError(ValueError):
+-    """Pattern could not be compiled — config must be rejected."""
++    """Pattern syntax is invalid — must be rejected at config-load time."""
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class HookMatcher:
+-    """Matches hook invocations by tool name pattern."""
++    """Compiled hook matcher — one pattern per instance."""
+ 
+-    pattern: str
+-    _compiled: re.Pattern = None  # set in __post_init__
++    pattern: str = "*"
+ 
+     def __post_init__(self) -> None:
+-        try:
+-            object.__setattr__(self, "_compiled", re.compile(self.pattern))
+-        except re.error as exc:
+-            raise MatcherCompileError(
+-                f"Invalid hook matcher pattern '{self.pattern}': {exc}"
+-            ) from exc
++        _validate(self.pattern)
+ 
+     def matches(self, tool_name: str) -> bool:
+-        return bool(self._compiled.match(tool_name))
++        """Return True if *tool_name* matches this matcher."""
++        if not self.pattern or self.pattern == "*":
++            return True
++        for part in self.pattern.split("|"):
++            part = part.strip()
++            if not part:
++                continue
++            if part.endswith("*"):
++                prefix = part[:-1]
++                if tool_name.startswith(prefix):
++                    return True
++            elif part == tool_name:
++                return True
++        return False
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class HookSelector:
+-    """Selects which hooks fire for an event.
++    """Composite selector — OR of multiple matchers.
+ 
+-    If matchers is empty, the hook fires for ALL tools.
+-    If matchers is non-empty, the hook fires only for matching tools.
++    An empty selector matches ALL tools.
+     """
+ 
+     matchers: tuple[HookMatcher, ...] = ()
+ 
+     @classmethod
+-    def all_tools(cls) -> HookSelector:
++    def all_tools(cls) -> "HookSelector":
+         return cls()
+ 
+     @classmethod
+-    def matching(cls, *patterns: str) -> HookSelector:
++    def matching(cls, *patterns: str) -> "HookSelector":
+         return cls(matchers=tuple(HookMatcher(p) for p in patterns))
+ 
+     def selects(self, tool_name: str) -> bool:
+         if not self.matchers:
+-            return True
++            return True  # all_tools()
+         return any(m.matches(tool_name) for m in self.matchers)
++
++    def __bool__(self) -> bool:
++        return bool(self.matchers)
++
++
++def _validate(pattern: str) -> None:
++    """Reject patterns that look like regex."""
++    if not pattern or pattern == "*":
++        return
++    for part in pattern.split("|"):
++        part = part.strip()
++        if not part or part == "*":
++            continue
++        for ch in ".^$+?{}[]()\\":
++            if ch in part:
++                raise MatcherCompileError(
++                    f"Pattern '{part}' contains regex metacharacter '{ch}'. "
++                    f"Use exact tool names, pipe-separated lists, or "
++                    f"prefix wildcards (e.g. 'Edit|Write', 'mcp__server__*')."
++                )
+diff --git a/hook_core/policies.py b/hook_core/policies.py
+index 9b47a1c..cad2b8d 100644
+--- a/hook_core/policies.py
++++ b/hook_core/policies.py
+@@ -1,7 +1,7 @@
+ """
+-P9: Hook policies — per-event scheduling, decision authority, data authority, failure.
++CC-aligned hook policies — per-event scheduling, decision authority, data authority, failure.
+ 
+-No Any/dict.  Each hook event type has a declared policy.
++Each hook event type has a declared default policy.
+ """
+ 
+ from __future__ import annotations
+@@ -26,9 +26,10 @@ class DataAuthority(StrEnum):
+ 
+ 
+ class FailurePolicy(StrEnum):
+-    FAIL_CLOSED = "fail_closed"   # Hook error/timeout → block operation
+-    FAIL_OPEN = "fail_open"       # Hook error → operation continues
+-    FAIL_TURN = "fail_turn"       # Hook error → terminate current turn
++    FAIL_CLOSED = "fail_closed"     # Hook error → block operation
++    FAIL_OPEN = "fail_open"         # Hook error → continue
++    FAIL_TURN = "fail_turn"         # Hook error → terminate turn
++    EVENT_DEFAULT = "event_default" # blockable→FAIL_CLOSED, non-blockable→FAIL_OPEN
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -40,7 +41,7 @@ class HookPolicy:
+     timeout_s: float = 30.0
+ 
+ 
+-# ── Default policies per hook event ─────────────────────────────────────────
++# ── Per-event default policies ──────────────────────────────────────────────
+ 
+ PRETOOL_USE = HookPolicy(
+     scheduling=Scheduling.AWAITED,
+@@ -56,6 +57,34 @@ POSTTOOL_USE = HookPolicy(
+     failure_policy=FailurePolicy.FAIL_OPEN,
+ )
+ 
++POSTTOOL_USE_FAILURE = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.OBSERVE,
++    data_authority=DataAuthority.OBSERVE,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
++POSTTOOL_BATCH = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.BLOCKABLE,
++    data_authority=DataAuthority.OBSERVE,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
++PERMISSION_REQUEST = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.BLOCKABLE,
++    data_authority=DataAuthority.OBSERVE,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
++PERMISSION_DENIED = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.OBSERVE,
++    data_authority=DataAuthority.OBSERVE,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
+ USER_PROMPT_SUBMIT = HookPolicy(
+     scheduling=Scheduling.AWAITED,
+     decision_authority=DecisionAuthority.BLOCKABLE,
+@@ -71,6 +100,34 @@ STOP = HookPolicy(
+     timeout_s=5.0,
+ )
+ 
++STOP_FAILURE = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.OBSERVE,
++    data_authority=DataAuthority.OBSERVE,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
++SESSION_START = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.OBSERVE,
++    data_authority=DataAuthority.TRANSFORM,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
++SESSION_END = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.OBSERVE,
++    data_authority=DataAuthority.OBSERVE,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
++SUBAGENT_START = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.OBSERVE,
++    data_authority=DataAuthority.OBSERVE,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
+ SUBAGENT_STOP = HookPolicy(
+     scheduling=Scheduling.AWAITED,
+     decision_authority=DecisionAuthority.BLOCKABLE,
+@@ -78,9 +135,54 @@ SUBAGENT_STOP = HookPolicy(
+     failure_policy=FailurePolicy.FAIL_OPEN,
+ )
+ 
+-PRECOMPACT = HookPolicy(
++PRE_COMPACT = HookPolicy(
+     scheduling=Scheduling.AWAITED,
+     decision_authority=DecisionAuthority.BLOCKABLE,
+     data_authority=DataAuthority.OBSERVE,
+     failure_policy=FailurePolicy.FAIL_OPEN,
+ )
++
++POST_COMPACT = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.OBSERVE,
++    data_authority=DataAuthority.OBSERVE,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
++NOTIFICATION = HookPolicy(
++    scheduling=Scheduling.AWAITED,
++    decision_authority=DecisionAuthority.OBSERVE,
++    data_authority=DataAuthority.OBSERVE,
++    failure_policy=FailurePolicy.FAIL_OPEN,
++)
++
++
++def policy_for(event_type: str) -> HookPolicy:
++    """Return the default policy for a hook event type string."""
++    _map: dict[str, HookPolicy] = {
++        "PreToolUse": PRETOOL_USE,
++        "PostToolUse": POSTTOOL_USE,
++        "PostToolUseFailure": POSTTOOL_USE_FAILURE,
++        "PostToolBatch": POSTTOOL_BATCH,
++        "PermissionRequest": PERMISSION_REQUEST,
++        "PermissionDenied": PERMISSION_DENIED,
++        "UserPromptSubmit": USER_PROMPT_SUBMIT,
++        "Stop": STOP,
++        "StopFailure": STOP_FAILURE,
++        "SessionStart": SESSION_START,
++        "SessionEnd": SESSION_END,
++        "SubagentStart": SUBAGENT_START,
++        "SubagentStop": SUBAGENT_STOP,
++        "PreCompact": PRE_COMPACT,
++        "PostCompact": POST_COMPACT,
++        "Notification": NOTIFICATION,
++    }
++    return _map.get(
++        event_type,
++        HookPolicy(
++            scheduling=Scheduling.AWAITED,
++            decision_authority=DecisionAuthority.OBSERVE,
++            data_authority=DataAuthority.OBSERVE,
++            failure_policy=FailurePolicy.FAIL_OPEN,
++        ),
++    )
+diff --git a/hook_core/registry.py b/hook_core/registry.py
+index 7ec2029..8efd64f 100644
+--- a/hook_core/registry.py
++++ b/hook_core/registry.py
+@@ -1,23 +1,13 @@
+ """
+-P10: Immutable Hook Registry — copy-on-write revision.
++CC-aligned Hook Registry — copy-on-write, snapshot-based isolation.
+ 
+-Task binding captures a revision snapshot; subsequent registrations
+-do not affect already-bound tasks.
++Tasks bind to a RegistrySnapshot; later registrations don't affect them.
+ """
+ 
+ from __future__ import annotations
+ 
+-import uuid
+ from dataclasses import dataclass, field
+ 
+-from hook_core.decisions import (
+-    PreToolUseDecision, PostToolUseDecision, UserPromptSubmitDecision,
+-    StopDecision, PreCompactDecision,
+-)
+-from hook_core.inputs import (
+-    PreToolUseInput, PostToolUseInput, UserPromptSubmitInput,
+-    StopInput, SubagentStopInput, PreCompactInput,
+-)
+ from hook_core.matcher import HookSelector
+ 
+ 
+@@ -32,9 +22,10 @@ class HookNotFoundError(ValueError):
+ @dataclass(frozen=True, slots=True)
+ class HookRegistration:
+     name: str
+-    event_type: str  # "PreToolUse" | "PostToolUse" | ...
+-    selector: HookSelector
+-    handler: object   # callable(input) -> decision
++    event_type: str       # "PreToolUse" | "Stop" | ...
++    handler: object        # callable(input) → decision
++    selector: HookSelector = field(default_factory=HookSelector.all_tools)
++    priority: int = 100
+ 
+ 
+ @dataclass(frozen=True)
+@@ -47,7 +38,7 @@ class RegistrySnapshot:
+ class HookRegistry:
+     """Copy-on-write hook registry.
+ 
+-    Registration creates a new revision.  Tasks bind to a revision
++    Registration creates a new revision. Tasks bind to a revision
+     snapshot and are immune to subsequent registrations.
+     """
+ 
+@@ -57,15 +48,18 @@ class HookRegistry:
+ 
+     def register(self, name: str, event_type: str,
+                  handler: object,
+-                 selector: HookSelector | None = None) -> None:
++                 selector: HookSelector | None = None,
++                 priority: int = 100) -> None:
+         if name in self._hooks:
+             raise HookAlreadyRegisteredError(
+-                f"Hook '{name}' already registered for '{self._hooks[name].event_type}'"
++                f"Hook '{name}' already registered for "
++                f"'{self._hooks[name].event_type}'"
+             )
+         self._hooks[name] = HookRegistration(
+             name=name, event_type=event_type,
+-            selector=selector or HookSelector.all_tools(),
+             handler=handler,
++            selector=selector or HookSelector.all_tools(),
++            priority=priority,
+         )
+         self._revision += 1
+ 
+@@ -76,7 +70,7 @@ class HookRegistry:
+         self._revision += 1
+ 
+     def snapshot(self) -> RegistrySnapshot:
+-        """Capture current revision.  Task binds to this snapshot."""
++        """Capture current revision. Task binds to this snapshot."""
+         return RegistrySnapshot(
+             revision=self._revision,
+             hooks=tuple(self._hooks.values()),
+@@ -84,9 +78,9 @@ class HookRegistry:
+ 
+     def get_hooks(self, snapshot: RegistrySnapshot | None,
+                   event_type: str, tool_name: str = "") -> list[HookRegistration]:
+-        """Get hooks for *event_type* from *snapshot*.
++        """Get hooks for *event_type*, sorted by priority (ascending).
+ 
+-        If snapshot is None, uses the current state.
++        If snapshot is None, uses current state.
+         Filters by selector if tool_name is provided.
+         """
+         hooks = (
+@@ -98,6 +92,7 @@ class HookRegistry:
+             if h.event_type == event_type
+             and (not tool_name or h.selector.selects(tool_name))
+         ]
++        matching.sort(key=lambda h: h.priority)
+         return matching
+ 
+     @property
+diff --git a/infrastructure/outbox/sqlite_store.py b/infrastructure/outbox/sqlite_store.py
+index 6c89180..02031c2 100644
+--- a/infrastructure/outbox/sqlite_store.py
++++ b/infrastructure/outbox/sqlite_store.py
+@@ -155,7 +155,8 @@ class SqliteOutboxStore:
+     def dead_letter(self, event_id: str, worker_id: str, error: str) -> bool:
+         with self._connect() as conn:
+             c = conn.execute(
+-                "UPDATE event_outbox SET status='dead_letter', last_error=? "
++                "UPDATE event_outbox SET status='dead_letter', "
++                "attempts=attempts+1, last_error=? "
+                 "WHERE event_id=? AND claimed_by=?",
+                 (error[:500], event_id, worker_id),
+             )
+diff --git a/listeners/ws_gateway.py b/listeners/ws_gateway.py
+index 7403d87..6b957b7 100644
+--- a/listeners/ws_gateway.py
++++ b/listeners/ws_gateway.py
+@@ -1,12 +1,32 @@
+ """P16: WS Gateway — best-effort broadcast, no backpressure on outbox."""
+ from __future__ import annotations
+ 
++from eventing.subscriber import DeliveryReceipt
++
++
+ class WsGateway:
++    NAME = "ws_gateway"
++
+     def __init__(self, subscribers: dict | None = None) -> None:
+         self._subs: dict[str, list] = {}
+         if subscribers:
+             self._subs.update({k: list(v) for k, v in subscribers.items()})
+ 
++    def on_event(self, envelope) -> DeliveryReceipt:
++        """Handle a domain event from the EventBus.
++
++        Broadcasts to all WebSocket subscribers of the event's session.
++        """
++        sid = str(envelope.scope.session_id) if envelope.scope.session_id else ""
++        if sid:
++            self.broadcast(sid, {
++                "event_type": str(envelope.event_type),
++                "event_id": str(envelope.event_id),
++                "aggregate_id": str(envelope.aggregate_id),
++                "payload": envelope.canonical_json(),
++            })
++        return DeliveryReceipt.ok(str(envelope.event_id), self.NAME)
++
+     def broadcast(self, session_id: str, msg: dict) -> None:
+         for ws in self._subs.get(session_id, []):
+             try:
+diff --git a/run_server.py b/run_server.py
+index af60b42..77ec032 100644
+--- a/run_server.py
++++ b/run_server.py
+@@ -28,4 +28,18 @@ if __name__ == "__main__":
+     service.ensure_root_session()
+     app = create_app(service)
+ 
+-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
++    # P19: Start native event pipeline when GRACE_RUNTIME_MODE=NATIVE
++    _native_shutdown = None
++    if os.environ.get("GRACE_RUNTIME_MODE") == "NATIVE":
++        from composition.runtime_composition import start_native_pipeline
++        db_path = os.path.join(repo, ".grace", "grace.db")
++        if os.path.exists(db_path):
++            _native = start_native_pipeline(db_path)
++            _native_shutdown = _native["shutdown"]
++            print(f"  Native event pipeline started (worker={_native['relay']._worker_id})")
++
++    try:
++        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
++    finally:
++        if _native_shutdown is not None:
++            _native_shutdown()
+diff --git a/server/services/agent_service.py b/server/services/agent_service.py
+index 388863c..9e003e8 100644
+--- a/server/services/agent_service.py
++++ b/server/services/agent_service.py
+@@ -199,19 +199,22 @@ class AgentService:
+             )
+ 
+         # Durable lifecycle chain: transaction -> outbox -> trace -> live WS.
+-        from server.services.event_outbox import OutboxRelay, OutboxStore
+-        from server.projections.projection_runner import ProjectionRunner
+-        from server.projections.trace_projection import TraceProjection
+-
+-        self._outbox_store = OutboxStore(db_path)
+-        self._outbox_store.install()
+-        self._projection_runner = ProjectionRunner(
+-            TraceProjection(db_path),
+-            self._event_bus.publish_live if self._event_bus is not None else None,
+-        )
+-        self._outbox_relay = OutboxRelay(
+-            self._outbox_store, self._projection_runner.deliver,
+-        )
++        # N0: When NATIVE mode owns the pipeline, the legacy relay must NOT
++        # compete for the same outbox table.
++        if os.environ.get("GRACE_RUNTIME_MODE") != "NATIVE":
++            from server.services.event_outbox import OutboxRelay, OutboxStore
++            from server.projections.projection_runner import ProjectionRunner
++            from server.projections.trace_projection import TraceProjection
++
++            self._outbox_store = OutboxStore(db_path)
++            self._outbox_store.install()
++            self._projection_runner = ProjectionRunner(
++                TraceProjection(db_path),
++                self._event_bus.publish_live if self._event_bus is not None else None,
++            )
++            self._outbox_relay = OutboxRelay(
++                self._outbox_store, self._projection_runner.deliver,
++            )
+ 
+         # ── SessionService ─────────────────────────────────────────────
+         from server.services.session_service import SessionService
+diff --git a/server/services/run_submission.py b/server/services/run_submission.py
+index 6843f93..933a75e 100644
+--- a/server/services/run_submission.py
++++ b/server/services/run_submission.py
+@@ -144,47 +144,139 @@ def submit_run_turn(
+ 
+ def _submit_via_coordinator(storage, *, session_id: str, prompt: str,
+                             idempotency_key: str = "") -> SubmittedRun:
+-    """P19: Route run submission through the new RunCoordinator."""
++    """P19: Route run submission through the new RunCoordinator.
++
++    Pre-checks (idempotency, active-run) execute on a read connection.
++    The happy-path transaction runs through RunCoordinator.submit() which
++    orchestrates: increment_generation → create_run → insert_message →
++    append_fact — all in one SQLite transaction via SqliteOutboxStore.
++    """
+     from core.eventing.identifiers import SessionId
+     from application.commands.run_commands import SubmitRun
+     from application.coordinators.run_coordinator import RunCoordinator
++    from application.events.schema_registry import SchemaRegistry
+     from runtime_core.runtime import AgentRuntime
+     from runtime_core.ports import RuntimePorts
+-    from application.transactions.unit_of_work import SessionUnitOfWork
++    from infrastructure.outbox.sqlite_store import SqliteOutboxStore
++
++    key = idempotency_key.strip()
++    db_path = storage._db_path
++
++    # ── Pre-checks (read-only, same semantics as LEGACY path) ──────────
++    conn = sqlite3.connect(db_path)
++    conn.row_factory = sqlite3.Row
++    try:
++        if key:
++            existing = conn.execute(
++                """SELECT id, turn_id, turn_index, prompt
++                   FROM runs WHERE session_id = ? AND idempotency_key = ?""",
++                (session_id, key),
++            ).fetchone()
++            if existing is not None:
++                if existing["prompt"] != prompt:
++                    raise IdempotencyConflictError(
++                        "idempotency key reused with different prompt"
++                    )
++                return SubmittedRun(
++                    run_id=existing["id"],
++                    turn_id=existing["turn_id"],
++                    turn_index=int(existing["turn_index"]),
++                    created=False,
++                )
++
++        active = conn.execute(
++            """SELECT id FROM runs
++               WHERE session_id = ? AND status IN ('queued', 'running')
++               LIMIT 1""",
++            (session_id,),
++        ).fetchone()
++        if active is not None:
++            raise RunAlreadyActiveError("RUN_ALREADY_ACTIVE")
++    finally:
++        conn.close()
++
++    # ── Happy path: coordinator in real transaction ────────────────────
++    registry = SchemaRegistry()
+ 
+-    # Build coordinator with the storage-backed UoW
+     class _StorageUoW:
+         def execute(self, fn):
+-            conn = sqlite3.connect(storage._db_path)
+-            conn.row_factory = sqlite3.Row
++            conn2 = sqlite3.connect(db_path)
++            conn2.row_factory = sqlite3.Row
++            outbox = SqliteOutboxStore(db_path, registry)
+             try:
+-                conn.execute("BEGIN IMMEDIATE")
+-                fn(_StorageTx(conn))
+-                conn.commit()
++                conn2.execute("BEGIN IMMEDIATE")
++                result = fn(_StorageTx(conn2, outbox))
++                conn2.commit()
++                return result
+             except Exception:
+-                conn.rollback()
++                conn2.rollback()
+                 raise
+             finally:
+-                conn.close()
++                conn2.close()
+ 
+     class _StorageTx:
+-        def __init__(self, conn):
++        __slots__ = ("conn", "_outbox")
++
++        def __init__(self, conn, outbox_store):
+             self.conn = conn
++            self._outbox = outbox_store
++
++        @staticmethod
++        def _to_str(value) -> str:
++            return str(value.value) if hasattr(value, 'value') else str(value)
++
++        def increment_generation(self, session_id) -> int:
++            sid = self._to_str(session_id)
++            self.conn.execute(
++                "UPDATE sessions SET run_generation = run_generation + 1 WHERE id = ?",
++                (sid,),
++            )
++            row = self.conn.execute(
++                "SELECT run_generation FROM sessions WHERE id = ?", (sid,)
++            ).fetchone()
++            if row is None:
++                raise ValueError(f"Unknown session: {sid}")
++            return int(row["run_generation"])
++
++        def create_run(self, *, run_id, session_id, turn_id, turn_index,
++                       idempotency_key: str, prompt: str) -> None:
++            now = datetime.now(timezone.utc).isoformat()
++            sid = self._to_str(session_id)
++            rid = self._to_str(run_id)
++            self.conn.execute(
++                """INSERT INTO runs
++                   (id, session_id, turn_id, turn_index, idempotency_key, prompt,
++                    status, created_at, updated_at)
++                   VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
++                (rid, sid, turn_id, turn_index, idempotency_key, prompt, now, now),
++            )
++
++        def insert_message(self, *, session_id, role: str, content: str,
++                           turn_id: str) -> None:
++            now = datetime.now(timezone.utc).isoformat()
++            sid = self._to_str(session_id)
++            self.conn.execute(
++                """INSERT INTO session_messages
++                   (session_id, role, content, turn_id, created_at)
++                   VALUES (?, ?, ?, ?, ?)""",
++                (sid, role, content, turn_id, now),
++            )
++
+         def append_fact(self, envelope) -> None:
+-            pass  # OutboxStore integration in next iteration
++            self._outbox.append(self.conn, envelope)
+ 
+     uow = _StorageUoW()
+     rt = AgentRuntime(RuntimePorts())
+     coord = RunCoordinator(rt, uow)
+ 
+     cmd = SubmitRun(session_id=SessionId(session_id), prompt=prompt,
+-                    idempotency_key=idempotency_key)
++                    idempotency_key=key)
+     envelope = coord.submit(cmd)
+ 
+-    run_id = str(envelope.aggregate_id)
++    payload = envelope.payload
+     return SubmittedRun(
+-        run_id=run_id,
+-        turn_id=str(envelope.event_id),
+-        turn_index=0,
++        run_id=str(envelope.aggregate_id),
++        turn_id=payload.turn_id,
++        turn_index=payload.turn_index,
+         created=True,
+     )
+diff --git a/tests/application/events/test_run_fact_schema.py b/tests/application/events/test_run_fact_schema.py
+index b9cdd0d..40aecce 100644
+--- a/tests/application/events/test_run_fact_schema.py
++++ b/tests/application/events/test_run_fact_schema.py
+@@ -65,11 +65,29 @@ class TestRunFacts:
+ 
+ class TestEnvelope:
+ 
++    @staticmethod
++    def _event_type_for(payload) -> str:
++        """Map payload class to its registered event type name."""
++        from application.events.run_facts import (
++            RunSubmittedV1, RunStartedV1, RunCompletedV1, RunFailedV1,
++            RunCancelledV1, RunBlockedV1, RunGaveUpV1,
++        )
++        _map = {
++            RunSubmittedV1: "run.submitted.v1",
++            RunStartedV1: "run.started.v1",
++            RunCompletedV1: "run.completed.v1",
++            RunFailedV1: "run.failed.v1",
++            RunCancelledV1: "run.cancelled.v1",
++            RunBlockedV1: "run.blocked.v1",
++            RunGaveUpV1: "run.gave_up.v1",
++        }
++        return _map.get(type(payload), "run.submitted.v1")
++
+     def _envelope(self, payload):
+         sid = SessionId("s1")
+         return EventEnvelope(
+             event_id=EventId.generate(),
+-            event_type=EventTypeName("run.submitted.v1"),
++            event_type=EventTypeName(self._event_type_for(payload)),
+             schema_version=SchemaVersion(1),
+             occurred_at=datetime.now(timezone.utc),
+             source=EventSource(process_id="test", component="runtime"),
+@@ -113,3 +131,23 @@ class TestEnvelope:
+         env = self._envelope(submitted("r1"))
+         with pytest.raises(Exception):
+             env.event_type = EventTypeName("other.v1")  # type: ignore
++
++    def test_typed_round_trip_preserves_payload_class(self):
++        """R0: decode(encode(envelope)) must preserve the exact payload type.
++
++        MUST FAIL on current code: SchemaRegistry has no decode method.
++        """
++        from application.events.schema_registry import SchemaRegistry
++        from application.events.run_facts import RunCompletedV1
++
++        registry = SchemaRegistry()
++        env = self._envelope(completed("r1", steps_taken=5, tokens_used=100))
++
++        js = env.canonical_json()
++        # R0: registry must be able to decode JSON back to typed EventEnvelope
++        decoded = registry.decode(js)
++        assert decoded.event_id == env.event_id
++        assert decoded.event_type == env.event_type
++        assert type(decoded.payload) is RunCompletedV1, (
++            f"R0 FAIL: payload type lost. Expected RunCompletedV1, got {type(decoded.payload).__name__}"
++        )
+diff --git a/tests/application/test_run_coordinator_atomicity.py b/tests/application/test_run_coordinator_atomicity.py
+index cb412ee..ddf8f58 100644
+--- a/tests/application/test_run_coordinator_atomicity.py
++++ b/tests/application/test_run_coordinator_atomicity.py
+@@ -21,26 +21,52 @@ from runtime_core.runtime import AgentRuntime
+ 
+ 
+ class FakeUoW:
+-    """Fake UoW — records appended facts in memory."""
++    """Fake UoW — records appended facts and state mutations in memory."""
+     def __init__(self):
+         self.facts: list = []
++        self.runs: list[dict] = []
++        self.messages: list[dict] = []
++        self.generations: dict[str, int] = {}
+ 
+-    def execute(self, fn) -> None:
++    def execute(self, fn):
+         tx = FakeTransaction(self)
+-        fn(tx)
++        return fn(tx)
+ 
+ 
+ class FakeTransaction:
+     def __init__(self, uow: FakeUoW):
+         self._uow = uow
+ 
++    def increment_generation(self, session_id) -> int:
++        sid = str(session_id)
++        current = self._uow.generations.get(sid, 0)
++        new_val = current + 1
++        self._uow.generations[sid] = new_val
++        return new_val
++
++    def create_run(self, *, run_id, session_id, turn_id, turn_index,
++                   idempotency_key: str = "", prompt: str = "") -> None:
++        self._uow.runs.append({
++            "run_id": str(run_id), "session_id": str(session_id),
++            "turn_id": turn_id, "turn_index": turn_index,
++            "idempotency_key": idempotency_key, "prompt": prompt,
++            "status": "queued",
++        })
++
++    def insert_message(self, *, session_id, role: str, content: str,
++                       turn_id: str) -> None:
++        self._uow.messages.append({
++            "session_id": str(session_id), "role": role,
++            "content": content, "turn_id": turn_id,
++        })
++
+     def append_fact(self, envelope) -> None:
+         self._uow.facts.append(envelope)
+ 
+ 
+ class TestRunCoordinator:
+ 
+-    def test_submit_creates_fact(self):
++    def test_submit_creates_fact_and_state(self):
+         uow = FakeUoW()
+         rt = AgentRuntime(RuntimePorts())
+         coord = RunCoordinator(rt, uow)
+@@ -48,9 +74,26 @@ class TestRunCoordinator:
+         cmd = SubmitRun(session_id=SessionId("s1"), prompt="test")
+         envelope = coord.submit(cmd)
+ 
++        # Fact must be appended
+         assert len(uow.facts) == 1
+         assert str(envelope.event_type) == "run.submitted.v1"
+ 
++        # State mutations must occur in same transaction
++        assert len(uow.runs) == 1
++        assert uow.runs[0]["session_id"] == "s1"
++        assert uow.runs[0]["prompt"] == "test"
++        assert uow.runs[0]["status"] == "queued"
++
++        assert len(uow.messages) == 1
++        assert uow.messages[0]["role"] == "user"
++        assert uow.messages[0]["content"] == "test"
++
++        assert uow.generations.get("s1", 0) >= 1
++
++        # Envelope payload must carry real metadata
++        assert envelope.payload.turn_index >= 1
++        assert envelope.payload.turn_id  # must be non-empty
++
+     def test_finalize_persists_terminal_fact(self):
+         uow = FakeUoW()
+         rt = AgentRuntime(RuntimePorts())
+diff --git a/tests/eventing/test_scope_isolation.py b/tests/eventing/test_scope_isolation.py
+index f0a2d35..76a215d 100644
+--- a/tests/eventing/test_scope_isolation.py
++++ b/tests/eventing/test_scope_isolation.py
+@@ -16,7 +16,7 @@ import pytest
+ from core.eventing.identifiers import (
+     SessionId, TaskId, RunId, EventId, AggregateVersion,
+ )
+-from core.eventing.scope import ScopeKind
++from core.eventing.scope import ScopeKind, ScopeToken
+ from application.events.envelope import (
+     EventEnvelope, EventTypeName, SchemaVersion, EventSource,
+     CorrelationId, AggregateId,
+@@ -45,24 +45,26 @@ def _envelope(session_id: str, scope, event_type: str = "run.submitted.v1"):
+ class TestScopeIsolation:
+ 
+     def test_no_cross_session_leak(self):
+-        """Event published to session A does NOT reach session B subscriber."""
++        """R0: Event published to session A MUST NOT reach session B subscriber."""
+         bus = ScopedEventBus()
+         sid_a = SessionId("s-a")
+         sid_b = SessionId("s-b")
+         bus.ensure_session(sid_a)
+         bus.ensure_session(sid_b)
+ 
++        scope_a = bus._tree.ensure_session(sid_a, 0).token
++        scope_b = bus._tree.ensure_session(sid_b, 0).token
++
+         received_a = []
+         received_b = []
+ 
+-        bus.subscribe("run.submitted.v1", lambda e: received_a.append(e), "a")
+-        bus.subscribe("run.submitted.v1", lambda e: received_b.append(e), "b")
++        bus.subscribe("run.submitted.v1", lambda e: received_a.append(e), "a", scope=scope_a)
++        bus.subscribe("run.submitted.v1", lambda e: received_b.append(e), "b", scope=scope_b)
+ 
+-        scope_a = bus._tree.ensure_session(sid_a, 0).token
+         bus.publish(_envelope("s-a", scope_a))
+ 
+-        assert len(received_a) == 1
+-        assert len(received_b) == 1  # sync bus, global subscribers get everything
++        assert len(received_a) == 1, "Session A subscriber must receive the event"
++        assert len(received_b) == 0, f"R0 FAIL: Session B received {len(received_b)} events — cross-session leak"
+ 
+     def test_closed_scope_rejects(self):
+         bus = ScopedEventBus()
+@@ -89,6 +91,79 @@ class TestScopeIsolation:
+         with pytest.raises(ScopeClosedError):
+             bus.publish(_envelope("s1", stale))
+ 
++    def test_global_subscriber_receives_all(self):
++        """GLOBAL-scope subscriber receives events from any session."""
++        bus = ScopedEventBus()
++        sid_a = SessionId("s-a")
++        sid_b = SessionId("s-b")
++        bus.ensure_session(sid_a)
++        bus.ensure_session(sid_b)
++
++        scope_a = bus._tree.ensure_session(sid_a, 0).token
++        scope_b = bus._tree.ensure_session(sid_b, 0).token
++
++        received = []
++        bus.subscribe("run.submitted.v1", lambda e: received.append(e), "global")
++
++        bus.publish(_envelope("s-a", scope_a))
++        bus.publish(_envelope("s-b", scope_b))
++
++        assert len(received) == 2, "GLOBAL subscriber must receive events from all sessions"
++
++    def test_task_scope_isolation(self):
++        """TASK-scope subscriber only receives events from same session AND task."""
++        bus = ScopedEventBus()
++        sid = SessionId("s1")
++        tid_a = TaskId("t-a")
++        tid_b = TaskId("t-b")
++        bus.ensure_task(sid, tid_a)
++        bus.ensure_task(sid, tid_b)
++
++        scope_a = bus._tree.ensure_task(sid, tid_a, 0).token
++        scope_b = bus._tree.ensure_task(sid, tid_b, 0).token
++
++        received_a = []
++        received_b = []
++
++        bus.subscribe("run.submitted.v1", lambda e: received_a.append(e), "a", scope=scope_a)
++        bus.subscribe("run.submitted.v1", lambda e: received_b.append(e), "b", scope=scope_b)
++
++        bus.publish(_envelope("s1", scope_a))
++        assert len(received_a) == 1
++        assert len(received_b) == 0, "Task B must not receive task A events"
++
++    def test_close_session_removes_subscriptions(self):
++        """Closing a session removes its scoped subscriptions."""
++        bus = ScopedEventBus()
++        sid = SessionId("s1")
++        bus.ensure_session(sid)
++        scope = bus._tree.ensure_session(sid, 0).token
++
++        received_session = []
++        received_global = []
++
++        bus.subscribe("run.submitted.v1", lambda e: received_session.append(e), "s", scope=scope)
++        bus.subscribe("run.submitted.v1", lambda e: received_global.append(e), "g")
++
++        # Verify both receive before close
++        bus.publish(_envelope("s1", scope))
++        assert len(received_session) == 1
++        assert len(received_global) == 1
++
++        # Record count before close
++        count_before = bus.subscriber_count
++        assert count_before == 2
++
++        # Close session — session-scoped subscriber should be removed
++        bus.close_session(sid)
++
++        # Verify session-scoped subscriber was removed (only global remains)
++        assert bus.subscriber_count == 1, "Session-scoped subscriber should be removed on close"
++
++        # Publishing to closed scope should raise
++        with pytest.raises(ScopeClosedError):
++            bus.publish(_envelope("s1", scope))
++
+     def test_subscription_close_unsubscribes(self):
+         bus = ScopedEventBus()
+         sid = SessionId("s1")
+diff --git a/tests/hook_core/test_contracts.py b/tests/hook_core/test_contracts.py
+index 010c2d7..04b19a8 100644
+--- a/tests/hook_core/test_contracts.py
++++ b/tests/hook_core/test_contracts.py
+@@ -1,9 +1,8 @@
+-"""P9: Hook contracts — acceptance tests.
++"""Hook contracts — acceptance tests.
+ 
+ AC: All inputs are frozen dataclasses.
+ AC: All decisions are frozen dataclasses.
+ AC: Policies are immutable.
+-AC: No Any/dict raw transform types.
+ """
+ 
+ from __future__ import annotations
+@@ -11,17 +10,42 @@ from __future__ import annotations
+ import pytest
+ 
+ from hook_core.inputs import (
+-    PreToolUseInput, PostToolUseInput, UserPromptSubmitInput,
+-    StopInput, SubagentStopInput, PreCompactInput,
++    PreToolUseInput, PostToolUseInput, PostToolUseFailureInput,
++    UserPromptSubmitInput, StopInput, StopFailureInput,
++    SessionStartInput, SessionEndInput,
++    SubagentStartInput, SubagentStopInput,
++    PreCompactInput, PostCompactInput,
++    NotificationInput, PostToolBatchInput,
++    PermissionRequestInput, PermissionDeniedInput,
+ )
+ from hook_core.decisions import (
+-    PreToolUseDecision, PostToolUseDecision, UserPromptSubmitDecision,
+-    StopDecision, PreCompactDecision,
++    PermissionDecision,
++    PreToolUseDecision, PostToolUseDecision, PostToolUseFailureDecision,
++    UserPromptSubmitDecision, StopDecision, SessionStartDecision,
++    PreCompactDecision,
+ )
+ from hook_core.policies import (
+-    PRETOOL_USE, POSTTOOL_USE, USER_PROMPT_SUBMIT, STOP,
++    PRETOOL_USE, POSTTOOL_USE, STOP,
+     Scheduling, DecisionAuthority, DataAuthority, FailurePolicy,
++    policy_for,
+ )
++from hook_core.events import HookEvent, BLOCKABLE_EVENTS
++
++
++class TestEvents:
++
++    def test_all_16_events(self):
++        assert len(HookEvent) >= 16
++
++    def test_blockable_events(self):
++        assert HookEvent.PRE_TOOL_USE in BLOCKABLE_EVENTS
++        assert HookEvent.NOTIFICATION not in BLOCKABLE_EVENTS
++        assert HookEvent.SESSION_START not in BLOCKABLE_EVENTS
++
++    def test_policy_for_all_events(self):
++        for ev in HookEvent:
++            p = policy_for(ev.value)
++            assert p is not None
+ 
+ 
+ class TestInputs:
+@@ -39,16 +63,56 @@ class TestInputs:
+         i = PostToolUseInput(tool_name="Read", tool_input={}, tool_output="data")
+         assert i.tool_output == "data"
+ 
++    def test_post_tool_use_failure_fields(self):
++        i = PostToolUseFailureInput(
++            tool_name="Bash", tool_input={},
++            error_message="timeout", error_type="TIMEOUT",
++        )
++        assert i.error_message == "timeout"
++
++    def test_stop_input_guard_field(self):
++        i = StopInput(stop_hook_active=True)
++        assert i.stop_hook_active is True
++
++    def test_all_inputs_exist_for_all_events(self):
++        """Every event should have a corresponding input class."""
++        event_inputs = {
++            "PreToolUse": PreToolUseInput,
++            "PostToolUse": PostToolUseInput,
++            "PostToolUseFailure": PostToolUseFailureInput,
++            "PostToolBatch": PostToolBatchInput,
++            "PermissionRequest": PermissionRequestInput,
++            "PermissionDenied": PermissionDeniedInput,
++            "UserPromptSubmit": UserPromptSubmitInput,
++            "Stop": StopInput,
++            "StopFailure": StopFailureInput,
++            "SessionStart": SessionStartInput,
++            "SessionEnd": SessionEndInput,
++            "SubagentStart": SubagentStartInput,
++            "SubagentStop": SubagentStopInput,
++            "PreCompact": PreCompactInput,
++            "PostCompact": PostCompactInput,
++            "Notification": NotificationInput,
++        }
++        for ev_name, cls in event_inputs.items():
++            assert hasattr(cls, '__dataclass_fields__'), f"{ev_name} input missing"
++
+ 
+ class TestDecisions:
+ 
+     def test_all_frozen(self):
+-        d = PreToolUseDecision(permission="allow")
++        d = PreToolUseDecision(permission=PermissionDecision.ALLOW)
+         with pytest.raises(Exception):
+             d.permission = "deny"  # type: ignore
+ 
++    def test_permission_precedence(self):
++        prec = PermissionDecision.precedence()
++        assert prec[0] == PermissionDecision.DENY
++        assert prec[-1] == PermissionDecision.ALLOW
++
+     def test_stop_decision(self):
+-        d = StopDecision(decision="block", reason="not done")
++        from hook_core.decisions import StopVerdict
++        d = StopDecision(decision=StopVerdict.BLOCK, reason="not done")
+         assert d.decision == "block"
+ 
+ 
+diff --git a/tests/hook_core/test_dispatch_failure_policy.py b/tests/hook_core/test_dispatch_failure_policy.py
+index 8d29b25..ae06b2a 100644
+--- a/tests/hook_core/test_dispatch_failure_policy.py
++++ b/tests/hook_core/test_dispatch_failure_policy.py
+@@ -1,9 +1,10 @@
+-"""P11: Hook dispatch failure policy — acceptance tests.
++"""Hook dispatch — acceptance tests.
+ 
+ AC: Fail-closed hook blocks on exception.
+ AC: Fail-open hook continues on exception.
+ AC: Deny overrides allow.
+-AC: Total deadline enforced.
++AC: Defer passes to next hook.
++AC: stop_hook_active guard prevents infinite loop.
+ """
+ 
+ from __future__ import annotations
+@@ -12,25 +13,42 @@ import pytest
+ 
+ from hook_core.registry import HookRegistry
+ from hook_core.dispatcher import HookDispatcher
+-from hook_core.inputs import PreToolUseInput, StopInput
+-from hook_core.decisions import PreToolUseDecision, StopDecision
++from hook_core.inputs import (
++    PreToolUseInput, StopInput, PostToolUseInput,
++    UserPromptSubmitInput, SessionStartInput, NotificationInput,
++)
++from hook_core.decisions import (
++    PermissionDecision,
++    PreToolUseDecision, StopDecision, PostToolUseDecision,
++    UserPromptSubmitDecision, SessionStartDecision,
++)
+ 
+ 
++# ── Handlers ─────────────────────────────────────────────────────────────────
++
+ def _allow(_in) -> PreToolUseDecision:
+-    return PreToolUseDecision(permission="allow")
++    return PreToolUseDecision(permission=PermissionDecision.ALLOW)
+ 
+ def _deny(_in) -> PreToolUseDecision:
+-    return PreToolUseDecision(permission="deny", reason="blocked")
++    return PreToolUseDecision(permission=PermissionDecision.DENY, reason="blocked")
++
++def _defer(_in) -> PreToolUseDecision:
++    return PreToolUseDecision(permission=PermissionDecision.DEFER)
++
++def _ask(_in) -> PreToolUseDecision:
++    return PreToolUseDecision(permission=PermissionDecision.ASK)
+ 
+ def _fail(_in) -> None:
+     raise RuntimeError("boom")
+ 
+-def _continue(_in) -> StopDecision:
+-    return StopDecision(decision="continue")
+-
+ def _block_stop(_in) -> StopDecision:
+     return StopDecision(decision="block", reason="not done")
+ 
++def _continue_stop(_in) -> StopDecision:
++    return StopDecision(decision="continue")
++
++
++# ── PreToolUse ───────────────────────────────────────────────────────────────
+ 
+ class TestPreToolUseDispatch:
+ 
+@@ -38,13 +56,13 @@ class TestPreToolUseDispatch:
+         reg = HookRegistry()
+         reg.register("allow_hook", "PreToolUse", _allow)
+         dispatcher = HookDispatcher(reg)
+-        snap = reg.snapshot()
+ 
+         result = dispatcher.dispatch(
+-            snap, "PreToolUse",
++            "PreToolUse",
+             PreToolUseInput(tool_name="Read", tool_input={}),
+         )
+         assert not result.blocked
++        assert result.permission == PermissionDecision.ALLOW
+ 
+     def test_deny_blocks(self):
+         reg = HookRegistry()
+@@ -52,25 +70,72 @@ class TestPreToolUseDispatch:
+         dispatcher = HookDispatcher(reg)
+ 
+         result = dispatcher.dispatch(
+-            reg.snapshot(), "PreToolUse",
++            "PreToolUse",
+             PreToolUseInput(tool_name="Bash", tool_input={}),
+         )
+         assert result.blocked
+         assert "blocked" in result.block_reason
++        assert result.permission == PermissionDecision.DENY
++
++    def test_defer_then_allow(self):
++        reg = HookRegistry()
++        reg.register("d", "PreToolUse", _defer, priority=1)
++        reg.register("a", "PreToolUse", _allow, priority=2)
++        dispatcher = HookDispatcher(reg)
++
++        result = dispatcher.dispatch(
++            "PreToolUse",
++            PreToolUseInput(tool_name="Bash", tool_input={}),
++        )
++        assert not result.blocked
++        assert result.permission == PermissionDecision.ALLOW
+ 
+-    def test_fail_closed_blocks_pre_tool_use(self):
++    def test_defer_then_deny(self):
++        reg = HookRegistry()
++        reg.register("d", "PreToolUse", _defer, priority=1)
++        reg.register("x", "PreToolUse", _deny, priority=2)
++        dispatcher = HookDispatcher(reg)
++
++        result = dispatcher.dispatch(
++            "PreToolUse",
++            PreToolUseInput(tool_name="Bash", tool_input={}),
++        )
++        assert result.blocked
++        assert result.permission == PermissionDecision.DENY
++
++    def test_fail_closed_blocks(self):
+         reg = HookRegistry()
+         reg.register("failing", "PreToolUse", _fail)
+         dispatcher = HookDispatcher(reg)
+ 
+         result = dispatcher.dispatch(
+-            reg.snapshot(), "PreToolUse",
++            "PreToolUse",
+             PreToolUseInput(tool_name="Read", tool_input={}),
+         )
+         # PreToolUse is FAIL_CLOSED → failing hook blocks
+         assert result.blocked
+         assert "fail-closed" in result.block_reason
+ 
++    def test_updated_input_merged(self):
++        reg = HookRegistry()
++        def _add_x(_in):
++            return PreToolUseDecision(
++                permission=PermissionDecision.ALLOW, updated_input={"x": 1},
++            )
++        def _add_y(_in):
++            return PreToolUseDecision(
++                permission=PermissionDecision.ALLOW, updated_input={"y": 2},
++            )
++        reg.register("a", "PreToolUse", _add_x)
++        reg.register("b", "PreToolUse", _add_y)
++        dispatcher = HookDispatcher(reg)
++        result = dispatcher.dispatch(
++            "PreToolUse", PreToolUseInput(tool_name="Bash", tool_input={}),
++        )
++        assert result.updated_input == {"x": 1, "y": 2}
++
++
++# ── Stop ─────────────────────────────────────────────────────────────────────
+ 
+ class TestStopDispatch:
+ 
+@@ -80,19 +145,73 @@ class TestStopDispatch:
+         dispatcher = HookDispatcher(reg)
+ 
+         result = dispatcher.dispatch(
+-            reg.snapshot(), "Stop",
+-            StopInput(steps_taken=3),
++            "Stop", StopInput(steps_taken=3),
+         )
+         assert result.blocked
+         assert "not done" in result.block_reason
+ 
+     def test_continue_stop(self):
+         reg = HookRegistry()
+-        reg.register("ok_stop", "Stop", _continue)
++        reg.register("ok_stop", "Stop", _continue_stop)
+         dispatcher = HookDispatcher(reg)
+ 
+         result = dispatcher.dispatch(
+-            reg.snapshot(), "Stop",
+-            StopInput(steps_taken=5),
++            "Stop", StopInput(steps_taken=5),
++        )
++        assert not result.blocked
++
++    def test_stop_hook_active_prevents_block(self):
++        reg = HookRegistry()
++        reg.register("stop_check", "Stop", _block_stop)
++        dispatcher = HookDispatcher(reg)
++
++        result = dispatcher.dispatch(
++            "Stop", StopInput(stop_hook_active=True, steps_taken=3),
++        )
++        assert not result.blocked, "stop_hook_active should prevent blocking"
++
++
++# ── PostToolUse ──────────────────────────────────────────────────────────────
++
++class TestPostToolUseDispatch:
++
++    def test_fail_open_continues(self):
++        reg = HookRegistry()
++        reg.register("failing", "PostToolUse", _fail)
++        dispatcher = HookDispatcher(reg)
++
++        result = dispatcher.dispatch(
++            "PostToolUse",
++            PostToolUseInput(tool_name="Bash", tool_input={}),
++        )
++        assert not result.blocked
++        assert len(result.warnings) >= 1
++
++    def test_additional_context_accumulated(self):
++        def _ctx_a(_in):
++            return PostToolUseDecision(additional_context="a")
++        def _ctx_b(_in):
++            return PostToolUseDecision(additional_context="b")
++        reg = HookRegistry()
++        reg.register("a", "PostToolUse", _ctx_a)
++        reg.register("b", "PostToolUse", _ctx_b)
++        dispatcher = HookDispatcher(reg)
++        result = dispatcher.dispatch(
++            "PostToolUse", PostToolUseInput(tool_name="Bash", tool_input={}),
++        )
++        assert "a" in result.additional_context
++        assert "b" in result.additional_context
++
++
++# ── Notification (observe-only) ──────────────────────────────────────────────
++
++class TestNotificationDispatch:
++
++    def test_notification_not_blockable(self):
++        reg = HookRegistry()
++        reg.register("n", "Notification", _fail)
++        dispatcher = HookDispatcher(reg)
++        result = dispatcher.dispatch(
++            "Notification", NotificationInput(message="test"),
+         )
+         assert not result.blocked
+diff --git a/tests/hook_core/test_registry_snapshot.py b/tests/hook_core/test_registry_snapshot.py
+index 7da9c13..8a0da9f 100644
+--- a/tests/hook_core/test_registry_snapshot.py
++++ b/tests/hook_core/test_registry_snapshot.py
+@@ -1,8 +1,8 @@
+-"""P10: Hook Registry — acceptance tests.
++"""Hook Registry — acceptance tests.
+ 
+ AC: Registration creates new revision.
+ AC: Snapshot is immune to subsequent registrations.
+-AC: Matcher compile failure raises MatcherCompileError.
++AC: Matcher uses CC syntax (no regex).
+ AC: Duplicate registration raises HookAlreadyRegisteredError.
+ """
+ 
+@@ -22,15 +22,34 @@ def _noop(_input) -> None:
+ 
+ class TestMatcher:
+ 
+-    def test_valid_pattern(self):
+-        m = HookMatcher(r"^(Write|Edit)$")
+-        assert m.matches("Write")
++    def test_exact_match(self):
++        m = HookMatcher("Bash")
++        assert m.matches("Bash")
++        assert not m.matches("BashRead")
++        assert not m.matches("Read")
++
++    def test_pipe_separated(self):
++        m = HookMatcher("Edit|Write|NotebookEdit")
+         assert m.matches("Edit")
++        assert m.matches("Write")
++        assert m.matches("NotebookEdit")
+         assert not m.matches("Read")
+ 
+-    def test_invalid_pattern_rejected(self):
+-        with pytest.raises(MatcherCompileError):
+-            HookMatcher("[unclosed")
++    def test_prefix_wildcard(self):
++        m = HookMatcher("mcp__github__*")
++        assert m.matches("mcp__github__search")
++        assert m.matches("mcp__github__push")
++        assert not m.matches("Bash")
++        assert not m.matches("mcp__gitlab__search")
++
++    def test_match_all(self):
++        assert HookMatcher("*").matches("anything")
++        assert HookMatcher("").matches("anything")
++
++    def test_regex_metacharacters_rejected(self):
++        for bad in [".*", "foo.bar", "^Bash$", "[abc]", "foo?", "foo+"]:
++            with pytest.raises(MatcherCompileError, match="regex"):
++                HookMatcher(bad)
+ 
+     def test_selector_all_tools(self):
+         sel = HookSelector.all_tools()
+@@ -41,6 +60,12 @@ class TestMatcher:
+         assert sel.selects("Bash")
+         assert not sel.selects("Read")
+ 
++    def test_selector_multiple(self):
++        sel = HookSelector.matching("Bash", "Read")
++        assert sel.selects("Bash")
++        assert sel.selects("Read")
++        assert not sel.selects("Write")
++
+ 
+ class TestRegistry:
+ 
+@@ -91,3 +116,11 @@ class TestRegistry:
+         assert len(hooks) == 1
+         hooks2 = reg.get_hooks(None, "PreToolUse", tool_name="Read")
+         assert len(hooks2) == 0
++
++    def test_hooks_sorted_by_priority(self):
++        reg = HookRegistry()
++        reg.register("low", "PreToolUse", _noop, priority=200)
++        reg.register("high", "PreToolUse", _noop, priority=10)
++        hooks = reg.get_hooks(None, "PreToolUse")
++        assert hooks[0].name == "high"
++        assert hooks[1].name == "low"
+diff --git a/tests/test_runtime_architecture_gates.py b/tests/test_runtime_architecture_gates.py
+index f310f08..b695ad5 100644
+--- a/tests/test_runtime_architecture_gates.py
++++ b/tests/test_runtime_architecture_gates.py
+@@ -36,3 +36,82 @@ def test_team_topology_is_not_a_runtime_capability() -> None:
+ def test_outbox_relay_is_composed_not_left_as_placeholder() -> None:
+     text = (ROOT / "server/services/agent_service.py").read_text(encoding="utf-8")
+     assert "self._outbox_relay = OutboxRelay(" in text
++
++
++def test_native_submission_is_atomic() -> None:
++    """NATIVE submission writes Run + Message + Outbox atomically.
++
++    Verifies the full write path: submit_run_turn(NATIVE) →
++    RunCoordinator.submit() → _StorageTx → SqliteOutboxStore.
++    All three rows are written in a single SQLite transaction.
++    """
++    import sqlite3, tempfile, os
++    from server.services.run_submission import submit_run_turn
++    from infrastructure.outbox.sqlite_store import SqliteOutboxStore
++    from application.events.schema_registry import SchemaRegistry
++
++    db = os.path.join(tempfile.gettempdir(), "test_native_atomic.db")
++    # Clean slate
++    for ext in ("", "-wal", "-shm"):
++        try: os.unlink(db + ext)
++        except OSError: pass
++
++    conn = sqlite3.connect(db)
++    conn.executescript("""
++        CREATE TABLE IF NOT EXISTS sessions (
++            id TEXT PRIMARY KEY, root_id TEXT, agent_name TEXT, mode TEXT,
++            title TEXT, status TEXT, repo_path TEXT,
++            created_at TEXT, updated_at TEXT, completed_at TEXT NULL,
++            run_generation INTEGER DEFAULT 0
++        );
++        CREATE TABLE IF NOT EXISTS runs (
++            id TEXT PRIMARY KEY, session_id TEXT,
++            turn_id TEXT, turn_index INTEGER DEFAULT 0,
++            idempotency_key TEXT DEFAULT '', prompt TEXT DEFAULT '',
++            status TEXT, created_at TEXT, updated_at TEXT,
++            completed_at TEXT NULL
++        );
++        CREATE TABLE IF NOT EXISTS session_messages (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            session_id TEXT, role TEXT, content TEXT,
++            turn_id TEXT, created_at TEXT
++        );
++        INSERT INTO sessions(id,root_id,agent_name,mode,title,status,repo_path,created_at,updated_at)
++        VALUES('s1','s1','test','primary','test','idle','.',datetime('now'),datetime('now'));
++    """)
++    conn.commit()
++    # Use the new outbox store DDL so columns match
++    SqliteOutboxStore.install(conn)
++    conn.close()
++
++    # Minimal storage mock — provides _db_path for the NATIVE path
++    class _Storage:
++        def __init__(self, path):
++            self._db_path = path
++
++    os.environ["GRACE_RUNTIME_MODE"] = "NATIVE"
++    try:
++        result = submit_run_turn(
++            storage=_Storage(db),
++            session_id="s1",
++            prompt="test prompt",
++        )
++    finally:
++        os.environ.pop("GRACE_RUNTIME_MODE", None)
++
++    assert result.created is True
++    assert result.run_id
++    assert result.turn_id
++    assert result.turn_index >= 1
++
++    # Verify DB contents — all 3 writes in one transaction
++    conn2 = sqlite3.connect(db)
++    conn2.row_factory = sqlite3.Row
++    runs = conn2.execute("SELECT COUNT(*) as c FROM runs").fetchone()["c"]
++    msgs = conn2.execute("SELECT COUNT(*) as c FROM session_messages").fetchone()["c"]
++    outbox = conn2.execute("SELECT COUNT(*) as c FROM event_outbox").fetchone()["c"]
++    conn2.close()
++
++    assert runs >= 1, f"Expected >=1 runs, got {runs}"
++    assert msgs >= 1, f"Expected >=1 messages, got {msgs}"
++    assert outbox >= 1, f"Expected >=1 outbox events, got {outbox}"

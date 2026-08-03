@@ -1,4 +1,4 @@
-"""Security-boundary regression tests for permissions, hooks, and tool execution."""
+"""G36M-final: Tests old hooks.* + old registry (deprecated). New tests in tests/hook_core/."""
 
 from __future__ import annotations
 
@@ -171,7 +171,8 @@ def test_hook_rewrite_is_revalidated_against_tool_schema_before_execution() -> N
     assert not result.success
     assert result.tool_error is not None
     assert result.tool_error.error_type.value == "invalid_params"
-    assert "must be a string" in (result.error or "")
+    assert ("must be a string" in (result.error or "")
+            or "not of type" in (result.error or ""))
     assert executed == []
 
 

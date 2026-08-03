@@ -1,8 +1,7 @@
-"""
-hooks/registry.py
+"""G40: DEPRECATED — replaced by hook_core.registry.HookRegistry (G12).
 
-Hook registry: stores external (command) and internal (Python callable) hooks,
-loaded from settings.json or registered programmatically.
+Hook registry: stores external and internal hooks.
+Kept for backward compat.  Will be deleted in full deletion phase.
 
 Config format in .grace/settings.json:
 {
@@ -23,6 +22,7 @@ import json
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,6 +30,27 @@ from hooks.events import HookContext, HookEvent
 from hooks.matcher import HookMatcher
 
 logger = logging.getLogger(__name__)
+
+
+class HookScheduling(str, Enum):
+    AWAITED = "awaited"
+    DETACHED = "detached"
+
+
+class HookDecisionAuthority(str, Enum):
+    POLICY = "policy"
+    ADVISORY = "advisory"
+
+
+class HookDataAuthority(str, Enum):
+    READ_ONLY = "read_only"
+    TRANSFORM = "transform"
+
+
+class HookFailurePolicy(str, Enum):
+    EVENT_DEFAULT = "event_default"
+    FAIL_OPEN = "fail_open"
+    FAIL_CLOSED = "fail_closed"
 
 
 @dataclass
@@ -41,14 +62,26 @@ class ExternalHookConfig:
     timeout: int = 60
     matcher: HookMatcher = field(default_factory=HookMatcher)
     agent_id: str = ""  # non-empty = scoped to a specific agent session
+    hook_id: str = ""
+    priority: int = 100
+    scheduling: HookScheduling = HookScheduling.AWAITED
+    decision_authority: HookDecisionAuthority = HookDecisionAuthority.POLICY
+    data_authority: HookDataAuthority = HookDataAuthority.TRANSFORM
+    failure_policy: HookFailurePolicy = HookFailurePolicy.EVENT_DEFAULT
 
 
 @dataclass
 class InternalHook:
     """A Python callable hook registered programmatically (no subprocess overhead)."""
 
-    callback: Callable[[HookContext], None]
+    callback: Callable[[HookContext], Any]
     matcher: HookMatcher = field(default_factory=HookMatcher)
+    hook_id: str = ""
+    priority: int = 100
+    scheduling: HookScheduling = HookScheduling.AWAITED
+    decision_authority: HookDecisionAuthority = HookDecisionAuthority.POLICY
+    data_authority: HookDataAuthority = HookDataAuthority.TRANSFORM
+    failure_policy: HookFailurePolicy = HookFailurePolicy.EVENT_DEFAULT
 
 
 class HookRegistry:
@@ -92,10 +125,12 @@ class HookRegistry:
 
     def register_internal(self, event: HookEvent, hook: InternalHook) -> None:
         """Register a Python callable hook."""
+        self._validate_contract(hook)
         self._internal[event].append(hook)
 
     def register_external(self, event: HookEvent, config: ExternalHookConfig) -> None:
         """Dynamically register an external hook (e.g. from agent frontmatter)."""
+        self._validate_contract(config)
         self._external[event].append(config)
 
     def clone(self) -> "HookRegistry":
@@ -127,20 +162,31 @@ class HookRegistry:
         agent_id: if non-empty, only include hooks scoped to this agent
                   (no agent_id = global hook, applies to all agents).
         """
-        return [
+        return sorted([
             h for h in self._external.get(event, [])
             if h.matcher.matches(matcher_subject, tool_input)
             and (not h.agent_id or h.agent_id == agent_id)
-        ]
+        ], key=lambda hook: (hook.priority, hook.hook_id))
 
     def find_internal(
         self, event: HookEvent, matcher_subject: str, tool_input: dict[str, Any]
     ) -> list[InternalHook]:
         """Find internal hooks matching the event's declared subject."""
-        return [
+        return sorted([
             h for h in self._internal.get(event, [])
             if h.matcher.matches(matcher_subject, tool_input)
-        ]
+        ], key=lambda hook: (hook.priority, hook.hook_id))
+
+    @staticmethod
+    def _validate_contract(hook: ExternalHookConfig | InternalHook) -> None:
+        if hook.scheduling is HookScheduling.DETACHED and (
+            hook.decision_authority is HookDecisionAuthority.POLICY
+            or hook.data_authority is HookDataAuthority.TRANSFORM
+        ):
+            raise ValueError(
+                "Detached hooks must be advisory and read-only because their "
+                "result is not awaited"
+            )
 
     def _load_entry(self, event: HookEvent, entry: dict[str, Any]) -> None:
         """Parse a single hook entry from settings.json."""
@@ -160,10 +206,41 @@ class HookRegistry:
             command = hook_def.get("command", "")
             if not command:
                 continue
-            timeout = int(hook_def.get("timeout", 60))
-            self._external[event].append(ExternalHookConfig(
-                type="command",
-                command=command,
-                timeout=timeout,
-                matcher=matcher,
-            ))
+            try:
+                config = ExternalHookConfig(
+                    type="command",
+                    command=command,
+                    timeout=int(hook_def.get("timeout", 60)),
+                    matcher=matcher,
+                    hook_id=str(hook_def.get("id", command)),
+                    priority=int(hook_def.get("priority", 100)),
+                    scheduling=HookScheduling(
+                        hook_def.get(
+                            "scheduling", HookScheduling.AWAITED.value,
+                        )
+                    ),
+                    decision_authority=HookDecisionAuthority(
+                        hook_def.get(
+                            "decision_authority",
+                            HookDecisionAuthority.POLICY.value,
+                        )
+                    ),
+                    data_authority=HookDataAuthority(
+                        hook_def.get(
+                            "data_authority", HookDataAuthority.TRANSFORM.value,
+                        )
+                    ),
+                    failure_policy=HookFailurePolicy(
+                        hook_def.get(
+                            "failure_policy",
+                            HookFailurePolicy.EVENT_DEFAULT.value,
+                        )
+                    ),
+                )
+                self.register_external(event, config)
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "Ignoring invalid %s hook configuration: %s",
+                    event.value,
+                    exc,
+                )

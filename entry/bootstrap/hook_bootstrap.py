@@ -18,11 +18,27 @@ def init_hook_dispatcher(
     backend: Any = None,
 ) -> Any:
     """Create HookDispatcher with memory consolidation hooks."""
-    from hooks import HookDispatcher, HookEvent, HookMatcher, HookRegistry, InternalHook
+    from hooks import HookEvent, HookMatcher, HookRegistry, InternalHook
+    # G36M-final: bridge.py deleted — use native HookDispatcher directly
+    from hook_core.registry import HookRegistry as NativeHookRegistry
+    from hook_core.dispatcher import HookDispatcher
 
     registry = HookRegistry()
     settings_path = repo_path / ".grace" / "settings.json"
     registry.load_from_settings(settings_path)
+
+    from server.hooks.session_context import SessionContextInjector
+
+    registry.register_internal(
+        HookEvent.SESSION_START,
+        InternalHook(
+            callback=SessionContextInjector(
+                repo_path=str(repo_path),
+            ).on_session_start,
+            hook_id="session-context-injector",
+            priority=50,
+        ),
+    )
 
     if memory_store is not None:
         def _on_session_stop(ctx):
@@ -37,5 +53,6 @@ def init_hook_dispatcher(
                 pass
         registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))
 
-    dispatcher = HookDispatcher(registry, cwd=str(repo_path.resolve()))
+    native_registry = NativeHookRegistry()
+    dispatcher = HookDispatcher(native_registry)
     return dispatcher

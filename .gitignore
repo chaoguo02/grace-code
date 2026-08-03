@@ -33,3 +33,5 @@ agent/session/test_marker.txt
 web/node_modules/
 web/dist/
 web/package-lock.json
+.coverage
+coverage.xml

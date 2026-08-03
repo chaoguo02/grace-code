@@ -85,6 +85,16 @@ def test_delegation_terminal_state_and_trace_are_committed_once(tmp_path):
         "delegation-terminal:delegation-1:"
     )
     assert "_terminal_event" not in second
+    from server.projections.trace_projection import TraceProjection
+    from server.services.event_outbox import OutboxStore
+
+    outbox = OutboxStore(store.db_path)
+    batch = outbox.claim_batch("test-projection")
+    terminal = [record for record in batch if record.event_type == "delegation.completed"]
+    assert len(terminal) == 1
+    assert TraceProjection(store.db_path).project(terminal[0]) is True
+    assert TraceProjection(store.db_path).project(terminal[0]) is False
+
     with sqlite3.connect(store.db_path) as conn:
         rows = conn.execute(
             "SELECT event_json FROM session_trace_events "

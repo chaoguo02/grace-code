@@ -51,7 +51,8 @@ from dotenv import load_dotenv
 load_dotenv(_ROOT / ".env")
 
 from server.services.agent_service import AgentService
-from server.services.event_bus import EventBus
+# G36M-8: DEPRECATED — replaced by eventing.scoped_bus.ScopedEventBus (G5) + assemble() (G28)
+from server.services.event_bus import EventBus  # noqa: G36M
 
 logger = logging.getLogger(__name__)
 
@@ -138,12 +139,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 # ─── App factory ────────────────────────────────────────────────────────────
 
 
-def create_app(service: AgentService) -> FastAPI:
+def create_app(service: AgentService | None = None,
+                native_components=None) -> FastAPI:
     """Create and configure the FastAPI application.
 
+    G29: Supports native_components (typed object graph).
+    Falls back to old AgentService if native_components is None.
+
     Args:
-        service: Initialised AgentService singleton holding the
-            SessionRuntime and all sub-services.
+        service: Legacy AgentService (optional when native_components provided).
+        native_components: ApplicationComponents from G28 assemble().
 
     Returns:
         FastAPI app with all routes mounted.
@@ -154,10 +159,18 @@ def create_app(service: AgentService) -> FastAPI:
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
-        # Startup: no-op; AgentService is fully initialized before app creation.
+        # Phase A: Use native relay if available, else fallback to old
+        if native_components is not None:
+            logger.info("Native relay already started by ApplicationLifecycle")
+        elif service is not None:
+            _outbox_relay = getattr(service, '_outbox_relay', None)
+            if _outbox_relay is not None:
+                await _outbox_relay.start()
+                logger.info("Outbox relay started (legacy)")
         yield
         # Shutdown: release resources
-        await service.shutdown()
+        if service is not None:
+            await service.shutdown()
 
     app = FastAPI(
         title="Grace Code Web MVP",
@@ -174,10 +187,16 @@ def create_app(service: AgentService) -> FastAPI:
 
     # Store service reference in app.state for dependency injection
     app.state.service = service
+    # Phase A: Store native components so routes can access run_coordinator
+    app.state.native_components = native_components
 
     # ── Dependency: get_service ───────────────────────────────────────────
     def get_service(request: Request) -> AgentService:
         return request.app.state.service
+
+    def get_native_components(request: Request):
+        """Phase A: Provide native components to routes that need coordinator."""
+        return request.app.state.native_components
 
     # ── Register API routers ──────────────────────────────────────────────
     from server.routers.sessions import create_sessions_router
@@ -350,10 +369,19 @@ def main() -> None:
     print(f"  model   : {args.model or '(from config)'}")
     print(f"  provider: {args.provider or '(from config)'}")
 
-    # Create EventBus
-    event_bus = EventBus(repo_path=repo_path)
+    # G37: Native object graph — single startup path
+    from composition.runtime_composition import assemble
+    from composition.application_components import ApplicationLifecycle
 
-    # Create AgentService
+    db_path = os.path.join(repo_path, ".grace", "grace.db")
+    print("  Assembling Native object graph...")
+    components = assemble(db_path)
+    lifecycle = ApplicationLifecycle(components)
+    lifecycle.start()
+    print(f"  Native relay started")
+
+    # Backward compat: also create legacy service for routes that still need it
+    event_bus = EventBus(repo_path=repo_path)
     service = AgentService(
         repo_path=repo_path,
         config_path=args.config,
@@ -364,8 +392,7 @@ def main() -> None:
         base_url=args.base_url,
         max_steps=args.max_steps,
     )
-
-    # Ensure root session exists
+    service._native_components = components  # G37: pass native components through
     root_id = service.ensure_root_session()
     print(f"  root    : {root_id}")
 

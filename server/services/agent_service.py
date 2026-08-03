@@ -114,6 +114,7 @@ class AgentService:
         self._memory_stop_event: Any | None = None
         self._memory_maintenance_task: Any | None = None
         self._observe_retries: bool = os.environ.get("FORGE_OBSERVE_RETRIES") == "1"
+        self._outbox_relay: object | None = None  # R3.4: started in lifespan
         """P2-18 runtime switch: when True, LLM retry metrics are logged."""
 
         # ── 1. Load config ──
@@ -195,6 +196,24 @@ class AgentService:
             logger.warning(
                 "Recovered %d orphaned run(s) left by a previous process",
                 len(recovered),
+            )
+
+        # G37: When native components own the pipeline, the legacy relay
+        # must NOT compete for the same outbox table.
+        _has_native = getattr(self, '_native_components', None) is not None
+        if not _has_native and os.environ.get("GRACE_RUNTIME_MODE") != "NATIVE":
+            from server.services.event_outbox import OutboxRelay, OutboxStore
+            from server.projections.projection_runner import ProjectionRunner
+            from server.projections.trace_projection import TraceProjection
+
+            self._outbox_store = OutboxStore(db_path)
+            self._outbox_store.install()
+            self._projection_runner = ProjectionRunner(
+                TraceProjection(db_path),
+                self._event_bus.publish_live if self._event_bus is not None else None,
+            )
+            self._outbox_relay = OutboxRelay(
+                self._outbox_store, self._projection_runner.deliver,
             )
 
         # ── SessionService ─────────────────────────────────────────────
@@ -414,13 +433,12 @@ class AgentService:
             if self._event_bus is not None:
                 session_id = str(event.get("session_id", ""))
                 if session_id:
-                    self._event_bus.publish_raw(
-                        session_id,
-                        {
-                            "type": event.get("type"),
-                            "payload": event,
-                        },
-                    )
+                    from server.events import WsResourceGovernance
+                    self._event_bus.publish_typed(session_id, WsResourceGovernance(
+                        event_type=str(event.get("type", "")),
+                        payload=dict(event),
+                        session_id=session_id,
+                    ))
 
         self._resource_governor.on_event(_on_resource_event)
         if self._resource_governor.mode == "observe":
@@ -466,60 +484,47 @@ class AgentService:
         self._log_dir = str(ProjectStatePaths.for_project(self.repo_path).logs)
 
         # ── 9. SessionRuntime ──
-        from agent.session.runtime import SessionRuntime
+        # G36M-3: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+        from agent.session.runtime import RuntimeDependencies, SessionRuntime  # noqa: G36M
 
         # ── HookDispatcher with memory consolidation STOP hook ──
         # Must be created BEFORE SessionRuntime (passed via constructor).
         self._hook_dispatcher = None
-        if self._memory_store is not None:
-            try:
-                from hooks import HookDispatcher, HookEvent, HookRegistry, InternalHook
+        try:
+            from entry.bootstrap.hook_bootstrap import init_hook_dispatcher
 
-                _hook_registry = HookRegistry()
-                _settings_path = Path(self.repo_path) / ".grace" / "settings.json"
-                _hook_registry.load_from_settings(_settings_path)
-
-                _store_ref = self._memory_store
-                _log_dir_ref = self._log_dir
-                _backend_ref = self._backend
-                _repo_ref = Path(self.repo_path)
-
-                def _on_session_stop(ctx):
-                    from memory.consolidation import record_session_end, run_consolidation
-                    try:
-                        _store_dir = getattr(_store_ref, 'store_dir', None)
-                        if _store_dir:
-                            record_session_end(_store_dir)
-                        run_consolidation(
-                            _store_ref, log_dir=_log_dir_ref, backend=_backend_ref,
-                            async_run=True, workspace_root=_repo_ref,
-                        )
-                        _store_ref.prune_expired()
-                    except Exception as exc:
-                        logger.debug("Consolidation hook skipped: %s", exc)
-
-                _hook_registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))
-                self._hook_dispatcher = HookDispatcher(_hook_registry, cwd=str(_repo_ref.resolve()))
-                logger.info("HookDispatcher initialized with memory consolidation STOP hook")
-            except Exception:
-                logger.warning("Failed to initialize HookDispatcher", exc_info=True)
+            self._hook_dispatcher = init_hook_dispatcher(
+                Path(self.repo_path),
+                memory_store=self._memory_store,
+                log_dir=self._log_dir,
+                backend=self._backend,
+            )
+            logger.info("HookDispatcher initialized")
+        except Exception:
+            logger.warning("Failed to initialize HookDispatcher", exc_info=True)
 
         self._runtime = SessionRuntime(
-            store=self._store,
-            backend=self._backend,
-            base_registry=self._registry,
-            agent_registry=self._agent_registry,
-            root_agent_config=self._build_agent_cfg(),
-            log_dir=self._log_dir,
-            memory_context=self._memory_context,
-            hook_dispatcher=self._hook_dispatcher,
-            mcp_integration=self._mcp_integration,
-            event_callback=self._event_bus.publish if self._event_bus is not None else None,
-            governor=self._resource_governor,
+            dependencies=RuntimeDependencies(
+                store=self._store,
+                backend=self._backend,
+                base_registry=self._registry,
+                agent_registry=self._agent_registry,
+                root_agent_config=self._build_agent_cfg(),
+                log_dir=self._log_dir,
+                memory_context=self._memory_context,
+                hook_dispatcher=self._hook_dispatcher,
+                mcp_integration=self._mcp_integration,
+                event_callback=(
+                    self._event_bus.publish
+                    if self._event_bus is not None else None
+                ),
+                governor=self._resource_governor,
+            ),
         )
         # Mark as Web mode — child agents use this to create web callbacks
-        self._runtime._is_web_mode = True
-        self._runtime._stats_recorder = self._stats_recorder
+        # R4: inject web mode + stats recorder via Runtime public API
+        self._runtime.set_web_mode(True)
+        self._runtime.set_stats_recorder(self._stats_recorder)
 
         # Wire hook_dispatcher into registry for PreToolUse/PostToolUse hooks
         if self._hook_dispatcher is not None:
@@ -536,19 +541,6 @@ class AgentService:
                 ))
             self._runtime.set_worktree_completion_callback(_on_worktree_done)
 
-            # ── Run lifecycle callback: run_started / run_terminal ──
-            def _on_run_terminal(session_id: str, event: dict) -> None:
-                """Publish run_started / run_terminal via EventBus.
-
-                Both go through publish_raw → _publish_msg → persist
-                (insert_trace_event, gets sequence) → WS broadcast.
-                Same code path as all other events — no skip_persist.
-                """
-                if _eb is not None:
-                    _eb.publish_raw(session_id, event)
-
-            self._runtime._publish_run_terminal = _on_run_terminal
-
             def _on_evidence_record(entry) -> None:
                 from server.events import WsEvidenceRecord
                 _eb.publish_typed(
@@ -560,9 +552,7 @@ class AgentService:
                     ),
                 )
 
-            self._runtime._evidence_stores.set_event_callback(
-                _on_evidence_record,
-            )
+            self._runtime.set_evidence_event_callback(_on_evidence_record)
 
             def _on_memory_written(session_id, memory, source):
                 from server.events import WsMemoryWritten
@@ -574,7 +564,7 @@ class AgentService:
                     source=source,
                     confidence=float(getattr(memory.metadata, "confidence", 0.0)),
                 ))
-            self._runtime._memory_event_callback = _on_memory_written
+            self._runtime.set_memory_event_callback(_on_memory_written)
 
         # ── Plan revision storage (SQLite-backed) ───────────────────────
         from server.services.plan_revision_service import PlanRevisionService
@@ -607,12 +597,10 @@ class AgentService:
         from server.services.project_overview_service import ProjectOverviewService
         self._project_overview_service = ProjectOverviewService(self)
 
-        # ── Memory maintenance daemon: periodic decay + TTL expiry ──
-        self._memory_maintenance_stop = threading.Event()
-        self._memory_maintenance_thread = threading.Thread(
-            target=self._memory_maintenance_loop, daemon=True,
-        )
-        self._memory_maintenance_thread.start()
+        # ── Memory maintenance daemon (P23: extracted to jobs/) ──
+        from jobs.memory_maintenance import MemoryMaintenanceJob
+        self._memory_job = MemoryMaintenanceJob(self._memory_store)
+        self._memory_job.start_thread()
 
         logger.info(
             "AgentService initialized — repo=%s, model=%s",
@@ -753,7 +741,7 @@ class AgentService:
             HTTP POST → broker.resolve(request_id, decision)
             Event.set() → Agent thread continues
         """
-        broker = self._runtime._ensure_approval_broker(session_id)
+        broker = self._runtime.ensure_approval_broker(session_id)
         event_bus = self._event_bus
         from server.services.approval_broker import ApprovalRequest
 
@@ -907,6 +895,51 @@ class AgentService:
             resolved_intent = TaskIntent(intent.lower())
 
         def _run() -> RunResult:
+            # Phase B: Use native coordinator when available
+            if self._native_components is not None:
+                from application.commands.run_commands import ExecuteRun, FinalizeRun
+                from core.eventing.identifiers import RunId as CoreRunId, SessionId as CoreSid
+                from runtime_core.execution import ConversationSnapshot, CapabilitySnapshot
+                from core.base import ToolRegistry as CoreToolRegistry
+                coord = self._native_components.run_coordinator
+
+                # Build conversation from session messages
+                msgs = self._storage.list_messages(session_id, limit=50)
+                conv = ConversationSnapshot(messages=tuple(
+                    {"role": m["role"], "content": m["content"]} for m in msgs
+                ))
+
+                # Build capabilities from tool registry
+                caps = CapabilitySnapshot()
+                if hasattr(self, '_tool_registry'):
+                    caps = CapabilitySnapshot(
+                        tool_schemas=tuple(
+                            {"name": t.name, "description": t.schema.get("description","")}
+                            for t in self._tool_registry.list_tools()
+                        ) if hasattr(self._tool_registry, 'list_tools') else ()
+                    )
+
+                outcome = coord.execute(
+                    ExecuteRun(session_id=CoreSid(session_id),
+                               run_id=CoreRunId(str(uuid.uuid4()))),
+                    conversation=conv, capabilities=caps,
+                )
+                # Finalize — write terminal state + fact
+                from application.commands.run_commands import FinalizeRun
+                from core.eventing.identifiers import AggregateVersion
+                coord.finalize(
+                    FinalizeRun(run_id=outcome.run_id,
+                                expected_version=AggregateVersion(1),
+                                outcome=outcome),
+                    session_id=CoreSid(session_id),
+                )
+                return RunResult(
+                    status=outcome.status.value,
+                    summary=outcome.summary,
+                    steps_taken=outcome.steps_taken,
+                    total_tokens=outcome.tokens_used,
+                )
+
             return self._runtime.run_session(
                 session_id=session_id,
                 agent_name=agent_name,
@@ -997,8 +1030,13 @@ class AgentService:
             loaded_rules=lambda: list(self._loaded_rules),
             accumulate_session_stats=self._accumulate_session_stats,
             compact_session_async=self.compact_session_async,
+            finalize_run=self._store.finalize_run_with_event,
             event_bus=self._event_bus,
             plan_revisions=self._plan_revisions,
+            coordinator=(
+                self._native_components.run_coordinator
+                if self._native_components is not None else None
+            ),  # R3: Native coordinator for ChatPipeline
         )
         pipeline = ChatPipeline(ports)
         request = ChatRequest(
@@ -1154,10 +1192,11 @@ class AgentService:
                 msgs = self.session_service.get_messages(session_id)
                 if not msgs:
                     if self._event_bus is not None:
-                        self._event_bus.publish_raw(session_id, {
-                            "type": "status", "status": "compacted",
-                            "message": "No messages to compact",
-                        })
+                        from server.events import WsCompactStatus
+                        self._event_bus.publish_typed(session_id, WsCompactStatus(
+                            status="compacted", message="No messages to compact",
+                            session_id=session_id,
+                        ))
                     return
 
                 # Run compaction via runtime
@@ -1204,20 +1243,21 @@ class AgentService:
                     pass
 
                 if self._event_bus is not None:
-                    self._event_bus.publish_raw(session_id, {
-                        "type": "status",
-                        "status": "compacted",
-                        "compaction": result,
-                        "message": f"Compressed {len(msgs)} → {len(compacted)} messages",
-                    })
+                    from server.events import WsCompactStatus
+                    self._event_bus.publish_typed(session_id, WsCompactStatus(
+                        status="compacted",
+                        message=f"Compressed {len(msgs)} → {len(compacted)} messages",
+                        session_id=session_id,
+                    ))
             except Exception as exc:
                 logger.exception("Compact failed for session %s", session_id)
                 if self._event_bus is not None:
-                    self._event_bus.publish_raw(session_id, {
-                        "type": "status",
-                        "status": "failed",
-                        "error": str(exc),
-                    })
+                    from server.events import WsCompactStatus
+                    self._event_bus.publish_typed(session_id, WsCompactStatus(
+                        status="failed",
+                        error=str(exc),
+                        session_id=session_id,
+                    ))
 
         import threading
         thread = threading.Thread(target=_compact, daemon=True)
@@ -1353,36 +1393,80 @@ class AgentService:
         """
         return self.cancel_run(session_id, detail)
 
+    def list_run_evidence(self, run_id: str) -> list[dict[str, object]]:
+        """Return durable evidence through the application-service boundary."""
+        return self._store.list_evidence(run_id)
+
+    def cleanup_session_resources(self, session_id: str) -> None:
+        """Release runtime state and run-scoped evidence before deletion."""
+        self._runtime.cleanup_session(session_id)
+        for run in self._storage.list_runs(session_id, limit=10_000):
+            self._store.delete_run_evidence(str(run["id"]))
+
     def cancel_run(self, session_id: str, detail: str = "") -> bool:
         """Cancel the currently active run.
 
         CAS-updates the run to 'cancelled' and signals the cancellation
         token.  The agent loop will stop at the next safe point and the
         finally block will broadcast run_terminal { status: "cancelled" }.
+
+        P0_3 Batch 1: CAS result is now checked.  If the CAS fails (run
+        already completed/failed/cancelled), the session status is NOT
+        overwritten.  This prevents the state-split bug where a completed
+        run had its session incorrectly marked CANCELLED.
         """
         # Wake any pending approval first so the agent loop can exit quickly
+        # Cancellation must not create a broker as a side effect.  Wake only
+        # an approval that is already pending for this session.
         broker = self._runtime.get_approval_broker(session_id)
         if broker is not None:
             broker.cancel_pending()
 
+        # Active executions own their terminal transition. Signal first and
+        # let Runtime commit run state + outbox fact in its finally block.
+        cancelled = self._runtime.cancel_session(session_id, detail=detail)
+        if cancelled:
+            if getattr(self, "_event_bus", None) is not None:
+                self._event_bus.publish_typed(
+                    session_id,
+                    WsStatus(status="cancelling", message=detail or "User cancelled"),
+                )
+            return True
+
         # CAS-update the active run → cancelled
         active_run = self._storage.get_active_run(session_id)
+        run_cas_ok = False
         if active_run is not None:
             try:
-                self._storage.update_run(
+                rows_updated = self._store.finalize_run_with_event(
                     active_run["id"],
+                    session_id,
                     status="cancelled",
                     error=detail or "User cancelled",
-                    expect_status="running",
+                    event_payload={"reason": detail or "User cancelled"},
+                    expect_status=str(active_run.get("status") or "running"),
                 )
-                from agent.session.models import SessionStatus
+                # P0_3: check CAS result before touching session state
+                # Older Storage adapters returned None after a successful
+                # update; current adapters return an affected-row count.
+                run_cas_ok = (
+                    True if rows_updated is None
+                    else rows_updated > 0 if isinstance(rows_updated, int)
+                    else bool(rows_updated)
+                )
+            except Exception:
+                logger.debug("Run cancel CAS failed", exc_info=True)
+
+        if run_cas_ok:
+            from agent.session.models import SessionStatus
+            try:
                 self._storage.update_status(
                     session_id,
                     SessionStatus.CANCELLED,
                     error=detail or "User cancelled",
                 )
             except Exception:
-                logger.debug("Run cancel CAS failed", exc_info=True)
+                logger.debug("Session status update after CAS failed", exc_info=True)
 
         cancelled = self._runtime.cancel_session(session_id, detail=detail)
         if cancelled and getattr(self, "_event_bus", None) is not None:
@@ -1390,7 +1474,7 @@ class AgentService:
                 session_id,
                 WsStatus(status="cancelled", message=detail or "User cancelled"),
             )
-        return cancelled
+        return cancelled or run_cas_ok
 
     # ── Config snapshot ───────────────────────────────────────────────────
 
@@ -1431,12 +1515,9 @@ class AgentService:
         if self._resource_governor is not None:
             self._resource_governor.shutdown()
 
-        # 2. Cancel running sessions
+        # 2. Cancel running sessions (P2: uses public API)
         if self._runtime is not None:
-            for (session_id, gen) in list(self._runtime._cancellation_tokens.keys()):
-                self._runtime.cancel_session(
-                    session_id, detail="Server shutting down",
-                )
+            self._runtime.cancel_all_sessions(reason="Server shutting down")
 
         # 3. Close LLM backend streams
         if hasattr(self._backend, "close"):
@@ -1450,8 +1531,9 @@ class AgentService:
             self._runtime.dispose()
 
         # 5. Memory maintenance
-        if hasattr(self, '_memory_maintenance_stop'):
-            self._memory_maintenance_stop.set()
+        # P23: Memory maintenance via standalone job
+        if hasattr(self, '_memory_job') and self._memory_job is not None:
+            self._memory_job.stop_thread()
         if self._memory_stop_event is not None:
             self._memory_stop_event.set()
         if self._memory_maintenance_task is not None:
@@ -1470,6 +1552,15 @@ class AgentService:
             except Exception:
                 pass
 
-        # 6. Close the single Tool/Skills/MCP lifecycle root.
+        # 6. Stop outbox relay (R3.4) — drain pending events before DB close
+        if hasattr(self, '_outbox_relay') and self._outbox_relay is not None:
+            try:
+                remaining = await self._outbox_relay.stop(drain_timeout_s=5.0)
+                if remaining:
+                    logger.warning("Outbox relay stopped with %d undelivered events", remaining)
+            except Exception:
+                logger.debug("Outbox relay shutdown failed", exc_info=True)
+
+        # 7. Close the single Tool/Skills/MCP lifecycle root.
         if self._registry is not None:
             self._registry.close()

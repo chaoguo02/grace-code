@@ -33,7 +33,8 @@ if TYPE_CHECKING:
     from core.policy import PhasePolicy
     from hitl.pipeline import PermissionPipeline
     from agent.session.models import SessionRecord, WorktreeEvidence
-    from agent.session.runtime import SessionRuntime
+    # G36M-5: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+    from agent.session.runtime import SessionRuntime  # noqa: G36M
     from agent.session.task_contract import TaskContract
 
 _SUBAGENT_SUMMARY_RULE = """[Subagent Contract — CC-aligned delegation protocol]
@@ -95,12 +96,12 @@ def _inherit_parent_pipeline_state(
             # parent session's agent_name.
             _parent_def = source_definition
             if request.agent_kind is AgentKind.NAMED_SUBAGENT and session_record is not None:
-                _parent_session = session_runtime._store.get_session(
+                _parent_session = session_runtime.session_store.get_session(
                     session_record.parent_id
                 ) if session_record.parent_id else None
                 if _parent_session is not None:
                     try:
-                        _parent_def = session_runtime._agent_registry.get(
+                        _parent_def = session_runtime.agent_registry.get(
                             _parent_session.agent_name
                         )
                     except Exception:
@@ -111,7 +112,7 @@ def _inherit_parent_pipeline_state(
                             _parent_session.agent_name,
                             source_definition.name,
                         )
-            _child_mode = session_runtime._resolve_child_permission_mode(
+            _child_mode = session_runtime.resolve_child_permission_mode(
                 _parent_def,
                 definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,
             )

@@ -30,7 +30,8 @@ from llm.base import LLMMessage
 from config.env import SubagentSafetyLimits
 
 if TYPE_CHECKING:
-    from agent.session.runtime import SessionRuntime
+    # G36M-5: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+    from agent.session.runtime import SessionRuntime  # noqa: G36M
     from core.policy import PhasePolicy
 
 logger = logging.getLogger(__name__)
@@ -404,7 +405,7 @@ def spawn_agent(
     ))
 
     # Subagent permission inheritance (CC-aligned: parent mode overrides child)
-    _child_permission_mode = self._resolve_child_permission_mode(
+    _child_permission_mode = self.resolve_child_permission_mode(
         parent_definition,
         definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,
     )
@@ -618,7 +619,8 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
     finally:
         self._active_evidence_stores.pop(child.id, None)
         if evidence_store is not None:
-            from agent.session.runtime import _flush_skill_activations
+            # G36M-5: DEPRECATED — use runtime_core (G15-G20)
+            from agent.session.runtime import _flush_skill_activations  # noqa: G36M
             _flush_skill_activations(
                 evidence_store,
                 self._pending_skill_activations.pop(child.id, []),
@@ -764,23 +766,7 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                         converged = self._store.reconcile_delegation_run(
                             delegation_run_id
                         )
-                        terminal_event = converged.pop("_terminal_event", None)
-                        callback = getattr(self, "_event_callback", None)
-                        if isinstance(terminal_event, dict) and callback is not None:
-                            from agent.task import Event, EventType
-
-                            callback(Event(
-                                event_type=EventType.DELEGATION_COMPLETED,
-                                task_id=delegation_run_id,
-                                session_id=str(converged["parent_session_id"]),
-                                payload={
-                                    "delegation_run_id": delegation_run_id,
-                                    "parent_session_id": str(
-                                        converged["parent_session_id"]
-                                    ),
-                                    "_persisted_event": terminal_event,
-                                },
-                            ))
+                        converged.pop("_terminal_event", None)
                 except Exception:
                     logger.exception(
                         "Failed to persist delegation result for child %s — "

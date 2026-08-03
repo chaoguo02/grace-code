@@ -28,10 +28,12 @@ from agent.task import RunResult, TaskIntent
 from llm.base import LLMMessage
 
 if TYPE_CHECKING:
-    from agent.session.runtime import SessionRuntime
+    # G36M-3: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+    from agent.session.runtime import SessionRuntime  # noqa: G36M
     from hooks.protocol import HookAttachment
     from llm.base import LLMBackend
-    from server.services.event_bus import EventBus
+    # G36M-3: DEPRECATED — use eventing.scoped_bus.ScopedEventBus (G5)
+    from server.services.event_bus import EventBus  # noqa: G36M
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +64,10 @@ class ChatPipelinePorts:
     loaded_rules: Callable[[], list]
     accumulate_session_stats: Callable[[str, RunResult], None]
     compact_session_async: Callable[[str], None]
+    finalize_run: Callable[..., bool] = lambda *args, **kwargs: False
     event_bus: Any = None
     plan_revisions: Any = None
+    coordinator: Any = None  # R3: RunCoordinator for native execution path
 
 
 def _maybe_auto_compact(
@@ -413,6 +417,11 @@ class ChatPipeline:
         Call ``finish()`` afterwards to handle plan_ready / completed / failed.
         """
         request = prepared.request
+
+        # R3: Native execution path when coordinator is available
+        if self._ports.coordinator is not None:
+            return self._execute_native(request, prepared)
+
         self._ports.reload_rules()
 
         # Apply pending Skill/model runtime modifiers exactly once.
@@ -468,6 +477,79 @@ class ChatPipeline:
         )
 
         # Accumulate cross-round stats in session metadata
+        self._ports.accumulate_session_stats(request.session_id, result)
+        return result
+
+    def _execute_native(self, request, prepared) -> RunResult:
+        """R3: Execute via Native RunCoordinator + AgentRuntime.
+
+        Converts PreparedChatRun → RuntimeExecution → coordinator.execute()
+        → coordinator.finalize() → RunResult.  Produces evidence, token,
+        and outbox entries that the legacy path does not.
+        """
+        import uuid as _uuid
+        from application.commands.run_commands import ExecuteRun, FinalizeRun
+        from core.eventing.identifiers import RunId as CoreRunId, SessionId as CoreSid, AggregateVersion
+        from runtime_core.execution import ConversationSnapshot, CapabilitySnapshot
+
+        coord = self._ports.coordinator
+        sid = CoreSid(request.session_id)
+        run_id = CoreRunId(str(_uuid.uuid4()))
+        prompt = self._render_prepared_prompt(prepared)
+
+        # Build conversation from recent messages
+        msgs = []
+        if hasattr(self._ports.session_service, 'get_messages'):
+            try:
+                msgs = self._ports.session_service.get_messages(request.session_id, limit=50)
+            except Exception:
+                pass
+        # Append the current user prompt
+        msgs.append({"role": "user", "content": prompt})
+        conv = ConversationSnapshot(messages=tuple(msgs))
+
+        # Build capabilities from backend
+        caps = CapabilitySnapshot()
+        if hasattr(self._ports, 'backend') and self._ports.backend is not None:
+            try:
+                backend = self._ports.backend
+                caps = CapabilitySnapshot(
+                    tool_schemas=tuple(
+                        {"name": t.name, "description": t.description}
+                        for t in getattr(backend, 'tools', [])
+                    ) if hasattr(backend, 'tools') else ()
+                )
+            except Exception:
+                pass
+
+        # Execute via coordinator
+        outcome = coord.execute(
+            ExecuteRun(session_id=sid, run_id=run_id),
+            conversation=conv, capabilities=caps, max_steps=25,
+        )
+
+        # Finalize — write terminal state + fact to Outbox
+        coord.finalize(
+            FinalizeRun(run_id=outcome.run_id,
+                        expected_version=AggregateVersion(1),
+                        outcome=outcome),
+            session_id=sid,
+        )
+
+        # Map native RunStatus → legacy RunStatus
+        _status_map = {
+            "completed": "success", "failed": "failed",
+            "cancelled": "cancelled", "blocked": "blocked",
+            "gave_up": "gave_up",
+        }
+        # Accumulate stats (same as legacy path)
+        result = RunResult(
+            task_id=str(run_id),
+            status=_status_map.get(outcome.status.value, outcome.status.value),
+            summary=outcome.summary,
+            steps_taken=outcome.steps_taken,
+            total_tokens=outcome.tokens_used,
+        )
         self._ports.accumulate_session_stats(request.session_id, result)
         return result
 
@@ -607,35 +689,33 @@ class ChatPipeline:
                 self.finish(request, result)
             except Exception as exc:
                 logger.exception("ChatPipeline failed for session %s", request.session_id)
-                if self._event_bus is not None:
+                _rc = request.run_context
+                _run_id = getattr(_rc, "run_id", "") if _rc else ""
+                if _run_id:
+                    self._ports.finalize_run(
+                        _run_id,
+                        request.session_id,
+                        status="failed",
+                        error=str(exc),
+                        event_payload={
+                            "turn_id": getattr(_rc, "turn_id", ""),
+                            "turn_index": getattr(_rc, "turn_index", 0),
+                        },
+                        expect_status="running",
+                    )
+                if self._event_bus is not None and not _run_id:
                     # Send run_terminal (not status:failed) — consistent with _finalize_run.
                     # If run_context is available, use its run_id/turn_id so the frontend
                     # can deduplicate by run_id and properly archive the optimistic turn.
                     _rc = request.run_context
-                    _terminal = {
-                        "type": "run_terminal",
-                        "run_id": getattr(_rc, "run_id", "") if _rc else "",
-                        "turn_id": getattr(_rc, "turn_id", "") if _rc else "",
-                        "turn_index": getattr(_rc, "turn_index", 0) if _rc else 0,
-                        "status": "failed",
-                        "summary": "",
-                        "steps_taken": 0,
-                        "total_tokens": 0,
-                        "error": str(exc),
-                    }
-                    self._event_bus.publish_raw(request.session_id, _terminal)
-                    # Also CAS-update the Run record so DB reflects the failure
-                    _run_id = getattr(_rc, "run_id", "") if _rc else ""
-                    if _run_id:
-                        try:
-                            self._runtime._store.update_run(
-                                _run_id,
-                                status="failed",
-                                error=str(exc),
-                                expect_status="running",
-                            )
-                        except Exception:
-                            pass
+                    from server.events import WsRunTerminal
+                    self._event_bus.publish_typed(request.session_id, WsRunTerminal(
+                        run_id=getattr(_rc, "run_id", "") if _rc else "",
+                        turn_id=getattr(_rc, "turn_id", "") if _rc else "",
+                        turn_index=getattr(_rc, "turn_index", 0) if _rc else 0,
+                        status="failed", error=str(exc),
+                        session_id=request.session_id,
+                    ))
             finally:
                 self._runtime.release_session(request.session_id)
                 self._runtime.release_backend_for_session(request.session_id)

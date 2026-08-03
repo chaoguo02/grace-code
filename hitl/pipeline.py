@@ -176,7 +176,6 @@ class PipelineStats:
     prompted: int = 0
     hook_decided: int = 0
     total_wait_ms: float = 0.0
-    layer_blocks: dict[str, int] = field(default_factory=dict)
     _lock: RLock = field(default_factory=RLock, repr=False, compare=False)
 
     def record(self, result: PermissionResult) -> None:
@@ -186,8 +185,6 @@ class PipelineStats:
                 self.allowed += 1
             else:
                 self.denied += 1
-                ln = result.layer.value if hasattr(result.layer, "value") else str(result.layer)
-                self.layer_blocks[ln] = self.layer_blocks.get(ln, 0) + 1
             if result.layer is PermissionLayer.INTERACTIVE:
                 self.prompted += 1
             elif result.layer is PermissionLayer.PRE_TOOL_HOOK:
@@ -240,9 +237,6 @@ class PermissionPipeline:
         self._approved_prompts: list[dict[str, str]] = []
         self._write_allowed: bool = True
         """When False, all write-effect tools are denied."""
-        # Phase 2 #4: Session-level trust accumulator
-        from hitl.trust_accumulator import SessionTrustAccumulator
-        self._trust_accumulator = SessionTrustAccumulator(threshold=2)
 
         for r in (rules or []):
             if r.tier is PermissionRuleTier.DENY:
@@ -672,34 +666,8 @@ class PermissionPipeline:
                     self._stats.record(result)
                     return self._apply_tool_check(result, tool, params)
 
-        # Step 5.5: Session Trust Accumulator (Phase 2 #4)
-        # Check BEFORE the interactive callback.  If the same tool+path+digest
-        # has been explicitly approved >= threshold times in this session,
-        # auto-approve without prompting.  Never bypasses Layers 1-5 (deny
-        # rules, ask rules, path sandbox, write_allowed, plan mode).
-        from hitl.trust_accumulator import compute_trust_key
-        trust_key = compute_trust_key(tool_name, original_params)
-        if self._trust_accumulator.is_trusted(trust_key):
-            result = PermissionResult(
-                decision=PermissionDecision.ALLOW,
-                layer=PermissionLayer.RULE,
-                reason=f"Trust accumulated — {self._trust_accumulator._approved.get(trust_key, 0)} prior approvals",
-                updated_params=dict(hook_updates) or None,
-            )
-            self._stats.record(result)
-            return self._apply_tool_check(result, tool, params)
-
-        # Step 6: canUseTool Callback
-        if hook_proposal.approved and not force_interactive:
-            result = PermissionResult(
-                decision=PermissionDecision.ALLOW,
-                layer=PermissionLayer.PRE_TOOL_HOOK,
-                reason="Hook waived interactive approval",
-                updated_params=dict(hook_updates) or None,
-            )
-            self._stats.record(result)
-            return self._apply_tool_check(result, tool, params)
-
+        # Step 6: canUseTool Callback. Hook approval is advisory here: only
+        # explicit permission policy or a human decision may waive HITL.
         result = self._layer6_callback(
             tool_name, params, thought,
             force_interactive=force_interactive,
@@ -723,8 +691,6 @@ class PermissionPipeline:
                 result = mandatory_denial
         if result.decision is PermissionDecision.ALLOW:
             result.updated_params = final_updates or None
-            # Phase 2 #4: Record explicit user approval for trust accumulation
-            self._trust_accumulator.record_approval(trust_key)
 
         self._stats.record(result)
         return self._apply_tool_check(result, tool, final_params)
@@ -1162,14 +1128,6 @@ class PermissionPipeline:
                     layer=PermissionLayer.INTERACTIVE,
                     reason=hook_result.reason or "Permission request blocked by hook",
                 )
-            if hook_result.control is HookControl.APPROVE:
-                return PermissionResult(
-                    decision=PermissionDecision.ALLOW,
-                    layer=PermissionLayer.INTERACTIVE,
-                    reason="Permission request approved by hook",
-                    updated_params=hook_result.updated_input,
-                )
-
         # Path 2: Web headless callback (blocks on threading.Event internally)
         if self._web_confirm_callback is not None:
             t0 = time.time()

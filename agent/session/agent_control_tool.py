@@ -20,7 +20,8 @@ from core.base import (
 )
 
 if TYPE_CHECKING:
-    from agent.session.runtime import SessionRuntime
+    # G36M-4: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+    from agent.session.runtime import SessionRuntime  # noqa: G36M
     from agent.session.run_context import RunContext
 
 

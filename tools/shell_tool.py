@@ -231,17 +231,28 @@ class ShellTool(BaseTool):
         args: list[str] = params.get("args", [])
         timeout: int = int(params.get("timeout", 30))
         cwd: str | None = params.get("cwd", None)
+        use_shell: bool = params.get("use_shell", False)
 
         if not command and not cmd:
             return ToolResult(success=False, output="", error="Either 'command' or 'cmd' is required")
 
+        # P0_3: workspace root must exist (fail closed).
+        ws_root = getattr(self._runtime, "_workspace_root", None)
+        if ws_root is None:
+            return ToolResult(
+                success=False, output="",
+                error="Workspace root is not set. Shell execution requires a workspace boundary.",
+            )
+
         if command:
-            return self._execute_parameterized(command, args, timeout, cwd)
+            return self._execute_parameterized(command, args, timeout, cwd, use_shell=use_shell)
         return self._execute_legacy(cmd, timeout, cwd)
 
     # ── Parameterized execution (preferred) ──────────────────────────────
 
-    def _execute_parameterized(self, command: str, args: list[str], timeout: int, cwd: str | None) -> ToolResult:
+    def _execute_parameterized(
+        self, command: str, args: list[str], timeout: int, cwd: str | None, *, use_shell: bool = False,
+    ) -> ToolResult:
         import logging, platform, shutil
         _log = logging.getLogger(__name__)
         cmd_repr = f"{command} {' '.join(args)}" if args else command
@@ -250,35 +261,53 @@ class ShellTool(BaseTool):
         if blocked:
             return ToolResult(success=False, output="", error=f"Command blocked for safety: matched '{blocked}'")
 
-        # Path sandbox (P1-32): args must not reference paths outside the workspace.
-        # Skips validation when runtime has no workspace root (Docker sandbox active).
+        # P0_3: workspace root already validated in execute(); keep path sandbox.
         _ws_root = getattr(self._runtime, "_workspace_root", None)
         path_violation = _validate_workspace_paths(command, args, _ws_root)
         if path_violation:
             return ToolResult(success=False, output="", error=path_violation)
 
         cmd_name = command.split()[0] if command.split() else command
+
+        # ── Step 1: Direct argv execution (safe, no shell interpretation) ──
+        exe_path = shutil.which(cmd_name) if platform.system() != "Windows" else (
+            shutil.which(cmd_name)
+            or shutil.which(f"{cmd_name}.exe")
+            or shutil.which(f"{cmd_name}.cmd")
+            or shutil.which(f"{cmd_name}.bat")
+        )
+        if exe_path:
+            try:
+                run_result = self._runtime.execute(exe_path, args=args, cwd=cwd, timeout=timeout)
+                return self._build_result(run_result, cmd_repr)
+            except Exception as exc:
+                _log.debug("direct execute failed for %s: %s", exe_path, exc)
+                if not use_shell:
+                    return ToolResult(
+                        success=False, output="",
+                        error=f"Command '{cmd_name}' failed to execute directly: {exc}. Use use_shell=true for shell fallback.",
+                    )
+
+        # ── Step 2/3: Shell fallback — requires explicit opt-in ──
+        # P0_3: shell mode requires explicit use_shell=true.
+        # This prevents injection via args containing ; | $() etc
+        # when the command falls through to PowerShell -Command or cmd.exe.
+        if not use_shell:
+            return ToolResult(
+                success=False, output="",
+                error=(
+                    f"Command '{cmd_name}' not found as a direct executable "
+                    f"and use_shell is not set. Set use_shell=true to allow "
+                    f"execution via shell."
+                ),
+            )
+
         full_cmd = f"{command} {' '.join(args)}" if args else command
+        _log.warning("Shell fallback with use_shell=true: %r", full_cmd)
 
-        # ── Windows: use PowerShell or cmd.exe ──
         if platform.system() == "Windows":
-            _log.debug("shell cmd_name=%s full_cmd=%r cwd=%s", cmd_name, full_cmd, cwd)
-
-            # Step 1: Try direct execution (native exes like git, python)
-            exe_path = shutil.which(cmd_name)
-            if exe_path:
-                try:
-                    run_result = self._runtime.execute(exe_path, args=args, cwd=cwd, timeout=timeout)
-                    return self._build_result(run_result, cmd_repr)
-                except Exception as exc:
-                    _log.debug("direct execute failed: %s", exc)
-
-            # Step 2: Try PowerShell (for PowerShell cmdlets like Get-ChildItem)
-            # Use shutil.which which bypasses WOW64 file system redirector.
-            # os.path.exists on System32 paths returns False from 32-bit Python.
             ps_exe = shutil.which("powershell.exe") or shutil.which("powershell")
             if ps_exe is None:
-                # Known Windows paths (SysNative for 32-bit Python → 64-bit System32)
                 for _p in [r"C:\Windows\SysNative\WindowsPowerShell\v1.0\powershell.exe",
                            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"]:
                     if os.path.exists(_p):
@@ -290,10 +319,8 @@ class ShellTool(BaseTool):
                     run_result = self._runtime.execute(ps_exe, args=ps_args, cwd=cwd, timeout=timeout)
                     return self._build_result(run_result, cmd_repr)
                 except Exception as exc:
-                    _log.debug("powershell execute failed: %s", exc)
+                    _log.debug("powershell fallback failed: %s", exc)
 
-            # Step 3: shell=True via LocalRuntime.exec() — handles dir, tree, type.
-            # exec() uses subprocess with shell=True, resolving via COMSPEC.
             try:
                 run_result = self._runtime.exec(full_cmd, cwd=cwd, timeout=timeout)
                 return self._build_result(run_result, cmd_repr)
