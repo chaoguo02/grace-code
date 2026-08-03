@@ -14,12 +14,8 @@ export type ViewName =
   | "memory"
   | "runs"
   | "context"
-  | "replay"
-  | "events"
-  | "architecture"
   | "agents"
   | "safety"
-  | "reliability"
   | "evaluations";
 
 export interface NavigationState {
@@ -79,8 +75,6 @@ export const MODULES: readonly ModuleDefinition[] = [
       { key: "memory", label: "Memory", level: "core", scope: "hybrid" },
       { key: "runs", label: "Runs", level: "core", scope: "session" },
       { key: "context", label: "Context", level: "advanced", scope: "session" },
-      { key: "replay", label: "Replay", level: "advanced", scope: "session" },
-      { key: "events", label: "Event trace", level: "expert", scope: "session" },
     ],
   },
   {
@@ -91,9 +85,7 @@ export const MODULES: readonly ModuleDefinition[] = [
     views: [
       { key: "overview", label: "Overview", level: "core", scope: "project" },
       { key: "agents", label: "Agents", level: "core", scope: "session" },
-      { key: "reliability", label: "Health", level: "core", scope: "project" },
       { key: "safety", label: "Safety", level: "core", scope: "hybrid" },
-      { key: "architecture", label: "Architecture", level: "advanced", scope: "hybrid" },
       { key: "evaluations", label: "Evaluations", level: "advanced", scope: "project" },
     ],
   },
@@ -112,19 +104,14 @@ const MODULE_BY_VIEW = new Map<ViewName, ModuleName>(
 const VIEW_ALIASES: Record<string, ViewName> = {
   eval: "evaluations",
   evaluation: "evaluations",
-  health: "reliability",
   review: "reviews",
   changes: "reviews",
-  system: "architecture",
-  trace: "events",
   run: "runs",
 };
 
 const LEGACY_MODULE_DEFAULTS: Record<string, ViewName> = {
   overview: "overview",
   inspect: "runs",
-  control: "architecture",
-  quality: "reliability",
 };
 
 export const DEFAULT_NAVIGATION: NavigationState = {

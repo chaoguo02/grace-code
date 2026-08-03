@@ -3,15 +3,11 @@ export type OverviewRoute =
   | "runs"
   | "context"
   | "evaluations"
-  | "architecture"
   | "agents"
-  | "reliability"
   | "safety"
-  | "replay"
   | "reviews"
   | "plans"
-  | "memory"
-  | "events";
+  | "memory";
 
 export interface OverviewCapability {
   id: string;
@@ -21,22 +17,6 @@ export interface OverviewCapability {
   evidence_route: OverviewRoute;
   evidence_state: "observed" | "configured" | "unavailable" | string;
   evidence: string;
-}
-
-export interface DemoJourneyStep {
-  route: OverviewRoute;
-  label: string;
-  proof: string;
-}
-
-export interface DemoJourney {
-  id: string;
-  number: string;
-  title: string;
-  duration_minutes: number;
-  readiness: string;
-  goal: string;
-  steps: DemoJourneyStep[];
 }
 
 export interface OverviewRecentSession {
@@ -76,7 +56,6 @@ export interface ProjectOverview {
     state: string;
   };
   capabilities: OverviewCapability[];
-  journeys: DemoJourney[];
   recent_sessions: OverviewRecentSession[];
   signals: {
     reliability: {

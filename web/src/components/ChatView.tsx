@@ -12,6 +12,7 @@ import { RunOutcomeBar } from "./RunOutcomeBar";
 import { ModeTab, getPlaceholder } from "./ModeTab";
 import { KeyboardHelp } from "./KeyboardHelp";
 import { apiPost } from "../api/client";
+import { uploadAttachment } from "../api/attachments";
 import { cancelSession, fetchSkills, updateSession } from "../api/sessions";
 import { getModelCatalog } from "../api/config";
 import { formatBytes, formatRuntime, runtimeSeconds } from "../utils/format";
@@ -19,7 +20,7 @@ import { summarizeStatus } from "../utils/status";
 import { fuzzyFilter } from "../utils/fuzzy";
 import { uiModeForAgentName, type UiMode } from "../modes";
 
-type ComposerMenu = "closed" | "actions" | "mode" | "model" | "context" | "settings";
+type ComposerMenu = "closed" | "mode" | "model" | "context" | "settings";
 export type ModeKey = UiMode;
 type EffortKey = "low" | "medium" | "high";
 
@@ -28,6 +29,8 @@ interface ContextChip {
   label: string;
   kind: "upload" | "project";
   meta?: string;
+  /** Upload lifecycle for file chips: pending → uploading → ready/error. */
+  uploadState?: "uploading" | "error";
 }
 
 const MODE_OPTIONS: Array<{ key: ModeKey; title: string; description: string; intent?: string }> = [
@@ -68,42 +71,10 @@ const BUILTIN_SLASH_COMMANDS = [
   { key: "/help", title: "Show composer help", description: "Insert a short cheatsheet into the draft." },
 ];
 
-const HERO_CARDS = [
-  {
-    label: "Start",
-    title: "Create a new session",
-    body: "Open a fresh workspace and let the agent get to work.",
-    icon: "▶",
-    tone: "start",
-  },
-  {
-    label: "Trace",
-    title: "See live execution",
-    body: "Follow thoughts, actions, and observations as the loop progresses.",
-    icon: "◌",
-    tone: "trace",
-  },
-  {
-    label: "Review",
-    title: "Approve and steer",
-    body: "Review plans, approve tool actions, and guide the run with feedback.",
-    icon: "✓",
-    tone: "review",
-  },
-  {
-    label: "Knowledge",
-    title: "Connect context",
-    body: "Mention files, attach assets, and ground the task in project knowledge.",
-    icon: "▣",
-    tone: "knowledge",
-  },
-];
-
 const COMPOSER_QUICK_TOOLS = [
   { key: "attach", icon: "⊕" },
   { key: "mention", icon: "@" },
   { key: "code", icon: "</>" },
-  { key: "more", icon: "+" },
 ] as const;
 
 function intentForMode(mode: ModeKey) {
@@ -336,10 +307,6 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
     }
   }, [activeId, activeDetail?.status, setRunning]);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [timeline, isRunning, error]);
-
   // run_terminal owns the durable timeline reconciliation. This effect only
   // refreshes session metadata; issuing another timeline request here races
   // the terminal handler and can briefly restore a stale active turn.
@@ -430,13 +397,30 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
     if (!draftRef.current) return;
     draftRef.current.style.height = "0px";
     const nextHeight = Math.min(draftRef.current.scrollHeight, 220);
-    draftRef.current.style.height = `${Math.max(nextHeight, 96)}px`;
+    const minimumHeight = window.matchMedia("(max-height: 560px)").matches
+      ? 52
+      : 96;
+    draftRef.current.style.height = `${Math.max(nextHeight, minimumHeight)}px`;
   }, [draft]);
 
   // Single data source for welcome/messages toggle.
   // Both read from the same blocks state — no more timeline/welcome mismatch.
   const hasContent = activeTurn !== null || completedTurns.length > 0;
   const isLoadingSession = !!activeId && !activeDetail;
+
+  // Preserve the welcome canvas at its natural top position. Only follow the
+  // conversation tail once content exists and the reader is already near it.
+  useEffect(() => {
+    if (!hasContent || !bottomRef.current) return;
+    const scroller = bottomRef.current.closest<HTMLElement>(".chat.view");
+    if (!scroller) return;
+    const distanceFromBottom = scroller.scrollHeight
+      - scroller.scrollTop
+      - scroller.clientHeight;
+    if (isRunning || distanceFromBottom < 160) {
+      bottomRef.current.scrollIntoView({ block: "end" });
+    }
+  }, [hasContent, timeline, isRunning, error]);
 
   const slashMatches = useMemo(() => {
     if (!draft.startsWith("/")) return [];
@@ -464,11 +448,13 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
     if (!trimmed) return "";
     if (!contextChips.length) return trimmed;
     const contextBlock = contextChips
-      .map((chip) =>
-        chip.kind === "project"
-          ? `- project file: ${chip.label}`
-          : `- attached file: ${chip.label}${chip.meta ? ` (${chip.meta})` : ""}`,
-      )
+      .map((chip) => {
+        if (chip.kind === "project") return `- project file: ${chip.label}`;
+        if (chip.uploadState === "error") return `- attached file (failed to upload): ${chip.label}`;
+        // Ready upload: expose the server path so the agent can Read the file.
+        if (!chip.uploadState && chip.meta) return `- @mention ${chip.meta} (attached ${chip.label})`;
+        return `- attached file (upload pending): ${chip.label}`;
+      })
       .join("\n");
     return `${trimmed}\n\nContext references:\n${contextBlock}`;
   };
@@ -505,16 +491,39 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
-    if (!files.length) return;
-    const newChips = files.map((file) => ({
-      id: `${file.name}-${file.size}-${Date.now()}`,
+    if (!files.length || !activeId) return;
+    const sessionId = activeId;
+    const stamp = Date.now();
+    const newChips = files.map((file, index) => ({
+      id: `${file.name}-${file.size}-${stamp}-${index}`,
       label: file.name,
       kind: "upload" as const,
       meta: formatBytes(file.size),
+      uploadState: "uploading" as const,
     }));
     setContextChips((prev) => [...prev, ...newChips]);
     setComposerMenu("closed");
     e.target.value = "";
+
+    // Upload each file to the session attachment dir so the agent can Read it.
+    for (const [index, file] of files.entries()) {
+      const chipId = newChips[index].id;
+      uploadAttachment(sessionId, file)
+        .then((result) => {
+          setContextChips((prev) => prev.map((chip) => (
+            chip.id === chipId
+              ? { ...chip, uploadState: undefined, meta: result.path }
+              : chip
+          )));
+        })
+        .catch(() => {
+          setContextChips((prev) => prev.map((chip) => (
+            chip.id === chipId
+              ? { ...chip, uploadState: "error" }
+              : chip
+          )));
+        });
+    }
   };
 
   const handleSend = () => {
@@ -684,80 +693,15 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
       updateDraft((current) => `${current}${current ? "\n" : ""}\`\`\`\n\n\`\`\``);
       return;
     }
-    openMenu("actions");
   };
 
   const renderComposerMenu = () => {
     if (composerMenu === "closed") return null;
 
-    if (composerMenu === "actions") {
-      return (
-        <div className="composer-panel">
-          <ComposerPanelHeader
-            title="Quick actions"
-            detail="Common session and context actions around the composer."
-          />
-          <div className="composer-action-list">
-            <button type="button" className="composer-action-item" onClick={() => openMenu("context")}>
-              <span className="composer-action-icon">+</span>
-              <span>
-                <strong>Context</strong>
-                <small>Attach files or mention repo paths.</small>
-              </span>
-            </button>
-            <button type="button" className="composer-action-item" onClick={() => openMenu("mode")}>
-              <span className="composer-action-icon">M</span>
-              <span>
-                <strong>Mode</strong>
-                <small>Switch between build, plan, and Multi-Agent.</small>
-              </span>
-            </button>
-            <button type="button" className="composer-action-item" onClick={() => openMenu("model")}>
-              <span className="composer-action-icon">AI</span>
-              <span>
-                <strong>Model</strong>
-                <small>Pick the model preset for this run.</small>
-              </span>
-            </button>
-            <button type="button" className="composer-action-item" onClick={() => openMenu("settings")}>
-              <span className="composer-action-icon">S</span>
-              <span>
-                <strong>Runtime settings</strong>
-                <small>Thinking, effort, and execution style.</small>
-              </span>
-            </button>
-            <button
-              type="button"
-              className="composer-action-item"
-              disabled={!activeId || isRunning}
-              onClick={async () => {
-                if (!activeId) return;
-                await compactSession(activeId);
-                setComposerMenu("closed");
-              }}
-            >
-              <span className="composer-action-icon">Z</span>
-              <span>
-                <strong>Compact context</strong>
-                <small>Compress conversation to free context window.</small>
-              </span>
-            </button>
-            <button type="button" className="composer-action-item" onClick={handleClearConversation}>
-              <span className="composer-action-icon">C</span>
-              <span>
-                <strong>Clear conversation</strong>
-                <small>Reset the local timeline and draft.</small>
-              </span>
-            </button>
-          </div>
-        </div>
-      );
-    }
-
     if (composerMenu === "mode") {
       return (
         <div className="composer-panel">
-          <ComposerPanelHeader title="Choose mode" detail="The mode shapes the next task." onBack={() => setComposerMenu("actions")} />
+          <ComposerPanelHeader title="Choose mode" detail="The mode shapes the next task." onBack={() => setComposerMenu("closed")} />
           <div className="composer-option-list">
             {MODE_OPTIONS.map((option) => (
               <button
@@ -796,7 +740,7 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
       );
       return (
         <div className="composer-panel">
-          <ComposerPanelHeader title="Switch model" detail="Tiers + full model list." onBack={() => setComposerMenu("actions")} />
+          <ComposerPanelHeader title="Switch model" detail="Tiers + full model list." onBack={() => setComposerMenu("closed")} />
           <div className="composer-option-list">
             {orderedTiers.map((tier) => (
               <div key={tier}>
@@ -829,7 +773,7 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
     if (composerMenu === "context") {
       return (
         <div className="composer-panel">
-          <ComposerPanelHeader title="Add context" detail="Attach files or mention project paths." onBack={() => setComposerMenu("actions")} />
+          <ComposerPanelHeader title="Add context" detail="Attach files or mention project paths." onBack={() => setComposerMenu("closed")} />
           <div className="composer-context-toolbar">
             <button type="button" className="btn-secondary composer-mini-btn" onClick={handleAttachClick}>
               Attach file...
@@ -855,7 +799,7 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
 
     return (
       <div className="composer-panel">
-        <ComposerPanelHeader title="Runtime settings" detail="Shape the next run." onBack={() => setComposerMenu("actions")} />
+        <ComposerPanelHeader title="Runtime settings" detail="Shape the next run." onBack={() => setComposerMenu("closed")} />
         <div className="composer-settings-list">
           <div className="composer-setting-row">
             <div>
@@ -928,17 +872,6 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
                 Describe the outcome you need. Grace can investigate, plan, implement,
                 and verify the work while keeping every decision inspectable.
               </p>
-              <div className="welcome-grid welcome-grid-four">
-                {HERO_CARDS.map((card) => (
-                  <div key={card.title} className={`welcome-card welcome-feature-card tone-${card.tone}`}>
-                    <div className="welcome-feature-icon">{card.icon}</div>
-                    <div className="welcome-card-title">{card.label}</div>
-                    <div className="welcome-feature-subtitle">{card.title}</div>
-                    <div className="welcome-card-body">{card.body}</div>
-                    <div className="welcome-feature-arrow">→</div>
-                  </div>
-                ))}
-              </div>
             </div>
           )}
 
@@ -1107,10 +1040,12 @@ export function ChatView({ onInspectRun }: ChatViewProps = {}) {
               {contextChips.length ? (
                 <div className="composer-context-chips">
                   {contextChips.map((chip) => (
-                    <div key={chip.id} className={`context-chip ${chip.kind}`}>
+                    <div key={chip.id} className={`context-chip ${chip.kind}${chip.uploadState ? ` context-chip-${chip.uploadState}` : ""}`}>
                       <span className="context-chip-icon">{chip.kind === "project" ? "@@" : "F"}</span>
                       <span className="context-chip-label">{chip.label}</span>
                       {chip.meta ? <span className="context-chip-meta">{chip.meta}</span> : null}
+                      {chip.uploadState === "uploading" ? <span className="context-chip-meta">uploading…</span> : null}
+                      {chip.uploadState === "error" ? <span className="context-chip-meta">upload failed</span> : null}
                       <button type="button" className="context-chip-remove" onClick={() => removeContextChip(chip.id)}>
                         ×
                       </button>

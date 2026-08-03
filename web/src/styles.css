@@ -973,7 +973,7 @@ pre {
 
 .welcome-hero {
   position: relative;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .welcome-hero::after {
@@ -2586,6 +2586,71 @@ pre {
   align-items: center;
   gap: 6px;
   padding: 0 12px 4px;
+}
+
+.event-expand-toggle {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+.event-expand-toggle:hover {
+  text-decoration: underline;
+}
+
+.event-trace-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 0 8px 6px;
+}
+
+.event-timeline-full {
+  border-top: 1px solid var(--border);
+}
+
+.event-timeline-full .event-list {
+  padding: 8px;
+  gap: 6px;
+}
+
+/* Collapsible cards that keep the page quieter by default. */
+details.safety-invariants > summary,
+details.review-verification > summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+details.safety-invariants > summary::-webkit-details-marker,
+details.review-verification > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.safety-invariants > summary::before,
+details.review-verification > summary::before {
+  content: "▸ ";
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+details.safety-invariants[open] > summary::before,
+details.review-verification[open] > summary::before {
+  content: "▾ ";
+}
+
+/* Upload lifecycle states on composer context chips. */
+.context-chip-uploading {
+  opacity: 0.7;
+}
+
+.context-chip-error .context-chip-meta {
+  color: var(--error);
 }
 
 .event-filter {
@@ -4966,9 +5031,9 @@ pre {
 .memory-catalog-list {
   display: grid;
   gap: 12px;
-  max-height: 690px;
-  overflow: auto;
-  padding-right: 2px;
+  max-height: none;
+  overflow: visible;
+  padding-right: 0;
 }
 
 .memory-list-item {
@@ -12218,24 +12283,30 @@ body,
 
   .composer-main {
     position: relative;
-    display: block;
+    display: grid;
     width: 100%;
     min-width: 0;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
   }
 
   #prompt-input {
+    grid-column: 1;
+    grid-row: 1;
     width: 100%;
-    min-height: 92px;
-    padding: 8px 4px 52px;
+    min-height: 64px;
+    padding: 8px 4px;
   }
 
   .composer-actions-floating {
-    position: absolute;
-    right: 0;
-    bottom: 0;
+    position: static;
+    inset: auto;
     display: flex;
+    grid-column: 1;
+    grid-row: 2;
     width: auto;
-    max-width: calc(100% - 4px);
+    max-width: 100%;
+    justify-self: end;
     flex-direction: row;
     justify-content: flex-end;
   }
@@ -13064,12 +13135,23 @@ body,
 
 @media (max-width: 520px) {
   #app.adaptive-shell .topbar-module-navigation {
-    grid-template-columns: minmax(0, 1fr) 32px;
-    gap: 5px;
+    position: relative;
+    display: block;
+    min-block-size: 0;
     padding: 7px 8px !important;
   }
 
+  #app.adaptive-shell .topbar-module-navigation .topbar-left {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) 32px;
+    grid-template-rows: 32px auto auto;
+    gap: 5px;
+    inline-size: 100%;
+  }
+
   #app.adaptive-shell .mobile-session-toggle {
+    grid-column: 1;
+    grid-row: 1;
     inline-size: 34px;
     padding: 0;
     justify-content: center;
@@ -13078,6 +13160,22 @@ body,
 
   #app.adaptive-shell .mobile-session-toggle span {
     font-size: 14px;
+  }
+
+  #app.adaptive-shell .topbar-module-navigation .primary-navigation {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  #app.adaptive-shell .topbar-module-navigation .secondary-navigation {
+    grid-column: 1 / -1;
+    grid-row: 3;
+  }
+
+  #app.adaptive-shell .topbar-module-navigation .topbar-right {
+    position: absolute;
+    inset: 7px 8px auto auto;
+    z-index: 2;
   }
 
   #app.adaptive-shell .topbar-right > :not(.theme-toggle) {
@@ -13127,7 +13225,20 @@ body,
   }
 
   #app.adaptive-shell #prompt-input {
+    grid-column: 1;
+    grid-row: 1;
     min-block-size: 52px;
+  }
+
+  #app.adaptive-shell .composer-main {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 10px;
+  }
+
+  #app.adaptive-shell .composer-actions-floating {
+    grid-column: 2;
+    grid-row: 1;
   }
 
   #app.adaptive-shell .permission-dock,

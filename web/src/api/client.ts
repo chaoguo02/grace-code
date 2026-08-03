@@ -42,3 +42,24 @@ export function apiPatch<T>(path: string, body?: unknown, signal?: AbortSignal):
     ...(signal ? { signal } : {}),
   });
 }
+
+/**
+ * Multipart upload helper. Unlike the JSON helpers, no Content-Type header is
+ * set — the browser generates the multipart boundary itself.
+ */
+export async function apiUpload<T>(
+  path: string,
+  formData: FormData,
+  signal?: AbortSignal,
+): Promise<T> {
+  const resp = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    body: formData,
+    ...(signal ? { signal } : {}),
+  });
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    throw new ApiError(resp.status, data?.detail || `${resp.status} ${resp.statusText}`);
+  }
+  return data as T;
+}

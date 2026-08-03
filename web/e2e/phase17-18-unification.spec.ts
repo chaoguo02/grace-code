@@ -219,8 +219,10 @@ test("keeps core surfaces reachable and secondary surfaces quieter", async ({ pa
   await expect(page.locator(".sidebar")).toBeVisible();
   await expect(page.locator(".view-tab[data-view='chat']")).toHaveText(/Chat/);
   await expect(page.locator(".view-tab[data-view='plan']")).toHaveCount(0);
-  await expect(page.locator(".view-tab[data-view='reviews']")).toHaveText(/Changes/);
-  await expect(page.locator(".view-tab[data-view='memory']")).toHaveText(/Memory/);
+  // Workbench exposes only its own views; the rest live in their modules.
+  await expect(page.locator(".view-tab[data-view='plans']")).toHaveText(/Plans/);
+  await expect(page.locator(".view-tab[data-view='reviews']")).toHaveCount(0);
+  await expect(page.locator(".view-tab[data-view='memory']")).toHaveCount(0);
 
   await page.getByText("Phase 17-18 Workspace").click();
 
@@ -232,14 +234,18 @@ test("keeps core surfaces reachable and secondary surfaces quieter", async ({ pa
   await expect(page.getByRole("region", { name: "Plan approval" })).toBeVisible();
   await expect(page.getByRole("button", { name: /Approve & Build/ })).toBeVisible();
 
+  // The event timeline is inlined into the sidebar; expand it to inspect raw events.
+  await page.locator("button.event-expand-toggle").click();
+  await expect(page.locator(".event-timeline-full")).toBeVisible();
+  await expect(page.locator(".event-timeline-full .trace-summary", { hasText: "I should reduce visual noise." }))
+    .toBeVisible();
+  await page.locator("button.event-expand-toggle").click();
+
   await page.locator("button[data-view='memory']").click();
   await expect(page.locator(".memory-hero")).toBeVisible();
   await expect(page.locator(".memory-page")).toBeVisible();
 
   await page.getByRole("button", { name: "Inspect", exact: true }).click();
-  await page.locator("button[data-view='events']").click();
-  await expect(page.locator("[data-view-name='events']")).toBeVisible();
-  await expect(page.locator("[data-view-name='events'] .trace-summary").first()).toContainText("I should reduce visual noise.");
 
   await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.locator("button[data-view='plans']").click();

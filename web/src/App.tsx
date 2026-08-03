@@ -5,15 +5,11 @@ import { ChatView } from "./components/ChatView";
 import { DiffReviewView } from "./components/DiffReviewView";
 import { PlanLibrary } from "./components/PlanLibrary";
 import { MemoryView } from "./components/MemoryView";
-import { TraceView } from "./components/TraceView";
 import { RunInspector } from "./components/RunInspector";
 import { ContextInspector } from "./components/ContextInspector";
 import { EvaluationLab } from "./components/EvaluationLab";
-import { ArchitectureExplorer } from "./components/ArchitectureExplorer";
-import { ReplayLab } from "./components/ReplayLab";
 import { SafetyCenter } from "./components/SafetyCenter";
 import { MultiAgentControlPlane } from "./components/MultiAgentControlPlane";
-import { ReliabilityDashboard } from "./components/ReliabilityDashboard";
 import { ProjectOverview } from "./components/ProjectOverview";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
@@ -317,12 +313,8 @@ export default function App() {
                 <ContextInspector requestedRunId={navigation.runId} />
               )}
               {activeView === "evaluations" && (
-                <EvaluationLab
-                  onNavigate={navigateView}
-                  onOpenHealth={() => navigateView("reliability")}
-                />
+                <EvaluationLab onNavigate={navigateView} />
               )}
-              {activeView === "architecture" && <ArchitectureExplorer />}
               {activeView === "agents" && (
                 <MultiAgentControlPlane
                   onOpenChanges={(sessionId) => {
@@ -330,36 +322,9 @@ export default function App() {
                   }}
                 />
               )}
-              {activeView === "reliability" && (
-                <ReliabilityDashboard
-                  onOpenEvaluations={() => navigateView("evaluations")}
-                />
-              )}
-              {activeView === "safety" && (
-                <SafetyCenter
-                  onInspectApproval={(sequence) => navigateView("events", {
-                    sequence,
-                  })}
-                />
-              )}
-              {activeView === "replay" && (
-                <ReplayLab
-                  requestedRunId={navigation.runId}
-                  onSelectRun={(runId, turnId) => navigateView("replay", {
-                    runId,
-                    turnId,
-                  })}
-                />
-              )}
-              {activeView === "plans" && <PlanLibrary />}
+              {activeView === "safety" && <SafetyCenter />}
+              {activeView === "plans" && <PlanLibrary onNavigate={navigateView} />}
               {activeView === "memory" && <MemoryView />}
-              {activeView === "events" && (
-                <TraceView
-                  requestedRunId={navigation.runId}
-                  requestedSequence={navigation.sequence}
-                  onShowSession={() => navigateView("events")}
-                />
-              )}
             </div>
           </main>
         </ErrorBoundary>

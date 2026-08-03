@@ -709,16 +709,6 @@ export function MemoryView() {
               ))}
             </div>
 
-            <div className="memory-side-card">
-              <div className="memory-side-title">What the code already supports</div>
-              <ul className="memory-architecture-list">
-                <li>Typed categories: user, feedback, project, reference</li>
-                <li>Lifecycle states: active and deprecated</li>
-                <li>Scope routing: session, project, global</li>
-                <li>Two-tier storage with archive separation</li>
-                <li>TTL, validation, access count, and anchor metadata</li>
-              </ul>
-            </div>
           </div>
         </div>
       </div>

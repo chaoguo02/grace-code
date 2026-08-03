@@ -137,12 +137,10 @@ function EmptyEvaluation({
 
 interface EvaluationLabProps {
   onNavigate: (view: "runs" | "context") => void;
-  onOpenHealth?: () => void;
 }
 
 export function EvaluationLab({
   onNavigate,
-  onOpenHealth,
 }: EvaluationLabProps) {
   const [overview, setOverview] = useState<EvaluationOverview | null>(null);
   const [selectedRunId, setSelectedRunId] = useState("");
@@ -203,11 +201,6 @@ export function EvaluationLab({
             </p>
           </div>
           <div className="quality-header-actions">
-            {onOpenHealth && (
-              <button type="button" onClick={onOpenHealth}>
-                Open health
-              </button>
-            )}
             <div className="eval-hero-badge">
               <span>Read-only artifact view</span>
               <strong>CLI / CI is the execution owner</strong>

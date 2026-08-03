@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import { getProjectOverview } from "../api/overview";
 import { useSessionStore } from "../stores/sessionStore";
 import type {
-  DemoJourney,
   OverviewCapability,
   OverviewRoute,
   ProjectOverview as ProjectOverviewData,
@@ -56,41 +55,6 @@ function CapabilityCard({
         <span>{capability.evidence}</span>
         <b>Open evidence →</b>
       </button>
-    </article>
-  );
-}
-
-function JourneyCard({
-  journey,
-  onNavigate,
-}: {
-  journey: DemoJourney;
-  onNavigate: (view: OverviewRoute) => void;
-}) {
-  return (
-    <article className="overview-journey">
-      <div className="overview-journey-number">{journey.number}</div>
-      <div className="overview-journey-title">
-        <div>
-          <span className={`overview-readiness readiness-${journey.readiness}`}>
-            {journey.readiness.replace(/_/g, " ")}
-          </span>
-          <small>{journey.duration_minutes} min</small>
-        </div>
-        <h3>{journey.title}</h3>
-        <p>{journey.goal}</p>
-      </div>
-      <ol>
-        {journey.steps.map((step, index) => (
-          <li key={`${step.route}-${index}`}>
-            <button type="button" onClick={() => onNavigate(step.route)}>
-              <i>{index + 1}</i>
-              <span><strong>{step.label}</strong><small>{step.proof}</small></span>
-              <b>→</b>
-            </button>
-          </li>
-        ))}
-      </ol>
     </article>
   );
 }
@@ -169,9 +133,6 @@ export function ProjectOverview({
             <button type="button" className="primary" onClick={() => onNavigate("chat")}>
               {activeId ? "Continue selected session" : "Start a live session"}
             </button>
-            <button type="button" onClick={() => onNavigate("architecture")}>
-              Explain the architecture
-            </button>
           </div>
           <div className="overview-runtime-line">
             <i />
@@ -233,25 +194,6 @@ export function ProjectOverview({
         </div>
       </section>
 
-      <section className="overview-section overview-demo">
-        <div className="overview-section-heading">
-          <div>
-            <span className="overview-eyebrow">Reusable interview flow</span>
-            <h2>Three evidence-led demos</h2>
-          </div>
-          <p>Each step opens the exact page that supports the spoken claim.</p>
-        </div>
-        <div className="overview-journey-grid">
-          {overview.journeys.map((journey) => (
-            <JourneyCard
-              journey={journey}
-              onNavigate={onNavigate}
-              key={journey.id}
-            />
-          ))}
-        </div>
-      </section>
-
       <div className="overview-lower-grid">
         <section className="overview-panel overview-signals">
           <div className="overview-section-heading compact">
@@ -261,7 +203,7 @@ export function ProjectOverview({
             </div>
           </div>
           <div className="overview-signal-grid">
-            <button type="button" onClick={() => onNavigate("reliability")}>
+            <button type="button" onClick={() => onNavigate("evaluations")}>
               <span>Operations</span>
               <strong>{formatPercent(signals.reliability.success_rate)}</strong>
               <small>P95 {formatDuration(signals.reliability.duration_p95_ms)} · {signals.reliability.terminal_runs} terminal</small>
@@ -281,12 +223,7 @@ export function ProjectOverview({
               <strong>{signals.multi_agent.available_for_selected_session ? `${signals.multi_agent.agents} agents` : "Select session"}</strong>
               <small>{signals.multi_agent.consistency || "No selected topology"}</small>
             </button>
-            <button type="button" onClick={() => onNavigate("replay")}>
-              <span>Replay</span>
-              <strong>{signals.replay.available_for_selected_session ? `${signals.replay.contracts} contracts` : "Select session"}</strong>
-              <small>{signals.replay.valid} valid · {signals.replay.runs} runs</small>
-            </button>
-            <button type="button" onClick={() => onNavigate("architecture")}>
+            <button type="button" onClick={() => onNavigate("agents")}>
               <span>Capability surface</span>
               <strong>{headline.registered_tools} tools</strong>
               <small>{headline.skills} skills · {headline.mcp_servers} MCP servers</small>

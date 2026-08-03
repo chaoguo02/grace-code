@@ -564,16 +564,17 @@ test("trace sidebar: filter buttons switch visible events", async ({ page }) => 
   await page.getByRole("button", { name: "Workbench", exact: true }).click();
   await page.getByText("Plan session test").click();
 
-  await page.getByRole("button", { name: "Inspect", exact: true }).click();
-  await page.locator("button[data-view='events']").click();
-  const timeline = page.locator(".trace-timeline:visible");
+  // Event timeline is inlined into the chat sidebar; expand and filter it.
+  await page.locator("button.event-expand-toggle").click();
+  const timeline = page.locator(".event-timeline-full");
+  await expect(timeline).toBeVisible();
   await expect.poll(() => timeline.locator(".trace-block").count()).toBeGreaterThanOrEqual(
     tracePayload().length,
   );
 
-  await page.locator("button.event-filter:has-text('Actions')").click();
+  await page.locator(".event-timeline-full button.event-filter:has-text('Actions')").click();
   await expect(timeline.locator(".trace-block-tool_call").first()).toBeVisible();
-  await expect(page.locator("button.event-filter:has-text('Actions')")).toHaveClass(/active/);
+  await expect(page.locator(".event-timeline-full button.event-filter:has-text('Actions')")).toHaveClass(/active/);
   await expect(timeline.locator(".trace-block-observation")).toHaveCount(0);
   await expect(timeline.locator(".trace-block-thought")).toHaveCount(0);
   await expect(timeline.locator(".trace-block-status")).toHaveCount(0);
@@ -593,7 +594,7 @@ test("trace sidebar: filter buttons switch visible events", async ({ page }) => 
 
 /* ── 5. Tab navigation ────────────────────────────────────────── */
 
-test("tab navigation: all 5 tabs render their content", async ({ page }) => {
+test("module navigation: all 4 modules render their content", async ({ page }) => {
   await setupCommonRoutes(page);
   await page.route("**/api/diffs/pending", async (route) => {
     await route.fulfill({ json: [] });
@@ -615,24 +616,25 @@ test("tab navigation: all 5 tabs render their content", async ({ page }) => {
   });
 
   await page.goto("/");
-  await page.getByRole("button", { name: "Workbench", exact: true }).click();
 
-  // Chat tab (default)
+  // Chat tab (default in Workbench)
   await expect(page.locator(".view-tab.active")).toContainText("Chat");
 
-  // Review tab
-  await page.locator("button[data-view='reviews']").click();
-  await expect(page.locator(".review-page")).toBeVisible();
-  await expect(page.locator(".plan-hero-title")).toContainText("Quality, changes, and readiness");
-
-  // Plans tab
+  // Plans tab (Workbench)
   await page.route("**/api/plans?limit=50&offset=0", async (route) => {
     await route.fulfill({ json: { plans: [], total: 0 } });
   });
   await page.locator("button[data-view='plans']").click();
   await expect(page.locator(".plan-library")).toBeVisible();
 
-  // Memory tab
+  // Reviews tab (Changes module)
+  await page.getByRole("button", { name: "Changes", exact: true }).click();
+  await page.locator("button[data-view='reviews']").click();
+  await expect(page.locator(".review-page")).toBeVisible();
+  await expect(page.locator(".plan-hero-title")).toContainText("Quality, changes, and readiness");
+
+  // Memory tab (History module)
+  await page.getByRole("button", { name: "History", exact: true }).click();
   await page.locator("button[data-view='memory']").click();
   await expect(page.locator("[data-view-name='memory']")).toBeVisible();
 });

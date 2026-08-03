@@ -75,12 +75,14 @@ export function getRunEvidence(
 export function createSession(
   agentName: string,
   repoPath: string,
-  title?: string
+  title?: string,
+  initialPlanFile?: string
 ): Promise<{ session_id: string }> {
   return apiPost("/api/sessions", {
     agent_name: agentName,
     repo_path: repoPath,
     title: title || `Session ${new Date().toLocaleTimeString()}`,
+    ...(initialPlanFile ? { initial_plan_file: initialPlanFile } : {}),
   });
 }
 

@@ -20,16 +20,17 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("supports scoped two-level keyboard navigation", async ({ page }) => {
-  await page.goto("/?module=overview&view=overview");
+  await page.goto("/?module=system&view=overview");
 
   const primary = page.getByRole("navigation", { name: "Primary modules" });
-  await expect(primary.getByRole("button")).toHaveCount(5);
+  await expect(primary.getByRole("button")).toHaveCount(4);
   await expect(page).toHaveTitle("Overview · Grace Code");
   await expect(page.getByText("Project scope", { exact: true })).toBeVisible();
 
-  const overview = primary.getByRole("button", { name: "Overview" });
-  await overview.focus();
-  await overview.press("ArrowRight");
+  // ArrowRight wraps from System (last) to Workbench (first).
+  const system = primary.getByRole("button", { name: "System" });
+  await system.focus();
+  await system.press("ArrowRight");
 
   await expect(primary.getByRole("button", { name: "Workbench" }))
     .toHaveAttribute("aria-current", "page");
@@ -59,9 +60,9 @@ test("keeps skip navigation and all modules reachable on a narrow viewport", asy
   await expect(page.locator("#main-workspace")).toBeFocused();
 
   const primary = page.getByRole("navigation", { name: "Primary modules" });
-  await expect(primary.getByRole("button")).toHaveCount(5);
-  await primary.getByRole("button", { name: "Quality" }).click();
-  await expect(page).toHaveURL(/module=quality.*view=reliability/);
-  await expect(page.getByRole("navigation", { name: "Quality views" }))
+  await expect(primary.getByRole("button")).toHaveCount(4);
+  await primary.getByRole("button", { name: "System" }).click();
+  await expect(page).toHaveURL(/module=system.*view=overview/);
+  await expect(page.getByRole("navigation", { name: "System views" }))
     .toBeVisible();
 });

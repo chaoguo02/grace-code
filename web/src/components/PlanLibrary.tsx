@@ -1,14 +1,16 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState } from "react";
 import type { PlanEntry, PlanDetail, PlanRevision, PlanRevisionDiff } from "../api/plans";
 import * as plansApi from "../api/plans";
+import { useSessionStore } from "../stores/sessionStore";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import type { ViewName } from "../navigation";
 
 type LibraryState =
   | { phase: "loading" }
   | { phase: "error"; message: string; retry?: () => void }
   | { phase: "ready" };
 
-export function PlanLibrary() {
+export function PlanLibrary({ onNavigate }: { onNavigate: (view: ViewName) => void }) {
   const [ui, setUi] = useState<LibraryState>({ phase: "loading" });
   const [plans, setPlans] = useState<PlanEntry[]>([]);
   const [total, setTotal] = useState(0);
@@ -194,9 +196,26 @@ export function PlanLibrary() {
                     {detail.session && <span>Agent: {detail.session.agent_name}</span>}
                   </div>
                 </div>
-                <button className="btn-ghost" onClick={() => detail && handleDelete(detail)} title="Delete this plan">
-                  Delete
-                </button>
+                <div className="plan-library-detail-actions">
+                  <button
+                    className="btn-primary"
+                    type="button"
+                    onClick={async () => {
+                      const sessionId = await useSessionStore.getState().createSession(
+                        detail.session?.agent_name || "build",
+                        ".",
+                        detail.filename,
+                      );
+                      if (sessionId) onNavigate("chat");
+                    }}
+                    title="Open a fresh session seeded with this plan"
+                  >
+                    Continue in Chat →
+                  </button>
+                  <button className="btn-ghost" onClick={() => detail && handleDelete(detail)} title="Delete this plan">
+                    Delete
+                  </button>
+                </div>
               </div>
 
               {/* ── Revisions ── */}

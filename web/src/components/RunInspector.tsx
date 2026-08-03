@@ -405,24 +405,6 @@ export function RunInspector({
               >
                 Context
               </button>
-              <button
-                type="button"
-                onClick={() => onNavigate?.("replay", {
-                  runId: selectedRun.run_id,
-                  turnId: selectedRun.turn_id,
-                })}
-              >
-                Replay
-              </button>
-              <button
-                type="button"
-                onClick={() => onNavigate?.("events", {
-                  runId: selectedRun.run_id,
-                  turnId: selectedRun.turn_id,
-                })}
-              >
-                Event trace
-              </button>
             </nav>
           </div>
 

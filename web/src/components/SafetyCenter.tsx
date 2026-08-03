@@ -77,10 +77,8 @@ function LayerInspector({ layer }: { layer: SafetyLayer }) {
 
 function ApprovalItem({
   item,
-  onInspect,
 }: {
   item: ApprovalAuditItem;
-  onInspect?: (sequence: number) => void;
 }) {
   const decision = item.status === "timed_out"
     ? "timeout"
@@ -107,26 +105,11 @@ function ApprovalItem({
         <div><dt>Input changed</dt><dd>{item.updated_input ? "Yes" : "No"}</dd></div>
         <div><dt>Request</dt><dd>{item.request_id.slice(0, 8)}</dd></div>
       </dl>
-      {onInspect && item.sequence > 0 && (
-        <button
-          type="button"
-          className="safety-approval-trace"
-          onClick={() => onInspect(item.sequence)}
-        >
-          View in trace
-        </button>
-      )}
     </article>
   );
 }
 
-interface SafetyCenterProps {
-  onInspectApproval?: (sequence: number) => void;
-}
-
-export function SafetyCenter({
-  onInspectApproval,
-}: SafetyCenterProps = {}) {
+export function SafetyCenter() {
   const activeId = useSessionStore((state) => state.activeId);
   const liveApprovalKey = useChatStore((state) => {
     if (!activeId) return "";
@@ -293,16 +276,18 @@ export function SafetyCenter({
           )}
         </section>
 
-        <section className="safety-card safety-invariants">
-          <span className="safety-eyebrow">Non-negotiable contracts</span>
-          <h2>Safety invariants</h2>
+        <details className="safety-card safety-invariants">
+          <summary>
+            <span className="safety-eyebrow">Non-negotiable contracts</span>
+            <h2>Safety invariants</h2>
+          </summary>
           {snapshot.invariants.map((item, index) => (
             <article key={item.name}>
               <i>{index + 1}</i>
               <div><strong>{item.name}</strong><p>{item.detail}</p></div>
             </article>
           ))}
-        </section>
+        </details>
       </div>
 
       <section className="safety-card safety-approval-audit">
@@ -326,7 +311,6 @@ export function SafetyCenter({
               <ApprovalItem
                 key={item.request_id}
                 item={item}
-                onInspect={onInspectApproval}
               />
             ))}
           </div>

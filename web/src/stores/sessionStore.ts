@@ -16,7 +16,7 @@ interface SessionState {
 
   loadSessions: () => Promise<void>;
   openSession: (id: string) => Promise<void>;
-  createSession: (agentName?: string, repoPath?: string) => Promise<string | null>;
+  createSession: (agentName?: string, repoPath?: string, initialPlanFile?: string) => Promise<string | null>;
   deleteSession: (id: string) => Promise<boolean>;
   fetchSessionTree: (id: string) => Promise<void>;
   deleteSessionsBatch: (ids: string[]) => Promise<number>;
@@ -130,10 +130,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
-  createSession: async (agentName = "build", repoPath = ".") => {
+  createSession: async (agentName = "build", repoPath = ".", initialPlanFile) => {
     set({ isLoading: true, error: null });
     try {
-      const resp = await api.createSession(agentName, repoPath);
+      const resp = await api.createSession(agentName, repoPath, initialPlanFile);
       await get().openSession(resp.session_id);
       void get().loadSessions();
       return resp.session_id;

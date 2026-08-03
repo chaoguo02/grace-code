@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getSessionDiffs, getPendingDiffs, updateDiffStatus } from "../api/diffs";
-import { getSessionStats, getSessionSteps } from "../api/stats";
+import { getSessionSteps } from "../api/stats";
 import {
   cancelReview,
   getLatestReview,
@@ -14,7 +14,7 @@ import { DiffBlock } from "./DiffBlock";
 import { ReviewOrchestrationPanel } from "./ReviewOrchestrationPanel";
 import { useSessionStore } from "../stores/sessionStore";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
-import type { SessionDiff, SessionStats, StepLog } from "../types/stats";
+import type { SessionDiff, StepLog } from "../types/stats";
 import type { ReviewJob } from "../api/reviews";
 
 function EmptyState({ title, body }: { title: string; body: string }) {
@@ -43,13 +43,6 @@ function formatDuration(ms?: number) {
   const sec = Math.round(ms / 1000);
   if (sec < 60) return `${sec}s`;
   return `${Math.floor(sec / 60)}m ${sec % 60}s`;
-}
-
-function statusTone(status?: string | null) {
-  if (status === "completed" || status === "finish") return "good";
-  if (status === "failed" || status === "gave_up") return "bad";
-  if (status === "running") return "busy";
-  return "neutral";
 }
 
 function collectVerificationSignals(steps: StepLog[]) {
@@ -83,7 +76,6 @@ export function DiffReviewView() {
 
   const [globalDiffs, setGlobalDiffs] = useState<SessionDiff[]>([]);
   const [sessionDiffs, setSessionDiffs] = useState<SessionDiff[]>([]);
-  const [stats, setStats] = useState<SessionStats | null>(null);
   const [steps, setSteps] = useState<StepLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [submittingId, setSubmittingId] = useState<number | null>(null);
@@ -105,14 +97,12 @@ export function DiffReviewView() {
     Promise.all([
       getPendingDiffs().catch(() => []),
       activeId ? getSessionDiffs(activeId).catch(() => []) : Promise.resolve([]),
-      activeId ? getSessionStats(activeId).catch(() => null) : Promise.resolve(null),
       activeId ? getSessionSteps(activeId).catch(() => []) : Promise.resolve([]),
       activeId ? getLatestReview(activeId).catch(() => null) : Promise.resolve(null),
-    ]).then(([pendingData, sessionDiffData, statsData, stepsData, latestReview]) => {
+    ]).then(([pendingData, sessionDiffData, stepsData, latestReview]) => {
       if (cancelled) return;
       setGlobalDiffs(pendingData as SessionDiff[]);
       setSessionDiffs(sessionDiffData as SessionDiff[]);
-      setStats(statsData as SessionStats | null);
       setSteps(stepsData as StepLog[]);
       setReviewJob(latestReview as ReviewJob | null);
     }).finally(() => {
@@ -215,12 +205,6 @@ export function DiffReviewView() {
   );
 
   const sessionPending = sessionDiffs.filter((item) => item.status === "pending").length;
-  const sessionLineStats = useMemo(() => {
-    return sessionDiffs.reduce((acc, diff) => {
-      const next = countDiffLines(diff.diff_content);
-      return { added: acc.added + next.added, removed: acc.removed + next.removed, total: acc.total + next.total };
-    }, { added: 0, removed: 0, total: 0 });
-  }, [sessionDiffs]);
 
   const verificationSignals = useMemo(() => collectVerificationSignals(steps), [steps]);
   const failedSignals = verificationSignals.filter((step) => step.status === "error" || step.status === "failed").length;
@@ -446,46 +430,13 @@ export function DiffReviewView() {
           )}
         </div>
 
-        <div className="stats-grid">
-          <div className="stats-card">
-            <div className="stats-card-header">
-              <div>
-                <div className="summary-label">Session outcome</div>
-                <h3 className="stats-card-title">{activeDetail?.title || "No session selected"}</h3>
-              </div>
-              <span className={`summary-status-dot ${statusTone(activeDetail?.status)}`} />
-            </div>
-            <div className="session-drawer-grid">
-              <div className="session-drawer-stat"><span>Status</span><strong>{stats?.status || activeDetail?.status || "—"}</strong></div>
-              <div className="session-drawer-stat"><span>Steps</span><strong>{stats?.total_steps ?? activeDetail?.message_count ?? "—"}</strong></div>
-              <div className="session-drawer-stat"><span>Tokens</span><strong>{(stats?.total_tokens ?? activeDetail?.total_tokens_estimate ?? 0).toLocaleString()}</strong></div>
-              <div className="session-drawer-stat"><span>Runtime</span><strong>{formatDuration(stats?.total_duration_ms)}</strong></div>
-            </div>
-          </div>
-
-          <div className="stats-card">
-            <div className="stats-card-header">
-              <div>
-                <div className="summary-label">Changed files</div>
-                <h3 className="stats-card-title">Active session diff summary</h3>
-              </div>
-            </div>
-            <div className="session-drawer-grid">
-              <div className="session-drawer-stat"><span>Files</span><strong>{sessionDiffs.length}</strong></div>
-              <div className="session-drawer-stat"><span>Pending</span><strong>{sessionPending}</strong></div>
-              <div className="session-drawer-stat"><span>Added</span><strong>+{sessionLineStats.added}</strong></div>
-              <div className="session-drawer-stat"><span>Removed</span><strong>−{sessionLineStats.removed}</strong></div>
-            </div>
-          </div>
-        </div>
-
-        <div className="stats-card stats-card-wide">
-          <div className="stats-card-header">
+        <details className="stats-card stats-card-wide review-verification">
+          <summary className="stats-card-header">
             <div>
               <div className="summary-label">Verification</div>
               <h3 className="stats-card-title">Build, test, and command signals</h3>
             </div>
-          </div>
+          </summary>
           {loading ? (
             <div className="empty-state">Loading verification signals...</div>
           ) : verificationSignals.length === 0 ? (
@@ -506,7 +457,7 @@ export function DiffReviewView() {
               ))}
             </div>
           )}
-        </div>
+        </details>
 
         <div className="stats-card stats-card-wide">
           <div className="stats-card-header">

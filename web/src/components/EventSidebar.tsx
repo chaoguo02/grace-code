@@ -1,17 +1,9 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { useSessionStore } from "../stores/sessionStore";
+import { WsEventBlock } from "./WsEventBlock";
 import type { WsMessage } from "../types";
-import { getStorageStats } from "../api/storage";
 import { getSessionStats } from "../api/stats";
-
-interface StorageStats {
-  backend: string;
-  total_sessions: number;
-  total_messages: number;
-  total_memories?: number;
-  db_size_bytes: number | null;
-}
 
 interface SessionStats {
   steps_taken?: number;
@@ -21,18 +13,16 @@ interface SessionStats {
   tools?: Record<string, number>;
 }
 
-function formatTimeLabel(ev: { timestamp?: string }, index: number) {
-  if (ev.timestamp) {
-    const d = new Date(ev.timestamp);
-    if (!Number.isNaN(d.getTime())) {
-      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    }
-  }
-  // Fallback: synthetic relative label
-  const now = new Date();
-  now.setSeconds(now.getSeconds() - index * 28);
-  return now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
+type FilterValue = "all" | "thought" | "tool_call" | "observation" | "status" | "subagent";
+
+const FILTERS: { key: FilterValue; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "thought", label: "Thoughts" },
+  { key: "tool_call", label: "Actions" },
+  { key: "observation", label: "Results" },
+  { key: "status", label: "Status" },
+  { key: "subagent", label: "Subagents" },
+];
 
 function formatDuration(seconds?: number | null) {
   if (seconds == null || Number.isNaN(seconds)) return "00:00";
@@ -64,19 +54,11 @@ function countTools(events: WsMessage[]) {
 export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => void }) {
   const activeId = useSessionStore((s) => s.activeId);
   const { events, isRunning, steps, tokens } = useChatStore((s) => selectSessionUi(s, activeId));
-  const sessionCount = useSessionStore((s) => s.sessions.length);
   const activeDetail = useSessionStore((s) => s.activeDetail);
-  const [stats, setStats] = useState<StorageStats | null>(null);
+  const { loadTraceEvents } = useChatStore();
   const [sessionStats, setSessionStats] = useState<SessionStats | null>(null);
-
-  // Fetch storage stats once on mount — not per-session.
-  useEffect(() => {
-    const controller = new AbortController();
-    getStorageStats(controller.signal)
-      .then(setStats)
-      .catch(() => {});
-    return () => controller.abort();
-  }, []);  // empty deps: fire once, never refire
+  const [traceExpanded, setTraceExpanded] = useState(false);
+  const [filter, setFilter] = useState<FilterValue>("all");
 
   // Fetch persisted session stats when activeId changes (baseline).
   // Live execution stats follow the WS stream — no polling.
@@ -98,6 +80,13 @@ export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => vo
     };
   }, [activeId]);
 
+  // Load the persisted event backlog only when the full timeline is expanded.
+  useEffect(() => {
+    if (activeId && traceExpanded) {
+      loadTraceEvents(activeId);
+    }
+  }, [activeId, traceExpanded, loadTraceEvents]);
+
   const toolCounts = sessionStats?.tools && Object.keys(sessionStats.tools).length
     ? sessionStats.tools
     : countTools(events);
@@ -108,6 +97,16 @@ export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => vo
   const totalTokens = sessionStats?.total_tokens ?? tokens ?? activeDetail?.total_tokens_estimate ?? 0;
   const durationSeconds = sessionStats?.duration_seconds ?? deriveDurationSeconds(activeDetail?.created_at, activeDetail?.completed_at);
   const progressRatio = Math.min(100, Math.max(0, maxSteps ? Math.round((totalSteps / maxSteps) * 100) : 0));
+
+  // Filtered, chronological event list for the expanded timeline.
+  const filteredTimeline = useMemo(() => {
+    const base = [...events].reverse();
+    if (filter === "all") return base;
+    if (filter === "subagent") return base.filter((e) => e.type === "subagent_start" || e.type === "subagent_stop");
+    return base.filter((e) => e.type === filter);
+  }, [events, filter]);
+
+  const previewEvents = events.slice(0, 5);
 
   return (
     <aside className="event-sidebar" id="event-sidebar">
@@ -136,9 +135,14 @@ export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => vo
       </div>
 
       <div className="event-filter-row" style={{ justifyContent: "flex-end" }}>
-        <a href="#" onClick={(e) => { e.preventDefault(); /* TODO: switch to Trace tab */ }} style={{ fontSize: 10, color: "var(--text-muted)" }}>
-          Open Full Trace →
-        </a>
+        <button
+          type="button"
+          className="event-expand-toggle"
+          onClick={() => setTraceExpanded((v) => !v)}
+          aria-expanded={traceExpanded}
+        >
+          {traceExpanded ? "Collapse full trace −" : "Expand full trace +"}
+        </button>
       </div>
 
       <div className="execution-stats-card">
@@ -185,56 +189,50 @@ export function EventSidebar({ onToggleCollapse }: { onToggleCollapse?: () => vo
         </div>
       </div>
 
-      <div className="event-list event-timeline">
-        {events.length === 0 && (
-          <div className="empty-state">Waiting for execution...</div>
-        )}
-
-        {events.slice(0, 5).map((ev, i) => {
-          const icon = ev.type === "tool_call" ? "⚙" :
-                       ev.type === "thought" ? "▸" :
-                       ev.type === "observation" ? "○" : "•";
-          const label = ev.type === "tool_call" ? (ev.name || "Tool") :
-                        ev.type === "thought" ? "Thought" :
-                        ev.type === "observation" ? (ev.tool_name || "Result") : (ev.type || "Event");
-          return (
-            <div key={i} className="timeline-row-compact">
-              <span className="timeline-compact-icon">{icon}</span>
-              <span className="timeline-compact-label">{label}</span>
-            </div>
-          );
-        })}
-      </div>
-
-      {stats && (
-        <div className="storage-card resource-card">
-          <div className="resource-card-title">Session Resources</div>
-          <div className="resource-list">
-            <div className="resource-row">
-              <span>Sessions tracked</span>
-              <strong>{stats.total_sessions}</strong>
-            </div>
-            <div className="resource-row">
-              <span>Messages stored</span>
-              <strong>{stats.total_messages}</strong>
-            </div>
-            {stats.total_memories != null && (
-              <div className="resource-row">
-                <span>Memories</span>
-                <strong>{stats.total_memories}</strong>
-              </div>
-            )}
-            <div className="resource-row">
-              <span>Storage backend</span>
-              <strong>{stats.backend}</strong>
-            </div>
-            {stats.db_size_bytes != null && (
-              <div className="resource-row">
-                <span>DB size</span>
-                <strong>{(stats.db_size_bytes / 1024).toFixed(0)} KB</strong>
-              </div>
-            )}
+      {traceExpanded ? (
+        <div className="event-timeline-full">
+          <div className="event-trace-filter-row">
+            {FILTERS.map((f) => (
+              <button
+                key={f.key}
+                type="button"
+                className={`event-filter ${filter === f.key ? "active" : ""}`}
+                onClick={() => setFilter(f.key)}
+              >
+                {f.label}
+              </button>
+            ))}
           </div>
+          <div className="event-list event-timeline" style={{ maxHeight: "56dvh", overflow: "auto" }}>
+            {events.length === 0 && (
+              <div className="empty-state">Waiting for execution...</div>
+            )}
+            {filteredTimeline.map((ev, i) => (
+              <div key={`${ev.sequence ?? i}-${i}`}>
+                <WsEventBlock event={ev} />
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="event-list event-timeline">
+          {events.length === 0 && (
+            <div className="empty-state">Waiting for execution...</div>
+          )}
+          {previewEvents.map((ev, i) => {
+            const icon = ev.type === "tool_call" ? "⚙" :
+                         ev.type === "thought" ? "▸" :
+                         ev.type === "observation" ? "○" : "•";
+            const label = ev.type === "tool_call" ? (ev.name || "Tool") :
+                          ev.type === "thought" ? "Thought" :
+                          ev.type === "observation" ? (ev.tool_name || "Result") : (ev.type || "Event");
+            return (
+              <div key={i} className="timeline-row-compact">
+                <span className="timeline-compact-icon">{icon}</span>
+                <span className="timeline-compact-label">{label}</span>
+              </div>
+            );
+          })}
         </div>
       )}
     </aside>
