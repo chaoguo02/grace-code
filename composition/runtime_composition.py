@@ -407,6 +407,19 @@ def assemble(db_path: str, *,
     outbox = SqliteOutboxStore(db_path, registry)
     lease = OwnerLease(db_path)
 
+    # ── DDL installation ──────────────────────────────────────────
+    import sqlite3 as _sqlite3
+    _ddl_conn = _sqlite3.connect(db_path)
+    try:
+        SqliteOutboxStore.install(_ddl_conn)
+        SqliteOutboxStore.migrate_add_columns(_ddl_conn)
+        OwnerLease.install(_ddl_conn)
+        from listeners.projection_state import ProjectionStateStore
+        ProjectionStateStore.install(_ddl_conn)
+        _ddl_conn.commit()
+    finally:
+        _ddl_conn.close()
+
     # ── Eventing ────────────────────────────────────────────────────
     bus = ScopedEventBus()
 
