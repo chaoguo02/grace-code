@@ -159,14 +159,18 @@ def create_app(service: AgentService | None = None,
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
-        # Startup: start outbox relay (R3.4)
-        _outbox_relay = getattr(service, '_outbox_relay', None)
-        if _outbox_relay is not None:
-            await _outbox_relay.start()
-            logger.info("Outbox relay started")
+        # Phase A: Use native relay if available, else fallback to old
+        if native_components is not None:
+            logger.info("Native relay already started by ApplicationLifecycle")
+        elif service is not None:
+            _outbox_relay = getattr(service, '_outbox_relay', None)
+            if _outbox_relay is not None:
+                await _outbox_relay.start()
+                logger.info("Outbox relay started (legacy)")
         yield
         # Shutdown: release resources
-        await service.shutdown()
+        if service is not None:
+            await service.shutdown()
 
     app = FastAPI(
         title="Grace Code Web MVP",
@@ -183,10 +187,16 @@ def create_app(service: AgentService | None = None,
 
     # Store service reference in app.state for dependency injection
     app.state.service = service
+    # Phase A: Store native components so routes can access run_coordinator
+    app.state.native_components = native_components
 
     # ── Dependency: get_service ───────────────────────────────────────────
     def get_service(request: Request) -> AgentService:
         return request.app.state.service
+
+    def get_native_components(request: Request):
+        """Phase A: Provide native components to routes that need coordinator."""
+        return request.app.state.native_components
 
     # ── Register API routers ──────────────────────────────────────────────
     from server.routers.sessions import create_sessions_router

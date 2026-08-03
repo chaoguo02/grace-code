@@ -170,7 +170,7 @@ class TestE2EFakeAdapter:
         tc = ToolCall(id="t1", name="read", params=freeze_json({"f": "x"}),
                       usage=TokenUsage(input_tokens=30, output_tokens=10))
         # Override the LLM port with a controlled one
-        comp.runtime_ports.llm.invoke = lambda m, t=None: tc
+        comp.runtime_ports.llm.invoke = lambda m, t=None, **kw: tc
 
         outcome = comp.runtime.run(
             RuntimeExecution(
@@ -208,4 +208,104 @@ class TestE2EFakeAdapter:
         elapsed = (_time.monotonic() - started) * 1000
         assert elapsed < 2000, (
             f"H8: E2E too slow: {elapsed:.0f}ms (must be < 2000ms)"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# R3 — ChatPipeline native path produces evidence + outbox entries
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestChatPipelineNative:
+    """R3: ChatPipeline with coordinator produces evidence and outbox facts."""
+
+    def test_native_path_produces_evidence(self, temp_db):
+        """ChatPipeline native execution produces RunEvidence (not None)."""
+        from composition.runtime_composition import assemble
+        from server.services.chat_pipeline import ChatPipeline, ChatPipelinePorts, PreparedChatRun
+        from server.schemas.session import ChatRequest
+
+        comp = assemble(temp_db)
+
+        # Build minimal ChatPipelinePorts with coordinator
+        ports = ChatPipelinePorts(
+            runtime=None,  # not used when coordinator is set
+            session_service=type('S', (), {'get_messages': lambda s, **kw: []})(),
+            backend=None,
+            config={},
+            effective_llm_config={},
+            repo_path=temp_db,
+            build_confirm_callback=lambda x: lambda: None,
+            reload_rules=lambda: None,
+            loaded_rules=lambda: [],
+            accumulate_session_stats=lambda s, r: None,
+            compact_session_async=lambda s: None,
+            coordinator=comp.run_coordinator,  # R3: native coordinator
+        )
+        pipeline = ChatPipeline(ports)
+
+        # Simulate a PreparedChatRun
+        from server.services.chat_pipeline import PreparedChatRun
+        request = ChatRequest(prompt="hello", agent_name="build")
+        object.__setattr__(request, 'session_id', 's-e2e')
+        object.__setattr__(request, 'display_prompt', 'hello')
+        prepared = PreparedChatRun(
+            request=request, resolved_prompt="hello",
+        )
+
+        result = pipeline.execute(prepared)
+        # R3: Native path must complete with non-zero tokens
+        assert result.status in ("success", "blocked"), (
+            f"Expected completed or blocked, got {result.status}"
+        )
+        assert result.total_tokens > 0, (
+            f"R3: native path must produce non-zero tokens, got {result.total_tokens}"
+        )
+
+    def test_native_path_writes_outbox(self, temp_db):
+        """ChatPipeline native execution writes terminal fact to outbox."""
+        from composition.runtime_composition import assemble
+        from server.services.chat_pipeline import ChatPipeline, ChatPipelinePorts, PreparedChatRun
+        from server.schemas.session import ChatRequest
+
+        comp = assemble(temp_db)
+
+        ports = ChatPipelinePorts(
+            runtime=None,
+            session_service=type('S', (), {'get_messages': lambda s, **kw: []})(),
+            backend=None, config={}, effective_llm_config={},
+            repo_path=temp_db,
+            build_confirm_callback=lambda x: lambda: None,
+            reload_rules=lambda: None, loaded_rules=lambda: [],
+            accumulate_session_stats=lambda s, r: None,
+            compact_session_async=lambda s: None,
+            coordinator=comp.run_coordinator,
+        )
+        pipeline = ChatPipeline(ports)
+
+        request = ChatRequest(prompt="test", agent_name="build")
+        object.__setattr__(request, 'session_id', 's-e2e-outbox')
+        object.__setattr__(request, 'display_prompt', 'test')
+        prepared = PreparedChatRun(
+            request=request, resolved_prompt="test",
+        )
+
+        pipeline.execute(prepared)
+
+        # R3: Verify outbox has terminal event
+        import sqlite3
+        conn = sqlite3.connect(temp_db)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT event_type FROM event_outbox WHERE session_id='s-e2e-outbox'"
+        ).fetchall()
+        conn.close()
+        event_types = [r["event_type"] for r in rows]
+        # R3: ChatPipeline execute() calls coordinator.execute() + finalize()
+        # which writes the terminal fact (run.completed — unversioned in outbox).
+        # run.submitted is written by the separate submit() call in the route.
+        assert len(event_types) >= 1, (
+            f"R3: outbox must have events, got {event_types}"
+        )
+        assert "run.completed" in event_types or "run.blocked" in event_types, (
+            f"R3: outbox must have terminal fact, got {event_types}"
         )

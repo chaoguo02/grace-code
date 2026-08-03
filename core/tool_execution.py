@@ -1,8 +1,9 @@
-"""Atomic tool execution boundary.
+"""T23: DEPRECATED — Native Runtime (StepLoop + HookDispatcher + _RealTools)
+now handles tool execution.  This module's Pipeline (schema validation,
+permission, post-tool hooks) is being migrated to the Native path (T0-T22).
 
-The registry resolves names and descriptors.  This module owns the mandatory
-per-call sequence: schema validation, capability interception, permission
-evaluation, final-parameter validation, execution, and post-tool hooks.
+Kept for backward compatibility with legacy SessionRuntime path.
+New code MUST use runtime_core/step_loop.py _process_tool_calls.
 """
 
 from __future__ import annotations

@@ -130,7 +130,7 @@ class TestDecodeToBusToProjections:
         decoded = registry.decode(js)
 
         # Publish to bus
-        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace")
+        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace", scope=bus._tree.root.token)
         bus.publish(decoded)
 
         # Trace projection should have written to DB
@@ -165,7 +165,7 @@ class TestDecodeToBusToProjections:
         js = env.canonical_json()
         decoded = registry.decode(js)
 
-        bus.subscribe("run.completed.v1", stats_projection.on_event, "stats")
+        bus.subscribe("run.completed.v1", stats_projection.on_event, "stats", scope=bus._tree.root.token)
         assert len(stats_projection.metrics) == 0
 
         bus.publish(decoded)
@@ -191,7 +191,7 @@ class TestDecodeToBusToProjections:
         js = env.canonical_json()
         decoded = registry.decode(js)
 
-        bus.subscribe("run.completed.v1", ws_gateway.on_event, "ws")
+        bus.subscribe("run.completed.v1", ws_gateway.on_event, "ws", scope=bus._tree.root.token)
         bus.publish(decoded)
 
         assert len(received) == 1
@@ -208,9 +208,9 @@ class TestDecodeToBusToProjections:
         ws_received = []
         ws_gateway.subscribe("s-test", lambda m: ws_received.append(m))
 
-        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace")
-        bus.subscribe("run.completed.v1", stats_projection.on_event, "stats")
-        bus.subscribe("run.completed.v1", ws_gateway.on_event, "ws")
+        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace", scope=bus._tree.root.token)
+        bus.subscribe("run.completed.v1", stats_projection.on_event, "stats", scope=bus._tree.root.token)
+        bus.subscribe("run.completed.v1", ws_gateway.on_event, "ws", scope=bus._tree.root.token)
 
         env = _make_envelope(
             "run.completed.v1",
@@ -310,7 +310,7 @@ class TestOutboxToBusIntegration:
 
         # Decode and publish (this is what _deliver does)
         decoded = registry.decode(record.payload_json)
-        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace")
+        bus.subscribe("run.completed.v1", trace_projection.on_event, "trace", scope=bus._tree.root.token)
         bus.publish(decoded)
 
         # Verify trace projection received

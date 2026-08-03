@@ -16,11 +16,11 @@ import pytest
 from core.eventing.identifiers import SessionId, RunId
 from core.json_values import freeze_json
 from runtime_core.execution import RuntimeExecution, ConversationSnapshot
-from runtime_core.model_actions import ToolCall, AssistantText
+from runtime_core.model_actions import ToolCall, ToolCallBatch, AssistantText
 from runtime_core.outcome import RunStatus
 from runtime_core.ports import (
     RuntimePorts, HookGateResult, ToolOutcome,
-    ToolSuccess, ToolFailure, ToolDenied,
+    ToolSuccess, ToolFailure, ToolDenied, ToolErrorType,
 )
 from runtime_core.step_loop import StepLoop, ToolResult
 
@@ -35,8 +35,8 @@ class FakeCancellation:
 
 class FakeLLM:
     def __init__(self, response): self.response = response
-    def invoke(self, messages, tools=None): return self.response
-    def stream(self, messages, tools=None):
+    def invoke(self, messages, tools=None, tool_choice=None): return self.response
+    def stream(self, messages, tools=None, tool_choice=None):
         async def _s(): return self.response
         return _s()
 
@@ -53,7 +53,7 @@ class FakeHooks:
 
 class FakeLiveEvents:
     def __init__(self): self.published = []
-    def publish(self, event_type, payload): self.published.append((event_type, payload))
+    def publish(self, event_type, payload, scope=None): self.published.append((event_type, payload, scope))
 
 
 class FakeClock:
@@ -100,7 +100,7 @@ class TestAllowExecutesTool:
             llm=FakeLLM(ToolCall(id="t1", name="read", params=freeze_json({"f": "x"}))),
             tools=tools, hooks=hooks,
             live_events=FakeLiveEvents(), clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         loop = StepLoop(ports)
         loop.execute(_context(max_steps=1))
@@ -127,7 +127,7 @@ class TestDenyBlocksTool:
             llm=FakeLLM(ToolCall(id="t1", name="rm", params=freeze_json({"f": "x"}))),
             tools=CountingTools(), hooks=hooks,
             live_events=FakeLiveEvents(), clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         loop = StepLoop(ports)
         outcome = loop.execute(_context(max_steps=1))
@@ -159,7 +159,7 @@ class TestTransform:
             llm=FakeLLM(ToolCall(id="t1", name="run", params=freeze_json({"cmd": "ls"}))),
             tools=CaptureTools(), hooks=hooks,
             live_events=FakeLiveEvents(), clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         loop = StepLoop(ports)
         loop.execute(_context(max_steps=1))
@@ -185,7 +185,7 @@ class TestToolFailure:
             llm=FakeLLM(ToolCall(id="t1", name="write", params=freeze_json({"f": "x"}))),
             tools=tools, hooks=hooks,
             live_events=FakeLiveEvents(), clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         loop = StepLoop(ports)
         outcome = loop.execute(_context(max_steps=1))
@@ -209,7 +209,7 @@ class TestLiveEvents:
             llm=FakeLLM(ToolCall(id="t1", name="read", params=freeze_json({"f": "x"}))),
             tools=FakeTools(), hooks=hooks,
             live_events=events, clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         loop = StepLoop(ports)
         loop.execute(_context(max_steps=1))
@@ -221,6 +221,104 @@ class TestLiveEvents:
 # ═══════════════════════════════════════════════════════════════════════════════
 # G17.6 — PostToolUse hook failure is non-blocking
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T1 — ToolSuccess.tool_use_id + ToolFailure structured error_type
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestToolOutcomeFields:
+    """T1: ToolSuccess has tool_use_id; ToolFailure.error_type is enum."""
+
+    def test_tool_success_has_tool_use_id(self):
+        ts = ToolSuccess(tool_name="read", output="ok", tool_use_id="tc-1")
+        assert ts.tool_use_id == "tc-1"
+
+    def test_tool_failure_error_type_is_enum(self):
+        tf = ToolFailure(tool_name="write", error="boom",
+                         error_type=ToolErrorType.TIMEOUT)
+        assert tf.error_type == ToolErrorType.TIMEOUT
+        assert tf.retryable is True
+
+    def test_tool_failure_retryable_from_map(self):
+        tf = ToolFailure(tool_name="rm", error="denied",
+                         error_type=ToolErrorType.PERMISSION_DENIED)
+        assert tf.retryable is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T8 — PostToolBatch hook triggered after batch completion
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestToolUseIdTracking:
+    """T20: tool_use_id flows through ToolEvidence."""
+    def test_evidence_has_tool_use_id(self):
+        hooks = FakeHooks(HookGateResult(allowed=True))
+        tc = ToolCall(id="tc-42", name="read", params=freeze_json({"f": "x"}))
+        ports = RuntimePorts(
+            llm=FakeLLM(tc), tools=FakeTools(), hooks=hooks,
+            live_events=FakeLiveEvents(), clock=FakeClock(),
+            token_usage=FakeTokenUsage(),
+        )
+        loop = StepLoop(ports)
+        outcome = loop.execute(_context(max_steps=1))
+        assert outcome.evidence is not None
+        assert outcome.evidence.tool_calls[0].tool_use_id == "tc-42", (
+            f"T20: tool_use_id must flow through evidence. Got: {outcome.evidence.tool_calls[0].tool_use_id}"
+        )
+
+
+class TestPermissionEscalation:
+    """T13: PreToolUse ask → PermissionRequest escalation."""
+    def test_ask_escalates_to_permission_request(self):
+        from hook_core.decisions import PreToolUseDecision, PermissionDecision
+        ask_decision = PreToolUseDecision(permission=PermissionDecision.ASK)
+        hooks = FakeHooks(HookGateResult(allowed=True, decision=ask_decision))
+        hook_events = []
+        class RecHooks:
+            def check(self, event_type, hook_input, tool_name=""):
+                hook_events.append(event_type)
+                if event_type == "PreToolUse":
+                    return HookGateResult(allowed=True, decision=ask_decision)
+                return HookGateResult(allowed=True)
+        tc = ToolCall(id="t1", name="read", params=freeze_json({"f": "x"}))
+        ports = RuntimePorts(
+            llm=FakeLLM(tc), tools=FakeTools(), hooks=RecHooks(),
+            live_events=FakeLiveEvents(), clock=FakeClock(),
+            token_usage=FakeTokenUsage(),
+        )
+        loop = StepLoop(ports)
+        loop.execute(_context(max_steps=1))
+        assert "PermissionRequest" in hook_events, (
+            f"T13: ask must escalate to PermissionRequest. Got: {hook_events}"
+        )
+
+
+class TestPostToolBatch:
+    """T8: PostToolBatch hook fires after tool batch completes."""
+
+    def test_post_tool_batch_triggered(self):
+        """T8: PostToolBatch hook fires after tool batch completes.
+        Uses a single ToolCall to avoid parallel path complexity."""
+        tc = ToolCall(id="t1", name="read", params=freeze_json({"f": "a.txt"}))
+
+        hook_events = []
+        class RecordingHooks:
+            def check(self, event_type, hook_input, tool_name=""):
+                hook_events.append(event_type)
+                return HookGateResult(allowed=True)
+
+        ports = RuntimePorts(
+            llm=FakeLLM(tc), tools=FakeTools(), hooks=RecordingHooks(),
+            live_events=FakeLiveEvents(), clock=FakeClock(),
+            token_usage=FakeTokenUsage(),
+        )
+        loop = StepLoop(ports)
+        outcome = loop.execute(_context(max_steps=1))
+        # Verify PostToolBatch was called
+        assert "PostToolBatch" in hook_events, (
+            f"T8: PostToolBatch must fire after batch. Got: {hook_events}"
+        )
+
 
 class TestPostToolNonBlocking:
     """G17: PostToolUse failure does NOT rollback or block."""
@@ -240,7 +338,7 @@ class TestPostToolNonBlocking:
             llm=FakeLLM(ToolCall(id="t1", name="read", params=freeze_json({"f": "x"}))),
             tools=FakeTools(), hooks=SeqHooks(),
             live_events=FakeLiveEvents(), clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         loop = StepLoop(ports)
         outcome = loop.execute(_context(max_steps=1))
@@ -261,7 +359,7 @@ class TestEvidenceCollection:
             llm=FakeLLM(ToolCall(id="t1", name="read", params=freeze_json({"f": "x"}))),
             tools=FakeTools(), hooks=hooks,
             live_events=FakeLiveEvents(), clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         loop = StepLoop(ports)
         outcome = loop.execute(_context(max_steps=1))
@@ -278,7 +376,7 @@ class TestEvidenceCollection:
             llm=FakeLLM(ToolCall(id="t1", name="bash", params=freeze_json({"cmd": "ls"}))),
             tools=FakeTools(), hooks=hooks,
             live_events=FakeLiveEvents(), clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         loop = StepLoop(ports)
         outcome = loop.execute(_context(max_steps=1))
@@ -291,7 +389,7 @@ class TestEvidenceCollection:
             llm=FakeLLM(ToolCall(id="t1", name="rm", params=freeze_json({}))),
             tools=FakeTools(), hooks=hooks,
             live_events=FakeLiveEvents(), clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         loop = StepLoop(ports)
         outcome = loop.execute(_context(max_steps=1))

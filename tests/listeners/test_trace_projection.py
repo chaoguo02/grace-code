@@ -40,6 +40,13 @@ def _setup_db(path: str) -> None:
             (consumer_name TEXT, event_id TEXT, processed_at TEXT, PRIMARY KEY(consumer_name, event_id));
         CREATE TABLE IF NOT EXISTS session_trace_events
             (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, seq INTEGER, event_type TEXT, timestamp TEXT, event_json TEXT, source TEXT);
+        CREATE TABLE IF NOT EXISTS projection_watermarks (
+            projection_name TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            last_version INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT,
+            PRIMARY KEY (projection_name, aggregate_id)
+        );
     """)
     conn.commit()
     conn.close()
@@ -102,10 +109,8 @@ class TestTraceProjection:
     def test_different_consumers_independent(self, tmp_path):
         db = str(tmp_path / "test.db")
         _setup_db(db)
-        proj1 = TraceProjection(db)
-        proj1.NAME = "trace_v1"
-        proj2 = TraceProjection(db)
-        proj2.NAME = "trace_v2"
+        proj1 = TraceProjection(db, name="trace_v1")
+        proj2 = TraceProjection(db, name="trace_v2")
 
         env = _envelope()
         assert proj1.on_event(env).success

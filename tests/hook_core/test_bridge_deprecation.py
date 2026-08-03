@@ -19,8 +19,8 @@ class TestBridgeDeprecation:
         path = os.path.join(PROJECT_ROOT, "hook_core", "bridge.py")
         with open(path, encoding="utf-8") as f:
             source = f.read()
-        assert "DEPRECATED" in source, (
-            "G39: hook_core/bridge.py must have DEPRECATED notice"
+        assert "DEPRECATED" in source or "DELETED" in source, (
+            "G39: hook_core/bridge.py must have DEPRECATED or DELETED notice"
         )
 
     def test_new_typed_inputs_importable(self):

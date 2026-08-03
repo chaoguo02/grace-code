@@ -895,6 +895,51 @@ class AgentService:
             resolved_intent = TaskIntent(intent.lower())
 
         def _run() -> RunResult:
+            # Phase B: Use native coordinator when available
+            if self._native_components is not None:
+                from application.commands.run_commands import ExecuteRun, FinalizeRun
+                from core.eventing.identifiers import RunId as CoreRunId, SessionId as CoreSid
+                from runtime_core.execution import ConversationSnapshot, CapabilitySnapshot
+                from core.base import ToolRegistry as CoreToolRegistry
+                coord = self._native_components.run_coordinator
+
+                # Build conversation from session messages
+                msgs = self._storage.list_messages(session_id, limit=50)
+                conv = ConversationSnapshot(messages=tuple(
+                    {"role": m["role"], "content": m["content"]} for m in msgs
+                ))
+
+                # Build capabilities from tool registry
+                caps = CapabilitySnapshot()
+                if hasattr(self, '_tool_registry'):
+                    caps = CapabilitySnapshot(
+                        tool_schemas=tuple(
+                            {"name": t.name, "description": t.schema.get("description","")}
+                            for t in self._tool_registry.list_tools()
+                        ) if hasattr(self._tool_registry, 'list_tools') else ()
+                    )
+
+                outcome = coord.execute(
+                    ExecuteRun(session_id=CoreSid(session_id),
+                               run_id=CoreRunId(str(uuid.uuid4()))),
+                    conversation=conv, capabilities=caps,
+                )
+                # Finalize — write terminal state + fact
+                from application.commands.run_commands import FinalizeRun
+                from core.eventing.identifiers import AggregateVersion
+                coord.finalize(
+                    FinalizeRun(run_id=outcome.run_id,
+                                expected_version=AggregateVersion(1),
+                                outcome=outcome),
+                    session_id=CoreSid(session_id),
+                )
+                return RunResult(
+                    status=outcome.status.value,
+                    summary=outcome.summary,
+                    steps_taken=outcome.steps_taken,
+                    total_tokens=outcome.tokens_used,
+                )
+
             return self._runtime.run_session(
                 session_id=session_id,
                 agent_name=agent_name,
@@ -988,6 +1033,10 @@ class AgentService:
             finalize_run=self._store.finalize_run_with_event,
             event_bus=self._event_bus,
             plan_revisions=self._plan_revisions,
+            coordinator=(
+                self._native_components.run_coordinator
+                if self._native_components is not None else None
+            ),  # R3: Native coordinator for ChatPipeline
         )
         pipeline = ChatPipeline(ports)
         request = ChatRequest(

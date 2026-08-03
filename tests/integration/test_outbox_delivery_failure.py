@@ -170,7 +170,7 @@ class TestDeliveryFailure:
                 if new_attempts >= OutboxRelay.MAX_ATTEMPTS:
                     outbox.dead_letter(record.event_id, "test-worker", str(exc)[:500])
                 else:
-                    outbox.reschedule(record.event_id, "test-worker", str(exc)[:500])
+                    outbox.reschedule(record.event_id, "test-worker", str(exc)[:500], delay_s=0)
 
         # Verify: poison message reached DLQ
         conn2 = sqlite3.connect(temp_db)

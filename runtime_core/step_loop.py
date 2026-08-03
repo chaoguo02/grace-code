@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from core.eventing.identifiers import RunId
+from core.eventing.scope import ScopeToken
 from core.json_values import freeze_json, FrozenJsonObject
 from runtime_core.execution import RuntimeExecution
 from runtime_core.model_actions import (
@@ -31,7 +32,7 @@ from runtime_core.outcome import (
     RuntimeOutcome, RunStatus, CancellationReason,
     ToolEvidence, RunEvidence,
 )
-from runtime_core.ports import RuntimePorts, HookGateResult, ToolOutcome, ToolSuccess, ToolFailure, ToolDenied
+from runtime_core.ports import RuntimePorts, HookGateResult, ToolOutcome, ToolSuccess, ToolFailure, ToolDenied, ToolErrorType
 from runtime_core.tool_scheduler import ToolScheduler, ToolMetadata
 from hook_core.inputs import PreToolUseInput, PostToolUseInput
 
@@ -56,6 +57,7 @@ class ToolResult:
             tool_name=self.tool_call.name,
             success=success,
             duration_ms=duration,
+            tool_use_id=self.tool_call.id,  # T20: trace tool_use_id through evidence
         )
 
 
@@ -89,6 +91,13 @@ class StepLoop:
         tool_evidences: list[ToolEvidence] = []
         files_touched: set[str] = set()
         hook_blocks: list[str] = []
+        # T10: Collect tool_result blocks for conversation backfill
+        _pending_tool_results: list[dict] = []
+        # R1: Derive session scope for live event routing
+        import uuid as _uuid
+        _exec_scope = ScopeToken.session_scope(
+            _uuid.uuid4(), context.session_id,
+        ) if context.session_id is not None else None
 
         for turn in range(context.max_steps):
             # G18: Cancellation check at top of every iteration
@@ -99,15 +108,20 @@ class StepLoop:
                     tool_evidences, files_touched, hook_blocks)
 
             # ── 1. Model call ───────────────────────────────────────
-            conv_json = freeze_json({
-                "messages": [
-                    {"role": m.get("role", ""), "content": m.get("content", "")}
-                    for m in context.conversation.messages
-                ],
-            })
+            _msgs = [
+                {"role": m.get("role", ""), "content": m.get("content", "")}
+                for m in context.conversation.messages
+            ]
+            # T10: Prepend pending tool_result blocks from previous turns
+            if _pending_tool_results:
+                _msgs.extend(_pending_tool_results)
+                _pending_tool_results = []
+            conv_json = freeze_json({"messages": _msgs})
 
             try:
-                model_action = self._ports.llm.invoke(conv_json)
+                model_action = self._ports.llm.invoke(
+                    conv_json, tool_choice={"type": "auto"},
+                )
             except Exception as exc:
                 return self._finalize_outcome(RuntimeOutcome.failed(
                     context.run_id, error=f"LLM invoke failed: {exc}",
@@ -168,6 +182,33 @@ class StepLoop:
                         self._ports.live_events.publish(
                             event_type="tool.executed.v1",
                             payload=freeze_json({"tool": tr.tool_call.name, "success": isinstance(tr.outcome, ToolSuccess)}),
+                            scope=_exec_scope,
+                        )
+
+                # T8: PostToolBatch hook — fires after batch completes
+                if len(tool_results) > 0:
+                    try:
+                        from hook_core.inputs import PostToolBatchInput
+                        _batch_input = PostToolBatchInput(
+                            session_id=str(context.session_id),
+                            tool_count=len(tool_results),
+                        )
+                        self._ports.hooks.check("PostToolBatch", _batch_input,
+                                                 tool_name="")
+                    except Exception:
+                        pass
+
+                # T10: Collect tool_result blocks for conversation backfill
+                for tr in tool_results:
+                    if tr.outcome is not None and hasattr(tr.outcome, 'to_chat_block'):
+                        _pending_tool_results.append(tr.outcome.to_chat_block())
+
+                # T21: Record per-tool token cost (spread step tokens across tools)
+                if len(tool_results) > 0 and step_tokens_in + step_tokens_out > 0:
+                    _cost_per_tool = (step_tokens_in + step_tokens_out) // len(tool_results)
+                    for tr in tool_results:
+                        self._ports.token_usage.record(
+                            context.run_id, _cost_per_tool, 0,
                         )
 
                 steps.append(StepResult(turn_index=turn, model_action=model_action,
@@ -283,6 +324,25 @@ class StepLoop:
             if gate_result.decision is not None and hasattr(gate_result.decision, 'permission'):
                 perm = gate_result.decision.permission
                 if hasattr(perm, 'value') and str(perm) == 'ask':
+                    # T13: Escalate to PermissionRequest hook
+                    try:
+                        from hook_core.inputs import PermissionRequestInput
+                        _perm_input = PermissionRequestInput(
+                            tool_name=tc.name,
+                            tool_input=tc.params,
+                            session_id=str(context.session_id) if context else "",
+                        )
+                        _perm_result = self._ports.hooks.check(
+                            "PermissionRequest", _perm_input, tool_name=tc.name,
+                        )
+                        if not _perm_result.allowed:
+                            results.append(ToolResult(
+                                tool_call=tc, hook_allowed=False,
+                                hook_deny_reason=_perm_result.reason or "denied by permission",
+                            ))
+                            continue
+                    except Exception:
+                        pass  # PermissionRequest failure → fall through to deny
                     results.append(ToolResult(
                         tool_call=tc,
                         hook_allowed=False,
@@ -315,6 +375,7 @@ class StepLoop:
                 tool_outcome = ToolFailure(
                     tool_name=tc.name,
                     error=f"{type(exc).__name__}: {exc}",
+                    error_type=ToolErrorType.EXECUTION_ERROR,
                 )
 
             # ── PostToolUse hook (observe only — cannot rollback) ────
@@ -421,7 +482,8 @@ class StepLoop:
             try:
                 outcome = self._ports.tools.execute(tc.name, params, tc.id)
             except Exception as exc:
-                outcome = ToolFailure(tool_name=tc.name, error=str(exc))
+                outcome = ToolFailure(tool_name=tc.name, error=str(exc),
+                                     error_type=ToolErrorType.EXECUTION_ERROR)
 
             results[idx] = ToolResult(
                 tool_call=tc, outcome=outcome, hook_allowed=True,

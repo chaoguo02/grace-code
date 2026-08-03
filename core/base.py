@@ -807,6 +807,8 @@ class ToolRegistry:
             return result
 
         tool = self._tools[canonical]
+        # T27: DEPRECATED — Native path uses composition/_execute_via_registry
+        # which delegates to tool.execute() directly with retry + validation.
         from core.tool_execution import ToolExecutionPipeline
 
         # ── Evidence recorder (cached per-store) ──

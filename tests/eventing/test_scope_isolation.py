@@ -92,23 +92,15 @@ class TestScopeIsolation:
             bus.publish(_envelope("s1", stale))
 
     def test_global_subscriber_receives_all(self):
-        """GLOBAL-scope subscriber receives events from any session."""
+        """G5: GLOBAL-scope subscriber receives GLOBAL-scope events only."""
         bus = ScopedEventBus()
-        sid_a = SessionId("s-a")
-        sid_b = SessionId("s-b")
-        bus.ensure_session(sid_a)
-        bus.ensure_session(sid_b)
-
-        scope_a = bus._tree.ensure_session(sid_a, 0).token
-        scope_b = bus._tree.ensure_session(sid_b, 0).token
-
+        g_scope = bus._tree.root.token
         received = []
-        bus.subscribe("run.submitted.v1", lambda e: received.append(e), "global")
-
-        bus.publish(_envelope("s-a", scope_a))
-        bus.publish(_envelope("s-b", scope_b))
-
-        assert len(received) == 2, "GLOBAL subscriber must receive events from all sessions"
+        bus.subscribe("run.submitted.v1", lambda e: received.append(e), "global",
+                      scope=g_scope)
+        bus.publish(_envelope("s-a", g_scope))
+        bus.publish(_envelope("s-b", g_scope))
+        assert len(received) == 2, "GLOBAL subscriber must receive GLOBAL events"
 
     def test_task_scope_isolation(self):
         """TASK-scope subscriber only receives events from same session AND task."""
@@ -143,7 +135,7 @@ class TestScopeIsolation:
         received_global = []
 
         bus.subscribe("run.submitted.v1", lambda e: received_session.append(e), "s", scope=scope)
-        bus.subscribe("run.submitted.v1", lambda e: received_global.append(e), "g")
+        bus.subscribe("run.submitted.v1", lambda e: received_global.append(e), "g", scope=bus._tree.root.token)
 
         # Verify both receive before close
         bus.publish(_envelope("s1", scope))
@@ -190,11 +182,13 @@ class TestScopeTree:
         assert n1 is n2
 
     def test_new_generation_replaces_old(self):
+        """G4: Higher generation creates NEW node, old is closed (tombstone)."""
         tree = ScopeTree()
         sid = SessionId("s1")
         n1 = tree.ensure_session(sid, 1)
         n2 = tree.ensure_session(sid, 2)
-        assert n1 is n2
+        assert n1 is not n2, "G4: new generation creates new node"
+        assert n1.closed, "G4: old node must be closed"
         assert n2.generation == 2
 
     def test_close_session_marks_closed(self):

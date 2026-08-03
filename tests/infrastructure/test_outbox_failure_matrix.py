@@ -68,8 +68,9 @@ class TestDeadLetter:
 
         store.claim_batch("w1", limit=5)
         # Simulate repeated claim→fail→reschedule cycles
+        # delay_s=0 allows immediate re-claim after reschedule
         for i in range(4):
-            store.reschedule("ev-dl", "w1", f"fail {i}")
+            store.reschedule("ev-dl", "w1", f"fail {i}", delay_s=0)
             store.claim_batch("w1", limit=5)
         # After 5 total attempts, move to dead-letter
         assert store.dead_letter("ev-dl", "w1", "fatal")
@@ -79,6 +80,7 @@ class TestRelayStop:
 
     def test_stop_returns_remaining(self, store):
         relay = OutboxRelay(store, deliver=lambda r: None)
+        relay.acquire_lease()
         relay.start()
         time.sleep(0.5)
         remaining = relay.stop(timeout_s=3.0)

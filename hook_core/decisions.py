@@ -138,7 +138,7 @@ EVENT_DECISION_MAP: dict[str, type] = {
     "PreToolUse": PreToolUseDecision,
     "PostToolUse": PostToolUseDecision,
     "PostToolUseFailure": PostToolUseFailureDecision,
-    "PostToolBatch": ObserveDecision,
+    "PostToolBatch": ObserveDecision,  # T7: batch-completion hook
     "UserPromptSubmit": UserPromptSubmitDecision,
     "Stop": StopDecision,
     "StopFailure": ObserveDecision,

@@ -24,7 +24,32 @@ class ToolMetadata:
     name: str = ""
     read_only: bool = False
     concurrency_safe: bool = False
-    resource_key: str = ""  # e.g. file path, DB name — conflicting keys → serial
+    resource_key: str = ""
+    retry_max: int = 0  # T15: max retries from BaseTool.retry_policy
+
+    @staticmethod
+    def from_base_tool(tool) -> "ToolMetadata":
+        """T2+T15: Bridge core.types.ToolMetadata → runtime_core ToolMetadata."""
+        from core.types import ToolConcurrency as TC
+        retry = 0
+        try:
+            rp = tool.retry_policy({})
+            if hasattr(rp, 'max_attempts'):
+                retry = max(0, rp.max_attempts - 1)
+        except Exception:
+            pass
+        return ToolMetadata(
+            name=tool.name,
+            read_only=tool.isReadOnly({}),
+            concurrency_safe=(tool.concurrency_mode({}) == TC.PARALLEL_SAFE),
+            resource_key=(
+                tool.metadata.path_parameter
+                if hasattr(tool, 'metadata')
+                   and hasattr(tool.metadata, 'path_parameter')
+                else ""
+            ),
+            retry_max=retry,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +83,12 @@ class ToolScheduler:
 
     def register(self, metadata: ToolMetadata) -> None:
         self._registry[metadata.name] = metadata
+
+    def register_batch(self, tools: list) -> None:
+        """T3: Register tool metadata from BaseTool instances using the bridge."""
+        for tool in tools:
+            meta = ToolMetadata.from_base_tool(tool)
+            self._registry[meta.name] = meta
 
     def schedule(self, calls: tuple[ToolCall, ...]) -> list[list[ToolCall]]:
         """Group tool calls into sequential batches.  Each batch can run in parallel.

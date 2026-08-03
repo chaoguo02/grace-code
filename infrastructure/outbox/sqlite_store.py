@@ -85,6 +85,17 @@ class SqliteOutboxStore:
 
     # ── Write ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_event_type(raw: str) -> str:
+        """Strip version suffix for backward compat with old outbox schema.
+
+        "run.submitted.v1" → "run.submitted"
+        "run.completed.v1" → "run.completed"
+        """
+        if raw.endswith((".v1", ".v2", ".v3")):
+            return raw.rsplit(".", 1)[0]
+        return raw
+
     def append(self, conn: sqlite3.Connection, envelope: EventEnvelope) -> None:
         """Append envelope to outbox in caller's transaction.
 
@@ -99,6 +110,9 @@ class SqliteOutboxStore:
                 f"Payload type mismatch: expected "
                 f"{self._registry.get(event_type).payload_class.__name__}"
             )
+
+        # Normalize to unversioned type for backward compat with old consumers
+        stored_event_type = self._normalize_event_type(event_type)
 
         payload_json = envelope.canonical_json()
         payload_digest = hashlib.sha256(
@@ -134,15 +148,17 @@ class SqliteOutboxStore:
         conn.execute(
             """INSERT INTO event_outbox
                (event_id, event_type, session_id, aggregate_id,
-                aggregate_version, payload_json, payload_digest, occurred_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (event_id, event_type,
+                aggregate_version, payload_json, payload_digest,
+                occurred_at, available_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event_id, stored_event_type,
              str(envelope.scope.session_id) if envelope.scope.session_id else "",
              str(envelope.aggregate_id),
              envelope.aggregate_version.value,
              payload_json,
              payload_digest,
-             envelope.occurred_at.isoformat()),
+             envelope.occurred_at.isoformat(),
+             envelope.occurred_at.isoformat()),  # available_at = occurred_at
         )
 
     # ── Claim (aggregate-ordered) ───────────────────────────────────────

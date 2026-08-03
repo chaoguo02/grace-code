@@ -17,12 +17,14 @@ from listeners.projection_state import ProjectionStateStore, GapInfo
 
 
 class TraceProjection:
-    """Consumes run facts → session_trace_events.  Idempotent by source+event_id."""
+    """Consumes run facts -> session_trace_events.  Idempotent by source+event_id."""
 
     NAME = "trace_projection"
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, name: str | None = None) -> None:
         self._db_path = db_path
+        if name is not None:
+            self.NAME = name
         self._state = ProjectionStateStore(db_path, self.NAME)
 
     def on_event(self, envelope) -> DeliveryReceipt:

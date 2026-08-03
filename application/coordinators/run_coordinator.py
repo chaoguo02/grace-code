@@ -121,9 +121,22 @@ class RunCoordinator:
         tx.append_fact(envelope)
         return run_id
 
-    def execute(self, cmd: ExecuteRun) -> RuntimeOutcome:
+    def execute(self, cmd: ExecuteRun,
+                conversation: ConversationSnapshot | None = None,
+                capabilities: CapabilitySnapshot | None = None,
+                max_steps: int = 25) -> RuntimeOutcome:
+        """Phase B: Execute via Native Runtime with real context.
+
+        conversation: messages from DB (not empty default)
+        capabilities: tool schemas from registry (not empty default)
+        """
+        from runtime_core.execution import ConversationSnapshot, CapabilitySnapshot
         context = RuntimeExecution(
-            session_id=cmd.session_id, run_id=cmd.run_id,
+            session_id=cmd.session_id,
+            run_id=cmd.run_id,
+            max_steps=max_steps,
+            conversation=conversation or ConversationSnapshot(),
+            capabilities=capabilities or CapabilitySnapshot(),
         )
         return self._runtime.run(context)
 

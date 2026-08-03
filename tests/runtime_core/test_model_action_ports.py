@@ -32,10 +32,10 @@ from runtime_core.ports import (
     LLMPort,
     ToolPort,
     HookGatePort,
+    ToolErrorType, ERROR_RETRY_MAP,
     LiveEventPort,
     ClockPort,
     TokenUsagePort,
-    CancellationPort,
     ToolOutcome,
     ToolSuccess,
     ToolFailure,
@@ -172,14 +172,8 @@ class FakeTokenUsage:
         pass
 
 
-class FakeCancellation:
-    @property
-    def cancelled(self) -> bool:
-        return False
-
-
 class TestRuntimePorts:
-    """G15: RuntimePorts requires all 7 ports; no Optional."""
+    """R2: RuntimePorts requires all 6 ports (cancellation removed)."""
 
     def test_all_ports_non_optional(self):
         ports = RuntimePorts(
@@ -189,7 +183,6 @@ class TestRuntimePorts:
             live_events=FakeLiveEvents(),
             clock=FakeClock(),
             token_usage=FakeTokenUsage(),
-            cancellation=FakeCancellation(),
         )
         assert ports.llm is not None
         assert ports.tools is not None
@@ -197,13 +190,12 @@ class TestRuntimePorts:
         assert ports.live_events is not None
         assert ports.clock is not None
         assert ports.token_usage is not None
-        assert ports.cancellation is not None
 
     def test_runtime_ports_is_frozen(self):
         ports = RuntimePorts(
             llm=FakeLLM(), tools=FakeTools(), hooks=FakeHooks(),
             live_events=FakeLiveEvents(), clock=FakeClock(),
-            token_usage=FakeTokenUsage(), cancellation=FakeCancellation(),
+            token_usage=FakeTokenUsage(),
         )
         with pytest.raises(Exception):
             ports.llm = FakeLLM()  # type: ignore
@@ -213,7 +205,7 @@ class TestRuntimePorts:
         fields = {f.name for f in RuntimePorts.__dataclass_fields__.values()}
         assert "web_mode" not in fields, "G15: web_mode must be removed"
         expected = {"llm", "tools", "hooks", "live_events", "clock",
-                     "token_usage", "cancellation"}
+                     "token_usage"}
         assert fields == expected, f"Unexpected fields: {fields - expected}"
 
 
@@ -291,6 +283,100 @@ class TestTokenUsage:
         u = TokenUsage(input_tokens=3, output_tokens=0)
         f = ModelFailure(error="timeout", usage=u)
         assert f.usage is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T0 — ToolErrorType enum + ERROR_RETRY_MAP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestToolErrorType:
+    """T0: ToolErrorType is structured, ERROR_RETRY_MAP is complete."""
+
+    def test_all_eight_error_types_defined(self):
+        expected = {"timeout", "permission_denied", "network_error",
+                     "validation_error", "tool_not_found", "execution_error",
+                     "resource_exhausted", "cancelled"}
+        actual = set(e.value for e in ToolErrorType)
+        assert actual == expected, f"Missing: {expected - actual}"
+
+    def test_error_retry_map_covers_all_types(self):
+        for e in ToolErrorType:
+            assert e in ERROR_RETRY_MAP, f"ERROR_RETRY_MAP missing {e}"
+
+    def test_timeout_is_retryable(self):
+        tf = ToolFailure(tool_name="test", error="timed out",
+                         error_type=ToolErrorType.TIMEOUT)
+        assert tf.retryable is True
+
+    def test_permission_denied_not_retryable(self):
+        tf = ToolFailure(tool_name="test", error="denied",
+                         error_type=ToolErrorType.PERMISSION_DENIED)
+        assert tf.retryable is False
+
+    def test_default_error_type(self):
+        tf = ToolFailure(tool_name="test", error="unknown")
+        assert tf.error_type == ToolErrorType.EXECUTION_ERROR
+        assert tf.retryable is True  # APPROVAL → retryable-ish
+
+    def test_retry_map_values_are_valid(self):
+        valid = {"automatic", "approval", "never"}
+        for v in ERROR_RETRY_MAP.values():
+            assert v in valid, f"Invalid retry value: {v}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T4 — ToolRegistryPort protocol
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T9 — ToolSuccess/ToolFailure.to_chat_block() CC format
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestChatBlockFormat:
+    """T9: ToolOutcome can be converted to CC-compatible chat blocks."""
+
+    def test_success_block_format(self):
+        ts = ToolSuccess(tool_name="read", output="file content", tool_use_id="tc-1")
+        block = ts.to_chat_block()
+        assert block["type"] == "tool_result"
+        assert block["tool_use_id"] == "tc-1"
+        assert block["content"] == "file content"
+
+    def test_failure_block_has_is_error(self):
+        tf = ToolFailure(tool_name="write", error="permission denied")
+        block = tf.to_chat_block()
+        assert block["is_error"] is True
+
+    def test_denied_block_is_error(self):
+        td = ToolDenied(tool_name="rm", reason="blocked by hook")
+        block = td.to_chat_block()
+        assert block["is_error"] is True
+        assert "blocked by hook" in block["content"]
+
+
+class TestToolRegistryPort:
+    """T4: ToolRegistryPort protocol is importable and has 5 methods."""
+
+    def test_protocol_importable(self):
+        from runtime_core.ports import ToolRegistryPort
+        assert ToolRegistryPort is not None
+
+    def test_protocol_has_five_methods(self):
+        import inspect
+        from runtime_core.ports import ToolRegistryPort
+        methods = [m for m in dir(ToolRegistryPort) if not m.startswith('_')]
+        expected = {'register', 'unregister', 'resolve', 'list_names', 'metadata_for'}
+        assert expected.issubset(set(methods)), (
+            f"Missing methods: {expected - set(methods)}"
+        )
+
+
+class TestPermissionPipelinePort:
+    """T11: PermissionPipelinePort is importable."""
+    def test_protocol_importable(self):
+        from runtime_core.ports import PermissionPipelinePort, PermissionResult
+        r = PermissionResult(allowed=False, reason="denied", mode="default")
+        assert r.allowed is False
 
 
 class TestStaticGate:

@@ -67,6 +67,7 @@ class ChatPipelinePorts:
     finalize_run: Callable[..., bool] = lambda *args, **kwargs: False
     event_bus: Any = None
     plan_revisions: Any = None
+    coordinator: Any = None  # R3: RunCoordinator for native execution path
 
 
 def _maybe_auto_compact(
@@ -416,6 +417,11 @@ class ChatPipeline:
         Call ``finish()`` afterwards to handle plan_ready / completed / failed.
         """
         request = prepared.request
+
+        # R3: Native execution path when coordinator is available
+        if self._ports.coordinator is not None:
+            return self._execute_native(request, prepared)
+
         self._ports.reload_rules()
 
         # Apply pending Skill/model runtime modifiers exactly once.
@@ -471,6 +477,79 @@ class ChatPipeline:
         )
 
         # Accumulate cross-round stats in session metadata
+        self._ports.accumulate_session_stats(request.session_id, result)
+        return result
+
+    def _execute_native(self, request, prepared) -> RunResult:
+        """R3: Execute via Native RunCoordinator + AgentRuntime.
+
+        Converts PreparedChatRun → RuntimeExecution → coordinator.execute()
+        → coordinator.finalize() → RunResult.  Produces evidence, token,
+        and outbox entries that the legacy path does not.
+        """
+        import uuid as _uuid
+        from application.commands.run_commands import ExecuteRun, FinalizeRun
+        from core.eventing.identifiers import RunId as CoreRunId, SessionId as CoreSid, AggregateVersion
+        from runtime_core.execution import ConversationSnapshot, CapabilitySnapshot
+
+        coord = self._ports.coordinator
+        sid = CoreSid(request.session_id)
+        run_id = CoreRunId(str(_uuid.uuid4()))
+        prompt = self._render_prepared_prompt(prepared)
+
+        # Build conversation from recent messages
+        msgs = []
+        if hasattr(self._ports.session_service, 'get_messages'):
+            try:
+                msgs = self._ports.session_service.get_messages(request.session_id, limit=50)
+            except Exception:
+                pass
+        # Append the current user prompt
+        msgs.append({"role": "user", "content": prompt})
+        conv = ConversationSnapshot(messages=tuple(msgs))
+
+        # Build capabilities from backend
+        caps = CapabilitySnapshot()
+        if hasattr(self._ports, 'backend') and self._ports.backend is not None:
+            try:
+                backend = self._ports.backend
+                caps = CapabilitySnapshot(
+                    tool_schemas=tuple(
+                        {"name": t.name, "description": t.description}
+                        for t in getattr(backend, 'tools', [])
+                    ) if hasattr(backend, 'tools') else ()
+                )
+            except Exception:
+                pass
+
+        # Execute via coordinator
+        outcome = coord.execute(
+            ExecuteRun(session_id=sid, run_id=run_id),
+            conversation=conv, capabilities=caps, max_steps=25,
+        )
+
+        # Finalize — write terminal state + fact to Outbox
+        coord.finalize(
+            FinalizeRun(run_id=outcome.run_id,
+                        expected_version=AggregateVersion(1),
+                        outcome=outcome),
+            session_id=sid,
+        )
+
+        # Map native RunStatus → legacy RunStatus
+        _status_map = {
+            "completed": "success", "failed": "failed",
+            "cancelled": "cancelled", "blocked": "blocked",
+            "gave_up": "gave_up",
+        }
+        # Accumulate stats (same as legacy path)
+        result = RunResult(
+            task_id=str(run_id),
+            status=_status_map.get(outcome.status.value, outcome.status.value),
+            summary=outcome.summary,
+            steps_taken=outcome.steps_taken,
+            total_tokens=outcome.tokens_used,
+        )
         self._ports.accumulate_session_stats(request.session_id, result)
         return result
 

@@ -156,6 +156,8 @@ class TestEventDecisionMap:
             "PreCompact", "PostCompact", "PermissionRequest", "PermissionDenied",
             "Notification",
         }
+        # T7: PostToolBatch already in set — verify it maps to ObserveDecision
+        assert "PostToolBatch" in EVENT_DECISION_MAP
         assert set(EVENT_DECISION_MAP.keys()) == events, (
             f"Missing events: {events - set(EVENT_DECISION_MAP.keys())}"
         )

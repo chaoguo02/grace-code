@@ -28,7 +28,7 @@ from runtime_core.model_actions import (
 from runtime_core.outcome import RuntimeOutcome, RunStatus
 from runtime_core.ports import (
     RuntimePorts, LLMPort, ToolPort, HookGatePort,
-    LiveEventPort, ClockPort, TokenUsagePort, CancellationPort,
+    LiveEventPort, ClockPort, TokenUsagePort,
     HookGateResult, ToolSuccess,
 )
 from runtime_core.step_loop import StepLoop, StepResult
@@ -36,26 +36,15 @@ from runtime_core.step_loop import StepLoop, StepResult
 
 # ── Fake ports with controllable model response ────────────────────────────
 
-class FakeCancellation:
-    def __init__(self) -> None:
-        self._cancelled = False
-
-    @property
-    def cancelled(self) -> bool:
-        return self._cancelled
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-
 class FakeLLM:
     """LLM port that returns a pre-configured ModelAction."""
     def __init__(self, response: ModelAction | None = None) -> None:
         self.response = response or AssistantText(text="ok")
         self.call_count = 0
 
-    def invoke(self, messages, tools=None) -> ModelAction:
+    def invoke(self, messages, tools=None, tool_choice=None) -> ModelAction:
         self.call_count += 1
+        self._last_tool_choice = tool_choice
         return self.response
 
     def stream(self, messages, tools=None):
@@ -79,7 +68,7 @@ class FakeLiveEvents:
     def __init__(self) -> None:
         self.published: list = []
 
-    def publish(self, event_type, payload) -> None:
+    def publish(self, event_type, payload, scope=None) -> None:
         self.published.append((event_type, payload))
 
 
@@ -107,7 +96,6 @@ def _make_ports(llm_response: ModelAction | None = None):
         live_events=FakeLiveEvents(),
         clock=FakeClock(),
         token_usage=FakeTokenUsage(),
-        cancellation=FakeCancellation(),
     )
 
 

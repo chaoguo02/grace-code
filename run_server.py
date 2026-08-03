@@ -33,6 +33,9 @@ if __name__ == "__main__":
     from composition.application_components import ApplicationLifecycle
 
     print("  Assembling Native object graph...")
+    # T24+T25: Pass tool_registry when available (AgentService._registry)
+    # For full production: create ToolRegistryAdapter(service._registry) and
+    # pass as tool_registry=adapter.  Default None = test/fake mode.
     components = assemble(db_path)
     lifecycle = ApplicationLifecycle(components)
 

@@ -40,6 +40,7 @@ class ToolEvidence:
     tool_name: str = ""
     success: bool = True
     duration_ms: float = 0.0
+    tool_use_id: str = ""  # T20: CC tool_use_id for traceability
 
 
 @dataclass(frozen=True, slots=True)

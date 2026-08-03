@@ -610,11 +610,17 @@ def create_sessions_router(get_service: Any) -> APIRouter:
                     RunAlreadyActiveError,
                     submit_run_turn,
                 )
+                # Phase A: Inject native coordinator if available
+                _coordinator = (
+                    getattr(service, '_native_components', None)
+                    and service._native_components.run_coordinator
+                ) if service is not None else None
                 submitted = submit_run_turn(
                     _storage,
                     session_id=session_id,
                     prompt=body.prompt,
                     idempotency_key=_idem_key,
+                    coordinator=_coordinator,
                 )
                 _run_id = submitted.run_id
                 _turn_id = submitted.turn_id

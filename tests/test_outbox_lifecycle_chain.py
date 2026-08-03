@@ -15,6 +15,94 @@ from server.projections.trace_projection import TraceProjection
 from server.services.event_outbox import OutboxRelay, OutboxStore
 from server.services.run_submission import submit_run_turn
 
+from application.coordinators.run_coordinator import RunCoordinator
+from application.events.schema_registry import SchemaRegistry
+from infrastructure.outbox.sqlite_store import SqliteOutboxStore
+from infrastructure.sqlite.run_uow import SqliteUnitOfWork
+from runtime_core.outcome import RunStatus
+from runtime_core.ports import (
+    RuntimePorts, LLMPort, ToolPort, HookGatePort,
+    LiveEventPort, ClockPort, TokenUsagePort,
+    HookGateResult, ToolSuccess,
+)
+from runtime_core.model_actions import ModelAction
+from runtime_core.runtime import AgentRuntime
+
+
+# ── Fake Ports ────────────────────────────────────────────────────────────────
+
+class FakeLLM:
+    def invoke(self, messages, tools=None, tool_choice=None):
+        return ModelAction.stop(reason="test")
+    def stream(self, messages, tools=None, tool_choice=None):
+        async def _stream():
+            return ModelAction.stop(reason="test")
+        return _stream()
+
+
+class FakeTools:
+    def execute(self, tool_name, params, invocation_id=""):
+        return ToolSuccess(tool_name=tool_name)
+
+
+class FakeHooks:
+    def check(self, event_type, hook_input, tool_name=""):
+        return HookGateResult(allowed=True)
+
+
+class FakeLiveEvents:
+    def publish(self, event_type, payload, scope=None):
+        pass
+
+
+class FakeClock:
+    def now(self):
+        import time
+        return time.monotonic()
+    def deadline(self, timeout_s):
+        return self.now() + timeout_s
+
+
+class FakeTokenUsage:
+    def record(self, run_id, input_tokens, output_tokens):
+        pass
+
+
+def _make_coordinator(db_path: str):
+    """Create a real RunCoordinator backed by the test DB.
+
+    Must create a unified event_outbox schema compatible with both
+    old SessionStore (needs event_version) and new SqliteOutboxStore
+    (needs payload_digest).
+    """
+    # Use old OutboxStore first (has event_version column)
+    from server.services.event_outbox import OutboxStore
+    old_outbox = OutboxStore(db_path)
+    old_outbox.install()
+    # Migrate to add new SqliteOutboxStore columns (payload_digest)
+    conn = sqlite3.connect(db_path)
+    SqliteOutboxStore.migrate_add_columns(conn)
+    # Also install the owner_lease table for OutboxRelay
+    from infrastructure.outbox.owner_lease import OwnerLease
+    OwnerLease.install(conn)
+    conn.commit()
+    conn.close()
+
+    registry = SchemaRegistry()
+    outbox_store = SqliteOutboxStore(db_path, registry)
+
+    ports = RuntimePorts(
+        llm=FakeLLM(),
+        tools=FakeTools(),
+        hooks=FakeHooks(),
+        live_events=FakeLiveEvents(),
+        clock=FakeClock(),
+        token_usage=FakeTokenUsage(),
+    )
+    runtime = AgentRuntime(ports)
+    uow = SqliteUnitOfWork(db_path, outbox_store)
+    return RunCoordinator(runtime, uow)
+
 
 @pytest.mark.asyncio
 async def test_run_lifecycle_state_outbox_trace_and_live_are_one_chain(tmp_path):
@@ -26,11 +114,13 @@ async def test_run_lifecycle_state_outbox_trace_and_live_are_one_chain(tmp_path)
         repo_path=str(tmp_path),
         title="outbox chain",
     )
+    coordinator = _make_coordinator(db_path)
     submitted = submit_run_turn(
         storage,
         session_id=session.id,
         prompt="implement",
         idempotency_key="chain-1",
+        coordinator=coordinator,
     )
 
     store = storage._store
@@ -98,8 +188,10 @@ def test_terminal_cas_emits_exactly_one_fact(tmp_path):
         agent_name="build", mode=SessionMode.PRIMARY,
         repo_path=str(tmp_path), title="cas",
     )
+    coordinator = _make_coordinator(db_path)
     submitted = submit_run_turn(
         storage, session_id=session.id, prompt="x", idempotency_key="cas-1",
+        coordinator=coordinator,
     )
     assert storage._store.start_run_with_event(submitted.run_id, session.id)
     assert storage._store.finalize_run_with_event(

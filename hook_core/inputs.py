@@ -145,6 +145,14 @@ class PostCompactInput:
     tokens_after: int = 0
 
 
+# ── T7: PostToolBatch ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class PostToolBatchInput:
+    session_id: str = ""
+    tool_count: int = 0
+
+
 # ── Notifications ───────────────────────────────────────────────────────────
 
 @dataclass(frozen=True, slots=True)

@@ -31,8 +31,11 @@ class AgentRuntime:
         loop = StepLoop(self._ports)
         outcome = loop.execute(context)
 
-        # H7: Publish live event with FrozenJsonObject payload (not bare string)
+        # H7: Publish live event with FrozenJsonObject payload
         from core.json_values import freeze_json
+        import uuid as _uuid
+        from core.eventing.scope import ScopeToken
+        _scope = ScopeToken.session_scope(_uuid.uuid4(), context.session_id) if context.session_id is not None else None
         self._ports.live_events.publish(
             event_type=f"run.{outcome.status.value}.v1",
             payload=freeze_json({
@@ -42,6 +45,7 @@ class AgentRuntime:
                 "steps_taken": outcome.steps_taken,
                 "tokens_used": outcome.tokens_used,
             }),
+            scope=_scope,
         )
 
         # H3: Record separated input/output token usage

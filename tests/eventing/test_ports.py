@@ -19,6 +19,7 @@ from eventing.publisher import (
 from eventing.subscriber import (
     EventSubscriber, AsyncEventSubscriber, DeliveryReceipt,
 )
+from core.eventing.scope import ScopeToken
 from eventing.subscription import Subscription
 
 
@@ -49,7 +50,7 @@ class TestSubscriber:
 class TestSubscription:
 
     def test_close_idempotent(self):
-        s = Subscription("run.completed.v1", "trace")
+        s = Subscription("run.completed.v1", "trace", scope=ScopeToken.global_scope())
         assert not s.closed
         s.close()
         assert s.closed
@@ -57,7 +58,7 @@ class TestSubscription:
         assert s.closed
 
     def test_subscription_fields(self):
-        s = Subscription("tool.executed.v1", "stats")
+        s = Subscription("tool.executed.v1", "stats", scope=ScopeToken.global_scope())
         assert s.event_type == "tool.executed.v1"
         assert s.subscriber_id == "stats"
 

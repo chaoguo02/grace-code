@@ -20,6 +20,10 @@ def map_domain_to_ws(record) -> dict | None:
     subscribers (e.g., internal lifecycle events with no UI representation).
     """
     event_type = record.event_type
+    # G38: Normalize versioned event types (e.g. "run.submitted.v1" → "run.submitted")
+    # to maintain backward compat with old unversioned event type checks.
+    if event_type.endswith((".v1", ".v2", ".v3")):
+        event_type = event_type.rsplit(".", 1)[0]
     payload = record.payload
 
     if event_type == "session.started":
@@ -42,6 +46,10 @@ def map_domain_to_ws(record) -> dict | None:
             "reason": payload.get("reason", ""),
             "timestamp": record.occurred_at,
         }
+    # run.submitted is deliberately not mapped — it's an internal event
+    # with no UI representation.  The TraceProjection fallback in
+    # server/projections/trace_projection.py still records it in
+    # session_trace_events so the trace assertion sees "run.submitted".
     if event_type == "run.started":
         return {
             "type": "run_started", "run_id": record.aggregate_id,

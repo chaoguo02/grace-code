@@ -180,3 +180,93 @@ class TestCancelParallel:
         results = await sched.execute_batch(calls, executor, cancel_event=cancel_evt)
         cancelled = [r for r in results if r.cancelled]
         assert len(cancelled) >= 2, "All tools should be cancelled"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T2 — ToolMetadata.from_base_tool() bridge
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMetadataBridge:
+    """T2: from_base_tool bridges core.types.ToolMetadata → runtime_core."""
+
+    def test_read_only_tool_maps_correctly(self):
+        """FileReadTool.isReadOnly() = True → read_only=True."""
+        from core.base import BaseTool
+        from core.types import ToolMetadata as CoreMetadata, ToolEffect, PathAccess
+
+        # Create a minimal read-only tool
+        class FakeReadTool(BaseTool):
+            name = "ReadFile"
+            schema = {"name": "ReadFile", "description": "Read a file"}
+            metadata = CoreMetadata(effects=frozenset({ToolEffect.READ_WORKSPACE}),
+                                     path_access=PathAccess.READ)
+            @property
+            def description(self): return "Read a file"
+            @property
+            def parameters_schema(self): return {"type": "object", "properties": {}, "required": []}
+            def isReadOnly(self, params=None): return True
+            def execute(self, params): return type('R', (), {'output': '', 'success': True})()
+
+        tool = FakeReadTool()
+        meta = ToolMetadata.from_base_tool(tool)
+        assert meta.name == "ReadFile"
+        assert meta.read_only is True, f"Expected read_only=True, got {meta.read_only}"
+
+    def test_write_tool_maps_correctly(self):
+        """Write tool → read_only=False."""
+        from core.base import BaseTool
+        from core.types import ToolMetadata as CoreMetadata, ToolEffect
+
+        class FakeWriteTool(BaseTool):
+            name = "WriteFile"
+            schema = {"name": "WriteFile", "description": "Write a file"}
+            metadata = CoreMetadata(effects=frozenset({ToolEffect.WRITE_WORKSPACE}))
+            @property
+            def description(self): return "Write a file"
+            @property
+            def parameters_schema(self): return {"type": "object", "properties": {}, "required": []}
+            def execute(self, params): return type('R', (), {'output': '', 'success': True})()
+
+        tool = FakeWriteTool()
+        meta = ToolMetadata.from_base_tool(tool)
+        assert meta.read_only is False
+
+    def test_resource_key_from_path_parameter(self):
+        from core.base import BaseTool
+        from core.types import ToolMetadata as CoreMetadata, ToolEffect
+
+        class FakeEditTool(BaseTool):
+            name = "Edit"
+            schema = {"name": "Edit", "description": "Edit a file"}
+            metadata = CoreMetadata(
+                effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+                path_parameter="file_path",
+            )
+            @property
+            def description(self): return "Edit a file"
+            @property
+            def parameters_schema(self): return {"type": "object", "properties": {}, "required": []}
+            def execute(self, params): return type('R', (), {'output': '', 'success': True})()
+
+        tool = FakeEditTool()
+        meta = ToolMetadata.from_base_tool(tool)
+        assert meta.resource_key == "file_path"
+
+    def test_retry_policy_read(self):
+        """T15: from_base_tool reads retry_policy.max_attempts."""
+        from core.base import BaseTool
+        from core.types import ToolMetadata as CoreMetadata, RetryPolicy, RetryMode
+        class RetryTool(BaseTool):
+            name = "RetryTool"
+            metadata = CoreMetadata()
+            def retry_policy(self, params):
+                return RetryPolicy(mode=RetryMode.AUTOMATIC, max_attempts=5)
+            @property
+            def description(self): return "R"
+            @property
+            def parameters_schema(self): return {"type":"object","properties":{}}
+            def execute(self, p): return type('R',(),{'output':'','success':True})()
+
+        tool = RetryTool()
+        meta = ToolMetadata.from_base_tool(tool)
+        assert meta.retry_max == 4, f"max_attempts=5 → retry_max=4, got {meta.retry_max}"

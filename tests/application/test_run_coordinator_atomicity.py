@@ -8,6 +8,7 @@ AC: Coordinator does not import server/sqlite.
 from __future__ import annotations
 
 import ast
+import uuid as _uuid
 
 import pytest
 
@@ -15,10 +16,71 @@ from application.commands.run_commands import SubmitRun, FinalizeRun
 from application.coordinators.run_coordinator import RunCoordinator
 from application.transactions.unit_of_work import SessionTransaction
 from core.eventing.identifiers import SessionId, RunId, AggregateVersion
+from core.eventing.scope import ScopeToken
+from core.json_values import FrozenJsonObject
+from runtime_core.model_actions import ModelAction
 from runtime_core.outcome import RuntimeOutcome
-from runtime_core.ports import RuntimePorts
+from runtime_core.ports import (
+    RuntimePorts, LLMPort, ToolPort, HookGatePort,
+    LiveEventPort, ClockPort, TokenUsagePort,
+    HookGateResult, ToolOutcome, ToolSuccess,
+)
 from runtime_core.runtime import AgentRuntime
 
+
+# ── Fake Ports ────────────────────────────────────────────────────────────────
+
+class FakeLLM:
+    def invoke(self, messages, tools=None, tool_choice=None):
+        return ModelAction.stop(reason="test")
+
+    def stream(self, messages, tools=None, tool_choice=None):
+        import asyncio
+        async def _stream():
+            return ModelAction.stop(reason="test")
+        return _stream()
+
+
+class FakeTools:
+    def execute(self, tool_name, params, invocation_id=""):
+        return ToolSuccess(tool_name=tool_name)
+
+
+class FakeHooks:
+    def check(self, event_type, hook_input, tool_name=""):
+        return HookGateResult(allowed=True)
+
+
+class FakeLiveEvents:
+    def publish(self, event_type, payload, scope=None):
+        pass
+
+
+class FakeClock:
+    def now(self):
+        import time
+        return time.monotonic()
+    def deadline(self, timeout_s):
+        return self.now() + timeout_s
+
+
+class FakeTokenUsage:
+    def record(self, run_id, input_tokens, output_tokens):
+        pass
+
+
+def _fake_ports() -> RuntimePorts:
+    return RuntimePorts(
+        llm=FakeLLM(),
+        tools=FakeTools(),
+        hooks=FakeHooks(),
+        live_events=FakeLiveEvents(),
+        clock=FakeClock(),
+        token_usage=FakeTokenUsage(),
+    )
+
+
+# ── Fake UoW ──────────────────────────────────────────────────────────────────
 
 class FakeUoW:
     """Fake UoW — records appended facts and state mutations in memory."""
@@ -36,6 +98,12 @@ class FakeUoW:
 class FakeTransaction:
     def __init__(self, uow: FakeUoW):
         self._uow = uow
+
+    def check_idempotency(self, session_id, key, digest):
+        return None
+
+    def check_active_run(self, session_id):
+        return None
 
     def increment_generation(self, session_id) -> int:
         sid = str(session_id)
@@ -64,19 +132,25 @@ class FakeTransaction:
         self._uow.facts.append(envelope)
 
 
+# ── Tests ─────────────────────────────────────────────────────────────────────
+
 class TestRunCoordinator:
 
     def test_submit_creates_fact_and_state(self):
         uow = FakeUoW()
-        rt = AgentRuntime(RuntimePorts())
+        rt = AgentRuntime(_fake_ports())
         coord = RunCoordinator(rt, uow)
 
         cmd = SubmitRun(session_id=SessionId("s1"), prompt="test")
-        envelope = coord.submit(cmd)
+        result = coord.submit(cmd)
 
-        # Fact must be appended
+        # G22: submit() returns RunId on success (not EventEnvelope)
+        assert result is not None
+        assert isinstance(result, RunId)
+
+        # Fact must be appended in the transaction
         assert len(uow.facts) == 1
-        assert str(envelope.event_type) == "run.submitted.v1"
+        assert str(uow.facts[0].event_type) == "run.submitted.v1"
 
         # State mutations must occur in same transaction
         assert len(uow.runs) == 1
@@ -91,12 +165,13 @@ class TestRunCoordinator:
         assert uow.generations.get("s1", 0) >= 1
 
         # Envelope payload must carry real metadata
+        envelope = uow.facts[0]
         assert envelope.payload.turn_index >= 1
         assert envelope.payload.turn_id  # must be non-empty
 
     def test_finalize_persists_terminal_fact(self):
         uow = FakeUoW()
-        rt = AgentRuntime(RuntimePorts())
+        rt = AgentRuntime(_fake_ports())
         coord = RunCoordinator(rt, uow)
 
         outcome = RuntimeOutcome.completed(RunId("r1"), steps=5, tokens=100)
