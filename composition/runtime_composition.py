@@ -333,12 +333,29 @@ def start_native_pipeline(db_path: str) -> dict:
     bus = ScopedEventBus()
     lease = OwnerLease(db_path)
 
-    # Install outbox + lease DDL
+    # Install outbox + lease DDL (first-run safe)
     import sqlite3
+    from pathlib import Path as _Path
+    _Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         SqliteOutboxStore.install(conn)
+        SqliteOutboxStore.migrate_add_columns(conn)
         OwnerLease.install(conn)
+        from listeners.projection_state import ProjectionStateStore
+        ProjectionStateStore.install(conn)
+        from listeners.stats_projection import StatsProjection
+        from listeners.audit_projection import AuditProjection
+        StatsProjection.install(conn)
+        AuditProjection.install(conn)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS run_token_usage (
+                run_id TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                recorded_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -407,15 +424,34 @@ def assemble(db_path: str, *,
     outbox = SqliteOutboxStore(db_path, registry)
     lease = OwnerLease(db_path)
 
-    # ── DDL installation ──────────────────────────────────────────
+    # ── DDL installation (first-run safe) ─────────────────────────
+    # Ensure .grace/ directory exists before sqlite3.connect()
     import sqlite3 as _sqlite3
+    from pathlib import Path as _Path
+    _Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
     _ddl_conn = _sqlite3.connect(db_path)
     try:
+        # Outbox + relay lease + projection infrastructure
         SqliteOutboxStore.install(_ddl_conn)
         SqliteOutboxStore.migrate_add_columns(_ddl_conn)
         OwnerLease.install(_ddl_conn)
         from listeners.projection_state import ProjectionStateStore
         ProjectionStateStore.install(_ddl_conn)
+        # Projection tables (stats, audit)
+        from listeners.stats_projection import StatsProjection
+        from listeners.audit_projection import AuditProjection
+        StatsProjection.install(_ddl_conn)
+        AuditProjection.install(_ddl_conn)
+        # Token usage recording
+        _ddl_conn.execute("""
+            CREATE TABLE IF NOT EXISTS run_token_usage (
+                run_id TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                recorded_at TEXT NOT NULL
+            )
+        """)
         _ddl_conn.commit()
     finally:
         _ddl_conn.close()
