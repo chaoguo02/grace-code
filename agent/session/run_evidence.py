@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -37,6 +38,10 @@ class EvidenceKind(str, Enum):
     WORKER_COMPLETED = "worker_completed"
     VALIDATION_COMPLETED = "validation_completed"
     COMPLETION_EVALUATED = "completion_evaluated"
+    RESUME_MARKER = "resume_marker"
+    """Phase 3A: turn 边界续传标记。metadata 携带 tool_calls_hash 和
+    files_hash；重启时比对当前 workspace 状态决定是否可跳过已完成 turns。
+    生产恢复基于此 + Git，Checkpoint 仅为调试工具。"""
 
 
 class EvidenceStatus(str, Enum):
@@ -402,6 +407,44 @@ class RunEvidenceStore:
                 # roll back committed evidence.
                 pass
         return canonical
+
+    # ── Phase 3A: turn-boundary resume markers ───────────────────────────
+
+    def record_resume_marker(self, session_id: str, turn_id: str,
+                             tool_calls_hash: str,
+                             files_hash: str) -> EvidenceEntry:
+        """Record a turn-boundary resume marker.
+
+        metadata carries the tool-call sequence hash and a workspace files
+        snapshot hash.  On restart, should_resume_from_marker() compares the
+        current workspace hash to decide whether completed turns can be
+        skipped (rather than re-running from step 0).
+        """
+        entry = EvidenceEntry(
+            evidence_id=f"resume_{self._root_run_id}_{turn_id}",
+            idempotency_key=f"resume-marker:{self._root_run_id}:{turn_id}",
+            root_run_id=self._root_run_id,
+            session_id=session_id,
+            producer_session_id=session_id,
+            kind=EvidenceKind.RESUME_MARKER,
+            status=EvidenceStatus.SUCCEEDED,
+            turn_id=turn_id,
+            metadata={
+                "tool_calls_hash": tool_calls_hash,
+                "files_hash": files_hash,
+            },
+        )
+        return self.record(entry)
+
+    def find_last_resume_marker(self, session_id: str) -> EvidenceEntry | None:
+        """Return the most recent RESUME_MARKER for *session_id*, or None."""
+        markers = [
+            e for e in self._entries
+            if e.kind is EvidenceKind.RESUME_MARKER and e.session_id == session_id
+        ]
+        if not markers:
+            return None
+        return max(markers, key=lambda e: e.sequence)
 
     def _bind(self, entry: EvidenceEntry) -> EvidenceEntry:
         if entry.root_run_id and entry.root_run_id != self._root_run_id:
@@ -1094,6 +1137,58 @@ def _json_mapping(value: Mapping[str, object] | object) -> dict[str, object]:
     serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     loaded = json.loads(serialized)
     return dict(loaded) if isinstance(loaded, dict) else {}
+
+
+# ── Phase 3A: resume helpers ──────────────────────────────────────────────
+# 不维护 step counter（对齐 CC）。用 workspace 文件快照哈希 + turn 边界
+# marker 判定"已完成 turns 是否可跳过"。宁可重跑，不可错误跳过（R-D）。
+
+_RESUME_SKIP_DIRS = frozenset({".git", "node_modules", "__pycache__", ".grace"})
+
+
+def workspace_files_hash(repo_path: str, *, limit: int = 2000) -> str:
+    """Deterministic snapshot hash of the workspace files (path:size:mtime).
+
+    Skips git metadata, dependencies, caches.  Returns a sha256 hex digest.
+    A changed file (size or mtime) changes the hash — used to decide
+    whether a recorded resume marker still reflects current workspace state.
+    """
+    h = hashlib.sha256()
+    count = 0
+    try:
+        walk = os.walk(repo_path)
+    except OSError:
+        return h.hexdigest()
+    for root, dirs, files in walk:
+        dirs[:] = [d for d in dirs if d not in _RESUME_SKIP_DIRS]
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            try:
+                stat = os.stat(full)
+            except OSError:
+                continue
+            rel = os.path.relpath(full, repo_path).replace("\\", "/")
+            h.update(f"{rel}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8"))
+            count += 1
+            if count >= limit:
+                return h.hexdigest()
+    return h.hexdigest()
+
+
+def should_resume_from_marker(
+    marker: EvidenceEntry | None,
+    current_files_hash: str,
+) -> bool:
+    """True when *marker* exists and its workspace hash matches the current state.
+
+    Matching → the turn (and all before it) is considered complete; the run
+    may skip straight past it.  Mismatch → discard the marker and re-run
+    (never wrongly skip work, R-D).
+    """
+    if marker is None:
+        return False
+    stored = marker.metadata.get("files_hash", "")
+    return bool(stored) and stored == current_files_hash
 
 
 def _load_json(value: str, default: Any) -> Any:

@@ -8,6 +8,13 @@ IdempotentToolCache: prevents duplicate tool execution when replaying
     a partially-completed turn after recovery.
 
 Design: CC-aligned prompt-level checkpoint + tool result dedup.
+
+⚠️ 定位（Phase 3C）：Checkpoint 是**调试工具，不是生产恢复机制**。
+默认关闭（AgentConfig.checkpoint_db_path=""，零开销）。生产环境的
+恢复依赖 Git（唯一状态源）+ Evidence（turn 级 RESUME_MARKER，
+见 run_evidence.py）。仅在调试长任务或验证状态机行为时通过
+--enable-checkpoint-debug 开启，避免后续开发者误以为这是功能缺失
+而反复尝试启用。
 """
 
 from __future__ import annotations

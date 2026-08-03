@@ -339,6 +339,14 @@ def main() -> None:
     parser.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
     parser.add_argument("--allow-remote", action="store_true", help="Allow non-loopback binds (0.0.0.0). Required to expose the server on LAN.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    parser.add_argument(
+        "--enable-checkpoint-debug", action="store_true",
+        help=(
+            "Enable step checkpoint DB for debugging long tasks. "
+            "NOT a production recovery mechanism — production recovery "
+            "relies on Git + Evidence. Default: checkpoint disabled."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -386,6 +394,10 @@ def main() -> None:
         api_key=args.api_key,
         base_url=args.base_url,
         max_steps=args.max_steps,
+        checkpoint_db_path=(
+            os.path.join(repo_path, ".grace", "checkpoints.db")
+            if args.enable_checkpoint_debug else ""
+        ),
     )
 
     # M9: pass real backend + registry into the Native graph so _RealLLM /

@@ -45,6 +45,9 @@ class Artifact:
     original_length: int     # length of the original output (before capping)
     line_count: int
     created_at: float = field(default_factory=time.time)
+    # ── Phase 3B: versioning + immutability ──
+    version: int = 1         # per-tool sequential version (v1, v2, ...)
+    superseded: bool = False # True when a newer version of this tool exists
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -58,14 +61,19 @@ class Artifact:
             summary=str(data.get("summary", "")),
             token_count=int(data.get("token_count", 0)),
             char_count=int(data.get("char_count", 0)),
+            original_length=int(data.get("original_length", 0)),
             line_count=int(data.get("line_count", 0)),
             created_at=float(data.get("created_at", time.time())),
+            version=int(data.get("version", 1)),
+            superseded=bool(data.get("superseded", False)),
         )
 
     def reference_text(self) -> str:
         """生成放入历史的引用文本。"""
+        ver = f" v{self.version}" if self.version and self.version > 1 else ""
+        stale = " [superseded]" if self.superseded else ""
         return (
-            f"[Artifact {self.artifact_id} | {self.tool_name} | "
+            f"[Artifact {self.artifact_id}{ver}{stale} | {self.tool_name} | "
             f"{self.line_count} lines, ~{self.token_count} tokens]\n"
             f"{self.summary}"
         )
@@ -100,6 +108,7 @@ class ArtifactStore:
         self._store: OrderedDict[str, Artifact] = OrderedDict()
         self._storage_dir: Path | None = None
         self._evicted_ids: set[str] = set()
+        self._tool_versions: dict[str, int] = {}  # Phase 3B: per-tool version counter
         if storage_dir is not None:
             self.set_storage_dir(storage_dir)
 
@@ -221,7 +230,7 @@ class ArtifactStore:
 
         # Cap per-artifact content at 1 MB to prevent OOM from single large output
         capped_output = output[:self._max_content_bytes]
-        return Artifact(
+        artifact = Artifact(
             artifact_id=artifact_id,
             tool_name=tool_name,
             full_content=capped_output,
@@ -231,6 +240,25 @@ class ArtifactStore:
             original_length=original_len,
             line_count=line_count,
         )
+        return self._assign_version(artifact)
+
+    def _assign_version(self, artifact: Artifact) -> Artifact:
+        """Phase 3B: assign the next per-tool version and mark older versions superseded.
+
+        Each new artifact for a given tool gets a monotonic version (v1, v2, ...).
+        Older non-superseded artifacts of the same tool are marked superseded so
+        references/checkpoints never silently point at stale content (R-E).
+        """
+        tool = artifact.tool_name
+        next_v = self._tool_versions.get(tool, 0) + 1
+        artifact.version = next_v
+        self._tool_versions[tool] = next_v
+        for existing in self._store.values():
+            if existing.tool_name == tool and not existing.superseded:
+                existing.superseded = True
+                # superseded 标记必须落盘，否则重启后旧版本丢失该状态
+                self._persist_artifact(existing)
+        return artifact
 
     def _build_summary(
         self, lines: list[str], tool_name: str, token_count: int, line_count: int
@@ -362,5 +390,8 @@ class ArtifactStore:
                 continue
             if artifact.artifact_id:
                 self._store[artifact.artifact_id] = artifact
+                # Rebuild per-tool version counter (Phase 3B)
+                cur = self._tool_versions.get(artifact.tool_name, 0)
+                self._tool_versions[artifact.tool_name] = max(cur, artifact.version)
         while len(self._store) > self._max_artifacts:
             self._store.popitem(last=False)

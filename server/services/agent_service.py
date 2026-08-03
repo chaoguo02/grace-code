@@ -93,9 +93,12 @@ class AgentService:
         api_key: str | None = None,
         base_url: str | None = None,
         max_steps: int | None = None,
+        checkpoint_db_path: str = "",
     ) -> None:
         self.repo_path = str(Path(repo_path).expanduser().resolve())
         self._config_path = config_path
+        self._checkpoint_db_path = checkpoint_db_path
+        """Phase 3C: 调试用 checkpoint DB 路径；"" 表示关闭（生产默认）。"""
         self._event_bus = event_bus
         self._root_session = None
         self._root_session_id: str | None = None
@@ -646,6 +649,7 @@ class AgentService:
             token_budget_continuation=True,
             streaming_tool_execution=True,
             prompt_config=self._config.prompts,
+            checkpoint_db_path=self._checkpoint_db_path,
         )
 
         # ── L-1: Langfuse RetryMetrics tracer (Phase 7) ────────────────
