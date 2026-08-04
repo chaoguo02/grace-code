@@ -21,7 +21,7 @@ class _RecordingCoordinator:
         self.caps = None
         self.finalized = False
 
-    def execute(self, cmd, *, conversation=None, capabilities=None, max_steps=25):
+    def execute(self, cmd, *, conversation=None, capabilities=None, max_steps=25, workspace=""):
         self.executed_conv = conversation
         self.caps = capabilities
         from runtime_core.outcome import RuntimeOutcome

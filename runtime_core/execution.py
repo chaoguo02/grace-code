@@ -101,3 +101,4 @@ class RuntimeExecution:
     capabilities: CapabilitySnapshot = field(default_factory=CapabilitySnapshot)
     max_steps: int = 25
     budget_tokens: int = 200_000
+    workspace: str = ""  # Phase 12: hook cwd / tool workspace (repo root or worktree)

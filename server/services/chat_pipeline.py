@@ -535,6 +535,7 @@ class ChatPipeline:
         outcome = coord.execute(
             ExecuteRun(session_id=sid, run_id=run_id),
             conversation=conv, capabilities=caps, max_steps=_max_steps,
+            workspace=self._ports.repo_path,  # Phase 12: hook cwd source
         )
 
         # Phase 5: 跨轮持久化 — 把 run 产生的 assistant/tool 消息写 session_messages，

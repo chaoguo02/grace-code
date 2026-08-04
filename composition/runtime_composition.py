@@ -530,23 +530,29 @@ def assemble(db_path: str, *,
           - PermissionPipeline → "may this run?"  (permission rules + mode +
                                per-session ask interaction)
 
-        Order here matches CC: hooks run FIRST.  A blocking hook short-circuits
-        before permission (so user scripts override rules).  If hooks pass, the
-        permission gate decides.  Permission ALLOW that skips hooks is avoided —
-        hooks always see every tool call (CC recommendation for must-run checks).
+        Per-session isolation (Phase 11 v2 — CC-aligned):
+        CC isolates sessions via process/event-loop boundaries — no shared
+        permission object, no locks.  Our process-internal equivalent is a
+        **fresh PermissionPipeline per session** (own RLock, own denial
+        counters, own rules copy).  No scoped() shallow-copy sharing.
 
-        P0-3: per-session PermissionPipeline copy + web_confirm_callback registry.
+        Base config (rules/mode/project_root) is captured at assemble() time
+        and used as the template for every session pipeline construction.
         """
         def __init__(self, dispatcher, permission_pipeline=None,
                      tool_registry=None):
             self._dispatcher = dispatcher
+            self._tool_registry = tool_registry
+            # Base template captured from assemble() — never used directly,
+            # only read for rules/mode/project_root when constructing a
+            # session pipeline.  None = no permission gate (test/legacy).
             self._base_permission = permission_pipeline
             self._permission = permission_pipeline
-            self._tool_registry = tool_registry
             self._session_confirm_callbacks: dict[str, Callable] = {}
+            # Per-session fresh pipelines (CC process-boundary equivalent).
             self._session_pipelines: dict[str, object] = {}
             import threading as _threading
-            self._session_lock = _threading.Lock()
+            self._session_lock = _threading.Lock()  # guards dict only
 
         def register_session_confirm(self, session_id: str, callback) -> None:
             """Register a per-session web_confirm_callback (CC control_response).
@@ -560,12 +566,14 @@ def assemble(db_path: str, *,
                 self._session_pipelines.pop(session_id, None)  # invalidate copy
 
         def _pipeline_for(self, session_id: str):
-            """Return the per-session PermissionPipeline (base + confirm cb).
+            """Return (or lazily build) the per-session fresh PermissionPipeline.
 
-            Uses ``PermissionPipeline.scoped()`` (deep-copied rule lists +
-            isolated denial counters) rather than raw copy.copy so per-session
-            state never leaks across sessions.  The confirm callback is applied
-            via configure_session on the per-session clone only.
+            Phase 11 v2: each session gets a NEW PermissionPipeline —
+            __init__ creates a fresh RLock + empty denial counters.  Rules are
+            deep-copied from the base template.  No scoped() shallow-copy
+            sharing (which leaked a shared lock across sessions).
+
+            Mirrors CC's process-per-session isolation within one process.
             """
             if self._base_permission is None:
                 return None
@@ -575,16 +583,23 @@ def assemble(db_path: str, *,
                 cached = self._session_pipelines.get(session_id)
                 if cached is not None:
                     return cached
-                from hitl.pipeline import PermissionSessionConfig
-                clone = self._base_permission.scoped(self._base_permission._project_root or ".")
-                cb = self._session_confirm_callbacks.get(session_id)
-                if cb is not None:
-                    clone.configure_session(PermissionSessionConfig(
-                        session_id=session_id,
-                        web_confirm_callback=cb,
-                    ))
-                self._session_pipelines[session_id] = clone
-                return clone
+                base = self._base_permission
+                from hitl.pipeline import PermissionPipeline, ToolApprovalMode
+                # Fresh construction — own RLock, own counters (CC session).
+                pipeline = PermissionPipeline(
+                    rules=(
+                        list(base._deny_rules)
+                        + list(base._ask_rules)
+                        + list(base._allow_rules)
+                    ),
+                    approval_mode=getattr(base, '_approval_mode', ToolApprovalMode.AUTO),
+                    project_root=getattr(base, '_project_root', None),
+                    web_confirm_callback=self._session_confirm_callbacks.get(session_id),
+                )
+                # Inherit base mode (e.g. acceptEdits / plan) per session.
+                pipeline._permission_mode = getattr(base, '_permission_mode', "")
+                self._session_pipelines[session_id] = pipeline
+                return pipeline
 
         def check(self, event_type, hook_input, tool_name=""):
             # CC-aligned: hooks run FIRST (bypass-immune), then permission.

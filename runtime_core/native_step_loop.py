@@ -439,6 +439,9 @@ class NativeStepLoop:
                     if context is not None and context.session_id is not None
                     else ""
                 ),
+                cwd=(
+                    context.workspace if context is not None and context.workspace else ""
+                ),
             )
             try:
                 gate_result = self._ports.hooks.check(
@@ -542,6 +545,9 @@ class NativeStepLoop:
                     str(context.session_id)
                     if context is not None and context.session_id is not None
                     else ""
+                ),
+                cwd=(
+                    context.workspace if context is not None and context.workspace else ""
                 ),
             )
             try:

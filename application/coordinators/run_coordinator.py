@@ -124,11 +124,14 @@ class RunCoordinator:
     def execute(self, cmd: ExecuteRun,
                 conversation: ConversationSnapshot | None = None,
                 capabilities: CapabilitySnapshot | None = None,
-                max_steps: int = 25) -> RuntimeOutcome:
+                max_steps: int = 25,
+                workspace: str = "") -> RuntimeOutcome:
         """Phase B: Execute via Native Runtime with real context.
 
         conversation: messages from DB (not empty default)
         capabilities: tool schemas from registry (not empty default)
+        workspace: repo root / worktree path — becomes RuntimeExecution.workspace
+            (hook cwd source, Phase 12).
         """
         from runtime_core.execution import ConversationSnapshot, CapabilitySnapshot
         context = RuntimeExecution(
@@ -137,6 +140,7 @@ class RunCoordinator:
             max_steps=max_steps,
             conversation=conversation or ConversationSnapshot(),
             capabilities=capabilities or CapabilitySnapshot(),
+            workspace=workspace,
         )
         return self._runtime.run(context)
 
