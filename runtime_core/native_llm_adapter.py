@@ -25,16 +25,19 @@ from runtime_core.native_message import (
 
 
 class NativeBackendAdapter:
-    """LLMPort implementation backed by NativeBackend.
+    """LLMPort implementation backed by any native backend (Anthropic or OpenAI).
 
     Converts legacy list[dict] messages to NativeConversation at the boundary,
-    then delegates to NativeBackend.invoke().
+    then delegates to the native backend's invoke().
 
     This is the SINGLE conversion point between Legacy (dict) and Native
     (NativeMessage) worlds.  Everything downstream is pure Native.
+
+    Works with: NativeBackend, OpenAINativeBackend (duck typing: any object
+    with invoke(NativeConversation) -> ModelAction).
     """
 
-    def __init__(self, native_backend: NativeBackend):
+    def __init__(self, native_backend):
         self._backend = native_backend
 
     def invoke(
@@ -43,9 +46,9 @@ class NativeBackendAdapter:
         tools: list[dict] | None = None,
         tool_choice: dict | None = None,
     ) -> ModelAction:
-        """LLMPort.invoke() -- dict boundary -> NativeConversation -> NativeBackend.
+        """LLMPort.invoke() -- dict boundary -> NativeConversation -> native backend.
 
-        tools parameter is ignored (NativeBackend has tools bound at init).
+        tools parameter is ignored (native backend has tools bound at init).
         """
         conv = _dicts_to_conversation(messages)
         return self._backend.invoke(
@@ -63,14 +66,14 @@ class NativeBackendAdapter:
         conv = _dicts_to_conversation(messages)
 
         async def _stream():
-            from llm.base import StreamEvent, StreamEventKind
-            events = list(self._backend.stream_iter(
-                conv, tool_choice=tool_choice,
-            ))
-            for ev in events:
-                if ev.kind == StreamEventKind.FINISH:
-                    # Return the final ModelAction from the finish event
-                    return self._backend.invoke(conv, tool_choice=tool_choice)
+            if hasattr(self._backend, 'stream_iter'):
+                from llm.base import StreamEventKind
+                events = list(self._backend.stream_iter(
+                    conv, tool_choice=tool_choice,
+                ))
+                for ev in events:
+                    if ev.kind == StreamEventKind.FINISH:
+                        return self._backend.invoke(conv, tool_choice=tool_choice)
             return self._backend.invoke(conv, tool_choice=tool_choice)
 
         return _stream()
@@ -81,16 +84,15 @@ class NativeBackendAdapter:
 # ---------------------------------------------------------------------------
 
 
-def _dicts_to_conversation(messages: list[dict]) -> NativeConversation:
+def _dicts_to_conversation(messages: list[dict] | None) -> NativeConversation:
     """Convert legacy list[dict] messages to NativeConversation.
 
-    Handles the 5 dict shapes (same as message_mapper._message_from_dict):
-      1. {"role": "user", "content": "..."}
-      2. {"role": "assistant", "content": "...", "tool_calls": [{id,name,params}]}
-      3. {"role": "tool", "tool_call_id": "...", "content": "...", "is_error": ...}
-      4. {"type": "tool_result", "tool_use_id": "...", "content": "...", "is_error": ...}
-      5. {"role": "user", "content": [{"type": "text", ...}]}
+    Handles the 5 dict shapes (same as message_mapper._message_from_dict).
+    Returns empty conversation for None/empty input.
     """
+    if messages is None:
+        return NativeConversation.empty()
+
     native_msgs: list[NativeMessage] = []
 
     for m in messages:

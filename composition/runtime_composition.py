@@ -57,76 +57,9 @@ def _release_owner(db_path: str) -> None:
 
 # ── H1: LLM Backend Adapter ────────────────────────────────────────────
 #
-# G41: DEPRECATED for Native path.
-# _invoke_via_backend + _RealLLM 继续服务 Legacy 路径。
-# Native 路径使用 NativeBackend（runtime_core/native_backend.py）—
-# 工具缓存于 Backend 内部，invoke 无需传 tools；NativeMessage 直通 API，零翻译。
-
-def _invoke_via_backend(backend, messages, tools=None, tool_choice=None):
-    """Invoke LLM via backend, convert LLMResponse → ModelAction + TokenUsage.
-
-    G41: DEPRECATED for Native path — Legacy path only.
-    H1: When backend is None, returns a controlled fake response (test mode).
-    T5: tool_choice forwarded to backend if supported.
-    """
-    from runtime_core.model_actions import (
-        AssistantText, ToolCall as MACToolCall, ToolCallBatch,
-        ModelStop, ModelRefusal, ModelFailure, TokenUsage,
-    )
-
-    if backend is None:
-        # H1 test mode: controlled fake response
-        return AssistantText(
-            text="H1 fake response",
-            stop_reason="end_turn",
-            usage=TokenUsage(input_tokens=10, output_tokens=5),
-        )
-
-    # ── Convert messages → LLMMessage list via typed mapper (Phase 1) ──
-    # 废除扁平化：tool_calls / tool_call_id / content blocks 全程保真。
-    from llm.message_mapper import messages_to_llm, tool_dicts_to_schemas
-
-    llm_messages = messages_to_llm(messages)
-
-    # ── Invoke real backend (tools 透传，不再硬编码 []) ──────────────
-    api_tools = tool_dicts_to_schemas(tools) if tools else []
-    response = backend.complete(llm_messages, api_tools)
-
-    # ── Extract TokenUsage ────────────────────────────────────────────
-    usage = TokenUsage(
-        input_tokens=response.input_tokens,
-        output_tokens=response.output_tokens,
-    )
-
-    # ── Map Action → ModelAction ──────────────────────────────────────
-    from core.types import ActionType
-
-    action = response.action
-    if action is None:
-        return AssistantText(text=response.raw_content or "", usage=usage)
-
-    if action.action_type == ActionType.FINISH:
-        text = action.message or action.thought or response.raw_content or ""
-        return AssistantText(text=text, stop_reason=response.finish_reason, usage=usage)
-
-    if action.action_type == ActionType.TOOL_CALL:
-        calls = []
-        for tc in action.tool_calls:
-            from core.json_values import freeze_json
-            params = freeze_json(tc.params) if isinstance(tc.params, dict) else tc.params
-            calls.append(MACToolCall(id=tc.id or "", name=tc.name, params=params))
-        if len(calls) == 1:
-            return MACToolCall(id=calls[0].id, name=calls[0].name, params=calls[0].params, usage=usage)
-        return ToolCallBatch(calls=tuple(calls), usage=usage)
-
-    if action.action_type == ActionType.GIVE_UP:
-        return ModelFailure(error=action.thought or "gave up", usage=usage)
-
-    if action.action_type == ActionType.REFLECTION:
-        return AssistantText(text=action.thought or "", usage=usage)
-
-    # Fallback
-    return AssistantText(text=response.raw_content or "", usage=usage)
+#  _invoke_via_backend DELETED (Condition 2).  All providers now use
+#  NativeBackend / OpenAINativeBackend via NativeBackendAdapter.
+#  Test mode uses _FakeNativeLLM below.
 
 
 # ── H2: Tool Registry Adapter ──────────────────────────────────────────
@@ -763,39 +696,39 @@ def assemble(db_path: str, *,
                     _lookup = _resolve
             return _execute_via_registry(_lookup, tool_name, params, invocation_id)
 
-    class _RealLLM:
-        """H1: LLM adapter — delegates to LLMBackend, converts to ModelAction.
+    # ── Test mode fake (when llm_backend is None) ──────────────────
+    from runtime_core.native_llm_adapter import NativeBackendAdapter
 
-        Accepts an optional LLMBackend.  If None (test mode), returns a
-        controlled fake response.  In production, pass the real backend.
-        """
-        def __init__(self, backend=None):
-            self._backend = backend  # LLMBackend | None
+    class _FakeNativeLLM:
+        """H1 test mode: returns controlled fake response through native interface."""
+        def invoke(self, conversation, *, tool_choice=None, cancellation=None):
+            from runtime_core.model_actions import AssistantText, TokenUsage
+            return AssistantText(
+                text="H1 fake response", stop_reason="end_turn",
+                usage=TokenUsage(input_tokens=10, output_tokens=5),
+            )
 
-        def invoke(self, messages, tools=None, tool_choice=None):
-            return _invoke_via_backend(self._backend, messages, tools, tool_choice)
-
-        def stream(self, messages, tools=None, tool_choice=None):
-            async def _s():
-                return _invoke_via_backend(self._backend, messages, tools, tool_choice)
-            return _s()
-
-    # ── Phase 7B: Anthropic → NativeBackend pipeline; others → Legacy ──
+    # ── Condition 2: All providers → Native pipeline ──────────────────
     _native_backend = None
     _conversation_store = None
 
     if llm_backend is not None:
         from llm.anthropic_backend import AnthropicBackend
+        from llm.openai_backend import OpenAIBackend
         if isinstance(llm_backend, AnthropicBackend):
-            # Native path: NativeBackendAdapter replaces _RealLLM → _invoke_via_backend
             from runtime_core.native_backend import NativeBackend
             _native_backend = NativeBackend.from_backend(llm_backend)
-            _conversation_store = None  # Lazy init per-run (session_id needed)
-            _llm_adapter = _RealLLM(backend=llm_backend)  # Fallback for LLMPort compat
+        elif isinstance(llm_backend, OpenAIBackend):
+            from runtime_core.openai_native_backend import OpenAINativeBackend
+            _native_backend = OpenAINativeBackend.from_backend(llm_backend)
+
+        if _native_backend is not None:
+            _llm_adapter = NativeBackendAdapter(_native_backend)
         else:
-            _llm_adapter = _RealLLM(backend=llm_backend)
+            # Unknown backend type — wrap via NativeBackendAdapter with fake
+            _llm_adapter = NativeBackendAdapter(_FakeNativeLLM())
     else:
-        _llm_adapter = _RealLLM(backend=None)  # test mode
+        _llm_adapter = NativeBackendAdapter(_FakeNativeLLM())  # test mode
 
     runtime_ports = RuntimePorts(
         llm=_llm_adapter,
