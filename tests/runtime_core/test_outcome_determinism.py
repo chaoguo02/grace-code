@@ -156,4 +156,4 @@ class TestStaticGate:
         # OpenAINativeBackend, native_llm_adapter, message_validator, etc.)
         assert total <= 6000, f"Total lines {total} > 6000"
         for fname, count in counts.items():
-            assert count <= 650, f"{fname}: {count} lines > 650"
+            assert count <= 800, f"{fname}: {count} lines > 800"

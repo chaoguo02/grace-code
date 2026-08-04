@@ -497,6 +497,121 @@ class NativeStepLoop:
 
         return results
 
+    # ── Async tool execution (CC runTools) ────────────────────────────────
+
+    async def _atool_calls(
+        self, calls: tuple[ToolCall, ...],
+        context: RuntimeExecution,
+    ) -> list[ToolResult]:
+        """CC runTools() 等价 — 读工具并行, 写工具串行.
+
+        Phase D: async 是工具执行主路径。分区（partitionToolCalls 等价）：
+          - read_only + concurrency_safe → 并行 (TaskGroup, cap 10)
+          - 其他 (写/破坏性) → 串行
+        """
+        import asyncio
+
+        # CC partitionToolCalls
+        safe: list[ToolCall] = []
+        serial: list[ToolCall] = []
+        for tc in calls:
+            meta = self._scheduler._registry.get(tc.name)
+            if meta and meta.read_only and meta.concurrency_safe:
+                safe.append(tc)
+            else:
+                serial.append(tc)
+
+        results: list[ToolResult] = []
+        # 并行读 (CC runToolsConcurrently, cap 10)
+        if safe:
+            for i in range(0, len(safe), 10):
+                chunk = safe[i:i + 10]
+                chunk_results = await asyncio.gather(
+                    *[self._atool_one(tc, context) for tc in chunk],
+                )
+                results.extend(chunk_results)
+        # 串行写 (CC runToolsSerially)
+        for tc in serial:
+            results.append(await self._atool_one(tc, context))
+        return results
+
+    async def _atool_one(
+        self, tc: ToolCall, context: RuntimeExecution,
+    ) -> ToolResult:
+        """CC runToolUse() 等价 — hook → permission → await tool → post.
+
+        Phase D: 工具执行 await tool.aexecute (async, 不阻塞事件循环)。
+        """
+        import asyncio
+        from hook_core.inputs import PreToolUseInput, PostToolUseInput
+
+        if context.cancellation.cancelled:
+            return ToolResult(
+                tool_call=tc, hook_allowed=False, hook_deny_reason="cancelled",
+            )
+
+        hook_input = PreToolUseInput(
+            tool_name=tc.name, tool_input=tc.params, tool_use_id=tc.id,
+            session_id=(
+                str(context.session_id)
+                if context.session_id is not None else ""
+            ),
+            cwd=(context.workspace if context.workspace else ""),
+        )
+        try:
+            gate_result = self._ports.hooks.check(
+                "PreToolUse", hook_input, tool_name=tc.name,
+            )
+        except Exception:
+            gate_result = HookGateResult(allowed=False, reason="hook error")
+
+        if not gate_result.allowed:
+            return ToolResult(
+                tool_call=tc, hook_allowed=False,
+                hook_deny_reason=gate_result.reason or "denied",
+            )
+
+        final_params = gate_result.updated_input or tc.params
+
+        if context.cancellation.cancelled:
+            return ToolResult(
+                tool_call=tc, hook_allowed=False, hook_deny_reason="cancelled",
+            )
+
+        try:
+            # CC tool.call() — await async 工具执行
+            tool_outcome = await self._ports.tools.aexecute(
+                tc.name, final_params, tc.id,
+            )
+        except Exception as exc:
+            tool_outcome = ToolFailure(
+                tool_name=tc.name,
+                error=f"{type(exc).__name__}: {exc}",
+                error_type=ToolErrorType.EXECUTION_ERROR,
+            )
+
+        post_context = ""
+        try:
+            post_input = PostToolUseInput(
+                tool_name=tc.name,
+                tool_input=final_params,
+                tool_output=getattr(tool_outcome, 'output', ''),
+                tool_use_id=tc.id,
+                success=isinstance(tool_outcome, ToolSuccess),
+            )
+            post_result = self._ports.hooks.check(
+                "PostToolUse", post_input, tool_name=tc.name,
+            )
+            if post_result.additional_context:
+                post_context = post_result.additional_context
+        except Exception:
+            pass
+
+        return ToolResult(
+            tool_call=tc, outcome=tool_outcome,
+            hook_allowed=True, post_hook_context=post_context,
+        )
+
     async def _process_tool_calls_parallel(
         self, calls: tuple[ToolCall, ...],
         context: RuntimeExecution,
