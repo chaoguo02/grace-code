@@ -279,23 +279,22 @@ def _parse_anthropic_response(response: Any) -> Action:
 # 流式支持
 # ---------------------------------------------------------------------------
 
-from llm.base import StreamCallback
+from llm.base import StreamCallback, StreamEvent, StreamEventKind
 
-# Anthropic 流式适配器
-# Python 不允许事后修改继承，用 monkey-patch 把 stream() 方法加进去
 
-def _anthropic_stream(
+def _anthropic_stream_iter(
     self: "AnthropicBackend",
     messages: list,
     tools: list,
-    on_text: StreamCallback | None = None,
-) -> LLMResponse:
+):
+    """Native SDK streaming -- yields StreamEvent during LLM response.
+
+    Phase 8 (Condition 1): Replaces the old fallback-to-complete() path.
+    Uses anthropic SDK's stream() directly, yielding TEXT_DELTA, TOOL_USE,
+    and FINISH events without going through _to_anthropic_messages() or
+    _parse_anthropic_response().
     """
-    Anthropic 流式调用实现。
-    用 anthropic SDK 的 stream() context manager，
-    边收 text_delta 边调用 on_text 回调实时打印。
-    """
-    # 提取 system prompt
+    # Extract system prompt
     system_parts: list[str | list] = []
     non_system = []
     for msg in messages:
@@ -320,24 +319,42 @@ def _anthropic_stream(
     if api_tools:
         kwargs["tools"] = api_tools
 
-    # 使用 stream() context manager
-    with self._client.messages.stream(**kwargs) as stream:
-        for text_chunk in stream.text_stream:
-            if on_text and text_chunk:
-                on_text(text_chunk)
+    try:
+        with self._client.messages.stream(**kwargs) as stream:
+            for text_chunk in stream.text_stream:
+                if text_chunk:
+                    yield StreamEvent(
+                        kind=StreamEventKind.TEXT_DELTA,
+                        text=text_chunk,
+                    )
 
-        # 流结束后拿最终完整响应
-        final = stream.get_final_message()
+            final = stream.get_final_message()
 
-    action = _parse_anthropic_response(final)
-    cache_stats = _extract_cache_stats(final.usage)
-    return LLMResponse(
-        action=action,
-        raw_content=_extract_text(final),
-        input_tokens=final.usage.input_tokens,
-        output_tokens=final.usage.output_tokens,
-        cache_stats=cache_stats,
-    )
+        # Parse tool_use blocks from final response
+        from core.types import ToolCall as CoreToolCall
+        action = _parse_anthropic_response(final)
+        raw_text = _extract_text(final)
 
-# 把 stream() 方法绑定到 AnthropicBackend
-AnthropicBackend.stream = _anthropic_stream
+        # Emit tool_use events
+        if action.tool_calls:
+            for tc in action.tool_calls:
+                yield StreamEvent(
+                    kind=StreamEventKind.TOOL_USE,
+                    tool_call=tc,
+                )
+
+        cache_stats = _extract_cache_stats(final.usage)
+        yield StreamEvent(
+            kind=StreamEventKind.FINISH,
+            text=raw_text,
+            finish_message=raw_text,
+            input_tokens=final.usage.input_tokens,
+            output_tokens=final.usage.output_tokens,
+        )
+
+    except Exception as exc:
+        yield StreamEvent(kind=StreamEventKind.ERROR, text=str(exc))
+
+
+# Override stream_iter with native SDK streaming (no more fallback-to-complete)
+AnthropicBackend.stream_iter = _anthropic_stream_iter
