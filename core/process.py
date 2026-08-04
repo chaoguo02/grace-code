@@ -361,6 +361,28 @@ class Runtime(ABC):
     def __exit__(self, *_) -> None:
         self.cleanup()
 
+    async def aexec(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        cwd: str | None = None,
+        timeout: int = 30,
+        env: dict[str, str] | None = None,
+        cancel_token: object | None = None,
+    ) -> RunResult:
+        """CC Bash async 等价 — asyncio.subprocess, 不阻塞事件循环.
+
+        Phase B: async 版本。子类 override 用 asyncio.subprocess。
+        取消用 asyncio task 取消（对齐 CC AbortController），不再线程 watcher。
+
+        Default: 同步 execute() 用 to_thread 兜底（过渡）。
+        """
+        import asyncio
+        return await asyncio.to_thread(
+            self.execute, command, args, cwd=cwd,
+            timeout=timeout, env=env, cancel_token=cancel_token,
+        )
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -662,6 +684,86 @@ class LocalRuntime(Runtime):
             if proc is not None:
                 self._current_proc = None
 
+    async def aexec(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        cwd: str | None = None,
+        timeout: int = 30,
+        env: dict[str, str] | None = None,
+        cancel_token: object | None = None,
+    ) -> RunResult:
+        """CC Bash async — asyncio.subprocess, 不阻塞事件循环。
+
+        与 execute() 同语义（shell=False 参数隔离），但 async。
+        取消 = asyncio task 取消。
+        """
+        import asyncio
+        cmd_list = [command] + (args or [])
+
+        popen_kwargs: dict[str, Any] = {
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "cwd": self._resolve_cwd(cwd),
+        }
+        if env:
+            popen_kwargs["env"] = with_utf8_env(env)
+        else:
+            popen_kwargs["env"] = with_utf8_env()
+        # Note: asyncio.subprocess does not support preexec_fn/start_new_session.
+        # Process-tree kill is handled via proc.kill() + task-group based tree kill.
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_list, **popen_kwargs,
+            )
+            self._current_proc = proc
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                await self._kill_async_proc(proc)
+                return RunResult(
+                    returncode=-1, stdout="", stderr=f"Command timed out after {timeout}s",
+                    termination=ProcessTermination.TIMED_OUT,
+                )
+            stdout, stderr = self._shell_provider.decode_output(
+                stdout_bytes or b"", stderr_bytes or b"",
+            )
+            return RunResult(
+                returncode=proc.returncode if proc.returncode is not None else -1,
+                stdout=stdout, stderr=stderr,
+            )
+        except FileNotFoundError:
+            if os.name == "nt" and command.lower() == "powershell":
+                return await self.aexec(
+                    "powershell.exe", args, cwd=cwd, timeout=timeout, env=env,
+                )
+            return RunResult(
+                returncode=-1, stdout="", stderr=f"Command not found: {command}",
+                termination=ProcessTermination.START_FAILED,
+            )
+        except Exception as exc:
+            return RunResult(
+                returncode=-1, stdout="", stderr=str(exc),
+                termination=ProcessTermination.START_FAILED,
+            )
+        finally:
+            self._current_proc = None
+
+    @staticmethod
+    async def _kill_async_proc(proc) -> None:
+        """Kill an asyncio subprocess tree."""
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # DockerRuntime — Docker 沙箱
@@ -956,6 +1058,82 @@ class DockerRuntime(Runtime):
                     pass
             return RunResult(
                 returncode=-1, stdout="", stderr=str(e),
+                termination=ProcessTermination.START_FAILED,
+            )
+
+    async def aexec(
+        self,
+        command: str,
+        args: list[str] | None = None,
+        cwd: str | None = None,
+        timeout: int = 30,
+        env: dict[str, str] | None = None,
+        cancel_token: object | None = None,
+    ) -> RunResult:
+        """CC Bash async — docker exec via asyncio.subprocess.
+
+        与 execute() 同语义（docker exec + 参数隔离），但 async。
+        """
+        import asyncio
+        import shlex
+        if not self.is_running:
+            startup_result = self._start_container()
+            if startup_result is not None:
+                return startup_result
+
+        if cwd:
+            host_cwd = str(Path(cwd).resolve())
+            if host_cwd.startswith(self._repo_path):
+                relative = host_cwd[len(self._repo_path):].lstrip("/\\").replace("\\", "/")
+                container_cwd = f"{CONTAINER_WORKDIR}/{relative}" if relative else CONTAINER_WORKDIR
+            else:
+                container_cwd = cwd
+        else:
+            container_cwd = CONTAINER_WORKDIR
+
+        arg_str = " ".join(shlex.quote(a) for a in (args or []))
+        bash_cmd = f"{shlex.quote(command)} {arg_str}".strip()
+        docker_cmd = [
+            "docker", "exec", "--workdir", container_cwd,
+            self._container_id, "bash", "-c", bash_cmd,
+        ]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *docker_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout + 5,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                return RunResult(
+                    returncode=-1, stdout="",
+                    stderr=f"Command timed out after {timeout}s in container: {command!r}",
+                    termination=ProcessTermination.TIMED_OUT,
+                )
+            stdout, stderr = self._shell_provider.decode_output(
+                stdout_bytes or b"", stderr_bytes or b"",
+            )
+            return RunResult(
+                returncode=proc.returncode if proc.returncode is not None else -1,
+                stdout=stdout, stderr=stderr,
+            )
+        except FileNotFoundError:
+            return RunResult(
+                returncode=-1, stdout="",
+                stderr="docker command not found",
+                termination=ProcessTermination.START_FAILED,
+            )
+        except Exception as exc:
+            return RunResult(
+                returncode=-1, stdout="", stderr=str(exc),
                 termination=ProcessTermination.START_FAILED,
             )
 
