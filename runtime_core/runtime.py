@@ -20,17 +20,22 @@ class AgentRuntime:
     retained between runs.  All providers now use the Native pipeline.
     """
 
-    def __init__(self, ports: RuntimePorts) -> None:
+    def __init__(self, ports: RuntimePorts, scheduler=None) -> None:
         self._ports = ports
+        self._scheduler = scheduler  # Phase 7: ToolScheduler for parallel tool execution
 
-    def run(self, context: RuntimeExecution) -> RuntimeOutcome:
+    def run(self, context: RuntimeExecution, *,
+            text_callback: "Callable[[str], None] | None" = None,
+            ) -> RuntimeOutcome:
         """Execute one run.  Pure logic -- no side effects.
 
         G18: Cancellation is checked via context.cancellation at every
         boundary (model, hook, tool execution).
+
+        text_callback: CC-aligned streaming text output (Phase 10).
         """
-        loop = NativeStepLoop(self._ports)
-        outcome = loop.execute(context)
+        loop = NativeStepLoop(self._ports, scheduler=self._scheduler)
+        outcome = loop.execute(context, text_callback=text_callback)
 
         # H7: Publish live event with FrozenJsonObject payload
         from core.json_values import freeze_json

@@ -104,7 +104,11 @@ class ToolScheduler:
         for tc in calls:
             meta = self._registry.get(tc.name, ToolMetadata(name=tc.name))
 
-            can_parallel = meta.read_only and meta.concurrency_safe
+            # Phase 7: concurrency_safe alone is sufficient for parallelism.
+            # read_only is a weaker guarantee (safe to interleave with writes);
+            # concurrency_safe tools like Agent (each child has own session)
+            # can run in parallel even though they are not read-only.
+            can_parallel = meta.concurrency_safe
 
             if can_parallel and meta.resource_key:
                 if meta.resource_key in used_resources:

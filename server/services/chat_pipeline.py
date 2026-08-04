@@ -64,10 +64,10 @@ class ChatPipelinePorts:
     loaded_rules: Callable[[], list]
     accumulate_session_stats: Callable[[str, RunResult], None]
     compact_session_async: Callable[[str], None]
+    coordinator: Any  # R3: RunCoordinator (required — Phase 0a: single native path)
     finalize_run: Callable[..., bool] = lambda *args, **kwargs: False
     event_bus: Any = None
     plan_revisions: Any = None
-    coordinator: Any = None  # R3: RunCoordinator for native execution path
 
 
 def _maybe_auto_compact(
@@ -407,78 +407,21 @@ class ChatPipeline:
         return confirm_callback, stream_callback
 
     # ── Stage 5: execute ─────────────────────────────────────────────────
+    # Phase 0a: single native path — SessionRuntime.run_session() removed.
+    # Old code (SessionRuntime.run_session() path + reload_rules / effort /
+    # skill_modifier / thinking / inject_rules / stats tracking) is preserved
+    # in git history (commit 891e870).  Restore if native path needs fallback.
 
     def execute(
         self, prepared: PreparedChatRun,
     ) -> RunResult:
-        """Run the agent via SessionRuntime.run_session().
+        """Run the agent via Native RunCoordinator + AgentRuntime.
 
-        Returns the ``RunResult`` — *does not* push any WS events.
-        Call ``finish()`` afterwards to handle plan_ready / completed / failed.
+        Phase 0a: always-native.  Returns the ``RunResult`` — *does not*
+        push any WS events.  Call ``finish()`` afterwards.
         """
         request = prepared.request
-
-        # R3: Native execution path when coordinator is available
-        if self._ports.coordinator is not None:
-            return self._execute_native(request, prepared)
-
-        self._ports.reload_rules()
-
-        # Apply pending Skill/model runtime modifiers exactly once.
-        effort_override = (
-            self._runtime.pop_pending_effort(request.session_id) or ""
-        )
-        pop_skill_modifier = getattr(
-            self._runtime,
-            "pop_pending_skill_modifier",
-            None,
-        )
-        skill_modifier = (
-            pop_skill_modifier(request.session_id)
-            if callable(pop_skill_modifier)
-            else None
-        )
-        self._runtime.pop_pending_thinking(request.session_id)
-
-        # Permission mode — consumed by run_chat_async() and passed via ctx.
-        # NOT re-popped here; the pop happens once in the caller.
-        inject_rules = None
-        loaded_rules = self._ports.loaded_rules()
-        if loaded_rules:
-            inject_rules = list(loaded_rules)
-
-        # Register agent name for stats tracking
-        if self._event_bus is not None and self._event_bus.recorder is not None:
-            self._event_bus.recorder.set_session_agent(
-                request.session_id, request.agent_name,
-            )
-
-        result = self._runtime.run_session(
-            session_id=request.session_id,
-            agent_name=request.agent_name,
-            task_description=self._render_prepared_prompt(prepared),
-            intent=request.intent,
-            product_mode=request.product_mode,
-            request_skill=request.skill_name,
-            skill_arguments=request.skill_arguments,
-            messages=(
-                [LLMMessage(role="user", content=request.display_prompt)]
-                if request.display_prompt
-                and request.display_prompt != request.prompt
-                else None
-            ),
-            inject_permission_mode=request.permission_mode,
-            inject_rules=inject_rules,
-            session_context_text=prepared.session_context_text or "",
-            allowed_prompts=list(request.allowed_prompts),
-            effort_override=effort_override,
-            skill_modifier=skill_modifier,
-            run_context=request.run_context,
-        )
-
-        # Accumulate cross-round stats in session metadata
-        self._ports.accumulate_session_stats(request.session_id, result)
-        return result
+        return self._execute_native(request, prepared)
 
     def _execute_native(self, request, prepared) -> RunResult:
         """R3: Execute via Native RunCoordinator + AgentRuntime.
@@ -508,24 +451,37 @@ class ChatPipeline:
         msgs.append({"role": "user", "content": prompt})
         conv = ConversationSnapshot(messages=tuple(msgs))
 
-        # Build capabilities from backend
+        # Build capabilities from backend (Phase 10: NativeBackend.tool_schemas)
         caps = CapabilitySnapshot()
         if hasattr(self._ports, 'backend') and self._ports.backend is not None:
             try:
                 backend = self._ports.backend
-                caps = CapabilitySnapshot(
-                    tool_schemas=tuple(
-                        {"name": t.name, "description": t.description}
-                        for t in getattr(backend, 'tools', [])
-                    ) if hasattr(backend, 'tools') else ()
-                )
+                schemas = getattr(backend, 'tool_schemas', None)
+                if schemas is not None:
+                    caps = CapabilitySnapshot(
+                        tool_schemas=tuple(
+                            {"name": s.name, "description": s.description}
+                            for s in schemas
+                        )
+                    )
             except Exception:
                 pass
+
+        # Resolve max_steps from agent definition (Phase 10: CC-aligned)
+        _max_steps = 25
+        try:
+            from agent.session.agent_definition import load_agent_definitions
+            _defs = load_agent_definitions(project_dir=self._ports.repo_path)
+            _def = _defs.get(request.agent_name)
+            if _def is not None:
+                _max_steps = getattr(_def, "max_turns", 25) or 25
+        except Exception:
+            pass
 
         # Execute via coordinator
         outcome = coord.execute(
             ExecuteRun(session_id=sid, run_id=run_id),
-            conversation=conv, capabilities=caps, max_steps=25,
+            conversation=conv, capabilities=caps, max_steps=_max_steps,
         )
 
         # Phase 5: 跨轮持久化 — 把 run 产生的 assistant/tool 消息写 session_messages，

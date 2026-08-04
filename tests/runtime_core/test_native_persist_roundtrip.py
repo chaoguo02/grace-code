@@ -57,6 +57,10 @@ def _make_outcome_with_messages():
 
 def _make_pipeline(session_service):
     from server.services.chat_pipeline import ChatPipeline, ChatPipelinePorts
+    from application.coordinators.run_coordinator import RunCoordinator
+    # Phase 0a: coordinator is required.  Tests only use _persist_native_messages()
+    # which does not call execute(), so a dummy coordinator suffices.
+    _fake_coord = RunCoordinator.__new__(RunCoordinator)
     ports = ChatPipelinePorts(
         runtime=None, session_service=session_service,
         backend=None, config={}, effective_llm_config={},
@@ -65,7 +69,7 @@ def _make_pipeline(session_service):
         reload_rules=lambda: None, loaded_rules=lambda: [],
         accumulate_session_stats=lambda s, r: None,
         compact_session_async=lambda s: None,
-        coordinator=None,
+        coordinator=_fake_coord,
     )
     return ChatPipeline(ports)
 

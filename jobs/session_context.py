@@ -13,20 +13,29 @@ logger = logging.getLogger(__name__)
 
 
 def build_recovery_context(repo_path: str) -> str:
-    """Build context to re-inject after compaction: CLAUDE.md + recent files."""
+    """Build context to re-inject after compaction: GRACE.md (.grace/) + recent files.
+
+    Phase 10: GRACE.md is the Grace Code equivalent of CC's CLAUDE.md.
+    """
     import os as _os
     parts: list[str] = []
     root = Path(repo_path)
 
-    for md_name in ("CLAUDE.md", "AGENTS.md", "AGENT.md"):
-        md_path = root / md_name
-        if md_path.is_file():
-            try:
-                content = md_path.read_text(encoding="utf-8")[:3000]
-                parts.append(f"## Project Instructions ({md_name})\n{content}")
-            except Exception:
-                pass
-            break
+    # Phase 10: GRACE.md first (Grace Code native), CLAUDE.md as CC fallback
+    grace_path = root / ".grace" / "GRACE.md"
+    claude_path = root / "CLAUDE.md"
+    if grace_path.is_file():
+        try:
+            content = grace_path.read_text(encoding="utf-8")[:3000]
+            parts.append(f"## Project Instructions (GRACE.md)\n{content}")
+        except Exception:
+            pass
+    elif claude_path.is_file():
+        try:
+            content = claude_path.read_text(encoding="utf-8")[:3000]
+            parts.append(f"## Project Instructions (CLAUDE.md)\n{content}")
+        except Exception:
+            pass
 
     _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
                   ".forge-agent", ".grace", ".claude", ".mypy_cache",

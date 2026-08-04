@@ -114,11 +114,17 @@ if TYPE_CHECKING:
 
 
 class SessionRuntime:
-    """Session runtime with fresh-context subagent orchestration.
+    """DEPRECATED — Phase 10: replaced by AgentRuntime + NativeStepLoop.
 
-    Coordinator agents (build, plan) carry the `task` tool and can
-    dispatch child subagents. Each child runs in a fresh context with
-    tools restricted to its agent definition allow-list.
+    Web path uses AgentRuntime via ChatPipeline._execute_native() (Phase 0a).
+    CLI path supports native via ChatSession(agent_runtime=...) (Phase 10 Batch B).
+    Remaining callers: entry/modes/v2_runner.py, agent_service.py callbacks.
+    Do not add new dependencies on this class.
+
+    Original docstring: Session runtime with fresh-context subagent orchestration.
+    Coordinator agents (build, plan) carry the `task` tool and can dispatch child
+    subagents. Each child runs in a fresh context with tools restricted to its
+    agent definition allow-list.
     """
 
     def __init__(

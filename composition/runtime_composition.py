@@ -735,7 +735,40 @@ def assemble(db_path: str, *,
         live_events=_RealLiveEvents(bus), clock=_RealClock(),
         token_usage=_RealTokenUsage(outbox),
     )
-    runtime = AgentRuntime(runtime_ports)
+
+    # ── Phase 7: ToolScheduler — parallel tool execution ─────────────────
+    # Agent tool is marked concurrency_safe so multiple Agent calls in one
+    # ToolCallBatch can execute in parallel (CC parallel fan-out).
+    from runtime_core.tool_scheduler import ToolScheduler, ToolMetadata
+    _scheduler = ToolScheduler()
+    # Pre-register Agent metadata so scheduler knows Agent calls are parallel-safe
+    _scheduler.register(ToolMetadata(
+        name="Agent", read_only=False, concurrency_safe=True,
+    ))
+    runtime = AgentRuntime(runtime_ports, scheduler=_scheduler)
+
+    # ── Phase 2: Register NativeAgentTool ──────────────────────────────
+    # Agent definitions are loaded from .grace/agents/ (project + user + built-in).
+    # The NativeAgentTool routes CC Agent tool calls through the native path.
+    try:
+        from agent.session.agent_definition import load_agent_definitions
+        _project_dir = os.path.dirname(db_path) if os.path.dirname(db_path) else "."
+        _agent_defs = load_agent_definitions(project_dir=_project_dir)
+        from runtime_core.native_agent_tool import NativeAgentTool
+        _native_backend = (
+            _native if (llm_backend is not None and not isinstance(_native, _FakeNativeLLM))
+            else None
+        )
+        _native_agent = NativeAgentTool(
+            definition_registry=_agent_defs,
+            parent_ports=runtime_ports,
+            parent_backend=_native_backend,
+            project_dir=_project_dir,  # Phase 3: GRACE.md injection
+        )
+        runtime_ports.tools.register(_native_agent)
+    except Exception:
+        pass  # Agent tool registration is best-effort; not fatal for test mode
+
     # T12: Permission rules stored for T13 wiring
     # (frozen slots dataclass cannot have extra attributes; rules passed via
     #  hook_settings dict to _RealHooks in T13)

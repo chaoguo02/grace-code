@@ -119,8 +119,14 @@ class NativeStepLoop:
 
     # ── Main loop ───────────────────────────────────────────────────────
 
-    def execute(self, context: RuntimeExecution) -> RuntimeOutcome:
-        """Execute one Run -- pure Model -> Hook -> Tool -> Outcome loop."""
+    def execute(self, context: RuntimeExecution, *,
+                text_callback: "Callable[[str], None] | None" = None,
+                ) -> RuntimeOutcome:
+        """Execute one Run -- pure Model -> Hook -> Tool -> Outcome loop.
+
+        text_callback: if set, model calls use stream_iter() and push each
+        text delta to this callback (CC-aligned streaming text output).
+        """
         # Rebuild state from DB if store available (crash recovery)
         if self._store is not None:
             self._state = ConversationState.rebuild_from(
@@ -179,11 +185,17 @@ class NativeStepLoop:
 
             # ── 1. Model call — 无需传 tools！ ────────────────────────
             try:
-                model_action = self._backend.invoke(
-                    pruned_conv,
-                    tool_choice={"type": "auto"},
-                    cancellation=context.cancellation,
-                )
+                if text_callback is not None and hasattr(self._backend, 'stream_iter'):
+                    model_action = self._stream_model_call(
+                        pruned_conv, text_callback,
+                        cancellation=context.cancellation,
+                    )
+                else:
+                    model_action = self._backend.invoke(
+                        pruned_conv,
+                        tool_choice={"type": "auto"},
+                        cancellation=context.cancellation,
+                   )
             except Exception as exc:
                 return RuntimeOutcome.failed(
                     context.run_id,
@@ -338,6 +350,59 @@ class NativeStepLoop:
             tool_evidences, files_touched, hook_blocks,
         )
 
+    # ── Streaming model call (Phase 10) ────────────────────────────────────
+
+    def _stream_model_call(self, conversation, text_callback, *, cancellation):
+        """stream_iter → text_callback 实时输出 → 返回完整 ModelAction。
+
+        CC-aligned streaming pipeline:
+          TEXT_DELTA → text_callback (rendering)
+          TOOL_USE → collect
+          FINISH / end of stream → assemble ModelAction
+        Errors propagate as ModelFailure.
+        """
+        tool_uses: list[ToolCall] = []
+        final_text_parts: list[str] = []
+
+        try:
+            for event in self._backend.stream_iter(
+                conversation, tool_choice={"type": "auto"},
+            ):
+                if cancellation is not None and getattr(cancellation, 'cancelled', False):
+                    break
+                kind = getattr(event, 'kind', None)
+                if kind is None:
+                    continue
+                from llm.base import StreamEventKind
+                if kind == StreamEventKind.TEXT_DELTA:
+                    text = getattr(event, 'text', '') or ''
+                    if text:
+                        text_callback(text)
+                        final_text_parts.append(text)
+                elif kind == StreamEventKind.TOOL_USE:
+                    tc = getattr(event, 'tool_call', None)
+                    if tc is not None:
+                        tool_uses.append(tc)
+                elif kind == StreamEventKind.ERROR:
+                    return ModelFailure(
+                        error=getattr(event, 'text', '') or 'stream error',
+                        retryable=False,
+                    )
+                elif kind == StreamEventKind.FINISH:
+                    break
+        except Exception as exc:
+            return ModelFailure(
+                error=f"Stream failed: {exc}", retryable=True,
+            )
+
+        if tool_uses:
+            if len(tool_uses) == 1:
+                return tool_uses[0]
+            return ToolCallBatch(calls=tuple(tool_uses))
+        return AssistantText(
+            text="".join(final_text_parts), stop_reason="end_turn",
+        )
+
     # ── Tool processing (same as old StepLoop — unchanged contract) ─────
 
     def _process_tool_calls(
@@ -440,14 +505,17 @@ class NativeStepLoop:
 
         results: list[ToolResult] = [None] * len(batch)  # type: ignore
 
-        async def run_one(idx: int, tc: ToolCall) -> None:
+        # Phase 7: asyncio.to_thread so blocking tool.execute() calls
+        # run in real OS threads — not blocking the event loop.
+        async def _run_in_thread(idx: int, tc: ToolCall) -> None:
+            await asyncio.to_thread(_run_sync, idx, tc)
+
+        def _run_sync(idx: int, tc: ToolCall) -> None:
             if context.cancellation.cancelled:
                 results[idx] = ToolResult(
-                    tool_call=tc, hook_allowed=False,
-                    hook_deny_reason="cancelled",
+                    tool_call=tc, hook_allowed=False, hook_deny_reason="cancelled",
                 )
                 return
-
             hook_input = PreToolUseInput(
                 tool_name=tc.name, tool_input=tc.params, tool_use_id=tc.id,
             )
@@ -457,14 +525,12 @@ class NativeStepLoop:
                 )
             except Exception:
                 gate = HookGateResult(allowed=False, reason="hook error")
-
             if not gate.allowed:
                 results[idx] = ToolResult(
                     tool_call=tc, hook_allowed=False,
                     hook_deny_reason=gate.reason or "denied",
                 )
                 return
-
             params = gate.updated_input or tc.params
             try:
                 outcome = self._ports.tools.execute(tc.name, params, tc.id)
@@ -473,14 +539,12 @@ class NativeStepLoop:
                     tool_name=tc.name, error=str(exc),
                     error_type=ToolErrorType.EXECUTION_ERROR,
                 )
-            results[idx] = ToolResult(
-                tool_call=tc, outcome=outcome, hook_allowed=True,
-            )
+            results[idx] = ToolResult(tool_call=tc, outcome=outcome, hook_allowed=True)
 
         try:
             async with asyncio.TaskGroup() as tg:
                 for i, tc in enumerate(batch):
-                    tg.create_task(run_one(i, tc))
+                    tg.create_task(_run_in_thread(i, tc))
         except* Exception:
             pass
 

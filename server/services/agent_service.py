@@ -75,7 +75,15 @@ def _load_json_file(path: Path, rules: list, label: str) -> None:
 
 
 class AgentService:
-    """Web-facing SessionRuntime wrapper.
+    """Web API facade that wires server routes to runtime subsystems.
+
+    This class is the web composition boundary: it owns configuration loading,
+    persistence, memory, permission/approval callbacks, tool/MCP lifecycle,
+    legacy ``SessionRuntime`` adapters, and the native ``RunCoordinator`` handle
+    injected by ``server/main.py``.  Request execution itself is delegated to
+    ``ChatPipeline`` / native runtime; read-side APIs are delegated to focused
+    services such as ``SessionService``, ``ReviewService`` and
+    ``ArchitectureService``.
 
     Attributes:
         repo_path: Absolute path to the repository being worked on.
@@ -668,16 +676,20 @@ class AgentService:
     # ── Permission rule loading ────────────────────────────────────────────
 
     def _load_permission_rules(self) -> list:
-        """Load deny/ask/allow permission rules from settings files.
+        """Load web-session permission rule overrides from settings files.
 
-        CC-aligned configuration hierarchy (latter overrides former):
-        1. Builtin defaults (read-only tools allowed, destructive blocked)
-        2. ~/.forge-agent/settings.json (user-level)
-        3. .forge-agent/settings.json (project-level, version-controlled)
-        4. .forge-agent/settings.local.json (local, git-ignored)
+        The base registry already loads builtin/project settings when
+        ``build_registry()`` runs.  This method supplies the per-run rule list
+        that ChatPipeline passes into the legacy permission pipeline, so edits
+        to settings can take effect without rebuilding AgentService.
 
-        Returns:
-            list[PermissionRule]: Merged rules from all sources.
+        Current sources, in increasing precedence:
+        1. ~/.forge-agent/settings.json (user-level)
+        2. .forge-agent/settings.json (project-level, version-controlled)
+        3. .forge-agent/settings.local.json (local, git-ignored)
+
+        Note: native execution is now the primary path; keep this only while
+        ChatPipeline/runtime adapters still consume ``loaded_rules``.
         """
         from hitl.permission_rule import PermissionRule
 
@@ -701,10 +713,13 @@ class AgentService:
         return rules
 
     def _maybe_reload_rules(self) -> None:
-        """Re-read settings files if any have changed on disk (mtime polling).
+        """Refresh cached permission overrides when settings mtimes change.
 
-        Called before each run — lightweight (just stat() calls), no
-        external dependencies needed.
+        ``run_chat_async()`` calls this immediately before creating a
+        ChatPipeline request.  It is intentionally a cheap stat-only poll so
+        web sessions can pick up permission edits between turns without a
+        server restart.  It should disappear with ``_load_permission_rules``
+        once the native permission gate owns all settings loading.
         """
         if not hasattr(self, '_settings_mtimes'):
             self._settings_mtimes: dict[str, float] = {}
@@ -731,16 +746,21 @@ class AgentService:
     # ── Web headless approval callback (CC control_request equivalent) ────
 
     def _build_web_confirm_callback(self, session_id: str):
-        """Build a synchronous blocking callback for Web headless approval.
+        """Create the blocking approval bridge used by web tool execution.
+
+        The callback turns a runtime permission prompt into a WebSocket
+        ``approval_required`` event, blocks the agent thread in
+        ``ApprovalBroker.wait_for_decision()``, then publishes the resolved or
+        timed-out state when the frontend answers through the approval API.
 
         CC equivalent::
 
             stdout → {"type":"control_request","request_id":"...","tool":"..."}
             stdin  ← {"type":"control_response","request_id":"...","decision":"allow"}
 
-        Forge equivalent::
+        Web equivalent::
 
-            WS push → {"type":"approval_required","request_id":"...","tool_name":"..."}
+            WS push → approval_required
             Agent thread blocks on threading.Event
             HTTP POST → broker.resolve(request_id, decision)
             Event.set() → Agent thread continues
@@ -882,102 +902,6 @@ class AgentService:
 
     # ── Execution ─────────────────────────────────────────────────────────
 
-    async def chat(
-        self,
-        session_id: str,
-        prompt: str,
-        agent_name: str = "build",
-        intent: str | None = None,
-    ) -> RunResult:
-        """Execute one chat round via SessionRuntime.run_session() (blocking).
-
-        Kept for backward compatibility. New code should use
-        ``run_chat_async()`` for non-blocking execution with WS events.
-        """
-        resolved_intent: TaskIntent | None = None
-        if intent is not None:
-            resolved_intent = TaskIntent(intent.lower())
-
-        def _run() -> RunResult:
-            # Phase B: Use native coordinator when available
-            if self._native_components is not None:
-                from application.commands.run_commands import ExecuteRun, FinalizeRun
-                from core.eventing.identifiers import RunId as CoreRunId, SessionId as CoreSid
-                from runtime_core.execution import ConversationSnapshot, CapabilitySnapshot
-                from core.base import ToolRegistry as CoreToolRegistry
-                coord = self._native_components.run_coordinator
-
-                # Build conversation from session messages (Phase 3: 富 dict 保真)
-                msgs = self._storage.list_messages(session_id, limit=50)
-                conv_msgs = []
-                for m in msgs:
-                    d = {"role": m.role, "content": m.content}
-                    if getattr(m, "tool_calls", None):
-                        d["tool_calls"] = [
-                            {
-                                "id": tc.id, "name": tc.name,
-                                "params": dict(tc.params) if isinstance(tc.params, dict) else tc.params,
-                            }
-                            for tc in m.tool_calls
-                        ]
-                    if getattr(m, "tool_call_id", None):
-                        d["tool_call_id"] = m.tool_call_id
-                        d["is_error"] = bool(getattr(m, "is_error", False))
-                    conv_msgs.append(d)
-                conv = ConversationSnapshot(messages=tuple(conv_msgs))
-
-                # Build capabilities from tool registry (Phase 3: 补 parameters)
-                caps = CapabilitySnapshot()
-                if hasattr(self, '_tool_registry'):
-                    caps = CapabilitySnapshot(
-                        tool_schemas=tuple(
-                            {
-                                "name": t.name,
-                                "description": (
-                                    t.schema.get("description", "")
-                                    if hasattr(t, "schema") and isinstance(t.schema, dict)
-                                    else ""
-                                ),
-                                "parameters": (
-                                    t.parameters_schema
-                                    if hasattr(t, "parameters_schema")
-                                    else {}
-                                ),
-                            }
-                            for t in self._tool_registry.list_tools()
-                        ) if hasattr(self._tool_registry, 'list_tools') else ()
-                    )
-
-                outcome = coord.execute(
-                    ExecuteRun(session_id=CoreSid(session_id),
-                               run_id=CoreRunId(str(uuid.uuid4()))),
-                    conversation=conv, capabilities=caps,
-                )
-                # Finalize — write terminal state + fact
-                from application.commands.run_commands import FinalizeRun
-                from core.eventing.identifiers import AggregateVersion
-                coord.finalize(
-                    FinalizeRun(run_id=outcome.run_id,
-                                expected_version=AggregateVersion(1),
-                                outcome=outcome),
-                    session_id=CoreSid(session_id),
-                )
-                return RunResult(
-                    status=outcome.status.value,
-                    summary=outcome.summary,
-                    steps_taken=outcome.steps_taken,
-                    total_tokens=outcome.tokens_used,
-                )
-
-            return self._runtime.run_session(
-                session_id=session_id,
-                agent_name=agent_name,
-                task_description=prompt,
-                intent=resolved_intent,
-            )
-
-        return await asyncio.to_thread(_run)
-
     def run_chat_async(
         self,
         session_id: str,
@@ -991,21 +915,19 @@ class AgentService:
         skill_name: str = "",
         skill_arguments: str = "",
     ) -> None:
-        """Execute chat asynchronously in a background thread.
+        """Submit one web chat turn to ChatPipeline in the background.
 
-        Returns immediately.  All execution events are pushed through the
-        EventBus to WebSocket subscribers.
+        This is the production write path for POST /chat: it performs the
+        session run guard, waits briefly for MCP discovery, resolves pending
+        permission mode, builds explicit ChatPipeline ports, and returns
+        immediately while pipeline events stream over WebSocket.
 
-        When *run_context* is provided (from the POST /chat transaction),
-        it carries the pre-created run_id / turn_id / turn_index.  The
-        pipeline will transition the run through QUEUED → RUNNING →
-        COMPLETED / FAILED / CANCELLED.
+        When *run_context* is provided by the POST /chat transaction it carries
+        the pre-created run_id / turn_id / turn_index; the pipeline owns state
+        transitions from QUEUED to a terminal run status.
 
-        The caller should ensure the frontend has subscribed to the WS
-        before calling this method.
-
-        allowed_prompts: CC-aligned ExitPlanMode pre-approved tool calls
-        that carry over to the build session.
+        allowed_prompts: CC-aligned ExitPlanMode pre-approved tool calls that
+        carry over to the build session.
         """
         resolved_intent: TaskIntent | None = None
         if intent is not None:
@@ -1062,10 +984,8 @@ class AgentService:
             finalize_run=self._store.finalize_run_with_event,
             event_bus=self._event_bus,
             plan_revisions=self._plan_revisions,
-            coordinator=(
-                self._native_components.run_coordinator
-                if self._native_components is not None else None
-            ),  # R3: Native coordinator for ChatPipeline
+            coordinator=self._native_components.run_coordinator,
+            # Phase 0a: coordinator is always present (single native path)
         )
         pipeline = ChatPipeline(ports)
         request = ChatRequest(
@@ -1151,69 +1071,14 @@ class AgentService:
 
     # ── Compression recovery helper (module-level) ──────────────────────
 
-    @staticmethod
-    def _build_recovery_context(repo_path: str) -> str:
-        """Build recovery context to re-inject after compaction.
-
-        Returns CLAUDE.md content (if present) and a list of recently
-        modified files so the agent can re-orient after compression.
-        CC equivalent: post-AutoCompact context restoration.
-        """
-        import os as _os
-        parts: list[str] = []
-        root = Path(repo_path)
-
-        # 1. CLAUDE.md / AGENTS.md
-        for md_name in ("CLAUDE.md", "AGENTS.md", "AGENT.md"):
-            md_path = root / md_name
-            if md_path.is_file():
-                try:
-                    content = md_path.read_text(encoding="utf-8")[:3000]
-                    parts.append(f"## Project Instructions ({md_name})\n{content}")
-                except Exception:
-                    pass
-                break
-
-        # 2. Recently modified files (last 5, capped at 1K chars each)
-        # Limit scope: skip VCS, caches, and dependency dirs
-        _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
-                       ".forge-agent", ".grace", ".claude", ".mypy_cache",
-                       ".pytest_cache", ".tox", "dist", "build", ".eggs"}
-        try:
-            recent: list[tuple[str, float]] = []
-            for dirpath, dirnames, filenames in _os.walk(str(root)):
-                dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-                for fn in filenames:
-                    if fn.startswith("."):
-                        continue
-                    fp = _os.path.join(dirpath, fn)
-                    try:
-                        mtime = _os.stat(fp).st_mtime
-                        recent.append((fp, mtime))
-                    except OSError:
-                        continue
-            recent.sort(key=lambda x: x[1], reverse=True)
-            shown = 0
-            for fp, _ in recent:
-                if shown >= 5:
-                    break
-                rel = str(Path(fp).relative_to(root))
-                try:
-                    content = Path(fp).read_text(encoding="utf-8")[:1000]
-                    parts.append(f"## Recent file: {rel}\n```\n{content}\n```")
-                except Exception:
-                    parts.append(f"## Recent file: {rel}\n[Binary or unreadable]")
-                shown += 1
-        except Exception:
-            pass
-
-        return "\n\n".join(parts) if parts else ""
-
     def compact_session_async(self, session_id: str) -> None:
-        """Trigger context compression in a background thread.
+        """Compact a session history off-thread and notify Web clients.
 
-        Runs the Snip → MicroCompact → AutoCompact pipeline.
-        Pushes a ``compacted`` status event via EventBus when done.
+        The method reads persisted messages, runs ``ConversationCompactor``,
+        appends recovery context, replaces the stored history with a compaction
+        marker, opportunistically optimizes SQLite storage, then emits a
+        ``compact_status`` WebSocket event.  It is still called by ChatPipeline
+        auto-compaction and the manual session compaction route.
         """
         def _compact():
             try:
@@ -1238,7 +1103,8 @@ class AgentService:
                 )
 
                 # ── Recovery: re-inject critical context after compaction ──
-                _recovery = AgentService._build_recovery_context(self.repo_path)
+                from jobs.session_context import build_recovery_context
+                _recovery = build_recovery_context(self.repo_path)
                 if _recovery:
                     compacted.append({
                         "role": "user",
@@ -1294,25 +1160,6 @@ class AgentService:
 
     # ── Plan file management ─────────────────────────────────────────────
 
-    # ── Memory maintenance daemon ────────────────────────────────────────
-
-    def _memory_maintenance_loop(self) -> None:
-        """Background daemon: periodically prune expired + decay stale memories."""
-        _INTERVAL = int(os.environ.get("GRACE_MEMORY_MAINTENANCE_SECONDS", str(6 * 3600)))
-        while not self._memory_maintenance_stop.wait(_INTERVAL):
-            self._do_memory_maintenance()
-
-    def _do_memory_maintenance(self) -> None:
-        """Run one cycle of memory decay + TTL expiry."""
-        if self._memory_store is None:
-            return
-        try:
-            pruned = self._memory_store.prune_expired()
-            if pruned:
-                logger.info("Memory maintenance: %d entries cleaned", pruned)
-        except Exception:
-            logger.debug("Memory maintenance cycle skipped", exc_info=True)
-
     def remove_plan_file(self, session_id: str) -> bool:
         """Remove the plan file for a session (CC-aligned cleanup).
 
@@ -1329,56 +1176,6 @@ class AgentService:
         except Exception:
             logger.debug("Plan file removal skipped for %s", session_id, exc_info=True)
         return False
-
-    # ── Session context injection ────────────────────────────────────────
-
-    def _inject_session_context(self, session_id: str) -> bool:
-        """Inject previous session summary once per root session.
-
-        CLI ChatSession does this on startup (chat.py:130-138).
-        Web mode injects on the first round, then sets a metadata flag
-        to prevent duplicate injection on subsequent rounds.
-        """
-        # Guard: only inject once per session
-        rec = self.session_service.get_session(session_id)
-        if rec is None:
-            return False
-        already_injected = rec.metadata.get("session_context_injected")
-        if already_injected:
-            return False
-
-        injected = False
-        try:
-            from context.compaction import load_session_summary
-            summary_path = Path(self.repo_path) / ".grace" / "session_summary.md"
-            summary = load_session_summary(str(summary_path))
-            if summary:
-                from llm.base import LLMMessage
-                self._storage.append_message(session_id, LLMMessage(
-                    role="user",
-                    content=f"[Previous Session Context]\n{summary}",
-                ))
-                self._storage.append_message(session_id, LLMMessage(
-                    role="assistant", content="Understood.",
-                ))
-                injected = True
-        except Exception:
-            logger.debug("Session summary injection skipped", exc_info=True)
-
-        # Mark as injected regardless of success (don't retry every round)
-        try:
-            store = self._storage.store
-            with store._connect() as conn:
-                meta = dict(rec.metadata)
-                meta["session_context_injected"] = True
-                conn.execute(
-                    "UPDATE sessions SET metadata_json = ? WHERE id = ?",
-                    (json.dumps(meta, ensure_ascii=True), session_id),
-                )
-        except Exception:
-            pass
-
-        return injected
 
     # ── Cross-round stats ─────────────────────────────────────────────────
 
@@ -1411,14 +1208,11 @@ class AgentService:
     # ── Cancel ────────────────────────────────────────────────────────────
 
     def cancel_session(self, session_id: str, detail: str = "") -> bool:
-        """Cancel the active run via its cancellation token.
+        """Backward-compatible route entry point for cancelling active work.
 
-        Args:
-            session_id: The session whose active run to cancel.
-            detail: Human-readable reason.
-
-        Returns:
-            bool: True if an active cancellation token was found and signalled.
+        WebSocket and HTTP routes still call this name; the implementation is a
+        thin alias to ``cancel_run()`` so all cancellation semantics stay in one
+        method.
         """
         return self.cancel_run(session_id, detail)
 

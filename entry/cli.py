@@ -719,6 +719,20 @@ def chat(
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
     from entry.renderer import create_renderer
     rend = create_renderer(model=config.llm.model, mode=agent_name)
+
+    # Phase 0b: construct native AgentRuntime for CLI
+    _agent_runtime = None
+    _conv_store = None
+    try:
+        from app.storage.sqlite import SqliteStorageBackend
+        _grace_db = os.path.join(str(repo_path), ".grace", "grace.db")
+        _conv_store = SqliteStorageBackend(_grace_db)
+        from composition.runtime_composition import assemble
+        _components = assemble(_grace_db, llm_backend=backend, tool_registry=registry)
+        _agent_runtime = _components.runtime
+    except Exception:
+        pass  # fall back to legacy SessionRuntime path
+
     session = ChatSession(
         backend=backend,
         registry=registry,
@@ -732,6 +746,9 @@ def chat(
         memory_store=memory_store,
         memory_context=memory_context,
         skill_registry=skill_registry,
+        # Phase 0b: native path (falls back to SessionRuntime if None)
+        agent_runtime=_agent_runtime,
+        conversation_store=_conv_store,
     )
 
     # 设置初始模式

@@ -39,7 +39,12 @@ RendererBase = InlineRenderer
 
 
 class ChatSession:
-    """跨轮对话会话。每轮通过 SessionRuntime.run_session() 执行。"""
+    """跨轮对话会话。
+
+    Phase 0b: 支持双路径初始化——
+      - 传入 runtime + agent_runtime → AgentRuntime 核心执行 + SessionRuntime 回调
+      - 仅传 runtime (或无) → 完全 SessionRuntime（旧路径, 保留兼容）
+    """
 
     def __init__(
         self,
@@ -58,14 +63,11 @@ class ChatSession:
         memory_store=None,
         memory_context=None,
         skill_registry=None,
+        # Phase 0b: AgentRuntime 替代 SessionRuntime
+        agent_runtime=None,
+        conversation_store=None,
     ) -> None:
-        from agent.core import AgentConfig
         from context.history import ConversationHistory
-        # G36M-6: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
-        from agent.session.runtime import SessionRuntime  # noqa: G36M
-        from agent.session.session_store import SessionStore
-        from agent.session.agent_registry import AgentRegistryV2
-        from agent.session import default_session_db_path
 
         self.repo_path = repo_path
         self.log_dir = log_dir
@@ -79,6 +81,11 @@ class ChatSession:
         self._memory_store = memory_store
         self._memory_context = memory_context
         self._hook_dispatcher = hook_dispatcher
+        self._hooks_started = False  # Phase 0b: SESSION_START hook once
+
+        # Phase 0b Step 12: load_agent_definitions 替代 AgentRegistryV2
+        from agent.session.agent_definition import load_agent_definitions
+        self._agent_definitions = load_agent_definitions(project_dir=repo_path)
 
         from core.goal import GoalStore, goal_stop_hook
         from core.state_paths import ProjectStatePaths
@@ -117,43 +124,57 @@ class ChatSession:
 
         self._backend = backend
         self._registry = registry
-        self._agent_registry = AgentRegistryV2(project_dir=repo_path)
         self._renderer = renderer or create_renderer(
             model=self._model, mode=self._agent_name,
         )
 
-        # SessionRuntime: 统一执行入口
-        if runtime is not None:
-            self._runtime = runtime
+        # ── Phase 0b: AgentRuntime 路径（优先）vs SessionRuntime 回退 ──
+        if agent_runtime is not None and conversation_store is not None:
+            self._agent_runtime = agent_runtime
+            self._conversation_store = conversation_store
+            self._native_mode = True
+            # SessionRuntime 仅保留回调基础设施（compact / stream callbacks）
+            self._runtime = runtime  # 可能为 None
+            self._root_session_id = self._session_id  # 简化：直接用 session_id
+            self._root_session = None
         else:
-            db_path = default_session_db_path(str(repo_path))
-            from core.state_paths import migrate_legacy_session_db
-            migrate_legacy_session_db(repo_path, db_path)
-            store = SessionStore(db_path)
-            # Phase 4: ResourceGovernor for CLI
-            from core.resource_governor import ResourceGovernor
-            gov = ResourceGovernor(self.config.resource_governance)
+            # 旧路径：完全 SessionRuntime
+            # G36M-6: DEPRECATED — use runtime_core.runtime.AgentRuntime (G16)
+            from agent.session.runtime import SessionRuntime  # noqa: G36M
+            from agent.session.session_store import SessionStore
+            from agent.session import default_session_db_path
 
-            self._runtime = SessionRuntime(
-                store=store, backend=backend, base_registry=registry,
-                agent_registry=self._agent_registry,
-                root_agent_config=self._build_agent_cfg(),
-                log_dir=log_dir,
-                hook_dispatcher=hook_dispatcher,
-                mcp_integration=mcp_integration,
-                memory_context=memory_context,
-                event_callback=self._make_event_callback(),
-                governor=gov,
+            self._native_mode = False
+            if runtime is not None:
+                self._runtime = runtime
+            else:
+                db_path = default_session_db_path(str(repo_path))
+                from core.state_paths import migrate_legacy_session_db
+                migrate_legacy_session_db(repo_path, db_path)
+                store = SessionStore(db_path)
+                from core.resource_governor import ResourceGovernor
+                gov = ResourceGovernor(self.config.resource_governance)
+
+                self._runtime = SessionRuntime(
+                    store=store, backend=backend, base_registry=registry,
+                    agent_registry=None,  # deprecated — agent_definitions used instead
+                    root_agent_config=self._build_agent_cfg(),
+                    log_dir=log_dir,
+                    hook_dispatcher=hook_dispatcher,
+                    mcp_integration=mcp_integration,
+                    memory_context=memory_context,
+                    event_callback=self._make_event_callback(),
+                    governor=gov,
+                )
+
+            # Root session — 所有轮次共享
+            self._root_session = self._runtime.create_root_session(
+                agent_name=agent_name,
+                repo_path=repo_path,
+                title=f"Chat {self._session_id}",
+                metadata={"entrypoint": "chat", "session_id": self._session_id},
             )
-
-        # Root session — 所有轮次共享
-        self._root_session = self._runtime.create_root_session(
-            agent_name=agent_name,
-            repo_path=repo_path,
-            title=f"Chat {self._session_id}",
-            metadata={"entrypoint": "chat", "session_id": self._session_id},
-        )
-        self._root_session_id = self._root_session.id
+            self._root_session_id = self._root_session.id
 
         # 跨轮共享 history — 从 DB 初始化
         self._shared_history = ConversationHistory(
@@ -282,7 +303,13 @@ class ChatSession:
 
     def _sync_shared_history(self) -> None:
         """从 DB 读取消息，重建共享 history。"""
-        msgs = self._runtime._store.list_messages(self._root_session_id)
+        # Phase 0b Step 11: ConversationStore 替代 SessionStore
+        if self._native_mode and hasattr(self, '_conversation_store'):
+            msgs = self._conversation_store.list_messages(
+                self._root_session_id, limit=200,
+            )
+        else:
+            msgs = self._runtime._store.list_messages(self._root_session_id)
         self._shared_history._messages.clear()
         for m in msgs:
             self._shared_history.add(m)
@@ -290,34 +317,45 @@ class ChatSession:
     # ── 轮次执行 ──────────────────────────────────────────────────────
 
     def run_round(self, user_input: str) -> bool:
-        from agent.event_log import EventLog
-        from agent.task import Task, TaskIntent, RunStatus
-        from agent.session.models import _BUILTIN_AGENTS
+        from agent.task import TaskIntent
         from llm.base import LLMMessage
 
         self.round_count += 1
         reset_prompt_usage()
 
-        definition = _BUILTIN_AGENTS.get(self._agent_name)
+        # Phase 0b Step 12: _agent_definitions 替代 _BUILTIN_AGENTS
+        definition = self._agent_definitions.get(self._agent_name)
         intent = definition.intent if definition else TaskIntent.EDIT
+
+        # Phase 0b Step 13: SESSION_START hook（仅首次）
+        if self._hook_dispatcher and not self._hooks_started:
+            from hooks.events import HookContext, HookEvent
+            self._hook_dispatcher.dispatch(
+                HookEvent.SESSION_START,
+                HookContext(
+                    event=HookEvent.SESSION_START,
+                    session_id=self._root_session_id,
+                    user_input=user_input,
+                ),
+            )
+            self._hooks_started = True
 
         # SessionState 任务追踪
         task_ctx = self._session_state.start_task(user_goal=user_input, intent=intent)
 
-        # 重置 compaction thrashing
-        agent = getattr(self._runtime, "_last_agent", None)
-        if agent and hasattr(agent, "reset_context_planning"):
-            agent.reset_context_planning()
-
         t0 = time.time()
 
-        # 通过 SessionRuntime 执行
-        result = self._runtime.run_session(
-            self._root_session_id,
-            agent_name=self._agent_name,
-            task_description=user_input,
-            intent=intent,
-        )
+        # ── Phase 0b: AgentRuntime 路径 vs SessionRuntime 回退 ──
+        if self._native_mode:
+            result = self._run_native_turn(user_input, definition, intent)
+        else:
+            # 旧路径
+            result = self._runtime.run_session(
+                self._root_session_id,
+                agent_name=self._agent_name,
+                task_description=user_input,
+                intent=intent,
+            )
 
         elapsed = time.time() - t0
         self.total_tokens += result.total_tokens
@@ -340,22 +378,65 @@ class ChatSession:
         # Renderer 轮次结束
         sys.stdout.write("\n")
         sys.stdout.flush()
+        from agent.task import RunStatus
         self._renderer.on_round_end(
             round_num=self.round_count, steps=result.steps_taken,
             tokens=result.total_tokens, elapsed=elapsed,
-            cache_stats=result.cache_stats,
+            cache_stats=getattr(result, 'cache_stats', None),
         )
 
         flush_observability()
         return result.is_success() or result.status is RunStatus.GAVE_UP
 
+    # ── Phase 0b: Native Turn 执行 ────────────────────────────────────
+
+    def _run_native_turn(self, user_input: str, definition, intent):
+        """使用 AgentRuntime.run() 执行一轮——Step 1 的核心替换。"""
+        import uuid as _uuid
+        from runtime_core.execution import ConversationSnapshot, RuntimeExecution
+        from core.eventing.identifiers import SessionId, RunId
+
+        # 构建跨轮 conversation
+        conv_msgs = []
+        if hasattr(self, '_conversation_store'):
+            msgs = self._conversation_store.list_messages(
+                self._root_session_id, limit=200,
+            )
+            for m in msgs:
+                conv_msgs.append({
+                    "role": getattr(m, "role", "user"),
+                    "content": getattr(m, "content", ""),
+                })
+        conv_msgs.append({"role": "user", "content": user_input})
+        conv = ConversationSnapshot(messages=tuple(conv_msgs))
+
+        ctx = RuntimeExecution(
+            session_id=SessionId(self._root_session_id),
+            run_id=RunId(str(_uuid.uuid4())),
+            max_steps=getattr(definition, "max_turns", 25) or 25,
+            budget_tokens=200_000,
+            conversation=conv,
+        )
+
+        outcome = self._agent_runtime.run(ctx)
+
+        # 转为 RunResult 兼容格式
+        from agent.task import RunResult, RunStatus
+        return RunResult(
+            status=RunStatus(outcome.status.value),
+            summary=outcome.summary or "",
+            steps_taken=outcome.steps_taken,
+            total_tokens=outcome.tokens_used,
+        )
+
     # ── 模式/模型切换 ────────────────────────────────────────────────
 
     def switch_mode(self, agent_name: str) -> None:
-        from agent.session.models import _BUILTIN_AGENTS
-        if agent_name not in _BUILTIN_AGENTS:
+        # Phase 0b Step 12: load_agent_definitions 替代 _BUILTIN_AGENTS
+        if agent_name not in self._agent_definitions:
             raise ValueError(
-                f"Unknown agent: {agent_name!r}. Available: {sorted(_BUILTIN_AGENTS)}"
+                f"Unknown agent: {agent_name!r}. "
+                f"Available: {sorted(self._agent_definitions)}"
             )
         self._agent_name = agent_name
         self._renderer.mode = agent_name
@@ -367,7 +448,10 @@ class ChatSession:
             current_provider=self._provider,
         )
         self._renderer.model = model
-        self._runtime._backend = self._backend
+        # Phase 0b Step 10 gap: NativeBackend doesn't support per-invoke model override.
+        # For now, propagate to SessionRuntime if in legacy mode.
+        if not self._native_mode and self._runtime is not None:
+            self._runtime._backend = self._backend
 
     # ── 辅助：skill fork ─────────────────────────────────────────────
 
@@ -395,13 +479,16 @@ class ChatSession:
             session_id=self._root_session_id,
         )
         if activation is not None:
-            self._runtime.record_skill_activation(
-                activation.skill_name,
-                source=activation.source,
-                fingerprint=activation.fingerprint,
-                mcp_dependencies=list(activation.mcp_dependencies),
-                session_id=activation.session_id,
-            )
+            # Phase 0b: Skills are tool-invoked in native path, not preloaded.
+            # record_skill_activation is legacy SessionRuntime only.
+            if not self._native_mode and self._runtime is not None:
+                self._runtime.record_skill_activation(
+                    activation.skill_name,
+                    source=activation.source,
+                    fingerprint=activation.fingerprint,
+                    mcp_dependencies=list(activation.mcp_dependencies),
+                    session_id=activation.session_id,
+                )
         if meta.context == "fork":
             self._run_skill_fork(name, rendered, meta)
         else:
@@ -430,14 +517,22 @@ class ChatSession:
             prompt=rendered,
             execution_placement=ExecutionPlacement.FOREGROUND,
         )
-        result = self._runtime.spawn_agent(
-            parent_session_id=self._root_session_id,
-            request=fork_request,
-            parent_policy=PhasePolicy(),
-            cancellation_token=CancellationToken(),
-            budget_tokens=20_000,
-            parent_max_steps=10,
-        )
+        # Phase 0b: Fork agent not in native path scope (Phase 1-9 skipped fork).
+        if self._native_mode:
+            from agent.task import RunResult, RunStatus as _RS
+            result = RunResult(
+                status=_RS.GAVE_UP,
+                summary="Fork agent not available in native execution path.",
+            )
+        else:
+            result = self._runtime.spawn_agent(
+                parent_session_id=self._root_session_id,
+                request=fork_request,
+                parent_policy=PhasePolicy(),
+                cancellation_token=CancellationToken(),
+                budget_tokens=20_000,
+                parent_max_steps=10,
+            )
         if result.summary:
             self._shared_history.add(LLMMessage(
                 role="assistant",
@@ -448,6 +543,12 @@ class ChatSession:
     # ── 压缩 ──────────────────────────────────────────────────────────
 
     def compact(self, focus: str = "") -> str:
+        # Phase 0b Step 14: ContextBudgetManager for native path
+        if self._native_mode:
+            # Native path: ContextBudgetManager auto-trims in StepLoop.
+            # Manual compact = sync history (which is all we need for CLI display).
+            self._sync_shared_history()
+            return "Compacted (auto-budget management active)."
         msg = self._runtime.compact(focus=focus)
         self._sync_shared_history()
         return msg
@@ -456,7 +557,14 @@ class ChatSession:
         from agent.task import RunStatus
         if not getattr(self.config.context, "auto_compact_after_round", True):
             return
-        if result.status not in (RunStatus.SUCCESS, RunStatus.GAVE_UP, RunStatus.MAX_STEPS):
+        # Phase 0b: normalize RunStatus comparison
+        _status = getattr(result, 'status', None)
+        if isinstance(_status, str):
+            try:
+                _status = RunStatus(_status)
+            except ValueError:
+                _status = None
+        if _status not in (RunStatus.SUCCESS, RunStatus.GAVE_UP, RunStatus.MAX_STEPS):
             return
         compact_rounds = getattr(self.config.context, "compact_every_rounds", 3)
         if self.round_count % compact_rounds != 0:

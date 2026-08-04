@@ -193,6 +193,11 @@ class NativeBackend:
         """Names of bound tools."""
         return tuple(t.name for t in self._tool_schemas)
 
+    @property
+    def tool_schemas(self) -> tuple["NativeToolSchema", ...]:
+        """Expose bound tool schemas for child backend construction (Phase 2)."""
+        return self._tool_schemas
+
     @classmethod
     def from_backend(cls, anthropic_backend, tool_schemas=()) -> "NativeBackend":
         """Wrap an existing AnthropicBackend instance as NativeBackend.
@@ -217,6 +222,7 @@ class NativeBackend:
         *,
         tool_choice: dict | None = None,
         cancellation: object | None = None,
+        model: str = "",
     ) -> ModelAction:
         """Call LLM -- no tools parameter (already bound at init).
 
@@ -227,12 +233,7 @@ class NativeBackend:
             conversation: Complete conversation history (NativeMessage sequence)
             tool_choice: CC-aligned tool_choice (None="auto")
             cancellation: CancellationHandle | None
-
-        Returns:
-            ModelAction -- same type contract as StepLoop
-
-        Raises:
-            ValueError: Protocol pre-validation failed (messages violate API constraints)
+            model: Per-request model override (CC callModel({model:...})).  Empty = use bound default.
         """
         # ── P0: Protocol pre-validation ──────────────────────────────────
         from runtime_core.message_validator import validate_messages
@@ -255,7 +256,7 @@ class NativeBackend:
 
         # Step 3: Build request
         kwargs: dict[str, Any] = {
-            "model": self._model,
+            "model": model if model else self._model,
             "max_tokens": self._max_tokens,
             "messages": api_messages,
         }
@@ -292,10 +293,12 @@ class NativeBackend:
         conversation: NativeConversation,
         *,
         tool_choice: dict | None = None,
+        model: str = "",
     ):
         """Streaming call -- yield StreamEvent (CC-aligned streaming dispatch).
 
         Same event semantics as AnthropicBackend.stream_iter().
+        model: Per-request model override (CC callModel({model:...})).  Empty = use bound default.
         """
         from llm.base import StreamEvent, StreamEventKind
 
@@ -304,7 +307,7 @@ class NativeBackend:
         api_messages = [_native_msg_to_api_dict(m) for m in non_system]
 
         kwargs: dict[str, Any] = {
-            "model": self._model,
+            "model": model if model else self._model,
             "max_tokens": self._max_tokens,
             "messages": api_messages,
         }
