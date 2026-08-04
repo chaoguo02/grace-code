@@ -365,6 +365,204 @@ class NativeStepLoop:
             tool_evidences, files_touched, hook_blocks,
         )
 
+    # ── Async main loop (CC query) ─────────────────────────────────────────
+
+    async def aiterate(
+        self, context: RuntimeExecution, *,
+        text_callback: "Callable[[str], None] | None" = None,
+    ):
+        """CC query() 等价 — async generator, yield 事件给消费方.
+
+        Phase E: async 是主循环。yield 事件:
+          - {"type": "text_delta", "text": ...}
+          - {"type": "tool_result", "tool_call": ..., "outcome": ...}
+          - {"type": "completed", "outcome": ...}
+          - {"type": "failed", "outcome": ...}
+        await model (astream_iter/ainvoke) + await tool (_atool_calls).
+        """
+        import asyncio
+
+        # 初始化 state
+        if self._store is not None:
+            self._state = ConversationState.rebuild_from(
+                self._store.rebuild_conversation(),
+            )
+        else:
+            self._state = ConversationState()
+
+        for msg_dict in context.conversation.messages:
+            role = msg_dict.get("role", "user") if isinstance(msg_dict, dict) else "user"
+            content = msg_dict.get("content", "") if isinstance(msg_dict, dict) else str(msg_dict)
+            if role == "user" and content:
+                self._state.add_user_message(content)
+            elif role == "system" and content:
+                self._state.add_system_message(content)
+
+        total_tokens_in = 0
+        total_tokens_out = 0
+        tool_evidences: list[ToolEvidence] = []
+        files_touched: set[str] = set()
+        hook_blocks: list[str] = []
+        steps_taken = 0
+
+        for turn in range(context.max_steps):
+            if context.cancellation.cancelled:
+                self._state.drain_pending_as_errors()
+                self._flush_store()
+                outcome = self._cancelled_outcome(
+                    context.run_id, steps_taken,
+                    total_tokens_in + total_tokens_out,
+                    total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks,
+                )
+                yield {"type": "cancelled", "outcome": outcome}
+                return
+
+            steps_taken += 1
+
+            # Context budget
+            conv = self._state.to_conversation()
+            pruned_conv, _ = self._budget.ensure_budget(conv)
+
+            # CC callModel — await (async generator if stream, else ainvoke)
+            try:
+                tool_uses: list[ToolCall] = []
+                model_action = None
+                if hasattr(self._backend, 'astream_iter'):
+                    # async streaming — astream_iter may be a coroutine returning
+                    # an async generator, or an async generator function.
+                    _stream = self._backend.astream_iter(
+                        pruned_conv, tool_choice={"type": "auto"},
+                    )
+                    if asyncio.iscoroutine(_stream):
+                        _stream = await _stream
+                    async for event in _stream:
+                        from llm.base import StreamEventKind
+                        if event.kind == StreamEventKind.TEXT_DELTA:
+                            yield {"type": "text_delta", "text": event.text}
+                            if text_callback:
+                                text_callback(event.text)
+                        elif event.kind == StreamEventKind.TOOL_USE:
+                            tool_uses.append(event.tool_call)
+                        elif event.kind == StreamEventKind.FINISH:
+                            break
+                    if tool_uses:
+                        if len(tool_uses) == 1:
+                            model_action = tool_uses[0]
+                        else:
+                            model_action = ToolCallBatch(calls=tuple(tool_uses))
+                    else:
+                        model_action = AssistantText(
+                            text="", stop_reason="end_turn",
+                        )
+                elif hasattr(self._backend, 'ainvoke'):
+                    model_action = await self._backend.ainvoke(
+                        pruned_conv, tool_choice={"type": "auto"},
+                        cancellation=context.cancellation,
+                    )
+                else:
+                    model_action = self._backend.invoke(
+                        pruned_conv, tool_choice={"type": "auto"},
+                        cancellation=context.cancellation,
+                    )
+            except Exception as exc:
+                outcome = RuntimeOutcome.failed(
+                    context.run_id,
+                    error=f"LLM invoke failed: {exc}",
+                    steps=steps_taken,
+                    tokens=total_tokens_in + total_tokens_out,
+                )
+                yield {"type": "failed", "outcome": outcome}
+                return
+
+            # Token usage
+            if model_action is not None and getattr(model_action, 'usage', None) is not None:
+                total_tokens_in += model_action.usage.input_tokens
+                total_tokens_out += model_action.usage.output_tokens
+
+            self._state.add_assistant_message(model_action)
+            if self._store is not None:
+                self._store.append_message(self._state.last_message, turn_index=turn)
+
+            # CC: needsFollowUp? tool_use → run tools
+            if isinstance(model_action, (ToolCall, ToolCallBatch)):
+                calls = (model_action,) if isinstance(model_action, ToolCall) else model_action.calls
+                # await 工具 (async, 不阻塞)
+                tool_results = await self._atool_calls(calls, context)
+
+                for tr in tool_results:
+                    tool_evidences.append(tr.evidence)
+                    self._ports.live_events.publish(
+                        event_type="tool.executed.v1",
+                        payload=freeze_json({
+                            "tool": tr.tool_call.name,
+                            "success": isinstance(tr.outcome, ToolSuccess),
+                        }),
+                        scope=(
+                            ScopeToken.session_scope(_uuid.uuid4(), context.session_id)
+                            if context.session_id is not None else None
+                        ),
+                    )
+                    self._state.add_tool_result(
+                        tr.outcome or ToolFailure(
+                            tool_name=tr.tool_call.name,
+                            error=tr.hook_deny_reason or "unknown",
+                            error_type=ToolErrorType.EXECUTION_ERROR,
+                        ),
+                        tr.tool_call,
+                    )
+                    if self._store is not None:
+                        self._store.append_message(
+                            self._state.last_message, turn_index=turn,
+                        )
+                    yield {"type": "tool_result", "tool_call": tr.tool_call, "outcome": tr.outcome}
+
+                self._flush_store()
+                continue
+
+            # CC: 无 tool_use → 文本完成
+            if isinstance(model_action, AssistantText):
+                self._flush_store()
+                outcome = self._finalize_outcome(
+                    RuntimeOutcome.completed(
+                        context.run_id, steps=steps_taken,
+                        tokens=total_tokens_in + total_tokens_out,
+                        summary=model_action.text[:500],
+                    ),
+                    total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks,
+                )
+                yield {"type": "completed", "outcome": outcome}
+                return
+
+            if isinstance(model_action, ModelFailure):
+                if getattr(model_action, 'retryable', False):
+                    continue
+                outcome = self._finalize_outcome(
+                    RuntimeOutcome.failed(
+                        context.run_id, error=model_action.error,
+                        steps=steps_taken,
+                        tokens=total_tokens_in + total_tokens_out,
+                    ),
+                    total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks,
+                )
+                yield {"type": "failed", "outcome": outcome}
+                return
+
+        # max_steps 达到
+        outcome = self._finalize_outcome(
+            RuntimeOutcome.blocked(
+                context.run_id, steps=steps_taken,
+                tokens=total_tokens_in + total_tokens_out,
+                blocked_by="max_steps",
+                detail=f"max_steps={context.max_steps}",
+            ),
+            total_tokens_in, total_tokens_out,
+            tool_evidences, files_touched, hook_blocks,
+        )
+        yield {"type": "blocked", "outcome": outcome}
+
     # ── Streaming model call (Phase 10) ────────────────────────────────────
 
     def _stream_model_call(self, conversation, text_callback, *, cancellation):
