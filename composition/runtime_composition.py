@@ -780,8 +780,25 @@ def assemble(db_path: str, *,
                 return _invoke_via_backend(self._backend, messages, tools, tool_choice)
             return _s()
 
+    # ── Phase 7B: Anthropic → NativeBackend pipeline; others → Legacy ──
+    _native_backend = None
+    _conversation_store = None
+
+    if llm_backend is not None:
+        from llm.anthropic_backend import AnthropicBackend
+        if isinstance(llm_backend, AnthropicBackend):
+            # Native path: NativeBackendAdapter replaces _RealLLM → _invoke_via_backend
+            from runtime_core.native_backend import NativeBackend
+            _native_backend = NativeBackend.from_backend(llm_backend)
+            _conversation_store = None  # Lazy init per-run (session_id needed)
+            _llm_adapter = _RealLLM(backend=llm_backend)  # Fallback for LLMPort compat
+        else:
+            _llm_adapter = _RealLLM(backend=llm_backend)
+    else:
+        _llm_adapter = _RealLLM(backend=None)  # test mode
+
     runtime_ports = RuntimePorts(
-        llm=_RealLLM(backend=llm_backend),  # Phase C: real backend or None (test)
+        llm=_llm_adapter,
         tools=_RealTools(tool_lookup=tool_registry, tool_registry=tool_registry),  # T19: dual path
         hooks=_RealHooks(
             hook_dispatcher,
@@ -791,7 +808,11 @@ def assemble(db_path: str, *,
         live_events=_RealLiveEvents(bus), clock=_RealClock(),
         token_usage=_RealTokenUsage(outbox),
     )
-    runtime = AgentRuntime(runtime_ports)
+    runtime = AgentRuntime(
+        runtime_ports,
+        native_backend=_native_backend,
+        conversation_store=_conversation_store,
+    )
     # T12: Permission rules stored for T13 wiring
     # (frozen slots dataclass cannot have extra attributes; rules passed via
     #  hook_settings dict to _RealHooks in T13)

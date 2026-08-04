@@ -193,6 +193,22 @@ class NativeBackend:
         """Names of bound tools."""
         return tuple(t.name for t in self._tool_schemas)
 
+    @classmethod
+    def from_backend(cls, anthropic_backend, tool_schemas=()) -> "NativeBackend":
+        """Wrap an existing AnthropicBackend instance as NativeBackend.
+
+        Shares the existing SDK client (no new connection).  Extracts
+        model, max_tokens, timeout from the backend instance.
+        """
+        instance = object.__new__(cls)
+        instance._client = getattr(anthropic_backend, "_client")
+        instance._model = getattr(anthropic_backend, "_model", "")
+        instance._max_tokens = getattr(anthropic_backend, "_max_tokens", 4096)
+        instance._timeout_seconds = getattr(anthropic_backend, "_timeout_seconds", 60.0)
+        instance._tool_schemas = tuple(tool_schemas)
+        instance._cached_api_tools = [t.to_api_dict() for t in instance._tool_schemas]
+        return instance
+
     # ── invoke -- core entry point ──────────────────────────────────────
 
     def invoke(
