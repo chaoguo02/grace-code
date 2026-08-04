@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.json_values import freeze_json
+from llm.base import StreamEvent, StreamEventKind
 from runtime_core.model_actions import (
     AssistantText,
     ModelAction,
@@ -416,3 +417,96 @@ class OpenAINativeBackend:
         return AssistantText(
             text=content, stop_reason=choice.finish_reason or "stop", usage=usage,
         )
+
+    async def astream_iter(
+        self,
+        conversation: NativeConversation,
+        *,
+        tool_choice: dict | None = None,
+    ):
+        """CC callModel() async generator — OpenAI SSE 流式 await.
+
+        Same event semantics as Anthropic astream_iter — yields
+        TEXT_DELTA / TOOL_USE / FINISH.  Uses AsyncOpenAI stream.
+        """
+        api_messages = _native_conv_to_openai_dicts(conversation)
+
+        kwargs: dict = dict(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            messages=api_messages,
+            stream=True,
+        )
+        if self._use_function_calling and self._cached_api_tools:
+            kwargs["tools"] = self._cached_api_tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+
+        try:
+            full_text = ""
+            tool_calls_raw: list[dict] = []
+            yielded_indices: set[int] = set()
+
+            async for chunk in await self._async_client.chat.completions.create(**kwargs):
+                if getattr(chunk, "usage", None):
+                    pass  # usage on final chunk — handled below
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice:
+                    continue
+                delta = choice.delta
+
+                # text delta
+                if delta.content:
+                    full_text += delta.content
+                    yield StreamEvent(
+                        kind=StreamEventKind.TEXT_DELTA, text=delta.content,
+                    )
+
+                # tool call delta (CC-aligned: yield complete blocks)
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        while len(tool_calls_raw) <= idx:
+                            tool_calls_raw.append(
+                                {"id": "", "name": "", "arguments": ""},
+                            )
+                        if tc_delta.id:
+                            tool_calls_raw[idx]["id"] = tc_delta.id
+                        if tc_delta.function.name:
+                            tool_calls_raw[idx]["name"] += tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tool_calls_raw[idx]["arguments"] += tc_delta.function.arguments
+                        if idx not in yielded_indices:
+                            tc_data = tool_calls_raw[idx]
+                            if tc_data["id"] and tc_data["name"]:
+                                try:
+                                    params = json.loads(tc_data["arguments"])
+                                    yielded_indices.add(idx)
+                                    yield StreamEvent(
+                                        kind=StreamEventKind.TOOL_USE,
+                                        tool_call=MACToolCall(
+                                            name=tc_data["name"],
+                                            params=params,
+                                            id=tc_data["id"],
+                                        ),
+                                    )
+                                except json.JSONDecodeError:
+                                    pass
+
+            # Final FINISH
+            for i, tc in enumerate(tool_calls_raw):
+                if i not in yielded_indices and tc["name"]:
+                    yield StreamEvent(
+                        kind=StreamEventKind.TOOL_USE,
+                        tool_call=MACToolCall(
+                            name=tc["name"],
+                            params={},  # incomplete args — empty params
+                            id=tc["id"] or f"tc{i}",
+                        ),
+                    )
+            yield StreamEvent(
+                kind=StreamEventKind.FINISH,
+                text=full_text,
+                finish_message=full_text,
+            )
+        except Exception as exc:
+            yield StreamEvent(kind=StreamEventKind.ERROR, text=str(exc))
