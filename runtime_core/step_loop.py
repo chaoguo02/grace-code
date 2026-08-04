@@ -1,6 +1,12 @@
 """
 G17: Hook/Tool loop — PreToolUse gate, permission, execute, PostToolUse.
 
+G41: DEPRECATED for Native path.
+Native 路径使用 NativeStepLoop（runtime_core/native_step_loop.py）—
+零 LLMMessage、零 message_mapper、零手动 dict 构造。
+ConversationState 自动保证协议完整性，StepLoop 不再碰 tool_use_id。
+本模块继续服务 Legacy 路径（OpenAI/DeepSeek/文本模式）。
+
 ToolCall processing pipeline:
   PreToolUse hook → permission decision (allow/deny/ask/defer/transform)
   → ToolPort.execute() for allowed tools

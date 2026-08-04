@@ -3,6 +3,10 @@
 对话消息构造（Phase 2/5）—— 从 model_action + tool_results 生成 CC 规范
 dict 消息（assistant tool_use + role=tool tool_result）。
 
+G41: DEPRECATED — Legacy path only.
+Native 路径使用 ConversationState（runtime_core/conversation_state.py）自动
+保证协议完整性。build_tool_messages() 不再被 NativeStepLoop 调用。
+
 独立模块：避免 step_loop 硬编码 role dict（G16 架构约束：step_loop 不得
 内嵌 `{"role": "assistant"...}` 字面量）。
 """

@@ -2,6 +2,14 @@
 
 消息契约保真映射 —— 唯一 dict→LLMMessage 转换源（对齐 CC List[ContentBlock]）。
 
+G41: DEPRECATED — Legacy path only.
+Native 路径不再需要 dict→LLMMessage 翻译。NativeMessage 是 Anthropic Native
+Format 的强类型载体，与 LLMMessage 完全解耦。
+
+Native 路径替代方案：
+- ConversationState 自动构造协议完整消息（无需手动映射 5 种 dict 形态）
+- NativeBackend.invoke(NativeConversation) 直通 Anthropic API（零翻译）
+
 Phase 1: 废除 _invoke_via_backend 的扁平化循环，改为本模块统一转换。
 LLMMessage（llm/base.py）已是 CC ContentBlock 的 provider-agnostic 载体：
 content: str|list[dict]、tool_calls、tool_call_id、is_error。本模块保证

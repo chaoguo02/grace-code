@@ -56,10 +56,16 @@ def _release_owner(db_path: str) -> None:
 
 
 # ── H1: LLM Backend Adapter ────────────────────────────────────────────
+#
+# G41: DEPRECATED for Native path.
+# _invoke_via_backend + _RealLLM 继续服务 Legacy 路径。
+# Native 路径使用 NativeBackend（runtime_core/native_backend.py）—
+# 工具缓存于 Backend 内部，invoke 无需传 tools；NativeMessage 直通 API，零翻译。
 
 def _invoke_via_backend(backend, messages, tools=None, tool_choice=None):
     """Invoke LLM via backend, convert LLMResponse → ModelAction + TokenUsage.
 
+    G41: DEPRECATED for Native path — Legacy path only.
     H1: When backend is None, returns a controlled fake response (test mode).
     T5: tool_choice forwarded to backend if supported.
     """

@@ -47,6 +47,11 @@ class MessageKind(str, Enum):
 class LLMMessage:
     """
     发送给 LLM 的单条消息。
+
+    G41: DEPRECATED for Native path — Legacy/OpenAI path only.
+    Native 路径使用 runtime_core.native_message.NativeMessage
+    （强类型 ContentBlock 元组，零 str|list 联合类型）。
+
     role: "system" | "user" | "assistant" | "tool"
     content: 纯文本 str，或 content blocks 列表（Anthropic cache_control 格式）。
     tool_call_id 仅在 role=="tool" 时使用（工具执行结果关联到对应的 tool_use）。
