@@ -440,11 +440,19 @@ class ChatPipeline:
         run_id = CoreRunId(str(_uuid.uuid4()))
         prompt = self._render_prepared_prompt(prepared)
 
-        # Build conversation from recent messages
+        # Build conversation — CC-aligned: primary agent system prompt first
         msgs = []
+        try:
+            from agent.session.agent_definition import load_agent_definitions
+            _defs = load_agent_definitions(project_dir=self._ports.repo_path)
+            _def = _defs.get(request.agent_name)
+            if _def and _def.system_prompt:
+                msgs.append({"role": "system", "content": _def.system_prompt})
+        except Exception:
+            pass
         if hasattr(self._ports.session_service, 'get_messages'):
             try:
-                msgs = self._ports.session_service.get_messages(request.session_id, limit=50)
+                msgs.extend(self._ports.session_service.get_messages(request.session_id, limit=50))
             except Exception:
                 pass
         # Append the current user prompt
