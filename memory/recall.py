@@ -1,8 +1,19 @@
 """Session-aware active memory recall.
 
-This module owns runtime memory retrieval, session-scoped recall records, and
-session-level pin/disable overrides.  It is deliberately independent from the
-agent loop so both prompt injection and the web UI can use the same facts.
+DEPRECATED phase — algorithm-based recall replaced by CC's LLM-selection model.
+
+CC has no MemoryRecallService equivalent.  The LLM sees the memory catalog
+(memory/catalog.py) in its system prompt and autonomously decides which
+memories to read via the memory_read tool.  There is no algorithmic scoring,
+no automatic injection, and no recall tracking.
+
+This module is retained during migration:
+- Web UI recall records (MemoryRecallService.record_result / list_recalls)
+  continue to work for existing sessions
+- Pin/disable overrides remain functional
+
+New code should NOT add dependencies on MemoryRecallService.
+Please use memory/catalog.py + the memory_read tool instead.
 """
 
 from __future__ import annotations

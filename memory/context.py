@@ -1,12 +1,19 @@
 """
 memory/context.py
 
-MemoryContext — 管理记忆在 LLM 上下文中的注入。
+DEPRECATED phase —— MemoryContext.build_memory_section() replaced by CC-aligned
+catalog approach (memory/catalog.py:build_memory_catalog()).
 
-记忆索引以独立的 user message 注入（不影响 system prompt 的 prompt cache），
-在 compaction 后从 MemoryStore 重新读取以确保长对话不丢失长期记忆上下文。
+CC model: MEMORY.md catalog injected once per session → LLM autonomously
+calls memory_read tool to fetch full content.  Grace Code now aligns with
+this model — the catalog is generated from SQLite and injected into the
+system prompt.  LLM selects, not the system.
 
-支持相关性过滤：根据当前任务描述的关键词，优先展示相关记忆。
+MemoryContext is retained during migration for backward compat:
+- build_memory_section() delegates to catalog when available
+- Web UI recall displays (MemoryRecallService) keep running on old path
+
+New code should use memory/catalog.py directly.
 """
 
 from __future__ import annotations

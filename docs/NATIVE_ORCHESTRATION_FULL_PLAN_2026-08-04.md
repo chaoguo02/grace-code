@@ -1,8 +1,9 @@
 # Native Orchestration — 全阶段实现计划（含单路径合并）
 
-> 文档版本：3.2.0（Phase 10 完成）
-> 当前基线：全部 Phase 完成
-> **v3.2 更新**：Phase 10 全部 6 步完成。详见 [子文档](./PHASE10_REMAINING_4_POINTS_2026-08-04.md)。
+> 文档版本：3.3.0（记忆系统设计完成）
+> 当前基线：全部 Phase 完成，记忆系统详细设计文档就绪
+> **v3.3 更新**：新增 [记忆系统 CC 对齐执行文档](./MEMORY_CC_ALIGNMENT_EXECUTION_2026-08-04.md)——
+> SQLite 实现 CC "LLM 选择"模式，废弃算法评分检索，改为目录+按需加载。
 
 ---
 
