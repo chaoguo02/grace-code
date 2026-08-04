@@ -10,6 +10,7 @@ G32: Multi-Agent Coordinator — primary-mediated only, no Team.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -98,7 +99,7 @@ class MultiAgentCoordinator:
         return results
 
     def _execute_one_child(self, ctx: ChildTaskContext) -> ChildTaskResult:
-        """Execute a single child task."""
+        """Execute a single child task — CC query() 等价, async 主循环."""
         from runtime_core.execution import RuntimeExecution, ConversationSnapshot
 
         task_scope = self._scope_factory(
@@ -116,7 +117,7 @@ class MultiAgentCoordinator:
         )
 
         try:
-            outcome = self._runtime.run(execution)
+            outcome = asyncio.run(self._runtime.arun(execution))
             return ChildTaskResult(task_id=ctx.task_id, outcome=outcome)
         except Exception as exc:
             return ChildTaskResult(task_id=ctx.task_id, error=str(exc))

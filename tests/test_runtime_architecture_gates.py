@@ -8,6 +8,7 @@ AC: No excessive object retention after GC
 """
 
 import ast
+import asyncio
 import gc
 import os
 import time as _time
@@ -72,7 +73,14 @@ class TestFinalGate:
                              clock=s, token_usage=s)
         loop = NativeStepLoop(ports)
         started = _time.monotonic()
-        loop.execute(ctx)
+        # Consume aiterate async generator — cancellation check at loop entry
+        async def _run():
+            outcome = None
+            async for event in loop.aiterate(ctx):
+                if event["type"] in ("completed", "failed", "cancelled", "blocked"):
+                    outcome = event["outcome"]
+            return outcome
+        asyncio.run(_run())
         elapsed = (_time.monotonic() - started) * 1000
         assert elapsed < 500, f"cancel-to-return: {elapsed:.0f}ms > 500ms"
 

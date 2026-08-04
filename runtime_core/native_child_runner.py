@@ -14,6 +14,7 @@ no ReActAgent).  Operates entirely on NativeBackend / NativeMessage / RuntimePor
 
 from __future__ import annotations
 
+import asyncio
 import time as _time
 import uuid as _uuid
 from typing import TYPE_CHECKING, Callable
@@ -190,14 +191,12 @@ def run_native_child(
 ) -> RuntimeOutcome:
     """Execute one child run on the Native path.
 
-    Thin wrapper around AgentRuntime.run(RuntimeExecution(...)).
-    Functionally equivalent to legacy run_child_agent() but uses
-    NativeStepLoop instead of ReActAgent.
+    CC query() 等价 — asyncio.run(arun()) 驱动 aiterate 主循环。
+    Thin wrapper around AgentRuntime.arun(RuntimeExecution(...)).
+    Safe to call from thread-pool or daemon threads (no running loop).
 
-    The conversation (NativeConversation) is converted to API dicts
-    for ConversationSnapshot.  For fresh children this is safe because
-    the conversation contains only text system/user messages — no
-    structured tool_use/tool_result blocks.
+    Functionally equivalent to legacy run_child_agent() but uses
+    NativeStepLoop aiterate instead of ReActAgent.
     """
     started = _time.monotonic()
 
@@ -229,7 +228,7 @@ def run_native_child(
 
     from runtime_core.runtime import AgentRuntime
     runtime = AgentRuntime(ports)
-    outcome = runtime.run(ctx)
+    outcome = asyncio.run(runtime.arun(ctx))
 
     return outcome
 

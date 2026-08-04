@@ -9,6 +9,7 @@ AC: Active run check prevents duplicates
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -29,6 +30,7 @@ from runtime_core.outcome import RunStatus
 
 class FakeRuntime:
     def run(self, ctx): return object()
+    async def arun(self, ctx, *, event_handler=None, text_callback=None): return self.run(ctx)
 
 
 @pytest.fixture
@@ -129,8 +131,8 @@ class TestE2EFakeAdapter:
         assert isinstance(result, RunId), f"Expected RunId, got {type(result).__name__}"
         run_id = result
 
-        # Execute via coordinator
-        outcome = comp.runtime.run(
+        # Execute via coordinator — CC query() 等价
+        outcome = asyncio.run(comp.runtime.arun(
             RuntimeExecution(
                 session_id=SessionId("s-e2e"),
                 run_id=run_id,
@@ -139,7 +141,7 @@ class TestE2EFakeAdapter:
                     messages=({"role": "user", "content": "hello"},),
                 ),
             )
-        )
+        ))
         # H8: After H0-H7, fake LLM returns text + usage, tools return output
         assert outcome.status in (RunStatus.COMPLETED, RunStatus.BLOCKED), (
             f"Expected COMPLETED or BLOCKED, got {outcome.status}"
@@ -172,7 +174,7 @@ class TestE2EFakeAdapter:
         # Override the native backend (accessed via ports.llm._backend)
         comp.runtime_ports.llm._backend.invoke = lambda conv, **kw: tc
 
-        outcome = comp.runtime.run(
+        outcome = asyncio.run(comp.runtime.arun(
             RuntimeExecution(
                 session_id=SessionId("s-e2e-tool"),
                 run_id=RunId("r-e2e-tool"),
@@ -181,7 +183,7 @@ class TestE2EFakeAdapter:
                     messages=({"role": "user", "content": "read x"},),
                 ),
             )
-        )
+        ))
         # H4: Tool evidence must include the tool call
         assert outcome.evidence is not None
         assert len(outcome.evidence.tool_calls) >= 1, (
@@ -195,7 +197,7 @@ class TestE2EFakeAdapter:
         comp = assemble(temp_db)
 
         started = _time.monotonic()
-        outcome = comp.runtime.run(
+        outcome = asyncio.run(comp.runtime.arun(
             RuntimeExecution(
                 session_id=SessionId("s-perf"),
                 run_id=RunId("r-perf"),
@@ -204,7 +206,7 @@ class TestE2EFakeAdapter:
                     messages=({"role": "user", "content": "hi"},),
                 ),
             )
-        )
+        ))
         elapsed = (_time.monotonic() - started) * 1000
         assert elapsed < 2000, (
             f"H8: E2E too slow: {elapsed:.0f}ms (must be < 2000ms)"

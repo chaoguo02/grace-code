@@ -3,6 +3,9 @@ G16: AgentRuntime -- thin wrapper, no DB writes, per-run local state.
 
 Creates NativeStepLoop per run.  All providers (Anthropic, OpenAI compat)
 use the Native pipeline.  No persistent mutable state across runs.
+
+CC-aligned: arun() is the single entry point.  All paths (CLI, Web, child)
+go through aiterate.  No sync run() -- callers use asyncio.run(arun()).
 """
 
 from __future__ import annotations
@@ -16,63 +19,25 @@ from runtime_core.ports import RuntimePorts
 class AgentRuntime:
     """Thin runtime wrapper.  No DB, no WebSocket, no SQLite.
 
-    G16: Creates a fresh NativeStepLoop per run() call -- no mutable state
-    retained between runs.  All providers now use the Native pipeline.
+    CC-aligned: arun() is the only execution entry point.  Creates a fresh
+    NativeStepLoop per invocation -- no mutable state retained between runs.
     """
 
     def __init__(self, ports: RuntimePorts, scheduler=None) -> None:
         self._ports = ports
         self._scheduler = scheduler  # Phase 7: ToolScheduler for parallel tool execution
 
-    def run(self, context: RuntimeExecution, *,
-            text_callback: "Callable[[str], None] | None" = None,
-            ) -> RuntimeOutcome:
-        """Execute one run.  Pure logic -- no side effects.
-
-        G18: Cancellation is checked via context.cancellation at every
-        boundary (model, hook, tool execution).
-
-        text_callback: CC-aligned streaming text output (Phase 10).
-        """
-        loop = NativeStepLoop(self._ports, scheduler=self._scheduler)
-        outcome = loop.execute(context, text_callback=text_callback)
-
-        # H7: Publish live event with FrozenJsonObject payload
-        from core.json_values import freeze_json
-        import uuid as _uuid
-        from core.eventing.scope import ScopeToken
-        _scope = ScopeToken.session_scope(_uuid.uuid4(), context.session_id) if context.session_id is not None else None
-        self._ports.live_events.publish(
-            event_type=f"run.{outcome.status.value}.v1",
-            payload=freeze_json({
-                "run_id": str(outcome.run_id),
-                "status": outcome.status.value,
-                "summary": outcome.summary,
-                "steps_taken": outcome.steps_taken,
-                "tokens_used": outcome.tokens_used,
-            }),
-            scope=_scope,
-        )
-
-        # H3: Record separated input/output token usage
-        if outcome.tokens_used > 0:
-            self._ports.token_usage.record(
-                context.run_id,
-                outcome.input_tokens or outcome.tokens_used,
-                outcome.output_tokens,
-            )
-
-        return outcome
-
     async def arun(
         self, context: RuntimeExecution, *,
         event_handler: "Callable[[dict], None] | None" = None,
         text_callback: "Callable[[str], None] | None" = None,
     ) -> RuntimeOutcome:
-        """CC query() 等价 — async 执行, 消费 aiterate async generator.
+        """CC query() 等价 -- async 执行, 消费 aiterate async generator.
 
-        Phase F: async 是主路径。event_handler 可选消费 aiterate 事件
-        (text_delta / tool_result / completed), 用于 WebSocket 推流。
+        This is the SINGLE execution entry point.  All paths (CLI, Web, child)
+        go through aiterate.  Callers in sync context use asyncio.run(arun()).
+        event_handler 可选消费 aiterate 事件 (text_delta / tool_result /
+        completed), 用于 WebSocket 推流。
         """
         loop = NativeStepLoop(self._ports, scheduler=self._scheduler)
         final_outcome = None
@@ -89,7 +54,7 @@ class AgentRuntime:
                 context.run_id, error="aiterate produced no terminal outcome",
             )
 
-        # 复用 run() 的事件发布 + token 记录
+        # H7: Publish live event with FrozenJsonObject payload
         from core.json_values import freeze_json
         import uuid as _uuid
         from core.eventing.scope import ScopeToken

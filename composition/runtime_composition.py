@@ -868,12 +868,24 @@ def assemble(db_path: str, *,
     from runtime_core.native_llm_adapter import NativeBackendAdapter
 
     class _FakeNativeLLM:
-        """H1 test mode: returns controlled fake response through native interface."""
+        """H1 test mode: returns controlled fake response through native interface.
+
+        CC-aligned: provides both invoke() (sync, for sync execute() until retired)
+        and ainvoke() (async via to_thread, for aiterate).
+        """
         def invoke(self, conversation, *, tool_choice=None, cancellation=None):
             from runtime_core.model_actions import AssistantText, TokenUsage
             return AssistantText(
                 text="H1 fake response", stop_reason="end_turn",
                 usage=TokenUsage(input_tokens=10, output_tokens=5),
+            )
+
+        async def ainvoke(self, conversation, *, tool_choice=None, cancellation=None):
+            """CC callModel 等价 — async 模型调用，不阻塞事件循环。"""
+            import asyncio
+            return await asyncio.to_thread(
+                self.invoke, conversation,
+                tool_choice=tool_choice, cancellation=cancellation,
             )
 
     # ── Condition 2: All providers → Native pipeline ──────────────────

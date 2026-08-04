@@ -9,7 +9,20 @@ AC:
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
+
+
+def _consume_aiterate(loop, context):
+    """Consume aiterate async generator → RuntimeOutcome."""
+    async def _run():
+        outcome = None
+        async for event in loop.aiterate(context):
+            if event["type"] in ("completed", "failed", "cancelled", "blocked"):
+                outcome = event["outcome"]
+        return outcome
+    return asyncio.run(_run())
 
 
 def _assemble(tmp_path):
@@ -130,6 +143,9 @@ def test_hook_input_carries_cwd(tmp_path):
             from runtime_core.ports import ToolSuccess
             return ToolSuccess(tool_name=name)
 
+        async def aexecute(self, name, params, invocation_id=""):
+            return self.execute(name, params, invocation_id)
+
     # LLM returns a ToolCall first turn so _process_tool_calls runs
     class _LLM:
         _called = False
@@ -154,7 +170,7 @@ def test_hook_input_carries_cwd(tmp_path):
             {"role": "user", "content": "test"},
         )),
     )
-    loop.execute(ctx)
+    _consume_aiterate(loop, ctx)
     assert seen_cwd.get("cwd") == "/repo/workspace", (
         f"hook input 应带 cwd=/repo/workspace, got {seen_cwd.get('cwd')}"
     )

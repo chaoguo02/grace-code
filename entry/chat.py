@@ -15,6 +15,7 @@ entry/chat.py
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -391,7 +392,12 @@ class ChatSession:
     # ── Phase 0b: Native Turn 执行 ────────────────────────────────────
 
     def _run_native_turn(self, user_input: str, definition, intent):
-        """使用 AgentRuntime.run() 执行一轮——Step 1 的核心替换。"""
+        """CC query() 等价 — asyncio.run(arun()) 驱动 aiterate 主循环。
+
+        Step 1 (P0): CLI 切到 async arun，与 Web 路径统一走 aiterate。
+        CLI 主循环 (while True: input()) 是 sync 的，_run_native_turn 用
+        asyncio.run 驱动 arun——CLI 无 running loop，安全。
+        """
         import uuid as _uuid
         from runtime_core.execution import ConversationSnapshot, RuntimeExecution
         from core.eventing.identifiers import SessionId, RunId
@@ -418,7 +424,7 @@ class ChatSession:
             conversation=conv,
         )
 
-        outcome = self._agent_runtime.run(ctx)
+        outcome = asyncio.run(self._agent_runtime.arun(ctx))
 
         # 转为 RunResult 兼容格式
         from agent.task import RunResult, RunStatus

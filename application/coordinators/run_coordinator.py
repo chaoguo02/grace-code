@@ -126,13 +126,14 @@ class RunCoordinator:
                 capabilities: CapabilitySnapshot | None = None,
                 max_steps: int = 25,
                 workspace: str = "") -> RuntimeOutcome:
-        """Phase B: Execute via Native Runtime with real context.
+        """CC query() 等价 — async 主循环 via asyncio.run(arun()).
 
         conversation: messages from DB (not empty default)
         capabilities: tool schemas from registry (not empty default)
         workspace: repo root / worktree path — becomes RuntimeExecution.workspace
             (hook cwd source, Phase 12).
         """
+        import asyncio
         from runtime_core.execution import ConversationSnapshot, CapabilitySnapshot
         context = RuntimeExecution(
             session_id=cmd.session_id,
@@ -142,7 +143,7 @@ class RunCoordinator:
             capabilities=capabilities or CapabilitySnapshot(),
             workspace=workspace,
         )
-        return self._runtime.run(context)
+        return asyncio.run(self._runtime.arun(context))
 
     async def aexecute(self, cmd: ExecuteRun,
                        conversation: ConversationSnapshot | None = None,

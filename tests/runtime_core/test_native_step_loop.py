@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 
@@ -68,6 +69,10 @@ class _FakeTools:
             output=f"output-{tool_name}",
             tool_use_id=invocation_id,
         )
+
+    async def aexecute(self, tool_name, params, invocation_id=""):
+        """CC tool.call() 等价 — async 包装 sync execute，不阻塞事件循环。"""
+        return self.execute(tool_name, params, invocation_id)
 
 
 class _FakeHooks:
@@ -143,6 +148,17 @@ def _tool_call(cid, name="Read", params=None):
     )
 
 
+def _run_async(loop, context):
+    """Consume aiterate async generator → RuntimeOutcome.  CC-aligned test helper."""
+    async def _consume():
+        outcome = None
+        async for event in loop.aiterate(context):
+            if event["type"] in ("completed", "failed", "cancelled", "blocked"):
+                outcome = event["outcome"]
+        return outcome
+    return asyncio.run(_consume())
+
+
 # ── 核心轮转测试 ──────────────────────────────────────────────────────────
 
 class TestTwoTurnToolRoundtrip:
@@ -173,7 +189,7 @@ class TestTwoTurnToolRoundtrip:
             cancellation=_Cancellation(),
         )
 
-        outcome = loop.execute(context)
+        outcome = _run_async(loop, context)
 
         assert outcome.status is RunStatus.COMPLETED
         assert len(backend.invocations) == 2
@@ -215,7 +231,7 @@ class TestTwoTurnToolRoundtrip:
             cancellation=_Cancellation(),
         )
 
-        outcome = loop.execute(context)
+        outcome = _run_async(loop, context)
         assert outcome.status is RunStatus.COMPLETED
 
         conv = backend.invocations[1]
@@ -246,7 +262,7 @@ class TestProtocolCompleteness:
             cancellation=_Cancellation(),
         )
 
-        loop.execute(context)
+        _run_async(loop, context)
 
         # 验证 tool_result 的 tool_use_id 正确配对（由 ConversationState 保证）
         conv = backend.invocations[1]
@@ -273,7 +289,7 @@ class TestProtocolCompleteness:
             cancellation=_Cancellation(),
         )
 
-        loop.execute(context)
+        _run_async(loop, context)
 
         # tool_result 带 is_error（deny）
         conv = backend.invocations[1]
@@ -307,7 +323,7 @@ class TestInstantPersistence:
             cancellation=_Cancellation(),
         )
 
-        loop.execute(context)
+        _run_async(loop, context)
 
         # 从 DB 重建 — 验证即时持久化
         conv = store.rebuild_conversation()
@@ -345,7 +361,7 @@ class TestErrorPaths:
             cancellation=_Cancellation(),
         )
 
-        outcome = loop.execute(context)
+        outcome = _run_async(loop, context)
         assert outcome.status is RunStatus.BLOCKED
 
     def test_model_failure_non_retryable(self):
@@ -366,7 +382,7 @@ class TestErrorPaths:
             cancellation=_Cancellation(),
         )
 
-        outcome = loop.execute(context)
+        outcome = _run_async(loop, context)
         assert outcome.status is RunStatus.FAILED
 
     def test_max_steps_exceeded(self):
@@ -386,7 +402,7 @@ class TestErrorPaths:
             cancellation=_Cancellation(),
         )
 
-        outcome = loop.execute(context)
+        outcome = _run_async(loop, context)
         assert outcome.status is RunStatus.BLOCKED
         assert "max_steps" in outcome.blocked_by
 
@@ -411,7 +427,7 @@ class TestEvidenceCollection:
             cancellation=_Cancellation(),
         )
 
-        outcome = loop.execute(context)
+        outcome = _run_async(loop, context)
         assert outcome.evidence is not None
         assert len(outcome.evidence.tool_calls) == 1
         assert outcome.evidence.tool_calls[0].tool_name == "Read"
@@ -440,6 +456,6 @@ class TestBehavioralParity:
             cancellation=_Cancellation(),
         )
 
-        outcome = loop.execute(context)
+        outcome = _run_async(loop, context)
         assert outcome.status is RunStatus.COMPLETED
         assert "Hello" in outcome.summary

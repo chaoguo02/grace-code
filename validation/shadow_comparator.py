@@ -8,6 +8,7 @@ No production authority modified — projections use null sink.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 
@@ -108,7 +109,14 @@ class ShadowComparator:
             )
 
             loop = NativeStepLoop(self._ports)
-            new_outcome = loop.execute(context)
+            # Consume aiterate async generator → RuntimeOutcome
+            async def _run():
+                outcome = None
+                async for event in loop.aiterate(context):
+                    if event["type"] in ("completed", "failed", "cancelled", "blocked"):
+                        outcome = event["outcome"]
+                return outcome
+            new_outcome = asyncio.run(_run())
 
             # Compare outcomes
             if old_outcome.status == new_outcome.status:

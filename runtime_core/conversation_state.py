@@ -50,6 +50,23 @@ def _params_to_dict(params) -> dict:
     return {}
 
 
+# ── ConversationSnapshot2 ─────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ConversationSnapshot2:
+    """CC State 等价 — 不可变状态快照。
+
+    每轮 aiterate 继续前创建，对齐 CC 的 state = next 模式。
+    - messages: tuple（不可变）
+    - pending_tool_use_count: 用于验证协议完整性
+    - transition: 为何继续——'tool_use' / 'error_retry' / 'step' / 'cancelled'
+    """
+    messages: tuple[NativeMessage, ...]
+    pending_tool_use_count: int = 0
+    transition: str = ""
+
+
 # ── ConversationState ────────────────────────────────────────────────────────
 
 
@@ -64,10 +81,13 @@ class ConversationState:
 
     它永远不需要知道 tool_use_id 长什么样。
     ConversationState 内部处理 ID 匹配、block 构造、错误兜底。
+
+    CC 对齐：transition 记录状态转换原因，snapshot() 返回不可变视图。
     """
 
     _messages: list[NativeMessage] = field(default_factory=list)
     _pending_tool_uses: dict[str, ToolUseBlock] = field(default_factory=dict)
+    _transition: str = ""
     """跟踪所有已发出但未收到 tool_result 的 tool_use。
     用于：错误兜底（未匹配的 tool_use 生成 is_error 占位）。
     """
@@ -197,6 +217,33 @@ class ConversationState:
     def to_api_format(self) -> list[dict]:
         """直接输出 Anthropic API 格式 — 绕过 LLMMessage 翻译。"""
         return self.to_conversation().to_api_format()
+
+    def snapshot(self) -> "ConversationSnapshot2":
+        """CC state 等价 — 不可变状态快照，含 transition 原因。
+
+        每轮 aiterate 在 continue 前调用，对齐 CC 的 state = next 模式。
+        """
+        return ConversationSnapshot2(
+            messages=tuple(self._messages),
+            pending_tool_use_count=len(self._pending_tool_uses),
+            transition=self._transition,
+        )
+
+    def record_transition(self, reason: str) -> None:
+        """CC transition 等价 — 记录状态转换原因。
+
+        CC 有 ~9 个 continue 点，每个都写 transition reason:
+        - 'tool_use' — 工具执行完成，继续循环
+        - 'error_retry' — 可重试错误，继续循环
+        - 'step' — 正常步进到下一轮
+        - 'cancelled' — 取消检查通过，继续循环
+        """
+        self._transition = reason
+
+    @property
+    def transition(self) -> str:
+        """CC State.transition 等价 — 上次状态转换原因。"""
+        return self._transition
 
     @property
     def messages(self) -> tuple[NativeMessage, ...]:

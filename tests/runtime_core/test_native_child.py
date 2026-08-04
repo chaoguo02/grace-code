@@ -6,6 +6,7 @@ After implementation, BT-1 through BT-7 must all pass.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 
@@ -1155,7 +1156,7 @@ def test_parallel_tool_calls_finish_faster_than_serial():
     )
     started = _t.monotonic()
     runtime = AgentRuntime(ports, scheduler=scheduler)
-    outcome = runtime.run(ctx)
+    outcome = asyncio.run(runtime.arun(ctx))
     elapsed = (_t.monotonic() - started) * 1000
 
     assert outcome.status.value == "completed"
@@ -1273,7 +1274,7 @@ def test_orchestration_fan_out_batch_executes_and_synthesizes():
 
     started = _t.monotonic()
     runtime = AgentRuntime(ports, scheduler=scheduler)
-    outcome = runtime.run(ctx)
+    outcome = asyncio.run(runtime.arun(ctx))
     elapsed = (_t.monotonic() - started) * 1000
 
     assert outcome.status.value == "completed"
@@ -1332,7 +1333,7 @@ def test_chat_session_native_turn_completes():
         budget_tokens=5000,
         conversation=conv,
     )
-    outcome = agent_runtime.run(ctx)
+    outcome = asyncio.run(agent_runtime.arun(ctx))
 
     assert outcome.status.value == "completed"
     assert "Turn completed" in outcome.summary
@@ -1459,7 +1460,7 @@ def test_stream_callback_receives_text_deltas():
         )),
     )
     runtime = AgentRuntime(ports)
-    outcome = runtime.run(ctx, text_callback=_cb)
+    outcome = asyncio.run(runtime.arun(ctx, text_callback=_cb))
 
     assert outcome.status.value == "completed"
     assert parts == ["Hello ", "world."]

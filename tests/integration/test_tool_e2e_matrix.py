@@ -11,6 +11,8 @@ AC: Schema validation → VALIDATION_ERROR on invalid params
 
 from __future__ import annotations
 
+import asyncio
+
 import sqlite3
 import tempfile
 import uuid
@@ -59,10 +61,10 @@ class TestToolE2EMatrix:
                       params=freeze_json({"file_path": "test.txt"}),
                       usage=TokenUsage(input_tokens=10, output_tokens=5))
         comp.runtime_ports.llm._backend.invoke = lambda conv, **kw: tc
-        outcome = comp.runtime.run(
+        outcome = asyncio.run(comp.runtime.arun(
             RuntimeExecution(
                 session_id=SessionId("s-e2e-read"), run_id=RunId("r-read"),
-                max_steps=3, conversation=type('C',(),{'messages':({"role":"user","content":"read"},)})()))
+                max_steps=3, conversation=type('C',(),{'messages':({"role":"user","content":"read"},)})())))
         assert outcome.status.value in ("completed", "blocked")
 
     def test_tool_timeout_error_type(self):
@@ -99,10 +101,10 @@ class TestToolE2EMatrix:
         batch = ToolCallBatch(calls=(tc1, tc2, tc3),
                               usage=TokenUsage(input_tokens=30, output_tokens=15))
         comp.runtime_ports.llm._backend.invoke = lambda conv, **kw: batch
-        outcome = comp.runtime.run(
+        outcome = asyncio.run(comp.runtime.arun(
             RuntimeExecution(
                 session_id=SessionId("s-parallel"), run_id=RunId("r-parallel"),
-                max_steps=5, conversation=type('C',(),{'messages':({"role":"user","content":"read"},)})()))
+                max_steps=5, conversation=type('C',(),{'messages':({"role":"user","content":"read"},)})())))
         assert outcome.status.value in ("completed", "blocked")
         assert outcome.evidence is not None, "Parallel batch must produce evidence"
 

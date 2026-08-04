@@ -22,6 +22,9 @@ class FakeRuntime:
         from runtime_core.outcome import RuntimeOutcome, RunStatus
         return RuntimeOutcome.completed(ctx.run_id, steps=1, tokens=10)
 
+    async def arun(self, ctx, *, event_handler=None, text_callback=None):
+        return self.run(ctx)
+
 
 class FakeCoordinator:
     def submit(self, cmd): return object()

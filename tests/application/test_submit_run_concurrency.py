@@ -54,6 +54,7 @@ def temp_db():
 
 class FakeRuntime:
     def run(self, ctx): return object()
+    async def arun(self, ctx, *, event_handler=None, text_callback=None): return self.run(ctx)
 
 
 def _make_coordinator(db_path):

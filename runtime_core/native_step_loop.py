@@ -54,22 +54,6 @@ from runtime_core.ports import (
 from runtime_core.tool_scheduler import ToolScheduler
 
 
-def _run_async_from_sync(coro):
-    """Run a coroutine from a synchronous call site.
-
-    P1-1: ``NativeStepLoop.execute()`` is a synchronous loop running in a
-    worker thread (the caller isolates it via ``asyncio.to_thread`` — see the
-    Phase 11 ``SessionAgent`` design).  That thread has no running event loop,
-    so ``asyncio.run()`` is always safe here.  Calling ``execute()`` directly
-    on a thread that owns a running loop is a caller bug (it would block the
-    loop); the ``asyncio.run`` RuntimeError surfaces that clearly rather than
-    deadlocking.
-    """
-    import asyncio
-
-    return asyncio.run(coro)
-
-
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     """Result of processing one tool call through hook+execute."""
@@ -127,245 +111,43 @@ class NativeStepLoop:
             self._backend = ports.llm._backend
         else:
             self._backend = ports.llm
+
+        # CC-aligned: ensure every backend can participate in the async loop.
+        # Sync-only backends (test fakes, legacy adapters) are wrapped via
+        # to_thread — the same pattern CC uses for sync I/O in async context.
+        # This is boot-time harness wiring, not a runtime fallback.
+        if not hasattr(self._backend, 'ainvoke') and hasattr(self._backend, 'invoke'):
+            import asyncio as _asyncio
+            _sync_invoke = self._backend.invoke
+            async def _ainvoke(conversation, *, tool_choice=None, cancellation=None):
+                return await _asyncio.to_thread(
+                    _sync_invoke, conversation,
+                    tool_choice=tool_choice, cancellation=cancellation,
+                )
+            self._backend.ainvoke = _ainvoke  # type: ignore[attr-defined]
+
+        # CC-aligned: wrap sync stream_iter → async astream_iter.
+        # Sync-only streaming backends (test fakes) get async generator wrapper
+        # so they can participate in aiterate without blocking the event loop.
+        if not hasattr(self._backend, 'astream_iter') and hasattr(self._backend, 'stream_iter'):
+            import asyncio as _asyncio
+            _sync_stream = self._backend.stream_iter
+            async def _astream_iter(conversation, *, tool_choice=None, model=""):
+                # Yield events from sync iterator via to_thread batches
+                def _collect():
+                    return list(_sync_stream(conversation, tool_choice=tool_choice, model=model))
+                events = await _asyncio.to_thread(_collect)
+                for event in events:
+                    yield event
+            self._backend.astream_iter = _astream_iter  # type: ignore[attr-defined]
+
         # Store is optional — when absent, persistence is skipped (test mode)
         self._store = store
         self._scheduler = scheduler or ToolScheduler()
         self._state: ConversationState | None = None
         self._budget = context_budget or ContextBudgetManager()
 
-    # ── Main loop ───────────────────────────────────────────────────────
-
-    def execute(self, context: RuntimeExecution, *,
-                text_callback: "Callable[[str], None] | None" = None,
-                ) -> RuntimeOutcome:
-        """Execute one Run -- pure Model -> Hook -> Tool -> Outcome loop.
-
-        text_callback: if set, model calls use stream_iter() and push each
-        text delta to this callback (CC-aligned streaming text output).
-        """
-        # Rebuild state from DB if store available (crash recovery)
-        if self._store is not None:
-            self._state = ConversationState.rebuild_from(
-                self._store.rebuild_conversation()
-            )
-        else:
-            self._state = ConversationState()
-
-        # 注入本轮用户输入（如果尚未持久化）
-        for msg_dict in context.conversation.messages:
-            role = msg_dict.get("role", "user") if isinstance(msg_dict, dict) else "user"
-            content = msg_dict.get("content", "") if isinstance(msg_dict, dict) else str(msg_dict)
-            if role == "user" and content:
-                self._state.add_user_message(content)
-            elif role == "system" and content:
-                self._state.add_system_message(content)
-
-        total_tokens_in = 0
-        total_tokens_out = 0
-        tool_evidences: list[ToolEvidence] = []
-        files_touched: set[str] = set()
-        hook_blocks: list[str] = []
-        steps_taken = 0
-
-        _exec_scope = ScopeToken.session_scope(
-            _uuid.uuid4(), context.session_id,
-        ) if context.session_id is not None else None
-
-        for turn in range(context.max_steps):
-            # G18+P2: Cancellation check — 协作式取消
-            if context.cancellation.cancelled:
-                # P2: 优雅收敛 — drain pending tool_uses as errors
-                self._state.drain_pending_as_errors()
-                self._flush_store()
-                return self._cancelled_outcome(
-                    context.run_id, steps_taken,
-                    total_tokens_in + total_tokens_out,
-                    total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks,
-                )
-
-            steps_taken += 1
-
-            # ── P1: Context budget check ──────────────────────────────
-            conv = self._state.to_conversation()
-            pruned_conv, budget_report = self._budget.ensure_budget(conv)
-            if budget_report.messages_trimmed > 0:
-                logger = __import__("logging").getLogger(__name__)
-                logger.info(
-                    "Context budget: %d→%d tokens (%d messages trimmed, %d tool_results)",
-                    budget_report.original_tokens,
-                    budget_report.original_tokens - budget_report.trimmed_tokens,
-                    budget_report.messages_trimmed,
-                    budget_report.tool_results_trimmed,
-                )
-
-            # ── 1. Model call — 无需传 tools！ ────────────────────────
-            try:
-                if text_callback is not None and hasattr(self._backend, 'stream_iter'):
-                    model_action = self._stream_model_call(
-                        pruned_conv, text_callback,
-                        cancellation=context.cancellation,
-                    )
-                else:
-                    model_action = self._backend.invoke(
-                        pruned_conv,
-                        tool_choice={"type": "auto"},
-                        cancellation=context.cancellation,
-                   )
-            except Exception as exc:
-                return RuntimeOutcome.failed(
-                    context.run_id,
-                    error=f"LLM invoke failed: {exc}",
-                    steps=steps_taken,
-                    tokens=total_tokens_in + total_tokens_out,
-                )
-
-            # H3: Extract real token usage
-            if model_action is not None and hasattr(model_action, 'usage') and model_action.usage is not None:
-                step_tokens_in = model_action.usage.input_tokens
-                step_tokens_out = model_action.usage.output_tokens
-            else:
-                step_tokens_in = 0
-                step_tokens_out = 0
-            total_tokens_in += step_tokens_in
-            total_tokens_out += step_tokens_out
-
-            # ── 2. State 自动记录 assistant 消息 ──────────────────────
-            self._state.add_assistant_message(model_action)
-
-            # ── 3. 即时持久化 assistant 消息 ─────────────────────────
-            if self._store is not None:
-                self._store.append_message(
-                    self._state.last_message, turn_index=turn,
-                )
-
-            # ── 4. Process model action ───────────────────────────────
-            if isinstance(model_action, AssistantText):
-                # P1: Flush before completion
-                self._flush_store()
-                return self._finalize_outcome(
-                    RuntimeOutcome.completed(
-                        context.run_id, steps=steps_taken,
-                        tokens=total_tokens_in + total_tokens_out,
-                        summary=model_action.text[:500],
-                    ),
-                    total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks,
-                )
-
-            if isinstance(model_action, ModelStop):
-                self._flush_store()
-                return self._finalize_outcome(
-                    RuntimeOutcome.completed(
-                        context.run_id, steps=steps_taken,
-                        tokens=total_tokens_in + total_tokens_out,
-                        summary=model_action.text or model_action.stop_reason,
-                    ),
-                    total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks,
-                )
-
-            if isinstance(model_action, (ToolCall, ToolCallBatch)):
-                calls = (model_action,) if isinstance(model_action, ToolCall) else model_action.calls
-
-                # 执行工具（串行或并行）
-                if isinstance(model_action, ToolCallBatch) and len(calls) > 1:
-                    tool_results = _run_async_from_sync(
-                        self._process_tool_calls_parallel(calls, context=context)
-                    )
-                else:
-                    tool_results = self._process_tool_calls(calls, context=context)
-
-                # H4: Collect tool evidence
-                for tr in tool_results:
-                    tool_evidences.append(tr.evidence)
-
-                # Publish live events
-                for tr in tool_results:
-                    if tr.outcome is not None:
-                        self._ports.live_events.publish(
-                            event_type="tool.executed.v1",
-                            payload=freeze_json({
-                                "tool": tr.tool_call.name,
-                                "success": isinstance(tr.outcome, ToolSuccess),
-                            }),
-                            scope=_exec_scope,
-                        )
-
-                # ── 5. State 自动构造 tool_result（StepLoop 不碰 tool_use_id） ──
-                for tr in tool_results:
-                    self._state.add_tool_result(
-                        tr.outcome or ToolFailure(
-                            tool_name=tr.tool_call.name,
-                            error=tr.hook_deny_reason or "unknown",
-                            error_type=ToolErrorType.EXECUTION_ERROR,
-                        ),
-                        tr.tool_call,
-                    )
-                    # ── 6. 即时持久化 tool_result ────────────────────
-                    if self._store is not None:
-                        self._store.append_message(
-                            self._state.last_message, turn_index=turn,
-                        )
-
-                # T8: PostToolBatch hook
-                if len(tool_results) > 0:
-                    try:
-                        from hook_core.inputs import PostToolBatchInput
-                        self._ports.hooks.check(
-                            "PostToolBatch",
-                            PostToolBatchInput(
-                                session_id=str(context.session_id),
-                                tool_count=len(tool_results),
-                            ),
-                            tool_name="",
-                        )
-                    except Exception:
-                        pass
-
-                # P1: Flush after tool_use→tool_result pairs complete
-                self._flush_store()
-
-                continue
-
-            if isinstance(model_action, ModelRefusal):
-                return self._finalize_outcome(
-                    RuntimeOutcome.blocked(
-                        context.run_id, steps=steps_taken,
-                        tokens=total_tokens_in + total_tokens_out,
-                        blocked_by="model_refusal",
-                        detail=model_action.reason,
-                    ),
-                    total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks,
-                )
-
-            if isinstance(model_action, ModelFailure):
-                if model_action.retryable:
-                    continue
-                return self._finalize_outcome(
-                    RuntimeOutcome.failed(
-                        context.run_id,
-                        error=model_action.error,
-                        steps=steps_taken,
-                        tokens=total_tokens_in + total_tokens_out,
-                    ),
-                    total_tokens_in, total_tokens_out,
-                    tool_evidences, files_touched, hook_blocks,
-                )
-
-        return self._finalize_outcome(
-            RuntimeOutcome.blocked(
-                context.run_id, steps=steps_taken,
-                tokens=total_tokens_in + total_tokens_out,
-                blocked_by="max_steps",
-                detail=f"max_steps={context.max_steps}",
-            ),
-            total_tokens_in, total_tokens_out,
-            tool_evidences, files_touched, hook_blocks,
-        )
-
-    # ── Async main loop (CC query) ─────────────────────────────────────────
+    # ── Main loop (CC query) ─────────────────────────────────────────────────
 
     async def aiterate(
         self, context: RuntimeExecution, *,
@@ -418,6 +200,7 @@ class NativeStepLoop:
                 yield {"type": "cancelled", "outcome": outcome}
                 return
 
+            self._state.record_transition('step')
             steps_taken += 1
 
             # Context budget
@@ -436,9 +219,11 @@ class NativeStepLoop:
                     )
                     if asyncio.iscoroutine(_stream):
                         _stream = await _stream
+                    text_parts: list[str] = []
                     async for event in _stream:
                         from llm.base import StreamEventKind
                         if event.kind == StreamEventKind.TEXT_DELTA:
+                            text_parts.append(event.text)
                             yield {"type": "text_delta", "text": event.text}
                             if text_callback:
                                 text_callback(event.text)
@@ -453,7 +238,7 @@ class NativeStepLoop:
                             model_action = ToolCallBatch(calls=tuple(tool_uses))
                     else:
                         model_action = AssistantText(
-                            text="", stop_reason="end_turn",
+                            text="".join(text_parts), stop_reason="end_turn",
                         )
                 elif hasattr(self._backend, 'ainvoke'):
                     model_action = await self._backend.ainvoke(
@@ -461,9 +246,13 @@ class NativeStepLoop:
                         cancellation=context.cancellation,
                     )
                 else:
-                    model_action = self._backend.invoke(
-                        pruned_conv, tool_choice={"type": "auto"},
-                        cancellation=context.cancellation,
+                    # CC architecture: async loop demands async backend.
+                    # No silent fallback to sync invoke() — that blocks the
+                    # event loop and masks missing async support in backends.
+                    raise RuntimeError(
+                        f"Backend {type(self._backend).__name__!r} has neither "
+                        f"astream_iter nor ainvoke. All backends in the native "
+                        f"async path must implement async model calls."
                     )
             except Exception as exc:
                 outcome = RuntimeOutcome.failed(
@@ -517,6 +306,7 @@ class NativeStepLoop:
                         )
                     yield {"type": "tool_result", "tool_call": tr.tool_call, "outcome": tr.outcome}
 
+                self._state.record_transition('tool_use')
                 self._flush_store()
                 continue
 
@@ -537,6 +327,7 @@ class NativeStepLoop:
 
             if isinstance(model_action, ModelFailure):
                 if getattr(model_action, 'retryable', False):
+                    self._state.record_transition('error_retry')
                     continue
                 outcome = self._finalize_outcome(
                     RuntimeOutcome.failed(
@@ -548,6 +339,37 @@ class NativeStepLoop:
                     tool_evidences, files_touched, hook_blocks,
                 )
                 yield {"type": "failed", "outcome": outcome}
+                return
+
+            # CC: ModelRefusal → blocked (sync execute() parity)
+            if isinstance(model_action, ModelRefusal):
+                self._flush_store()
+                outcome = self._finalize_outcome(
+                    RuntimeOutcome.blocked(
+                        context.run_id, steps=steps_taken,
+                        tokens=total_tokens_in + total_tokens_out,
+                        blocked_by="model_refusal",
+                        detail=model_action.reason,
+                    ),
+                    total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks,
+                )
+                yield {"type": "blocked", "outcome": outcome}
+                return
+
+            # CC: ModelStop → completed (sync execute() parity)
+            if isinstance(model_action, ModelStop):
+                self._flush_store()
+                outcome = self._finalize_outcome(
+                    RuntimeOutcome.completed(
+                        context.run_id, steps=steps_taken,
+                        tokens=total_tokens_in + total_tokens_out,
+                        summary=model_action.text or model_action.stop_reason,
+                    ),
+                    total_tokens_in, total_tokens_out,
+                    tool_evidences, files_touched, hook_blocks,
+                )
+                yield {"type": "completed", "outcome": outcome}
                 return
 
         # max_steps 达到
@@ -562,138 +384,6 @@ class NativeStepLoop:
             tool_evidences, files_touched, hook_blocks,
         )
         yield {"type": "blocked", "outcome": outcome}
-
-    # ── Streaming model call (Phase 10) ────────────────────────────────────
-
-    def _stream_model_call(self, conversation, text_callback, *, cancellation):
-        """stream_iter → text_callback 实时输出 → 返回完整 ModelAction。
-
-        CC-aligned streaming pipeline:
-          TEXT_DELTA → text_callback (rendering)
-          TOOL_USE → collect
-          FINISH / end of stream → assemble ModelAction
-        Errors propagate as ModelFailure.
-        """
-        tool_uses: list[ToolCall] = []
-        final_text_parts: list[str] = []
-
-        try:
-            for event in self._backend.stream_iter(
-                conversation, tool_choice={"type": "auto"},
-            ):
-                if cancellation is not None and getattr(cancellation, 'cancelled', False):
-                    break
-                kind = getattr(event, 'kind', None)
-                if kind is None:
-                    continue
-                from llm.base import StreamEventKind
-                if kind == StreamEventKind.TEXT_DELTA:
-                    text = getattr(event, 'text', '') or ''
-                    if text:
-                        text_callback(text)
-                        final_text_parts.append(text)
-                elif kind == StreamEventKind.TOOL_USE:
-                    tc = getattr(event, 'tool_call', None)
-                    if tc is not None:
-                        tool_uses.append(tc)
-                elif kind == StreamEventKind.ERROR:
-                    return ModelFailure(
-                        error=getattr(event, 'text', '') or 'stream error',
-                        retryable=False,
-                    )
-                elif kind == StreamEventKind.FINISH:
-                    break
-        except Exception as exc:
-            return ModelFailure(
-                error=f"Stream failed: {exc}", retryable=True,
-            )
-
-        if tool_uses:
-            if len(tool_uses) == 1:
-                return tool_uses[0]
-            return ToolCallBatch(calls=tuple(tool_uses))
-        return AssistantText(
-            text="".join(final_text_parts), stop_reason="end_turn",
-        )
-
-    # ── Tool processing (same as old StepLoop — unchanged contract) ─────
-
-    def _process_tool_calls(
-        self, calls: tuple[ToolCall, ...],
-        context: RuntimeExecution | None = None,
-    ) -> list[ToolResult]:
-        """PreToolUse hook → permission → execute → PostToolUse hook."""
-        from hook_core.inputs import PreToolUseInput, PostToolUseInput
-
-        results: list[ToolResult] = []
-        for tc in calls:
-            if context is not None and context.cancellation.cancelled:
-                break
-
-            hook_input = PreToolUseInput(
-                tool_name=tc.name, tool_input=tc.params, tool_use_id=tc.id,
-                session_id=(
-                    str(context.session_id)
-                    if context is not None and context.session_id is not None
-                    else ""
-                ),
-                cwd=(
-                    context.workspace if context is not None and context.workspace else ""
-                ),
-            )
-            try:
-                gate_result = self._ports.hooks.check(
-                    "PreToolUse", hook_input, tool_name=tc.name,
-                )
-            except Exception:
-                gate_result = HookGateResult(allowed=False, reason="hook error")
-
-            if not gate_result.allowed:
-                results.append(ToolResult(
-                    tool_call=tc, hook_allowed=False,
-                    hook_deny_reason=gate_result.reason or "denied",
-                ))
-                continue
-
-            final_params = gate_result.updated_input or tc.params
-
-            if context is not None and context.cancellation.cancelled:
-                break
-
-            try:
-                tool_outcome = self._ports.tools.execute(
-                    tc.name, final_params, tc.id,
-                )
-            except Exception as exc:
-                tool_outcome = ToolFailure(
-                    tool_name=tc.name,
-                    error=f"{type(exc).__name__}: {exc}",
-                    error_type=ToolErrorType.EXECUTION_ERROR,
-                )
-
-            post_context = ""
-            try:
-                post_input = PostToolUseInput(
-                    tool_name=tc.name,
-                    tool_input=final_params,
-                    tool_output=getattr(tool_outcome, 'output', ''),
-                    tool_use_id=tc.id,
-                    success=isinstance(tool_outcome, ToolSuccess),
-                )
-                post_result = self._ports.hooks.check(
-                    "PostToolUse", post_input, tool_name=tc.name,
-                )
-                if post_result.additional_context:
-                    post_context = post_result.additional_context
-            except Exception:
-                pass
-
-            results.append(ToolResult(
-                tool_call=tc, outcome=tool_outcome,
-                hook_allowed=True, post_hook_context=post_context,
-            ))
-
-        return results
 
     # ── Async tool execution (CC runTools) ────────────────────────────────
 
@@ -809,90 +499,6 @@ class NativeStepLoop:
             tool_call=tc, outcome=tool_outcome,
             hook_allowed=True, post_hook_context=post_context,
         )
-
-    async def _process_tool_calls_parallel(
-        self, calls: tuple[ToolCall, ...],
-        context: RuntimeExecution,
-    ) -> list[ToolResult]:
-        """G19: 并行工具执行。"""
-        import asyncio
-
-        batches = self._scheduler.schedule(calls)
-        all_results: list[ToolResult] = []
-
-        for batch in batches:
-            if context.cancellation.cancelled:
-                break
-            if len(batch) == 1:
-                results = self._process_tool_calls(tuple(batch), context=context)
-                all_results.extend(results)
-            else:
-                results = await self._execute_parallel_batch(batch, context)
-                all_results.extend(results)
-
-        return all_results
-
-    async def _execute_parallel_batch(
-        self, batch: list[ToolCall], context: RuntimeExecution,
-    ) -> list[ToolResult]:
-        """Execute a single parallel batch."""
-        import asyncio
-        from hook_core.inputs import PreToolUseInput
-
-        results: list[ToolResult] = [None] * len(batch)  # type: ignore
-
-        # Phase 7: asyncio.to_thread so blocking tool.execute() calls
-        # run in real OS threads — not blocking the event loop.
-        async def _run_in_thread(idx: int, tc: ToolCall) -> None:
-            await asyncio.to_thread(_run_sync, idx, tc)
-
-        def _run_sync(idx: int, tc: ToolCall) -> None:
-            if context.cancellation.cancelled:
-                results[idx] = ToolResult(
-                    tool_call=tc, hook_allowed=False, hook_deny_reason="cancelled",
-                )
-                return
-            hook_input = PreToolUseInput(
-                tool_name=tc.name, tool_input=tc.params, tool_use_id=tc.id,
-                session_id=(
-                    str(context.session_id)
-                    if context is not None and context.session_id is not None
-                    else ""
-                ),
-                cwd=(
-                    context.workspace if context is not None and context.workspace else ""
-                ),
-            )
-            try:
-                gate = self._ports.hooks.check(
-                    "PreToolUse", hook_input, tool_name=tc.name,
-                )
-            except Exception:
-                gate = HookGateResult(allowed=False, reason="hook error")
-            if not gate.allowed:
-                results[idx] = ToolResult(
-                    tool_call=tc, hook_allowed=False,
-                    hook_deny_reason=gate.reason or "denied",
-                )
-                return
-            params = gate.updated_input or tc.params
-            try:
-                outcome = self._ports.tools.execute(tc.name, params, tc.id)
-            except Exception as exc:
-                outcome = ToolFailure(
-                    tool_name=tc.name, error=str(exc),
-                    error_type=ToolErrorType.EXECUTION_ERROR,
-                )
-            results[idx] = ToolResult(tool_call=tc, outcome=outcome, hook_allowed=True)
-
-        try:
-            async with asyncio.TaskGroup() as tg:
-                for i, tc in enumerate(batch):
-                    tg.create_task(_run_in_thread(i, tc))
-        except* Exception:
-            pass
-
-        return [r for r in results if r is not None]
 
     # ── Persistence helper ──────────────────────────────────────────────
 
