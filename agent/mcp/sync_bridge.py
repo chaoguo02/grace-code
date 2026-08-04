@@ -440,6 +440,54 @@ class SyncMCPToolManager:
                 f"MCP transport failed for '{server_name}': {exc}",
             ) from exc
 
+    async def aexecute_tool(
+        self,
+        runtime_tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout: float = 30.0,
+    ) -> MCPCallResult:
+        """CC tool.call() 等价 — async MCP 执行, 不阻塞事件循环.
+
+        Phase C: 直接 await bridge.call_tool (底层已 async)，去掉
+        run_coroutine_threadsafe 的 sync 外壳。
+        """
+        parsed = self._tool_map.get(runtime_tool_name)
+        if parsed is None:
+            parsed = self._parse_namespaced_name(runtime_tool_name)
+            if parsed is None:
+                raise KeyError(f"Invalid MCP tool name: {runtime_tool_name}")
+
+        server_name, tool_name = parsed
+        bridge = self._bridges.get(server_name)
+        if bridge is None:
+            raise ConnectionError(f"MCP server '{server_name}' is not connected")
+
+        if not bridge.is_connected:
+            logger.info("MCP server '%s' disconnected, attempting reconnect...", server_name)
+            if hasattr(self, "_loop") and self._loop is not None:
+                reconnected = await self._reconnect(server_name, bridge)
+                if not reconnected:
+                    raise ConnectionError(
+                        f"MCP server '{server_name}' is not connected and reconnection failed"
+                    )
+            else:
+                raise ConnectionError(
+                    f"MCP server '{server_name}' is not connected (no event loop for reconnect)"
+                )
+
+        try:
+            return await asyncio.wait_for(
+                bridge.call_tool(tool_name, arguments), timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise MCPToolTimeoutError(runtime_tool_name, timeout, 0)
+        except Exception as exc:
+            bridge.mark_disconnected()
+            raise ConnectionError(
+                f"MCP transport failed for '{server_name}': {exc}",
+            ) from exc
+
     def _parse_namespaced_name(self, namespaced_name: str) -> tuple[str, str] | None:
         parts = namespaced_name.split("__", 2)
         if len(parts) != 3 or parts[0] != "mcp" or not parts[1] or not parts[2]:

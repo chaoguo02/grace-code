@@ -837,6 +837,33 @@ def assemble(db_path: str, *,
                     _lookup = _resolve
             return _execute_via_registry(_lookup, tool_name, params, invocation_id)
 
+        async def aexecute(self, tool_name, params, invocation_id=""):
+            """CC tool.call() 等价 — async 执行工具, 不阻塞事件循环.
+
+            Phase C: async 是工具执行的核心接口。sync 工具用 to_thread 兜底
+            （迁移），逐个工具 override 为真 async。
+            """
+            import asyncio
+
+            # R2: dynamically-registered tools first (incl. mcp__ alias)
+            dyn = self._dynamic
+            resolved = tool_name
+            if tool_name not in dyn and tool_name.startswith("mcp__"):
+                parts = tool_name.split("__", 2)
+                if len(parts) >= 3 and parts[2] in dyn:
+                    resolved = parts[2]
+            if resolved in dyn:
+                tool = dyn[resolved]
+                # Prefer async execute, fall back to sync via to_thread
+                if hasattr(tool, 'aexecute'):
+                    return await tool.aexecute(params)
+                return await asyncio.to_thread(self._execute_dynamic, tool, tool_name, params, invocation_id)
+
+            # Fall back to sync path via to_thread (transition — later all async)
+            return await asyncio.to_thread(
+                self.execute, tool_name, params, invocation_id,
+            )
+
     # ── Test mode fake (when llm_backend is None) ──────────────────
     from runtime_core.native_llm_adapter import NativeBackendAdapter
 

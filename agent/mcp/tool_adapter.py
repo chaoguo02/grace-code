@@ -81,6 +81,7 @@ def deferred_mcp_tool(
     description: str,
     input_schema: dict[str, Any],
     execute_fn: Callable[[dict[str, Any]], Any],
+    aexecute_fn: Callable[[dict[str, Any]], Any] | None = None,
     connect_fn: Callable[[], None] | None = None,
     server_name: str = "",
     original_tool_name: str = "",
@@ -126,10 +127,37 @@ def deferred_mcp_tool(
                 },
             )
 
+    async def acall_fn(input: dict[str, Any]) -> ToolResult:
+        """CC tool.call() 等价 — async MCP 执行。
+
+        优先用 aexecute_fn (aexecute_tool 真 async)；缺失则 to_thread 包
+        sync execute_fn（过渡）。
+        """
+        import asyncio
+        try:
+            ensure_connected()
+            if aexecute_fn is not None:
+                result = await aexecute_fn(input)
+            else:
+                result = await asyncio.to_thread(execute_fn, input)
+            return _coerce_execute_result(name, result)
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=str(exc),
+                metadata={
+                    "mcp_server": server_name,
+                    "mcp_tool": original_tool_name or name,
+                    "mcp_error": str(exc),
+                },
+            )
+
     tool = build_tool(
         name=name,
         parameters_schema=input_schema,
         execute=call_fn,
+        aexecute=acall_fn,
         description=description,
         is_read_only=lambda _input: infer_mcp_is_read_only(
             original_tool_name or name, description,
@@ -175,6 +203,7 @@ def adapt_mcp_tools(tool_infos: list[MCPToolInfo], *, manager: Any, defer: bool 
                 description=info.description,
                 input_schema=info.input_schema,
                 execute_fn=lambda args, runtime_name=info.runtime_name: manager.execute_tool(runtime_name, args),
+                aexecute_fn=lambda args, runtime_name=info.runtime_name: manager.aexecute_tool(runtime_name, args),
                 server_name=info.server_name,
                 original_tool_name=info.name,
                 metadata=info.metadata,
@@ -187,6 +216,7 @@ def adapt_mcp_tools(tool_infos: list[MCPToolInfo], *, manager: Any, defer: bool 
                 description=info.description,
                 input_schema=info.input_schema,
                 execute_fn=lambda args, runtime_name=info.runtime_name: manager.execute_tool(runtime_name, args),
+                aexecute_fn=lambda args, runtime_name=info.runtime_name: manager.aexecute_tool(runtime_name, args),
                 server_name=info.server_name,
                 original_tool_name=info.name,
                 metadata=info.metadata,

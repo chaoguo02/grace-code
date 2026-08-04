@@ -6,7 +6,7 @@ second runtime Tool protocol and no proxy layer between MCP and the agent.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from core.base import (
@@ -41,6 +41,7 @@ class BuiltTool(BaseTool):
         self._description = description
         self._parameters_schema = dict(parameters_schema)
         self._execute = execute
+        self._aexecute = None  # Phase C: async execute (CC tool.call) — optional
         self.metadata = metadata or ToolMetadata()
         self.aliases = aliases
         self._is_enabled = is_enabled or (lambda: True)
@@ -139,6 +140,17 @@ class BuiltTool(BaseTool):
     def execute(self, params: dict[str, Any]) -> ToolResult:
         return self._execute(params)
 
+    async def aexecute(self, params: dict[str, Any]) -> ToolResult:
+        """CC tool.call() 等价 — async 执行。
+
+        _aexecute 设置时用真 async（MCP 直接接 bridge）；否则 to_thread
+        包 sync execute（过渡，功能正确）。
+        """
+        import asyncio
+        if self._aexecute is not None:
+            return await self._aexecute(params)
+        return await asyncio.to_thread(self._execute, params)
+
     def close(self, timeout: float = 5.0) -> None:
         if self._close is not None:
             self._close(timeout)
@@ -151,6 +163,7 @@ def build_tool(
     description: str = "",
     parameters_schema: dict[str, Any] | None = None,
     execute: Callable[[dict[str, Any]], ToolResult] | None = None,
+    aexecute: Callable[[dict[str, Any]], Awaitable[ToolResult]] | None = None,
     metadata: ToolMetadata | None = None,
     aliases: tuple[str, ...] = (),
     is_enabled: Callable[[], bool] | None = None,
@@ -187,6 +200,8 @@ def build_tool(
         close=close,
         mcp_props=mcp_props,
     )
+    if aexecute is not None:
+        tool_obj._aexecute = aexecute
     tool_obj._supports_cancellation = supports_cancellation
     tool_obj._parallel_safe = parallel_safe
     return tool_obj

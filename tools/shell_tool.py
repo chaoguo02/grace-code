@@ -225,7 +225,14 @@ class ShellTool(BaseTool):
             return f"{command} {' '.join(args)}" if args else command
         return params.get("cmd", "")
 
-    def execute(self, params: dict[str, Any]) -> ToolResult:
+    # ── Execution: async is the primary path (CC tool.call) ──────────────
+
+    async def aexecute(self, params: dict[str, Any]) -> ToolResult:
+        """CC tool.call() 等价 — async Bash, 不阻塞事件循环.
+
+        Phase C: execute 逻辑彻头彻尾 async — 所有 runtime 调用走 aexec
+        (asyncio.subprocess)。blocked/path/argv/shell 校验保留。
+        """
         cmd: str = params.get("cmd", "").strip()
         command: str = params.get("command", "").strip()
         args: list[str] = params.get("args", [])
@@ -245,12 +252,28 @@ class ShellTool(BaseTool):
             )
 
         if command:
-            return self._execute_parameterized(command, args, timeout, cwd, use_shell=use_shell)
-        return self._execute_legacy(cmd, timeout, cwd)
+            return await self._aexecute_parameterized(command, args, timeout, cwd, use_shell=use_shell)
+        return await self._aexecute_legacy(cmd, timeout, cwd)
 
-    # ── Parameterized execution (preferred) ──────────────────────────────
+    def execute(self, params: dict[str, Any]) -> ToolResult:
+        """Sync 兼容入口 — 仅无 loop 线程用（CLI 主线程、legacy 调用方）。
 
-    def _execute_parameterized(
+        CC 原则：async 是主路径。running loop 内调用 execute() 是
+        调用方 bug（应改 aexecute）——直接抛错，避免死锁。
+        """
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.aexecute(params))
+        raise RuntimeError(
+            f"ShellTool.execute() called from a running event loop — "
+            f"use ShellTool.aexecute() instead (CC async tool.call)."
+        )
+
+    # ── Parameterized execution (async) ─────────────────────────────────
+
+    async def _aexecute_parameterized(
         self, command: str, args: list[str], timeout: int, cwd: str | None, *, use_shell: bool = False,
     ) -> ToolResult:
         import logging, platform, shutil
@@ -261,7 +284,7 @@ class ShellTool(BaseTool):
         if blocked:
             return ToolResult(success=False, output="", error=f"Command blocked for safety: matched '{blocked}'")
 
-        # P0_3: workspace root already validated in execute(); keep path sandbox.
+        # P0_3: workspace root already validated in aexecute(); keep path sandbox.
         _ws_root = getattr(self._runtime, "_workspace_root", None)
         path_violation = _validate_workspace_paths(command, args, _ws_root)
         if path_violation:
@@ -278,10 +301,10 @@ class ShellTool(BaseTool):
         )
         if exe_path:
             try:
-                run_result = self._runtime.execute(exe_path, args=args, cwd=cwd, timeout=timeout)
+                run_result = await self._runtime.aexec(exe_path, args=args, cwd=cwd, timeout=timeout)
                 return self._build_result(run_result, cmd_repr)
             except Exception as exc:
-                _log.debug("direct execute failed for %s: %s", exe_path, exc)
+                _log.debug("direct aexec failed for %s: %s", exe_path, exc)
                 if not use_shell:
                     return ToolResult(
                         success=False, output="",
@@ -289,9 +312,6 @@ class ShellTool(BaseTool):
                     )
 
         # ── Step 2/3: Shell fallback — requires explicit opt-in ──
-        # P0_3: shell mode requires explicit use_shell=true.
-        # This prevents injection via args containing ; | $() etc
-        # when the command falls through to PowerShell -Command or cmd.exe.
         if not use_shell:
             return ToolResult(
                 success=False, output="",
@@ -316,16 +336,16 @@ class ShellTool(BaseTool):
             if ps_exe:
                 ps_args = ["-NoProfile", "-NonInteractive", "-Command", full_cmd]
                 try:
-                    run_result = self._runtime.execute(ps_exe, args=ps_args, cwd=cwd, timeout=timeout)
+                    run_result = await self._runtime.aexec(ps_exe, args=ps_args, cwd=cwd, timeout=timeout)
                     return self._build_result(run_result, cmd_repr)
                 except Exception as exc:
-                    _log.debug("powershell fallback failed: %s", exc)
+                    _log.debug("powershell aexec fallback failed: %s", exc)
 
             try:
-                run_result = self._runtime.exec(full_cmd, cwd=cwd, timeout=timeout)
+                run_result = await self._runtime.aexec("cmd.exe", args=["/C", full_cmd], cwd=cwd, timeout=timeout)
                 return self._build_result(run_result, cmd_repr)
             except Exception as exc:
-                _log.debug("exec(shell=True) failed: %s", exc)
+                _log.debug("cmd.exe fallback failed: %s", exc)
 
             return ToolResult(
                 success=False, output="",
@@ -337,7 +357,7 @@ class ShellTool(BaseTool):
 
         # ── Unix: direct execution ──
         try:
-            run_result = self._runtime.execute(command, args=args, cwd=cwd, timeout=timeout)
+            run_result = await self._runtime.aexec(command, args=args, cwd=cwd, timeout=timeout)
         except FileNotFoundError:
             return ToolResult(
                 success=False, output="",
@@ -345,24 +365,23 @@ class ShellTool(BaseTool):
             )
         return self._build_result(run_result, cmd_repr)
 
-    # ── Legacy execution ─────────────────────────────────────────────────
+    # ── Legacy execution (async) ────────────────────────────────────────
 
-    def _execute_legacy(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
+    async def _aexecute_legacy(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
         blocked = _check_blocked(cmd)
         if blocked:
             return ToolResult(success=False, output="", error=f"Command blocked for safety: matched '{blocked}'")
-        return self._run(cmd, timeout, cwd)
+        return await self._arun(cmd, timeout, cwd)
 
-    def _run(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
+    async def _arun(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
         import logging, platform
 
         if platform.system() == "Windows":
             _log = logging.getLogger(__name__)
-            # shutil.which bypasses WOW64 redirector; os.path.exists doesn't
             ps_exe = shutil.which("powershell.exe") or shutil.which("powershell")
             if ps_exe:
                 try:
-                    run_result = self._runtime.execute(
+                    run_result = await self._runtime.aexec(
                         ps_exe, args=["-NoProfile", "-NonInteractive", "-Command", cmd],
                         cwd=cwd, timeout=timeout,
                     )
@@ -370,7 +389,7 @@ class ShellTool(BaseTool):
                 except Exception:
                     pass
 
-        run_result = self._runtime.exec(cmd, cwd=cwd, timeout=timeout)
+        run_result = await self._runtime.aexec("cmd.exe", args=["/C", cmd], cwd=cwd, timeout=timeout)
         return self._build_result(run_result, cmd)
 
     def _build_result(self, run_result, cmd_repr: str) -> ToolResult:

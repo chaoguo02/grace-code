@@ -490,6 +490,16 @@ class BaseTool(ABC):
         """执行工具，返回 ToolResult。不抛异常——所有异常已在内部处理。"""
         ...
 
+    async def aexecute(self, params: dict[str, Any]) -> ToolResult:
+        """CC tool.call() 等价 — async 执行工具, 不阻塞事件循环.
+
+        Phase C: async 是工具系统的核心接口。sync 工具默认用 to_thread
+        兜底（迁移手段），逐个工具 override 为真 async（Bash → aexec,
+        file → async I/O, MCP → bridge.call_tool）。
+        """
+        import asyncio
+        return await asyncio.to_thread(self.execute, params)
+
     def to_llm_schema(
         self,
         *,

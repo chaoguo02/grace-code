@@ -388,6 +388,15 @@ class FileReadTool(BaseTool):
             }},
         )
 
+    async def aexecute(self, params: dict[str, Any]) -> ToolResult:
+        """CC tool.call() 等价 — async file read (to_thread 过渡).
+
+        Phase C: file I/O 通常快，真 async 收益低。to_thread 过渡，
+        后续如需并发行可换 aiofiles。
+        """
+        import asyncio
+        return await asyncio.to_thread(self.execute, params)
+
 
 class FileViewTool(BaseTool):
     metadata = ToolMetadata(
