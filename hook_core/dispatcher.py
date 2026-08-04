@@ -225,6 +225,11 @@ def _process_execution(
             result.block_reason = decision.reason or f"Hook '{hook.name}' denied"
             result.permission = PermissionDecision.DENY
             return result
+        if perm == PermissionDecision.ALLOW:
+            # CC-aligned: a hook ALLOW supersedes permission rules — the
+            # canUseTool permission gate is skipped for this tool call.
+            # Record it so _RealHooks can skip the permission pipeline.
+            result.permission = PermissionDecision.ALLOW
         if decision.reason and not result.block_reason:
             result.block_reason = decision.reason
 

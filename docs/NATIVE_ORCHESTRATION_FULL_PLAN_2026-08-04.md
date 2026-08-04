@@ -1,9 +1,9 @@
 # Native Orchestration — 全阶段实现计划（含单路径合并）
 
-> 文档版本：3.3.0（记忆系统设计完成）
-> 当前基线：全部 Phase 完成，记忆系统详细设计文档就绪
-> **v3.3 更新**：新增 [记忆系统 CC 对齐执行文档](./MEMORY_CC_ALIGNMENT_EXECUTION_2026-08-04.md)——
-> SQLite 实现 CC "LLM 选择"模式，废弃算法评分检索，改为目录+按需加载。
+> 文档版本：3.4.0（Phase 11 设计完成）
+> 当前基线：Phase 0-10 完成，Batch A+B 完成，记忆系统设计就绪
+> **v3.4 更新**：新增 [Phase 11 长生命周期 Session](./PHASE11_LONG_LIVED_SESSION_2026-08-04.md)——
+> CC async generator 模式，系统提示词+GRACE.md+记忆目录只注入一次，消除每轮 8K token 浪费。
 
 ---
 

@@ -402,11 +402,17 @@ def main() -> None:
 
     # M9: pass real backend + registry into the Native graph so _RealLLM /
     # _RealTools execute real work instead of the H1/H2 fake responses.
+    # P0-1: wire project permission rules (deny/ask/allow) + hooks into the
+    # native PermissionPipeline — without hook_settings the native gate is a
+    # no-op and even Layer 1 safety checks are skipped.
+    from hitl.settings_loader import build_native_hook_settings
+    _hook_settings = build_native_hook_settings(repo_path)
     print("  Assembling Native object graph...")
     components = assemble(
         db_path,
         llm_backend=service._backend,
         tool_registry=service._registry,
+        hook_settings=_hook_settings,
     )
     lifecycle = ApplicationLifecycle(components)
     lifecycle.start()

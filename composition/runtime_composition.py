@@ -408,11 +408,23 @@ def assemble(db_path: str, *,
     # 对齐 CC：permission_rules（settings.json 的 "Write": "deny" 等）必须在
     # Native StepLoop 生效。PermissionPipeline 同时承载 deny/ask/allow 规则 +
     # 权限模式 + RiskLevel/TrustAccumulator（Phase 2 已接线）。
-    _permission_pipeline = None
+    #
+    # P0-1: PermissionPipeline 必须始终存在——即使 settings 没有显式规则。
+    # 原因：(a) Layer 1 validateInput（工具自身黑名单 + 保护路径）是安全底线，
+    # 不依赖任何规则；(b) 没有 pipeline 时 _RealHooks 会跳过整个权限 gate，
+    # 连 deny 规则都不生效。空规则 → 退化为 builtin 安全默认（acceptEdits）。
+    #
+    # P0-2: approval_mode=AUTO —— native 是 headless 无交互，CC 语义下
+    # headless 的 "ask" = auto-deny。AUTO 让未分类工具直接放行（等价 legacy
+    # web 的 approval_mode="auto"），而 ask 规则因 force_interactive 会跳过
+    # AUTO 分支落到 INTERACTIVE DENY —— 这样 _RealHooks 拦截 INTERACTIVE
+    # DENY 才是安全的（不会误伤普通工具），ask 规则在 native 下变成硬拒绝
+    # 而非静默执行。
+    from hitl.permission_rule import PermissionRule
+    from hitl.pipeline import PermissionPipeline, ToolApprovalMode
+
+    _perm_rules_list = []
     if _perm_rules:
-        from hitl.permission_rule import PermissionRule
-        from hitl.pipeline import PermissionPipeline
-        _perm_rules_list = []
         for _pat, _tier in _perm_rules.items():
             try:
                 _perm_rules_list.append(
@@ -420,10 +432,31 @@ def assemble(db_path: str, *,
                 )
             except ValueError:
                 continue  # 跳过非法规则语法
-        if _perm_rules_list:
-            _permission_pipeline = PermissionPipeline(rules=_perm_rules_list)
-            if _perm_mode:
-                _permission_pipeline.set_permission_mode(_perm_mode)
+    if not _perm_rules_list:
+        # P0-2: native 用 acceptEdits 规则集（不含 Write/Edit ASK）。
+        # legacy 的 _builtin_defaults() 把 Write/Edit 标 ASK → native headless
+        # 下 ask=auto-deny → 主 agent 无法写文件。builtin_native_rules()
+        # 只保留 deny(blocked) + allow(readonly) + ask(危险命令)。
+        # Write/Edit 不在规则集 → acceptEdits 模式自动批准（CC coding agent）。
+        from hitl.settings_loader import builtin_native_rules
+        _perm_rules_list = builtin_native_rules()
+    # P0-3: bind project_root so Layer 5 path sandbox resolves relative to the
+    # real repo (db lives at <repo>/.grace/grace.db → repo root is two levels up).
+    import os as _os
+    _repo_root = _os.path.abspath(
+        _os.path.dirname(_os.path.dirname(db_path))
+        if _os.path.basename(_os.path.dirname(db_path)) == ".grace"
+        else _os.path.dirname(db_path)
+    )
+    _permission_pipeline = PermissionPipeline(
+        rules=_perm_rules_list,
+        approval_mode=ToolApprovalMode.AUTO,
+        project_root=_repo_root,
+    )
+    # P0-2: native 主 agent（build/orchestrator）是 coding agent → acceptEdits。
+    # 显式 permission_mode（如 plan）优先；空则 acceptEdits 让 Write/Edit 自动批准。
+    _effective_perm_mode = _perm_mode or "acceptEdits"
+    _permission_pipeline.set_permission_mode(_effective_perm_mode)
 
     # ── Runtime ─────────────────────────────────────────────────────
     from runtime_core.ports import (
@@ -481,41 +514,132 @@ def assemble(db_path: str, *,
     CHandle.set_process_registry(_proc_registry)
 
     class _RealHooks:
-        """Hook gate — PermissionPipeline (R1) + HookDispatcher.
+        """Hook gate — HookDispatcher + PermissionPipeline (CC-aligned order).
 
-        对齐 CC "权限是动态流水线"：PreToolUse 先经 PermissionPipeline 评估
-        （permission_rules + 权限模式 + RiskLevel/Trust），DENY 直接拦截；
-        ALLOW/未命中 → 继续 HookDispatcher（用户 hook 仍可 deny）。
+        CC tool-call order (runToolUse → streamedCheckPermissionsAndCallTool):
+          1. PreToolUse hooks     — user scripts, HIGHEST priority, bypass-immune
+          2. canUseTool permission — deny/ask/allow rules + mode + callback
+          3. tool.call()
+          4. PostToolUse hooks
+
+        Each layer owns a distinct concern:
+          - HookDispatcher  → "should this run?"  (user policy, safety scripts,
+                               absolute floor — a hook deny applies even in
+                               bypassPermissions, and a hook allow supersedes
+                               permission rules)
+          - PermissionPipeline → "may this run?"  (permission rules + mode +
+                               per-session ask interaction)
+
+        Order here matches CC: hooks run FIRST.  A blocking hook short-circuits
+        before permission (so user scripts override rules).  If hooks pass, the
+        permission gate decides.  Permission ALLOW that skips hooks is avoided —
+        hooks always see every tool call (CC recommendation for must-run checks).
+
+        P0-3: per-session PermissionPipeline copy + web_confirm_callback registry.
         """
         def __init__(self, dispatcher, permission_pipeline=None,
                      tool_registry=None):
             self._dispatcher = dispatcher
+            self._base_permission = permission_pipeline
             self._permission = permission_pipeline
             self._tool_registry = tool_registry
+            self._session_confirm_callbacks: dict[str, Callable] = {}
+            self._session_pipelines: dict[str, object] = {}
+            import threading as _threading
+            self._session_lock = _threading.Lock()
+
+        def register_session_confirm(self, session_id: str, callback) -> None:
+            """Register a per-session web_confirm_callback (CC control_response).
+
+            Called by the web layer (ChatPipeline) before a run starts, so the
+            pipeline's Layer 6 ask rule can block on the user's decision instead
+            of silently executing the tool.
+            """
+            with self._session_lock:
+                self._session_confirm_callbacks[session_id] = callback
+                self._session_pipelines.pop(session_id, None)  # invalidate copy
+
+        def _pipeline_for(self, session_id: str):
+            """Return the per-session PermissionPipeline (base + confirm cb).
+
+            Uses ``PermissionPipeline.scoped()`` (deep-copied rule lists +
+            isolated denial counters) rather than raw copy.copy so per-session
+            state never leaks across sessions.  The confirm callback is applied
+            via configure_session on the per-session clone only.
+            """
+            if self._base_permission is None:
+                return None
+            if not session_id:
+                return self._base_permission
+            with self._session_lock:
+                cached = self._session_pipelines.get(session_id)
+                if cached is not None:
+                    return cached
+                from hitl.pipeline import PermissionSessionConfig
+                clone = self._base_permission.scoped(self._base_permission._project_root or ".")
+                cb = self._session_confirm_callbacks.get(session_id)
+                if cb is not None:
+                    clone.configure_session(PermissionSessionConfig(
+                        session_id=session_id,
+                        web_confirm_callback=cb,
+                    ))
+                self._session_pipelines[session_id] = clone
+                return clone
 
         def check(self, event_type, hook_input, tool_name=""):
-            # R1: PreToolUse → permission pipeline gate first
-            if event_type == "PreToolUse" and self._permission is not None:
-                denied = self._permission_gate(tool_name, hook_input)
-                if denied is not None:
-                    return denied
-            result = self._dispatcher.dispatch(event_type, hook_input, tool_name=tool_name)
+            # CC-aligned: hooks run FIRST (bypass-immune), then permission.
+            # HookDispatcher owns "should this run?"; PermissionPipeline owns
+            # "may this run?".  A blocking hook short-circuits before permission
+            # so user scripts override rules (CC documented behavior).
+            hook_result = self._dispatcher.dispatch(
+                event_type, hook_input, tool_name=tool_name,
+            )
+            if event_type == "PreToolUse":
+                if hook_result.blocked:
+                    # Hook deny — absolute floor, even in bypassPermissions.
+                    return HookGateResult(
+                        allowed=False,
+                        reason=hook_result.block_reason or "blocked by hook",
+                        updated_input=hook_result.updated_input,
+                        additional_context=hook_result.additional_context,
+                    )
+                # CC-aligned: a hook ALLOW supersedes permission rules —
+                # canUseTool is skipped for this tool call.
+                if getattr(hook_result, "permission", None) is not None:
+                    from hitl.pipeline import PermissionDecision
+                    if hook_result.permission is PermissionDecision.ALLOW:
+                        return HookGateResult(
+                            allowed=True,
+                            reason="allowed by PreToolUse hook",
+                            updated_input=hook_result.updated_input,
+                            additional_context=hook_result.additional_context,
+                        )
+                # Hooks passed (no explicit decision) — permission gate decides.
+                if self._permission is not None:
+                    denied = self._permission_gate(tool_name, hook_input)
+                    if denied is not None:
+                        return denied
             return HookGateResult(
-                allowed=not result.blocked,
-                reason=result.block_reason,
-                updated_input=result.updated_input,
-                additional_context=result.additional_context,
+                allowed=not hook_result.blocked,
+                reason=hook_result.block_reason,
+                updated_input=hook_result.updated_input,
+                additional_context=hook_result.additional_context,
             )
 
         def _permission_gate(self, tool_name, hook_input):
             """PermissionPipeline 评估；明确 DENY 返回阻止结果，否则 None（继续）。
 
-            只拦截**非 INTERACTIVE 层**的 DENY（Layer 1 安全底线 / Layer 3 规则 /
-            Layer 4 模式）。Native headless 无交互回调时，Layer 6 会 fail closed
-            返回 DENY(layer=INTERACTIVE)——那不代表规则拒绝，必须放行给
-            HookDispatcher / StepLoop 的 PermissionRequest 处理。
+            P0-2/P0-3: 使用 per-session pipeline（带该 session 的
+            web_confirm_callback）。行为：
+              - 有回调的 ask 规则 → pipeline 阻塞等用户决策，返回 ALLOW 或
+                DENY(非 INTERACTIVE)，本函数如实执行/拦截。
+              - 无回调（headless）的 ask 规则 → pipeline 返回 DENY(INTERACTIVE)
+                = CC 语义 "headless 下 ask = auto-deny" → 拦截（fail-closed）。
+              - 未分类工具 → approval_mode=AUTO 直接 ALLOW，不受影响。
+            所以 INTERACTIVE 层 DENY 现在必须拦截，不再放行。
             """
-            from hitl.pipeline import PermissionDecision, PermissionLayer
+            from hitl.pipeline import PermissionDecision
+            session_id = str(getattr(hook_input, "session_id", "") or "")
             tool = self._resolve_tool(tool_name)
             if tool is None:
                 return None  # 无法 resolve 工具 → 跳过 permission
@@ -525,9 +649,11 @@ def assemble(db_path: str, *,
                 thaw_json(params) if hasattr(params, '__dataclass_fields__')
                 else (params or {})
             )
-            perm_result = self._permission.check(tool, params_dict)
-            if (perm_result.decision is PermissionDecision.DENY
-                    and perm_result.layer is not PermissionLayer.INTERACTIVE):
+            pipeline = self._pipeline_for(session_id)
+            if pipeline is None:
+                return None
+            perm_result = pipeline.check(tool, params_dict)
+            if perm_result.decision is PermissionDecision.DENY:
                 return HookGateResult(
                     allowed=False,
                     reason=perm_result.reason or "denied by permission rule",

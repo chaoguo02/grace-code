@@ -728,7 +728,15 @@ def chat(
         _grace_db = os.path.join(str(repo_path), ".grace", "grace.db")
         _conv_store = SqliteStorageBackend(_grace_db)
         from composition.runtime_composition import assemble
-        _components = assemble(_grace_db, llm_backend=backend, tool_registry=registry)
+        # P0-1: wire project permission rules into the native PermissionPipeline
+        from hitl.settings_loader import build_native_hook_settings
+        _hook_settings = build_native_hook_settings(str(repo_path))
+        _components = assemble(
+            _grace_db,
+            llm_backend=backend,
+            tool_registry=registry,
+            hook_settings=_hook_settings,
+        )
         _agent_runtime = _components.runtime
     except Exception:
         pass  # fall back to legacy SessionRuntime path

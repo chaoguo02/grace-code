@@ -54,6 +54,22 @@ from runtime_core.ports import (
 from runtime_core.tool_scheduler import ToolScheduler
 
 
+def _run_async_from_sync(coro):
+    """Run a coroutine from a synchronous call site.
+
+    P1-1: ``NativeStepLoop.execute()`` is a synchronous loop running in a
+    worker thread (the caller isolates it via ``asyncio.to_thread`` — see the
+    Phase 11 ``SessionAgent`` design).  That thread has no running event loop,
+    so ``asyncio.run()`` is always safe here.  Calling ``execute()`` directly
+    on a thread that owns a running loop is a caller bug (it would block the
+    loop); the ``asyncio.run`` RuntimeError surfaces that clearly rather than
+    deadlocking.
+    """
+    import asyncio
+
+    return asyncio.run(coro)
+
+
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     """Result of processing one tool call through hook+execute."""
@@ -254,8 +270,7 @@ class NativeStepLoop:
 
                 # 执行工具（串行或并行）
                 if isinstance(model_action, ToolCallBatch) and len(calls) > 1:
-                    import asyncio
-                    tool_results = asyncio.run(
+                    tool_results = _run_async_from_sync(
                         self._process_tool_calls_parallel(calls, context=context)
                     )
                 else:
@@ -419,6 +434,11 @@ class NativeStepLoop:
 
             hook_input = PreToolUseInput(
                 tool_name=tc.name, tool_input=tc.params, tool_use_id=tc.id,
+                session_id=(
+                    str(context.session_id)
+                    if context is not None and context.session_id is not None
+                    else ""
+                ),
             )
             try:
                 gate_result = self._ports.hooks.check(
@@ -518,6 +538,11 @@ class NativeStepLoop:
                 return
             hook_input = PreToolUseInput(
                 tool_name=tc.name, tool_input=tc.params, tool_use_id=tc.id,
+                session_id=(
+                    str(context.session_id)
+                    if context is not None and context.session_id is not None
+                    else ""
+                ),
             )
             try:
                 gate = self._ports.hooks.check(

@@ -65,6 +65,7 @@ class ChatPipelinePorts:
     accumulate_session_stats: Callable[[str, RunResult], None]
     compact_session_async: Callable[[str], None]
     coordinator: Any  # R3: RunCoordinator (required — Phase 0a: single native path)
+    hooks: Any = None  # P0-3: native _RealHooks — register_session_confirm(session_id, cb)
     memory_context: Any = None  # Phase 10 Batch B: MemoryContext for catalog injection
     finalize_run: Callable[..., bool] = lambda *args, **kwargs: False
     event_bus: Any = None
@@ -440,6 +441,20 @@ class ChatPipeline:
         sid = CoreSid(request.session_id)
         run_id = CoreRunId(str(_uuid.uuid4()))
         prompt = self._render_prepared_prompt(prepared)
+
+        # P0-3: register per-session web_confirm_callback into native _RealHooks.
+        # Without this, ask rules (dangerous commands) fail-closed in headless
+        # native.  The callback (ApprovalBroker bridge) lets the frontend approve
+        # via WS approval_required → HTTP tool-approve, matching CC's
+        # control_request / control_response.  `prepared.confirm_callback` was
+        # built by build_callbacks() from _build_web_confirm_callback().
+        if self._ports.hooks is not None and prepared.confirm_callback is not None:
+            try:
+                self._ports.hooks.register_session_confirm(
+                    request.session_id, prepared.confirm_callback,
+                )
+            except Exception:
+                pass  # best-effort: headless fallback to fail-closed
 
         # Build conversation — CC-aligned layered construction
         # Order: system prompt → project rules → memory catalog → session context → history → prompt

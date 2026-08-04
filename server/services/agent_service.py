@@ -985,6 +985,7 @@ class AgentService:
             event_bus=self._event_bus,
             plan_revisions=self._plan_revisions,
             coordinator=self._native_components.run_coordinator,
+            hooks=self._native_components.runtime_ports.hooks,  # P0-3: native _RealHooks
             memory_context=self._memory_context,
             # Phase 0a: coordinator is always present (single native path)
         )

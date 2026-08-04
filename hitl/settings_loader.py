@@ -17,6 +17,65 @@ from hitl.permission_rule import PermissionRule, PermissionRuleTier
 DEFAULT_SETTINGS_FILE = ".forge-agent/settings.json"
 
 
+def builtin_native_rules() -> list[PermissionRule]:
+    """CC-aligned native defaults (headless, no interactive prompt).
+
+    Difference from ``_builtin_defaults()``: Write/Edit are NOT marked ASK.
+    CC's coding agent runs in acceptEdits mode — file edits are auto-approved,
+    only dangerous operations (destructive shell, network) require interaction.
+    In native headless, ask = auto-deny, so marking Write/Edit as ASK would
+    block ALL file writes.  The native object graph sets permission_mode=
+    acceptEdits and uses this rule set.
+
+    Layering (CC-aligned):
+      - deny:      _BLOCKED_PATTERNS (Layer 1 safety floor) + destructive shell
+      - allow:     read-only tools + read-only shell commands
+      - ask:       destructive / network commands (docker, rm, git push, curl...)
+      - Write/Edit: NOT in any rule → acceptEdits mode auto-approves them
+    """
+    from tools.shell_tool import _BLOCKED_PATTERNS
+
+    rules: list[PermissionRule] = []
+
+    # deny: derived from _BLOCKED_PATTERNS (absolute safety floor)
+    for pattern in _BLOCKED_PATTERNS:
+        safe_pattern = pattern.rstrip()
+        rules.append(PermissionRule.parse(f"shell({safe_pattern} *)", tier=PermissionRuleTier.DENY, source="builtin"))
+
+    # allow: read-only tools (non-shell)
+    allow_tools = [
+        "Read", "file_view", "Grep", "Glob", "find_symbol",
+        "WebSearch", "WebFetch", "git_status", "git_diff",
+    ]
+    for t in allow_tools:
+        rules.append(PermissionRule.parse(t, tier=PermissionRuleTier.ALLOW, source="builtin"))
+
+    # allow: read-only shell commands
+    _READONLY_COMMANDS = (
+        "ls", "dir", "pwd", "echo", "cat", "head", "tail",
+        "wc", "sort", "uniq", "cut", "tr",
+        "date", "env", "printenv", "which", "type",
+        "du", "df", "free", "uptime",
+        "find", "locate", "xargs", "tee",
+        "grep", "rg", "awk", "sed",
+    )
+    for cmd in _READONLY_COMMANDS:
+        rules.append(PermissionRule.parse(f"shell({cmd} *)", tier=PermissionRuleTier.ALLOW, source="builtin"))
+
+    # ask: potentially destructive or network-exposed commands (headless → auto-deny)
+    _CONFIRM_COMMANDS = (
+        "git push", "git commit", "npm publish", "npm install -g",
+        "pip install", "docker", "docker-compose", "kubectl", "helm",
+        "terraform", "ansible", "systemctl", "service",
+        "chmod", "chown", "rm", "mv", "cp -r",
+        "scp", "rsync", "curl", "wget",
+    )
+    for cmd in _CONFIRM_COMMANDS:
+        rules.append(PermissionRule.parse(f"shell({cmd} *)", tier=PermissionRuleTier.ASK, source="builtin"))
+
+    return rules
+
+
 def load_permission_settings(
     project_path: str,
     settings_file: str = DEFAULT_SETTINGS_FILE,
@@ -56,6 +115,55 @@ def load_permission_settings(
 
     hooks = data.get("hooks", {}).get("PreToolUse", [])
     return rules, hooks
+
+
+def build_native_hook_settings(
+    project_path: str,
+    settings_file: str = DEFAULT_SETTINGS_FILE,
+) -> dict[str, Any]:
+    """Convert project settings.json into the native ``hook_settings`` dict.
+
+    The native object graph (``composition.runtime_composition.assemble``)
+    consumes a ``hook_settings`` dict shaped like::
+
+        {
+            "hooks": {...},
+            "permission_rules": {"Write": "deny", "Read": "allow"},
+            "permission_mode": "acceptEdits",
+        }
+
+    Legacy settings.json stores permissions as flat arrays under
+    ``permissions.deny/ask/allow``.  This helper reads that file and reshapes
+    it into the native format so web/CLI entry points can wire real rules into
+    the PermissionPipeline instead of falling back to builtin defaults.
+    """
+    # Project settings live at .grace/settings.json; legacy bootstrap read
+    # .forge-agent/settings.json.  Prefer the project location, fall back to
+    # the legacy one so both shapes are honored.
+    candidates = [
+        Path(project_path) / settings_file,
+        Path(project_path) / ".grace" / "settings.json",
+    ]
+    data: dict[str, Any] = {}
+    for _candidate in candidates:
+        if _candidate.exists():
+            try:
+                data = json.loads(_candidate.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = {}
+            break
+
+    permission_rules: dict[str, str] = {}
+    perms = data.get("permissions", {})
+    for tier in ("deny", "ask", "allow"):
+        for raw in perms.get(tier, []):
+            permission_rules[str(raw)] = tier
+
+    return {
+        "hooks": data.get("hooks", {}),
+        "permission_rules": permission_rules,
+        "permission_mode": str(data.get("permission_mode", "") or ""),
+    }
 
 
 def save_rule_to_settings(settings_path: str, rule: PermissionRule) -> None:
