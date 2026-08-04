@@ -289,7 +289,7 @@ if hasattr(self._ports, 'memory_context'):
 | 3 | 废弃标记 `memory/recall.py` | 模块 docstring | +10 |
 | 4 | `ChatPipelinePorts` + `agent_service` 接线 | +`memory_context` 字段 + 传入 | +3 |
 | 5 | `_execute_native()` 注入 MEMORY 目录 | +6 |
-| 6 | `_execute_native()` 注入项目指令 (GRADE.md) | +4 |
+| 6 | `_execute_native()` 注入项目指令 (GRACE.md) | +4 |
 | 7 | `_execute_native()` 注入 session context | +3 |
 | 8 | `_execute_native()` post-run memory 提取 | +10 |
 | 9 | 验证 `memory_read` 在 native 路径可用 | 确认 | — |

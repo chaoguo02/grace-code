@@ -65,6 +65,7 @@ class ChatPipelinePorts:
     accumulate_session_stats: Callable[[str, RunResult], None]
     compact_session_async: Callable[[str], None]
     coordinator: Any  # R3: RunCoordinator (required — Phase 0a: single native path)
+    memory_context: Any = None  # Phase 10 Batch B: MemoryContext for catalog injection
     finalize_run: Callable[..., bool] = lambda *args, **kwargs: False
     event_bus: Any = None
     plan_revisions: Any = None
@@ -440,8 +441,11 @@ class ChatPipeline:
         run_id = CoreRunId(str(_uuid.uuid4()))
         prompt = self._render_prepared_prompt(prepared)
 
-        # Build conversation — CC-aligned: primary agent system prompt first
+        # Build conversation — CC-aligned layered construction
+        # Order: system prompt → project rules → memory catalog → session context → history → prompt
         msgs = []
+
+        # 1. Primary agent system prompt (efc1ce9)
         try:
             from agent.session.agent_definition import load_agent_definitions
             _defs = load_agent_definitions(project_dir=self._ports.repo_path)
@@ -450,12 +454,38 @@ class ChatPipeline:
                 msgs.append({"role": "system", "content": _def.system_prompt})
         except Exception:
             pass
+
+        # 2. Project rules (GRACE.md — CC CLAUDE.md equivalent, context/claude_md.py)
+        try:
+            from context.claude_md import load as load_project_instructions
+            _project_rules = load_project_instructions(self._ports.repo_path)
+            if _project_rules:
+                msgs.append({"role": "system", "content": _project_rules})
+        except Exception:
+            pass
+
+        # 3. Memory catalog (CC MEMORY.md style, Grace Code extension)
+        if hasattr(self._ports, 'memory_context') and self._ports.memory_context is not None:
+            try:
+                from memory.catalog import build_memory_catalog
+                _catalog = build_memory_catalog(self._ports.memory_context.store)
+                if _catalog:
+                    msgs.append({"role": "system", "content": _catalog})
+            except Exception:
+                pass
+
+        # 4. Session context (plan context / change tracking)
+        if prepared.session_context_text:
+            msgs.append({"role": "user", "content": prepared.session_context_text})
+
+        # 5. Cross-turn history
         if hasattr(self._ports.session_service, 'get_messages'):
             try:
                 msgs.extend(self._ports.session_service.get_messages(request.session_id, limit=50))
             except Exception:
                 pass
-        # Append the current user prompt
+
+        # 6. Current user prompt
         msgs.append({"role": "user", "content": prompt})
         conv = ConversationSnapshot(messages=tuple(msgs))
 
