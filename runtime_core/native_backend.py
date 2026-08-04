@@ -207,6 +207,7 @@ class NativeBackend:
         """
         instance = object.__new__(cls)
         instance._client = getattr(anthropic_backend, "_client")
+        instance._async_client = getattr(anthropic_backend, "_async_client", None)
         instance._model = getattr(anthropic_backend, "_model", "")
         instance._max_tokens = getattr(anthropic_backend, "_max_tokens", 4096)
         instance._timeout_seconds = getattr(anthropic_backend, "_timeout_seconds", 60.0)
@@ -328,6 +329,113 @@ class NativeBackend:
                         )
 
                 final = stream.get_final_message()
+                native_response = _parse_sdk_response(final)
+
+                for tu in native_response.tool_uses:
+                    yield StreamEvent(
+                        kind=StreamEventKind.TOOL_USE,
+                        tool_call=MACToolCall(
+                            id=tu.id, name=tu.name,
+                            params=tu.input,  # type: ignore[arg-type]
+                        ),
+                    )
+
+                yield StreamEvent(
+                    kind=StreamEventKind.FINISH,
+                    text=native_response.text,
+                    finish_message=native_response.text,
+                )
+
+        except Exception as exc:
+            yield StreamEvent(kind=StreamEventKind.ERROR, text=str(exc))
+
+    # ── Async (CC callModel) ─────────────────────────────────────────────
+
+    async def ainvoke(
+        self,
+        conversation: NativeConversation,
+        *,
+        tool_choice: dict | None = None,
+        cancellation: object | None = None,
+        model: str = "",
+    ) -> ModelAction:
+        """CC callModel() 等价 — async 调用, 不阻塞事件循环。
+
+        Uses AsyncAnthropic client.  Same logic as invoke() but awaited.
+        """
+        import asyncio
+
+        # P0: Protocol pre-validation
+        from runtime_core.message_validator import validate_messages
+        validation = validate_messages(conversation)
+        validation.raise_if_invalid()
+
+        # P2: Cancellation check
+        if cancellation is not None and hasattr(cancellation, 'cancelled'):
+            if cancellation.cancelled:
+                return ModelFailure(
+                    error="Cancelled before LLM call", retryable=False,
+                )
+
+        system_content = _extract_system(conversation)
+        non_system = conversation.non_system_messages
+        api_messages = [_native_msg_to_api_dict(m) for m in non_system]
+
+        kwargs: dict[str, Any] = {
+            "model": model if model else self._model,
+            "max_tokens": self._max_tokens,
+            "messages": api_messages,
+        }
+        if system_content:
+            kwargs["system"] = system_content
+        if self._cached_api_tools:
+            kwargs["tools"] = self._cached_api_tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+
+        # Async call — does not block the event loop.
+        response = await self._async_client.messages.create(**kwargs)
+        native_response = _parse_sdk_response(response)
+        return native_response.to_model_action()
+
+    async def astream_iter(
+        self,
+        conversation: NativeConversation,
+        *,
+        tool_choice: dict | None = None,
+        model: str = "",
+    ):
+        """CC callModel() async generator — 流式 await, 不阻塞事件循环。
+
+        Same event semantics as stream_iter() but async (AsyncAnthropic).
+        """
+        from llm.base import StreamEvent, StreamEventKind
+
+        system_content = _extract_system(conversation)
+        non_system = conversation.non_system_messages
+        api_messages = [_native_msg_to_api_dict(m) for m in non_system]
+
+        kwargs: dict[str, Any] = {
+            "model": model if model else self._model,
+            "max_tokens": self._max_tokens,
+            "messages": api_messages,
+        }
+        if system_content:
+            kwargs["system"] = system_content
+        if self._cached_api_tools:
+            kwargs["tools"] = self._cached_api_tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+
+        try:
+            async with self._async_client.messages.stream(**kwargs) as stream:
+                async for text_chunk in stream.text_stream:
+                    if text_chunk:
+                        yield StreamEvent(
+                            kind=StreamEventKind.TEXT_DELTA, text=text_chunk,
+                        )
+
+                final = await stream.get_final_message()
                 native_response = _parse_sdk_response(final)
 
                 for tu in native_response.tool_uses:

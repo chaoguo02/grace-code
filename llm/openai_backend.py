@@ -66,8 +66,12 @@ class OpenAIBackend(LLMBackend):
         self._client_lock = threading.Lock()
         self._closed = False
         try:
-            from openai import OpenAI
+            from openai import OpenAI, AsyncOpenAI
             self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds)
+            # Phase A: async client — CC callModel() 不阻塞事件循环。
+            self._async_client = AsyncOpenAI(
+                api_key=api_key, base_url=base_url, timeout=timeout_seconds,
+            )
         except ImportError:
             raise ImportError("openai package not installed. Run: pip install openai")
 
@@ -84,6 +88,11 @@ class OpenAIBackend(LLMBackend):
     @property
     def model_name(self) -> str:
         return self._model
+
+    @property
+    def async_client(self):
+        """Async OpenAI client — CC callModel() 异步调用。"""
+        return self._async_client
 
     @property
     def supports_function_calling(self) -> bool:

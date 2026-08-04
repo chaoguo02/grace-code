@@ -41,6 +41,11 @@ class AnthropicBackend(LLMBackend):
         try:
             import anthropic as _anthropic
             self._client = _anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds)
+            # Phase A: async client — CC callModel() 不阻塞事件循环的前提。
+            # 同步 client 保留给 legacy 路径；async 用于 Native async 主循环。
+            self._async_client = _anthropic.AsyncAnthropic(
+                api_key=api_key, timeout=timeout_seconds,
+            )
         except ImportError:
             raise ImportError("anthropic package not installed. Run: pip install anthropic")
 
@@ -51,6 +56,11 @@ class AnthropicBackend(LLMBackend):
     @property
     def model_name(self) -> str:
         return self._model
+
+    @property
+    def async_client(self):
+        """Async Anthropic client — CC callModel() 异步调用。"""
+        return self._async_client
 
     @property
     def max_context_window(self) -> int:

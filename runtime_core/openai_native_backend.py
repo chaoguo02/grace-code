@@ -196,8 +196,14 @@ class OpenAINativeBackend:
         use_function_calling: bool = True,
     ):
         try:
-            from openai import OpenAI
+            from openai import OpenAI, AsyncOpenAI
             self._client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=timeout_seconds,
+            )
+            # Phase A: async client — CC callModel() 不阻塞事件循环。
+            self._async_client = AsyncOpenAI(
                 api_key=api_key,
                 base_url=base_url,
                 timeout=timeout_seconds,
@@ -224,6 +230,7 @@ class OpenAINativeBackend:
         """Wrap an existing OpenAIBackend as OpenAINativeBackend."""
         instance = object.__new__(cls)
         instance._client = getattr(openai_backend, "_client")
+        instance._async_client = getattr(openai_backend, "_async_client", None)
         instance._model = getattr(openai_backend, "_model", "")
         instance._base_url = getattr(openai_backend, "_base_url", None)
         instance._max_tokens = getattr(openai_backend, "_max_tokens", 4096)
@@ -338,4 +345,74 @@ class OpenAINativeBackend:
             text=content,
             stop_reason=choice.finish_reason or "stop",
             usage=usage,
+        )
+
+    # ── Async (CC callModel) ─────────────────────────────────────────────
+
+    async def ainvoke(
+        self,
+        conversation: NativeConversation,
+        *,
+        tool_choice: dict | None = None,
+        cancellation: object | None = None,
+    ) -> ModelAction:
+        """CC callModel() 等价 — async 调用, 不阻塞事件循环。"""
+        if cancellation is not None and hasattr(cancellation, 'cancelled'):
+            if cancellation.cancelled:
+                return ModelFailure(error="Cancelled before LLM call", retryable=False)
+
+        api_messages = _native_conv_to_openai_dicts(conversation)
+
+        if self._use_function_calling and self._cached_api_tools:
+            kwargs: dict = dict(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                messages=api_messages,
+                tools=self._cached_api_tools,
+                tool_choice=tool_choice or "auto",
+            )
+        else:
+            kwargs = dict(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                messages=api_messages,
+            )
+
+        response = await self._async_client.chat.completions.create(**kwargs)
+
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content or ""
+        usage = TokenUsage(
+            input_tokens=response.usage.prompt_tokens,
+            output_tokens=response.usage.completion_tokens,
+        )
+
+        if message.tool_calls:
+            calls = tuple(
+                MACToolCall(
+                    id=tc.id,
+                    name=tc.function.name,
+                    params=freeze_json(
+                        json.loads(tc.function.arguments)
+                        if tc.function.arguments else {}
+                    ),
+                    usage=usage if i == 0 else None,
+                )
+                for i, tc in enumerate(message.tool_calls)
+            )
+            if len(calls) == 1:
+                return calls[0]
+            return ToolCallBatch(calls=calls, usage=usage)
+
+        if choice.finish_reason in ("stop", "end_turn"):
+            return AssistantText(
+                text=content, stop_reason=choice.finish_reason, usage=usage,
+            )
+        if choice.finish_reason == "length":
+            return ModelStop(
+                text=content, stop_reason="max_tokens", usage=usage,
+            )
+        return AssistantText(
+            text=content, stop_reason=choice.finish_reason or "stop", usage=usage,
         )
