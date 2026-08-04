@@ -169,8 +169,8 @@ class TestE2EFakeAdapter:
         # Create a FakeLLM that returns a tool call
         tc = ToolCall(id="t1", name="read", params=freeze_json({"f": "x"}),
                       usage=TokenUsage(input_tokens=30, output_tokens=10))
-        # Override the LLM port with a controlled one
-        comp.runtime_ports.llm.invoke = lambda m, t=None, **kw: tc
+        # Override the native backend (accessed via ports.llm._backend)
+        comp.runtime_ports.llm._backend.invoke = lambda conv, **kw: tc
 
         outcome = comp.runtime.run(
             RuntimeExecution(

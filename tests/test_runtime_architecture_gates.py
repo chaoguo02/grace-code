@@ -43,7 +43,7 @@ class TestFinalGate:
     def test_cancellation_latency_under_500ms(self):
         from runtime_core.execution import CancellationHandle, RuntimeExecution, ConversationSnapshot
         from runtime_core.model_actions import AssistantText
-        from runtime_core.step_loop import StepLoop
+        from runtime_core.native_step_loop import NativeStepLoop
         from runtime_core.ports import RuntimePorts, HookGateResult
         from core.eventing.identifiers import SessionId, RunId
 
@@ -56,9 +56,10 @@ class TestFinalGate:
         handle.cancel()
 
         class S:
-            def invoke(self, m, t=None, tool_choice=None): return AssistantText(text="ok")
-            def stream(self, m, t=None, tool_choice=None):
-                async def _s(): return AssistantText(text="ok"); return _s()
+            # Native backend interface (NativeConversation -> ModelAction)
+            def invoke(self, conversation, *, tool_choice=None, cancellation=None):
+                return AssistantText(text="ok")
+            # LLMPort compat
             def execute(self, n, p, i=""): return object()
             def check(self, e, i, t=""): return HookGateResult(allowed=True)
             def publish(self, e, p, scope=None): pass
@@ -69,7 +70,7 @@ class TestFinalGate:
         s = S()
         ports = RuntimePorts(llm=s, tools=s, hooks=s, live_events=s,
                              clock=s, token_usage=s)
-        loop = StepLoop(ports)
+        loop = NativeStepLoop(ports)
         started = _time.monotonic()
         loop.execute(ctx)
         elapsed = (_time.monotonic() - started) * 1000

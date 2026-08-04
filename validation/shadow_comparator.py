@@ -90,7 +90,7 @@ class ShadowComparator:
         Returns:
             ComparisonReport with match rate and diffs.
         """
-        from runtime_core.step_loop import StepLoop
+        from runtime_core.native_step_loop import NativeStepLoop
 
         report = ComparisonReport(total_samples=len(inputs))
 
@@ -107,7 +107,7 @@ class ShadowComparator:
                 ),
             )
 
-            loop = StepLoop(self._ports)
+            loop = NativeStepLoop(self._ports)
             new_outcome = loop.execute(context)
 
             # Compare outcomes

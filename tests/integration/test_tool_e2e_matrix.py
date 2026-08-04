@@ -58,7 +58,7 @@ class TestToolE2EMatrix:
         tc = ToolCall(id="t1", name="read",
                       params=freeze_json({"file_path": "test.txt"}),
                       usage=TokenUsage(input_tokens=10, output_tokens=5))
-        comp.runtime_ports.llm.invoke = lambda m, t=None, **kw: tc
+        comp.runtime_ports.llm._backend.invoke = lambda conv, **kw: tc
         outcome = comp.runtime.run(
             RuntimeExecution(
                 session_id=SessionId("s-e2e-read"), run_id=RunId("r-read"),
@@ -98,7 +98,7 @@ class TestToolE2EMatrix:
         tc3 = ToolCall(id="t3", name="read", params=freeze_json({"f": "c.txt"}))
         batch = ToolCallBatch(calls=(tc1, tc2, tc3),
                               usage=TokenUsage(input_tokens=30, output_tokens=15))
-        comp.runtime_ports.llm.invoke = lambda m, t=None, **kw: batch
+        comp.runtime_ports.llm._backend.invoke = lambda conv, **kw: batch
         outcome = comp.runtime.run(
             RuntimeExecution(
                 session_id=SessionId("s-parallel"), run_id=RunId("r-parallel"),

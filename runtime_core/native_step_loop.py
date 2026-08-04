@@ -95,14 +95,23 @@ class NativeStepLoop:
     def __init__(
         self,
         ports: RuntimePorts,
-        backend: NativeBackend,
-        store: ConversationStore,
+        backend: "NativeBackend | None" = None,
+        store: "ConversationStore | None" = None,
         scheduler: ToolScheduler | None = None,
         *,
         context_budget: ContextBudgetManager | None = None,
     ) -> None:
         self._ports = ports
-        self._backend = backend
+        # Derive backend from ports.llm if not explicitly provided.
+        # Prefer ports.llm directly (allows test overrides on .invoke).
+        # Fall back to ports.llm._backend for NativeBackendAdapter wrapping.
+        if backend is not None:
+            self._backend = backend
+        elif hasattr(ports.llm, '_backend') and hasattr(ports.llm._backend, 'invoke'):
+            self._backend = ports.llm._backend
+        else:
+            self._backend = ports.llm
+        # Store is optional — when absent, persistence is skipped (test mode)
         self._store = store
         self._scheduler = scheduler or ToolScheduler()
         self._state: ConversationState | None = None
@@ -111,11 +120,14 @@ class NativeStepLoop:
     # ── Main loop ───────────────────────────────────────────────────────
 
     def execute(self, context: RuntimeExecution) -> RuntimeOutcome:
-        """执行一个 Run — 纯净的 Model → Hook → Tool → Outcome 循环。"""
-        # Phase 5: 从 DB 重建会话状态（崩溃恢复）
-        self._state = ConversationState.rebuild_from(
-            self._store.rebuild_conversation()
-        )
+        """Execute one Run -- pure Model -> Hook -> Tool -> Outcome loop."""
+        # Rebuild state from DB if store available (crash recovery)
+        if self._store is not None:
+            self._state = ConversationState.rebuild_from(
+                self._store.rebuild_conversation()
+            )
+        else:
+            self._state = ConversationState()
 
         # 注入本轮用户输入（如果尚未持久化）
         for msg_dict in context.conversation.messages:
@@ -194,9 +206,10 @@ class NativeStepLoop:
             self._state.add_assistant_message(model_action)
 
             # ── 3. 即时持久化 assistant 消息 ─────────────────────────
-            self._store.append_message(
-                self._state.last_message, turn_index=turn,
-            )
+            if self._store is not None:
+                self._store.append_message(
+                    self._state.last_message, turn_index=turn,
+                )
 
             # ── 4. Process model action ───────────────────────────────
             if isinstance(model_action, AssistantText):
@@ -263,9 +276,10 @@ class NativeStepLoop:
                         tr.tool_call,
                     )
                     # ── 6. 即时持久化 tool_result ────────────────────
-                    self._store.append_message(
-                        self._state.last_message, turn_index=turn,
-                    )
+                    if self._store is not None:
+                        self._store.append_message(
+                            self._state.last_message, turn_index=turn,
+                        )
 
                 # T8: PostToolBatch hook
                 if len(tool_results) > 0:
@@ -475,14 +489,14 @@ class NativeStepLoop:
     # ── Persistence helper ──────────────────────────────────────────────
 
     def _flush_store(self) -> None:
-        """P1: 显式刷盘 — 将缓冲消息写入 DB。
+        """P1: Explicit flush — write buffered messages to DB.
 
-        在以下关键边界调用：
-        - tool_use→tool_result 配对完成后
-        - 文本响应（结束 run）前
-        - 取消收敛后
+        Called at critical boundaries:
+        - After tool_use->tool_result pair completion
+        - Before text response (end of run)
+        - After cancellation convergence
         """
-        if hasattr(self._store, 'flush'):
+        if self._store is not None and hasattr(self._store, 'flush'):
             self._store.flush()
 
     # ── Outcome helpers ──────────────────────────────────────────────────

@@ -709,24 +709,18 @@ def assemble(db_path: str, *,
             )
 
     # ── Condition 2: All providers → Native pipeline ──────────────────
-    _native_backend = None
-    _conversation_store = None
-
     if llm_backend is not None:
         from llm.anthropic_backend import AnthropicBackend
         from llm.openai_backend import OpenAIBackend
         if isinstance(llm_backend, AnthropicBackend):
             from runtime_core.native_backend import NativeBackend
-            _native_backend = NativeBackend.from_backend(llm_backend)
+            _native = NativeBackend.from_backend(llm_backend)
         elif isinstance(llm_backend, OpenAIBackend):
             from runtime_core.openai_native_backend import OpenAINativeBackend
-            _native_backend = OpenAINativeBackend.from_backend(llm_backend)
-
-        if _native_backend is not None:
-            _llm_adapter = NativeBackendAdapter(_native_backend)
+            _native = OpenAINativeBackend.from_backend(llm_backend)
         else:
-            # Unknown backend type — wrap via NativeBackendAdapter with fake
-            _llm_adapter = NativeBackendAdapter(_FakeNativeLLM())
+            _native = _FakeNativeLLM()
+        _llm_adapter = NativeBackendAdapter(_native)
     else:
         _llm_adapter = NativeBackendAdapter(_FakeNativeLLM())  # test mode
 
@@ -741,11 +735,7 @@ def assemble(db_path: str, *,
         live_events=_RealLiveEvents(bus), clock=_RealClock(),
         token_usage=_RealTokenUsage(outbox),
     )
-    runtime = AgentRuntime(
-        runtime_ports,
-        native_backend=_native_backend,
-        conversation_store=_conversation_store,
-    )
+    runtime = AgentRuntime(runtime_ports)
     # T12: Permission rules stored for T13 wiring
     # (frozen slots dataclass cannot have extra attributes; rules passed via
     #  hook_settings dict to _RealHooks in T13)
