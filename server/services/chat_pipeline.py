@@ -531,12 +531,15 @@ class ChatPipeline:
         except Exception:
             pass
 
-        # Execute via coordinator
-        outcome = coord.execute(
+        # Execute via coordinator — Phase F: async aexecute (aiterate main loop).
+        # _execute_native runs in a daemon thread (no running loop) so
+        # asyncio.run is safe here.
+        import asyncio
+        outcome = asyncio.run(coord.aexecute(
             ExecuteRun(session_id=sid, run_id=run_id),
             conversation=conv, capabilities=caps, max_steps=_max_steps,
             workspace=self._ports.repo_path,  # Phase 12: hook cwd source
-        )
+        ))
 
         # Phase 5: 跨轮持久化 — 把 run 产生的 assistant/tool 消息写 session_messages，
         # 供下一轮 HTTP 重建 conversation 时保留工具历史（tool_use_id 关联不丢）。

@@ -29,6 +29,18 @@ class _RecordingCoordinator:
             run_id=cmd.run_id, steps=1, tokens=10, summary="done",
         )
 
+    async def aexecute(self, cmd, *, conversation=None, capabilities=None, max_steps=25, workspace="", event_handler=None):
+        """Phase F: async execute (aiterate)."""
+        self.executed_conv = conversation
+        self.caps = capabilities
+        from runtime_core.outcome import RuntimeOutcome
+        outcome = RuntimeOutcome.completed(
+            run_id=cmd.run_id, steps=1, tokens=10, summary="done",
+        )
+        if event_handler:
+            event_handler({"type": "completed", "outcome": outcome})
+        return outcome
+
     def finalize(self, cmd, *, session_id=None):
         self.finalized = True
         return None

@@ -144,6 +144,27 @@ class RunCoordinator:
         )
         return self._runtime.run(context)
 
+    async def aexecute(self, cmd: ExecuteRun,
+                       conversation: ConversationSnapshot | None = None,
+                       capabilities: CapabilitySnapshot | None = None,
+                       max_steps: int = 25,
+                       workspace: str = "",
+                       event_handler=None) -> RuntimeOutcome:
+        """CC query() 等价 — async 执行, 走 AgentRuntime.arun (aiterate).
+
+        Phase F: async 是主路径。event_handler 消费 aiterate 事件 (推流).
+        """
+        from runtime_core.execution import ConversationSnapshot, CapabilitySnapshot
+        context = RuntimeExecution(
+            session_id=cmd.session_id,
+            run_id=cmd.run_id,
+            max_steps=max_steps,
+            conversation=conversation or ConversationSnapshot(),
+            capabilities=capabilities or CapabilitySnapshot(),
+            workspace=workspace,
+        )
+        return await self._runtime.arun(context, event_handler=event_handler)
+
     def finalize(self, cmd: FinalizeRun, session_id: SessionId | None = None) -> EventEnvelope:
         """G23: Terminal CAS — state transition + fact in one UoW."""
         outcome = cmd.outcome
