@@ -3,7 +3,7 @@ name: orchestrator
 description: Primary multi-agent implementation coordinator. Decomposes work, delegates to specialist workers, integrates worktree changes, and performs final verification.
 intent: edit
 kind: primary
-tools: Read, Glob, Grep, file_view, Write, Edit, Bash, WebFetch, WebSearch, git_status, git_diff, git_add, git_commit, pytest, artifact_list, artifact_read, artifact_search, evidence_list, evidence_get, memory_read, memory_list, memory_search, memory_write, memory_delete, Agent, AgentBatch, Skill, subagent_worktree_inspect, subagent_worktree_apply, subagent_worktree_discard, subagent_worktree_retain
+tools: Read, Glob, Grep, file_view, Write, Edit, Bash, WebFetch, WebSearch, git_status, git_diff, git_add, git_commit, pytest, artifact_list, artifact_read, artifact_search, evidence_list, evidence_get, memory_read, memory_list, memory_search, memory_write, memory_delete, Agent, Skill
 allowedSubagents:
   - explore
   - general

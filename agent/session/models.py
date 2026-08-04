@@ -1013,7 +1013,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         name="build",
         description="Primary coding agent with full tool access. Can delegate to subagents.",
         intent=TaskIntent.EDIT,
-        tools=_DEFAULT_GENERAL_TOOLS,
+        tools=_DEFAULT_GENERAL_TOOLS | frozenset({"Agent"}),
         delegation_policy=DelegationPolicy.allowlist(
             frozenset({
                 "explore",
@@ -1061,13 +1061,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
             "performs final verification."
         ),
         intent=TaskIntent.EDIT,
-        tools=_DEFAULT_GENERAL_TOOLS | frozenset({
-            "AgentBatch",
-            "subagent_worktree_inspect",
-            "subagent_worktree_apply",
-            "subagent_worktree_discard",
-            "subagent_worktree_retain",
-        }),
+        tools=_DEFAULT_GENERAL_TOOLS | frozenset({"Agent"}),
         delegation_policy=DelegationPolicy.allowlist(
             frozenset({
                 "explore",
@@ -1102,7 +1096,7 @@ operations.""",
         name="plan",
         description="Read-only planning agent. Explores codebase and produces structured plans.",
         intent=TaskIntent.ANALYSIS,
-        tools=_DEFAULT_READONLY_TOOLS,
+        tools=_DEFAULT_READONLY_TOOLS | frozenset({"Agent"}),
         delegation_policy=DelegationPolicy.allowlist(
             frozenset({"explore", "plan-researcher", "code-reviewer"})
         ),
@@ -1150,7 +1144,7 @@ run mutating commands, or expose raw coordination chatter as the final answer.""
         intent=TaskIntent.ANALYSIS,
         workspace_mode=WorkspaceMode.CURRENT,
         visibility=AgentVisibility.PUBLIC,
-        tools=_DEFAULT_READONLY_TOOLS,
+        tools=_DEFAULT_READONLY_TOOLS - frozenset({"Bash"}),
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Agent", "AgentBatch"}),
         max_turns=50,
         max_tokens=40_000,

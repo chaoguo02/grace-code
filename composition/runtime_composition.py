@@ -766,6 +766,19 @@ def assemble(db_path: str, *,
             project_dir=_project_dir,  # Phase 3: GRACE.md injection
         )
         runtime_ports.tools.register(_native_agent)
+
+        # ── Phase 2 fix: Agent tool schema → NativeBackend ──────────────
+        if _native_backend is not None:
+            from runtime_core.native_backend import NativeToolSchema
+            _agent_schema = NativeToolSchema(
+                name="Agent",
+                description="Spawn a named subagent (explore, general, etc.) to delegate work in a fresh isolated context.",
+                input_schema=_native_agent.parameters_schema,
+            )
+            _existing = list(_native_backend._tool_schemas)
+            _existing.append(_agent_schema)
+            object.__setattr__(_native_backend, '_tool_schemas', tuple(_existing))
+            _native_backend._cached_api_tools.append(_agent_schema.to_api_dict())
     except Exception:
         pass  # Agent tool registration is best-effort; not fatal for test mode
 
